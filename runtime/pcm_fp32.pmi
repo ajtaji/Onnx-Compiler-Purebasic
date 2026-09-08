@@ -1,0 +1,133 @@
+; ======================================================================
+; pcm_fp32.pmi - portable FP32 waveform conversion and WAV framing.
+; ----------------------------------------------------------------------
+; Include the target's floating-point math support first. Input samples are
+; mono normalized FP32. Conversion saturates instead of wrapping and rounds
+; to nearest before producing signed 16-bit or signed 24-bit PCM.
+; ======================================================================
+
+Procedure.i PmPcmF32Finite(*value.i)
+  Protected bits.i
+  If *value = 0 : ProcedureReturn 0 : EndIf
+  bits = PeekN(*value) & $FFFFFFFF
+  If (bits & $7F800000) = $7F800000 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmPcmF32NonnegativeFinite(*value.i)
+  Protected bits.i
+  If PmPcmF32Finite(*value) = 0 : ProcedureReturn 0 : EndIf
+  bits = PeekN(*value) & $FFFFFFFF
+  If (bits & $80000000) <> 0 And (bits & $7FFFFFFF) <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmPcmF32BufferFinite(*source.i, samples.i)
+  Protected i.i
+  If *source = 0 Or samples < 0 : ProcedureReturn 0 : EndIf
+  i = 0
+  While i < samples
+    If PmPcmF32Finite(*source + i * 4) = 0 : ProcedureReturn 0 : EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmPcmSample24(value.f, gain.f)
+  Protected scaled.f
+  Protected result.i
+  If PmPcmF32Finite(@value) = 0 Or PmPcmF32NonnegativeFinite(@gain) = 0 : ProcedureReturn 0 : EndIf
+  scaled = value * gain
+  If scaled > 1.0 : scaled = 1.0 : EndIf
+  If scaled < -1.0 : scaled = -1.0 : EndIf
+  If scaled >= 0.0
+    scaled = scaled * 8388607.0
+    result = Int(scaled + 0.5)
+  Else
+    scaled = scaled * 8388608.0
+    result = Int(scaled - 0.5)
+  EndIf
+  If result > 8388607 : result = 8388607 : EndIf
+  If result < -8388608 : result = -8388608 : EndIf
+  ProcedureReturn result
+EndProcedure
+
+Procedure.i PmPcmSample16(value.f, gain.f)
+  Protected scaled.f
+  Protected result.i
+  If PmPcmF32Finite(@value) = 0 Or PmPcmF32NonnegativeFinite(@gain) = 0 : ProcedureReturn 0 : EndIf
+  scaled = value * gain
+  If scaled > 1.0 : scaled = 1.0 : EndIf
+  If scaled < -1.0 : scaled = -1.0 : EndIf
+  If scaled >= 0.0
+    scaled = scaled * 32767.0
+    result = Int(scaled + 0.5)
+  Else
+    scaled = scaled * 32768.0
+    result = Int(scaled - 0.5)
+  EndIf
+  If result > 32767 : result = 32767 : EndIf
+  If result < -32768 : result = -32768 : EndIf
+  ProcedureReturn result
+EndProcedure
+
+Procedure.i PmPcmF32ToS16(*source.i, *destination.i, samples.i, gain.f)
+  Protected i.i
+  Protected ps.i
+  If *source = 0 Or *destination = 0 Or samples < 0 : ProcedureReturn 0 : EndIf
+  If PmPcmF32NonnegativeFinite(@gain) = 0 : ProcedureReturn 0 : EndIf
+  If PmPcmF32BufferFinite(*source, samples) = 0 : ProcedureReturn 0 : EndIf
+  ps = *source
+  i = 0
+  While i < samples
+    PokeW(*destination + i * 2, PmPcmSample16(*ps.f, gain))
+    ps = ps + 4
+    i = i + 1
+  Wend
+  ProcedureReturn samples * 2
+EndProcedure
+
+Procedure PmPcmFourCc(*destination.i, offset.i, a.i, b.i, c.i, d.i)
+  PokeA(*destination + offset + 0, a)
+  PokeA(*destination + offset + 1, b)
+  PokeA(*destination + offset + 2, c)
+  PokeA(*destination + offset + 3, d)
+EndProcedure
+
+; Write a canonical little-endian mono PCM16 WAV header. The caller writes
+; samples*2 bytes immediately after the returned 44-byte header.
+Procedure.i PmPcmWavHeader(*destination.i, capacity.i, sampleRate.i, samples.i)
+  Protected dataBytes.i
+  If *destination = 0 Or capacity < 44 Or sampleRate <= 0 Or samples < 0 : ProcedureReturn 0 : EndIf
+  dataBytes = samples * 2
+  If dataBytes < 0 Or dataBytes > $7FFFFFD7 : ProcedureReturn 0 : EndIf
+  PmPcmFourCc(*destination, 0, 82, 73, 70, 70)       ; RIFF
+  PokeN(*destination + 4, dataBytes + 36)
+  PmPcmFourCc(*destination, 8, 87, 65, 86, 69)       ; WAVE
+  PmPcmFourCc(*destination, 12, 102, 109, 116, 32)   ; fmt
+  PokeN(*destination + 16, 16)
+  PokeW(*destination + 20, 1)
+  PokeW(*destination + 22, 1)
+  PokeN(*destination + 24, sampleRate)
+  PokeN(*destination + 28, sampleRate * 2)
+  PokeW(*destination + 32, 2)
+  PokeW(*destination + 34, 16)
+  PmPcmFourCc(*destination, 36, 100, 97, 116, 97)    ; data
+  PokeN(*destination + 40, dataBytes)
+  ProcedureReturn 44
+EndProcedure
+
+Procedure.i PmPcmF32ToWav16(*source.i, samples.i, sampleRate.i, gain.f, *destination.i, capacity.i)
+  Protected dataBytes.i
+  ; Validate the complete request before even the WAV header is written.  A
+  ; rejected waveform must not leave a plausible but partial file in place.
+  If *source = 0 Or *destination = 0 Or capacity < 44 : ProcedureReturn 0 : EndIf
+  If sampleRate <= 0 Or sampleRate > 2147483647 : ProcedureReturn 0 : EndIf
+  If samples < 0 Or samples > (capacity - 44) / 2 : ProcedureReturn 0 : EndIf
+  If PmPcmF32NonnegativeFinite(@gain) = 0 : ProcedureReturn 0 : EndIf
+  If PmPcmF32BufferFinite(*source, samples) = 0 : ProcedureReturn 0 : EndIf
+  If PmPcmWavHeader(*destination, capacity, sampleRate, samples) = 0 : ProcedureReturn 0 : EndIf
+  dataBytes = PmPcmF32ToS16(*source, *destination + 44, samples, gain)
+  If dataBytes <> samples * 2 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 44 + dataBytes
+EndProcedure

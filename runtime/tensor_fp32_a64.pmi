@@ -1,0 +1,246 @@
+; ======================================================================
+; tensor_fp32_a64.pmi - AArch64 scalar-FP acceleration for ONNX kernels.
+; ----------------------------------------------------------------------
+; Include tensor_fp32.pmi first. These are backend kernels selected by an
+; ONNX target profile; the graph compiler and tensor ABI remain portable.
+;
+; Forge currently gives ordinary PureMetal locals fixed memory homes. That
+; is harmless for small elementwise loops but disastrous inside billions of
+; multiply-accumulates: every loop counter, pointer and accumulator is then
+; reloaded from BSS. These kernels keep their hot state in AAPCS64 caller-
+; saved registers at the actual tensor emission boundary. They deliberately
+; use separate FMUL then FADD, in original K order, rather than FMLA or a
+; reordered reduction, so acceleration does not silently change FP32
+; arithmetic. The portable kernels remain the fallback for uncommon Gemm
+; attributes.
+; ======================================================================
+
+; A is MxK, B is KxN and dst is MxN, all row-major. Four adjacent output
+; columns are accumulated together. This reuses each A load and turns each
+; B row access into four adjacent loads while preserving the K reduction
+; order independently for every output element.
+Procedure PmTensorMatMul2A64(*a.i, *b.i, *dst.i, m.i, k.i, n.i)
+  ASM
+    ; x0=a x1=b x2=dst x3=m x4=k x5=n
+    cbz  x3, pmoA64MatMulDone
+    cbz  x5, pmoA64MatMulDone
+    lsl  x12, x5, #2                 ; bytes between B rows
+    movz x6, #0                      ; row
+pmoA64MatMulRow:
+    mul  x13, x6, x4
+    lsl  x13, x13, #2
+    add  x9, x0, x13                 ; A row base
+    mul  x13, x6, x5
+    lsl  x13, x13, #2
+    add  x11, x2, x13                ; dst cursor
+    movz x7, #0                      ; column
+pmoA64MatMulFourCheck:
+    sub  x13, x5, x7
+    cmp  x13, #4
+    b.lt pmoA64MatMulTailCheck
+    fmov s0, wzr
+    fmov s1, wzr
+    fmov s2, wzr
+    fmov s3, wzr
+    lsl  x13, x7, #2
+    add  x10, x1, x13                ; B at row zero, this column
+    mov  x14, x9                     ; A cursor
+    mov  x8, x4                      ; remaining K
+    cbz  x8, pmoA64MatMulFourStore
+pmoA64MatMulFourInner:
+    ldr  s4, [x14]
+    ldr  s5, [x10]
+    fmul s5, s5, s4
+    fadd s0, s0, s5
+    ldr  s5, [x10, #4]
+    fmul s5, s5, s4
+    fadd s1, s1, s5
+    ldr  s5, [x10, #8]
+    fmul s5, s5, s4
+    fadd s2, s2, s5
+    ldr  s5, [x10, #12]
+    fmul s5, s5, s4
+    fadd s3, s3, s5
+    add  x14, x14, #4
+    add  x10, x10, x12
+    subs x8, x8, #1
+    b.ne pmoA64MatMulFourInner
+pmoA64MatMulFourStore:
+    str  s0, [x11]
+    str  s1, [x11, #4]
+    str  s2, [x11, #8]
+    str  s3, [x11, #12]
+    add  x11, x11, #16
+    add  x7, x7, #4
+    b    pmoA64MatMulFourCheck
+pmoA64MatMulTailCheck:
+    cmp  x7, x5
+    b.ge pmoA64MatMulNextRow
+    fmov s0, wzr
+    lsl  x13, x7, #2
+    add  x10, x1, x13
+    mov  x14, x9
+    mov  x8, x4
+    cbz  x8, pmoA64MatMulTailStore
+pmoA64MatMulTailInner:
+    ldr  s4, [x14]
+    ldr  s5, [x10]
+    fmul s5, s5, s4
+    fadd s0, s0, s5
+    add  x14, x14, #4
+    add  x10, x10, x12
+    subs x8, x8, #1
+    b.ne pmoA64MatMulTailInner
+pmoA64MatMulTailStore:
+    str  s0, [x11]
+    add  x11, x11, #4
+    add  x7, x7, #1
+    b    pmoA64MatMulTailCheck
+pmoA64MatMulNextRow:
+    add  x6, x6, #1
+    cmp  x6, x3
+    b.lt pmoA64MatMulRow
+pmoA64MatMulDone:
+  EndASM
+EndProcedure
+
+; Fast path for the dominant inference Gemm contract: A and output are not
+; transposed, B is stored as N contiguous K-element rows, alpha=beta=1, and
+; C supplies one bias value per output column. Other legal Gemm forms tail
+; into the portable implementation with x0 (the argument block) untouched.
+Procedure PmTensorGemmA64(*g.PmTensorGemmArgs)
+  ASM
+    ldr  x8, [x0, #56]               ; TransA
+    cbnz x8, pmoA64GemmFallback
+    ldr  x8, [x0, #64]               ; TransB
+    cmp  x8, #1
+    b.ne pmoA64GemmFallback
+    ldr  w8, [x0, #72]               ; Alpha bits
+    movz w9, #0x3f80, lsl #16        ; 1.0f
+    cmp  w8, w9
+    b.ne pmoA64GemmFallback
+    ldr  w8, [x0, #76]               ; Beta bits
+    cmp  w8, w9
+    b.ne pmoA64GemmFallback
+    ldr  x7, [x0, #48]               ; N
+    ldr  x8, [x0, #80]               ; CCount
+    cmp  x8, x7
+    b.ne pmoA64GemmFallback
+    ldr  x3, [x0, #16]               ; C
+    cbz  x3, pmoA64GemmFallback
+
+    ldr  x1, [x0]                    ; A
+    ldr  x2, [x0, #8]                ; B
+    ldr  x4, [x0, #24]               ; Dst
+    ldr  x5, [x0, #32]               ; M
+    ldr  x6, [x0, #40]               ; K
+    cbz  x5, pmoA64GemmDone
+    cbz  x7, pmoA64GemmDone
+    movz x10, #0                     ; row
+pmoA64GemmRow:
+    mul  x8, x10, x6
+    lsl  x8, x8, #2
+    add  x12, x1, x8                 ; A row base
+    mul  x8, x10, x7
+    lsl  x8, x8, #2
+    add  x11, x4, x8                 ; dst cursor
+    movz x9, #0                      ; column
+pmoA64GemmFourCheck:
+    sub  x8, x7, x9
+    cmp  x8, #4
+    b.lt pmoA64GemmTailCheck
+    ; Match the portable kernel's FP32 operation order exactly: reduce from
+    ; +0.0 first, then add beta*C after the complete dot product. Starting
+    ; the reduction at C is algebraically equivalent but not bit-equivalent.
+    fmov s0, wzr
+    fmov s1, wzr
+    fmov s2, wzr
+    fmov s3, wzr
+    mul  x8, x9, x6
+    lsl  x8, x8, #2
+    add  x13, x2, x8                 ; B row for output column zero
+    lsl  x8, x6, #2                  ; bytes per transposed-B row
+    add  x14, x13, x8
+    add  x15, x14, x8
+    add  x16, x15, x8
+    mov  x17, x12                    ; A cursor
+    mov  x0, x6                      ; remaining K; argument block no longer needed
+    cbz  x0, pmoA64GemmFourStore
+pmoA64GemmFourInner:
+    ldr  s4, [x17]
+    ldr  s5, [x13]
+    fmul s5, s5, s4
+    fadd s0, s0, s5
+    ldr  s5, [x14]
+    fmul s5, s5, s4
+    fadd s1, s1, s5
+    ldr  s5, [x15]
+    fmul s5, s5, s4
+    fadd s2, s2, s5
+    ldr  s5, [x16]
+    fmul s5, s5, s4
+    fadd s3, s3, s5
+    add  x17, x17, #4
+    add  x13, x13, #4
+    add  x14, x14, #4
+    add  x15, x15, #4
+    add  x16, x16, #4
+    subs x0, x0, #1
+    b.ne pmoA64GemmFourInner
+pmoA64GemmFourStore:
+    lsl  x8, x9, #2
+    add  x17, x3, x8
+    ldr  s4, [x17]
+    fadd s0, s0, s4
+    ldr  s4, [x17, #4]
+    fadd s1, s1, s4
+    ldr  s4, [x17, #8]
+    fadd s2, s2, s4
+    ldr  s4, [x17, #12]
+    fadd s3, s3, s4
+    str  s0, [x11]
+    str  s1, [x11, #4]
+    str  s2, [x11, #8]
+    str  s3, [x11, #12]
+    add  x11, x11, #16
+    add  x9, x9, #4
+    b    pmoA64GemmFourCheck
+pmoA64GemmTailCheck:
+    cmp  x9, x7
+    b.ge pmoA64GemmNextRow
+    fmov s0, wzr
+    mul  x8, x9, x6
+    lsl  x8, x8, #2
+    add  x13, x2, x8
+    mov  x17, x12
+    mov  x0, x6
+    cbz  x0, pmoA64GemmTailStore
+pmoA64GemmTailInner:
+    ldr  s4, [x17]
+    ldr  s5, [x13]
+    fmul s5, s5, s4
+    fadd s0, s0, s5
+    add  x17, x17, #4
+    add  x13, x13, #4
+    subs x0, x0, #1
+    b.ne pmoA64GemmTailInner
+pmoA64GemmTailStore:
+    lsl  x8, x9, #2
+    add  x17, x3, x8
+    ldr  s4, [x17]
+    fadd s0, s0, s4
+    str  s0, [x11]
+    add  x11, x11, #4
+    add  x9, x9, #1
+    b    pmoA64GemmTailCheck
+pmoA64GemmNextRow:
+    add  x10, x10, #1
+    cmp  x10, x5
+    b.lt pmoA64GemmRow
+pmoA64GemmDone:
+    b    pmoA64GemmEnd
+pmoA64GemmFallback:
+    bl   pmtensorgemm
+pmoA64GemmEnd:
+  EndASM
+EndProcedure

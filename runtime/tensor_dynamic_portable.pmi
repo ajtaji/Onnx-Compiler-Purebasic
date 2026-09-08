@@ -1,0 +1,2039 @@
+; Resident runtime dimensions in caller-owned memory. No heap service, files,
+; graph interpreter, host process, or compiler is used by generated programs.
+; Arena blocks use 16-byte headers and 16-byte alignment. First-fit allocation
+; splits blocks; free coalesces adjacent blocks. Capacity includes all headers.
+Structure PmDynamicTensor
+  Data.i
+  Kind.i
+  Rank.i
+  Count.i
+  Bytes.i
+  Owned.i
+  Scales.i
+EndStructure
+Global Dim Dt.PmDynamicTensor(#PMD_TENSOR_COUNT+1)
+Global Dim DDims.i((#PMD_TENSOR_COUNT+1)*8)
+Global Dim DCall.i(16)
+Global DError.i
+Global DNode.i
+Global DCancel.i
+Global DLive.i
+Global DPeak.i
+Global DLimit.i
+Global DHeap.i
+Global DHeapBytes.i
+Global DHeapUsed.i
+Global DHeapPeak.i
+
+Procedure.i DMax(A.i,B.i)
+  If A>B
+    ProcedureReturn A
+  EndIf
+  ProcedureReturn B
+EndProcedure
+Procedure.i DMin(A.i,B.i)
+  If A<B
+    ProcedureReturn A
+  EndIf
+  ProcedureReturn B
+EndProcedure
+CompilerIf #PMD_NATIVE_BYTES=8
+  #PMD_INTEGER_MAX=$7FFFFFFFFFFFFFFF
+CompilerElse
+  #PMD_INTEGER_MAX=$7FFFFFFF
+CompilerEndIf
+#PMD_INTEGER_MIN=-#PMD_INTEGER_MAX-1
+Procedure.i DFail(Message.i)
+  If DError=0
+    DError=Message
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i DIntegerOp(A.i,B.i,Op.i)
+  Protected overflow.i=0
+  If Op=0
+    If B>0
+      If A>#PMD_INTEGER_MAX-B
+        overflow=1
+      EndIf
+    ElseIf B<0
+      If A<#PMD_INTEGER_MIN-B
+        overflow=1
+      EndIf
+    EndIf
+    If overflow=0
+      ProcedureReturn A+B
+    EndIf
+  ElseIf Op=1
+    If B<0
+      If A>#PMD_INTEGER_MAX+B
+        overflow=1
+      EndIf
+    ElseIf B>0
+      If A<#PMD_INTEGER_MIN+B
+        overflow=1
+      EndIf
+    EndIf
+    If overflow=0
+      ProcedureReturn A-B
+    EndIf
+  ElseIf Op=2
+    If A>0
+      If B>0
+        If A>#PMD_INTEGER_MAX/B
+          overflow=1
+        EndIf
+      ElseIf B<0
+        If B<#PMD_INTEGER_MIN/A
+          overflow=1
+        EndIf
+      EndIf
+    ElseIf A<0
+      If B>0
+        If A<#PMD_INTEGER_MIN/B
+          overflow=1
+        EndIf
+      ElseIf B<0
+        If A<#PMD_INTEGER_MAX/B
+          overflow=1
+        EndIf
+      EndIf
+    EndIf
+    If overflow=0
+      ProcedureReturn A*B
+    EndIf
+  ElseIf Op=3
+    If B=0
+      ProcedureReturn DFail("Integer division by zero.")
+    EndIf
+    If A=#PMD_INTEGER_MIN And B=-1
+      overflow=1
+    EndIf
+    If overflow=0
+      ProcedureReturn A/B
+    EndIf
+  EndIf
+  DFail("Integer arithmetic exceeds the native signed execution range.")
+  ProcedureReturn 0
+EndProcedure
+Procedure.f DFloat(Value.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+    ProcedureReturn MathFFromInt(Value)
+  CompilerElse
+    ProcedureReturn Value
+  CompilerEndIf
+EndProcedure
+Procedure.f DReadF(Address.i)
+  ProcedureReturn PmTensorGet(Address,0)
+EndProcedure
+Procedure DWriteF(Address.i,Value.f)
+  PmTensorPut(Address,0,Value)
+EndProcedure
+Procedure.i DReadI64(Address.i)
+  Protected value.i=0
+  value=PmTensorGetI64(Address,0)
+  If PmTensorInt64Ok=0
+    DFail("INT64 value exceeds the native signed execution range.")
+  EndIf
+  ProcedureReturn value
+EndProcedure
+Procedure DWriteI64(Address.i,Value.i)
+  PmTensorPutI64(Address,0,Value)
+EndProcedure
+Procedure DCopy(Source.i,Destination.i,Bytes.i)
+  Protected i.i=0
+  i=0
+  While i<Bytes
+    PokeA(Destination+i,PeekA(Source+i))
+    i=i+1
+  Wend
+EndProcedure
+Procedure DZero(Address.i,Bytes.i)
+  Protected index.i=0
+  While index<Bytes
+    PokeA(Address+index,0)
+    index=index+1
+  Wend
+EndProcedure
+Procedure.i DHeapBind(Address.i,Bytes.i)
+  If Address=0 Or (Address & 15)<>0 Or Bytes<32 Or Bytes>$7FFFFF00
+    ProcedureReturn DFail("Bind an aligned arena between 32 bytes and the signed addressable size limit.")
+  EndIf
+  DHeap=Address
+  DHeapBytes=Bytes & -16
+  DLimit=DHeapBytes
+  DHeapUsed=0
+  DHeapPeak=0
+  PokeL(DHeap,DHeapBytes)
+  PokeL(DHeap+4,0)
+  ProcedureReturn 1
+EndProcedure
+Procedure.i DAcquire(Bytes.i)
+  Protected offset.i=0
+  Protected span.i=0
+  Protected needed.i=0
+  Protected address.i=0
+  Protected i.i=0
+  If DHeap=0 Or Bytes<0 Or Bytes>DHeapBytes-16
+    DFail("Allocation exceeds the bound arena.")
+    ProcedureReturn 0
+  EndIf
+  needed=((DMax(Bytes,1)+15) & -16)+16
+  offset=0
+  While offset<DHeapBytes
+    span=PeekL(DHeap+offset)
+    If span<32 Or span>DHeapBytes-offset
+      DFail("Arena block metadata is invalid.")
+      ProcedureReturn 0
+    EndIf
+    If PeekL(DHeap+offset+4)=0 And span>=needed
+      If span-needed>=32
+        PokeL(DHeap+offset+needed,span-needed)
+        PokeL(DHeap+offset+needed+4,0)
+        span=needed
+        PokeL(DHeap+offset,span)
+      EndIf
+      PokeL(DHeap+offset+4,1)
+      DHeapUsed=DHeapUsed+span
+      DHeapPeak=DMax(DHeapPeak,DHeapUsed)
+      address=DHeap+offset+16
+      i=0
+      While i<span-16
+        PokeA(address+i,0)
+        i=i+1
+      Wend
+      ProcedureReturn address
+    EndIf
+    offset=offset+span
+  Wend
+  DFail("Request cannot fit in the remaining contiguous arena memory.")
+  ProcedureReturn 0
+EndProcedure
+Procedure DFree(Address.i)
+  Protected offset.i=0
+  Protected span.i=0
+  Protected nextSpan.i=0
+  If Address=0
+    ProcedureReturn
+  EndIf
+  offset=Address-DHeap-16
+  If offset<0 Or offset>=DHeapBytes Or (offset & 15)<>0
+    DFail("Invalid arena release.")
+    ProcedureReturn
+  EndIf
+  span=PeekL(DHeap+offset)
+  If span<32 Or span>DHeapBytes-offset Or PeekL(DHeap+offset+4)<>1
+    DFail("Invalid or duplicate arena release.")
+    ProcedureReturn
+  EndIf
+  PokeL(DHeap+offset+4,0)
+  DHeapUsed=DHeapUsed-span
+  offset=0
+  While offset<DHeapBytes
+    span=PeekL(DHeap+offset)
+    If PeekL(DHeap+offset+4)=0 And offset+span<DHeapBytes
+      If PeekL(DHeap+offset+span+4)=0
+        nextSpan=PeekL(DHeap+offset+span)
+        PokeL(DHeap+offset,span+nextSpan)
+        Continue
+      EndIf
+    EndIf
+    offset=offset+span
+  Wend
+EndProcedure
+Procedure.i DSize(Kind.i)
+  Select Kind
+    Case 1
+      ProcedureReturn 4
+    Case 6
+      ProcedureReturn 4
+    Case 7
+      ProcedureReturn 8
+    Case 3
+      ProcedureReturn 1
+    Case 9
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+Procedure DRelease(Id.i)
+  Protected i.i=0
+  If Id<=0 Or Id>#PMD_TENSOR_COUNT
+    ProcedureReturn
+  EndIf
+  If Dt(Id)\Owned
+    DFree(Dt(Id)\Data)
+    DLive=DLive-Dt(Id)\Bytes
+  EndIf
+  Dt(Id)\Data=0
+  Dt(Id)\Kind=0
+  Dt(Id)\Rank=0
+  Dt(Id)\Count=0
+  Dt(Id)\Bytes=0
+  Dt(Id)\Owned=0
+  Dt(Id)\Scales=0
+  For i=0 To 7
+    DDims(Id*8+i)=0
+  Next
+EndProcedure
+Procedure.i DAlloc(Id.i,Kind.i,Rank.i,DimsAddress.i)
+  Protected i.i=0
+  Protected count.i=0
+  Protected extent.i=0
+  Protected size.i=0
+  Protected bytes.i=0
+  Protected Dim dims.i(8)
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If DError<>0 Or DCancel<>0
+    ProcedureReturn DFail("Request cancelled or an earlier operation failed.")
+  EndIf
+  size=DSize(Kind)
+  If Id<=0 Or Id>#PMD_TENSOR_COUNT Or Rank<0 Or Rank>8 Or size=0
+    ProcedureReturn DFail("Unsupported tensor rank or type.")
+  EndIf
+  count=1
+  For i=0 To Rank-1
+    CompilerIf #PMD_NATIVE_BYTES=8
+      extent=PeekN(DimsAddress+i*8)
+    CompilerElse
+      extent=PeekL(DimsAddress+i*4)
+    CompilerEndIf
+    If extent<0 Or extent>DLimit
+      ProcedureReturn DFail("Invalid tensor dimension.")
+    EndIf
+    If extent>0 And count>DLimit/extent
+      ProcedureReturn DFail("Tensor element count exceeds the arena limit.")
+    EndIf
+    dims(i)=extent
+    count=count*extent
+  Next
+  If count>DLimit/size
+    ProcedureReturn DFail("Tensor bytes exceed the arena limit.")
+  EndIf
+  bytes=count*size
+  DRelease(Id)
+  If bytes>DLimit-DLive
+    ProcedureReturn DFail("Request exceeds its working-memory limit.")
+  EndIf
+  Dt(Id)\Data=DAcquire(bytes)
+  If Dt(Id)\Data=0
+    ProcedureReturn 0
+  EndIf
+  Dt(Id)\Kind=Kind
+  Dt(Id)\Rank=Rank
+  Dt(Id)\Count=count
+  Dt(Id)\Bytes=bytes
+  Dt(Id)\Owned=1
+  DLive=DLive+bytes
+  DPeak=DMax(DPeak,DLive)
+  For i=0 To Rank-1
+    DDims(Id*8+i)=dims(i)
+  Next
+  ProcedureReturn 1
+EndProcedure
+Procedure.i DShape(Id.i,Kind.i,Rank.i,d0.i,d1.i,d2.i,d3.i)
+  Protected Dim dims.i(8)
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Rank>4
+    ProcedureReturn DFail("Use DAlloc with eight dimensions for tensor rank above four.")
+  EndIf
+  dims(0)=d0
+  dims(1)=d1
+  dims(2)=d2
+  dims(3)=d3
+  ProcedureReturn DAlloc(Id,Kind,Rank,@dims(0))
+EndProcedure
+Procedure.i DInt(Id.i,Index.i)
+  If Id<=0 Or Id>#PMD_TENSOR_COUNT
+    DFail("Invalid integer tensor ID.")
+    ProcedureReturn 0
+  EndIf
+  If Index<0 Or Index>=Dt(Id)\Count
+    DFail("Integer tensor read is out of bounds.")
+    ProcedureReturn 0
+  EndIf
+  Select Dt(Id)\Kind
+    Case 7
+      ProcedureReturn DReadI64(Dt(Id)\Data+Index*8)
+    Case 6
+      ProcedureReturn PeekL(Dt(Id)\Data+Index*4)
+    Case 9
+      ProcedureReturn PeekA(Dt(Id)\Data+Index) & 255
+  EndSelect
+  DFail("Integer shape controls require integer tensors.")
+  ProcedureReturn 0
+EndProcedure
+Procedure.f DGet(Id.i,Index.i)
+  If Id<=0 Or Id>#PMD_TENSOR_COUNT
+    DFail("Invalid tensor ID.")
+    ProcedureReturn 0.0
+  EndIf
+  If Index<0 Or Index>=Dt(Id)\Count
+    DFail("Tensor read is out of bounds.")
+    ProcedureReturn 0.0
+  EndIf
+  If Dt(Id)\Kind=1
+    ProcedureReturn DReadF(Dt(Id)\Data+Index*4)
+  EndIf
+  ProcedureReturn DFloat(DInt(Id,Index))
+EndProcedure
+Procedure DPut(Id.i,Index.i,Value.f)
+  Select Dt(Id)\Kind
+    Case 1
+      DWriteF(Dt(Id)\Data+Index*4,Value)
+    Case 7
+      DWriteI64(Dt(Id)\Data+Index*8,Int(Value))
+    Case 6
+      PokeL(Dt(Id)\Data+Index*4,Int(Value))
+    Case 9
+      PokeA(Dt(Id)\Data+Index,Bool(Value<>0.0))
+  EndSelect
+EndProcedure
+Procedure.i DInt8Begin(Input.i,Elements.i,Extra.i)
+  Protected i.i=0
+  Protected bytes.i=0
+  If Elements<0 Or Extra<0 Or Elements>DLimit-Extra
+    ProcedureReturn DFail("INT8 activation scratch exceeds the arena limit.")
+  EndIf
+  bytes=Elements+Extra
+  If bytes>DLimit-DLive
+    ProcedureReturn DFail("INT8 scratch exceeds available working memory.")
+  EndIf
+  For i=0 To Elements-1
+    If (PeekL(Input+i*4) & $7F800000)=$7F800000
+      ProcedureReturn DFail("INT8 activations contain NaN or infinity.")
+    EndIf
+  Next
+  PmTensorInt8Scratch=DAcquire(bytes)
+  If PmTensorInt8Scratch=0
+    ProcedureReturn 0
+  EndIf
+  PmTensorInt8ScratchBytes=bytes
+  DLive=DLive+bytes
+  DPeak=DMax(DPeak,DLive)
+  ProcedureReturn 1
+EndProcedure
+Procedure DInt8End()
+  If PmTensorInt8Scratch
+    DFree(PmTensorInt8Scratch)
+    DLive=DLive-PmTensorInt8ScratchBytes
+  EndIf
+  PmTensorInt8Scratch=0
+  PmTensorInt8ScratchBytes=0
+EndProcedure
+
+Procedure.i DListValue(Text.i,Index.i)
+  Protected address.i=0
+  Protected field.i=0
+  Protected value.i=0
+  Protected sign.i=0
+  Protected char.i=0
+  address=Text
+  field=1
+  value=0
+  sign=1
+  While PeekA(address)
+    char=PeekA(address) & 255
+    If char=44
+      If field=Index
+        ProcedureReturn value*sign
+      EndIf
+      field=field+1
+      value=0
+      sign=1
+    ElseIf char=45
+      sign=-1
+    ElseIf char>=48 And char<=57
+      value=value*10+char-48
+    EndIf
+    address=address+1
+  Wend
+  If field=Index
+    ProcedureReturn value*sign
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i DListCount(Text.i)
+  Protected address.i=0
+  Protected count.i=0
+  address=Text
+  count=1
+  While PeekA(address)
+    If PeekA(address)=44
+      count=count+1
+    EndIf
+    address=address+1
+  Wend
+  ProcedureReturn count
+EndProcedure
+Procedure PmFastBinary(A.i,B.i,Destination.i,Count.i,AStride.i,BStride.i,Op.i)
+  Protected i.i=0
+  Protected av.f=0.0
+  Protected bv.f=0.0
+  Protected value.f=0.0
+  For i=0 To Count-1
+    av=DReadF(A+i*AStride*4)
+    bv=DReadF(B+i*BStride*4)
+    Select Op
+      Case 0
+        value=av+bv
+      Case 1
+        value=av-bv
+      Case 2
+        value=av*bv
+      Case 3
+        value=av/bv
+    EndSelect
+    DWriteF(Destination+i*4,value)
+  Next
+EndProcedure
+Procedure PmFastGemm(A.i,B.i,Destination.i,M.i,K.i,N.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+    PmTensorMatMul2Neon(A,B,Destination,M,K,N)
+  CompilerElse
+    PmTensorMatMul2(A,B,Destination,M,K,N)
+  CompilerEndIf
+EndProcedure
+Procedure PmFastReduce(Source.i,Destination.i,Outer.i,Width.i,Mean.i)
+  If Mean
+    PmTensorReduceMeanLast(Source,Destination,Outer,Width)
+  Else
+    PmTensorReduceSumLast(Source,Destination,Outer,Width)
+  EndIf
+EndProcedure
+Procedure PmFastTrig(Source.i,Destination.i,Count.i,Op.i)
+  PmTensorTrig(Source,Destination,Count,Op)
+EndProcedure
+Procedure.i PmFastConv(*g.PmTensorConv1DArgs,Available.i)
+  PmTensorConv1D(*g)
+  ProcedureReturn 1
+EndProcedure
+Procedure.i PmFastConvTranspose(*g.PmTensorConvTranspose1DArgs,Available.i)
+  PmTensorConvTranspose1D(*g)
+  ProcedureReturn 1
+EndProcedure
+Procedure.i DProduct(Id.i, First.i, Last.i)
+  Protected i.i=0
+  Protected n.i=1
+  For i=First To Last
+    n*DDims((Id)*8+(i))
+  Next
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i DLike(Y.i,A.i,Kind.i)
+  If Kind=0
+    Kind=Dt(A)\Kind
+  EndIf
+  ProcedureReturn DAlloc(Y,Kind,Dt(A)\Rank,@DDims((A)*8+(0)))
+EndProcedure
+
+Procedure.i DBroadcastIndex(Index.i,Y.i,A.i)
+  Protected ax.i=0
+  Protected src.i=0
+  Protected coord.i=0
+  Protected stride.i=1
+  Protected result.i=0
+  For ax=Dt(Y)\Rank-1 To 0 Step -1
+    coord=Index % DDims((Y)*8+(ax))
+    Index / DDims((Y)*8+(ax))
+    src=ax-(Dt(Y)\Rank-Dt(A)\Rank)
+    If src>=0
+      If DDims((A)*8+(src))<>1
+        result+coord*stride
+      EndIf
+      stride*DDims((A)*8+(src))
+    EndIf
+  Next
+  ProcedureReturn result
+EndProcedure
+
+Procedure.i DBroadcast(Y.i,A.i,B.i,Kind.i)
+  Protected rank.i=DMax(Dt(A)\Rank,Dt(B)\Rank)
+  Protected i.i=0
+  Protected ai.i=0
+  Protected bi.i=0
+  Protected ad.i=0
+  Protected bd.i=0
+  Protected Dim dims.i(8)
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Kind=0
+    Kind=Dt(A)\Kind
+  EndIf
+  For i=0 To rank-1
+    ai=i-rank+Dt(A)\Rank
+    bi=i-rank+Dt(B)\Rank
+    ad=1
+    bd=1
+    If ai>=0
+      ad=DDims((A)*8+(ai))
+    EndIf
+    If bi>=0
+      bd=DDims((B)*8+(bi))
+    EndIf
+    If ad<>bd And ad<>1 And bd<>1
+      ProcedureReturn DFail("Incompatible broadcast dimensions.")
+    EndIf
+    If ad=1
+      dims(i)=bd
+    Else
+      dims(i)=ad
+    EndIf
+  Next
+  ProcedureReturn DAlloc(Y,Kind,rank,@dims(0))
+EndProcedure
+
+Procedure DBinary(Y.i,A.i,B.i,Op.i)
+  Protected i.i=0
+  Protected ai.i=0
+  Protected bi.i=0
+  Protected kind.i=Dt(A)\Kind
+  Protected av.f=0.0
+  Protected bv.f=0.0
+  Protected v.f=0.0
+  Protected ia.i=0
+  Protected ib.i=0
+  Protected iv.i=0
+  Protected width.i=0
+  Protected row.i=0
+  Protected astep.i=0
+  Protected bstep.i=0
+  If Op=4 And Dt(A)\Kind=1 And Dt(B)\Kind=1 And Dt(B)\Count=1
+    If DReadF(Dt(B)\Data)=2
+      B=A
+      Op=2
+    EndIf
+  EndIf
+  If Op>=5
+    kind=9
+  EndIf
+  If DBroadcast(Y,A,B,kind)=0
+    ProcedureReturn
+  EndIf
+  If kind=1 And Dt(B)\Kind=1 And Op<=3
+    width=1
+    If Dt(Y)\Rank
+      width=DDims((Y)*8+(Dt(Y)\Rank-1))
+    EndIf
+    If width=0
+      ProcedureReturn
+    EndIf
+    If Dt(A)\Rank
+      astep=Bool(DDims((A)*8+(Dt(A)\Rank-1))<>1)
+    EndIf
+    If Dt(B)\Rank
+      bstep=Bool(DDims((B)*8+(Dt(B)\Rank-1))<>1)
+    EndIf
+    For row=0 To Dt(Y)\Count/width-1
+      i=row*width
+      ai=DBroadcastIndex(i,Y,A)
+      bi=DBroadcastIndex(i,Y,B)
+      PmFastBinary(Dt(A)\Data+ai*4,Dt(B)\Data+bi*4,Dt(Y)\Data+i*4,width,astep,bstep,Op)
+    Next
+    ProcedureReturn
+  EndIf
+  If Op=4 And Dt(A)\Kind=1 And Dt(B)\Kind=1 And Dt(B)\Count=1 And Dt(A)\Count=Dt(Y)\Count
+    bv=DReadF(Dt(B)\Data)
+    For i=0 To Dt(Y)\Count-1
+      DWriteF(Dt(Y)\Data+i*4,Pow(DReadF(Dt(A)\Data+i*4),bv))
+    Next
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(Y)\Count-1
+    ai=DBroadcastIndex(i,Y,A)
+    bi=DBroadcastIndex(i,Y,B)
+    If Dt(A)\Kind=1
+      av=DGet(A,ai)
+      bv=DGet(B,bi)
+      Select Op
+        Case 0
+          v=av+bv
+        Case 1
+          v=av-bv
+        Case 2
+          v=av*bv
+        Case 3
+          v=av/bv
+        Case 4
+          v=Pow(av,bv)
+        Case 5
+          v=DFloat(Bool(av=bv))
+        Case 6
+          v=DFloat(Bool(av>bv))
+        Case 7
+          v=DFloat(Bool(av<bv))
+        Case 8
+          v=DFloat(Bool(av>=bv))
+        Case 9
+          v=DFloat(Bool(av<>0 And bv<>0))
+      EndSelect
+      DPut(Y,i,v)
+    Else
+      ia=DInt(A,ai)
+      ib=DInt(B,bi)
+      Select Op
+        Case 0
+          iv=DIntegerOp(ia,ib,0)
+        Case 1
+          iv=DIntegerOp(ia,ib,1)
+        Case 2
+          iv=DIntegerOp(ia,ib,2)
+        Case 3
+          If ib=0
+            DFail("Integer division by zero.")
+            ProcedureReturn
+          EndIf
+          iv=DIntegerOp(ia,ib,3)
+        Case 5
+          iv=Bool(ia=ib)
+        Case 6
+          iv=Bool(ia>ib)
+        Case 7
+          iv=Bool(ia<ib)
+        Case 8
+          iv=Bool(ia>=ib)
+        Case 9
+          iv=Bool(ia<>0 And ib<>0)
+        Default
+          DFail("Unsupported integer arithmetic.")
+          ProcedureReturn
+      EndSelect
+      If DError<>0
+        ProcedureReturn
+      EndIf
+      If kind=7
+        DWriteI64(Dt(Y)\Data+i*8,iv)
+      ElseIf kind=6
+        If iv< -2147483648 Or iv>2147483647
+          DFail("INT32 arithmetic overflow.")
+          ProcedureReturn
+        EndIf
+        PokeL(Dt(Y)\Data+i*4,iv)
+      Else
+        DPut(Y,i,DFloat(iv))
+      EndIf
+    EndIf
+  Next
+EndProcedure
+
+Procedure DUnary(Y.i,A.i,Op.i,Alpha.f)
+  If Dt(A)\Kind<>1
+    DFail("This unary kernel requires FLOAT input.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y,A,0)=0
+    ProcedureReturn
+  EndIf
+  Select Op
+    Case 0
+      PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
+    Case 1
+      PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
+    Case 2
+      PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
+    Case 3
+      PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
+    Case 4
+      PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
+    Case 5
+      PmFastTrig(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op-5)
+    Case 6
+      PmFastTrig(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op-5)
+    Case 7
+      PmFastTrig(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op-5)
+    Case 8
+      PmTensorSigmoid(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
+    Case 9
+      PmTensorTanh(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
+    Case 10
+      PmTensorFloor(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
+    Case 11
+      PmTensorRoundEven(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
+    Case 12
+      PmTensorLeakyRelu(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Alpha)
+  EndSelect
+EndProcedure
+
+Procedure DCast(Y.i,A.i,Kind.i)
+  Protected i.i=0
+  Protected value.i=0
+  If DLike(Y,A,Kind)=0
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(A)\Count-1
+    If Dt(A)\Kind<>1 And Kind<>1
+      value=DInt(A,i)
+      If Kind=7
+        DWriteI64(Dt(Y)\Data+i*8,value)
+      ElseIf Kind=6
+        If value< -2147483648 Or value>2147483647
+          DFail("Cast exceeds INT32 execution range.")
+          ProcedureReturn
+        EndIf
+        PokeL(Dt(Y)\Data+i*4,value)
+      ElseIf Kind=9
+        PokeA(Dt(Y)\Data+i,Bool(value<>0))
+      EndIf
+    Else
+      DPut(Y,i,DGet(A,i))
+    EndIf
+  Next
+EndProcedure
+
+Procedure DShapeOf(Y.i,A.i)
+  Protected i.i=0
+  If DShape(Y,7,1,Dt(A)\Rank,0,0,0)=0
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(A)\Rank-1
+    DWriteI64(Dt(Y)\Data+i*8,DDims((A)*8+(i)))
+  Next
+EndProcedure
+
+Procedure DReshape(Y.i,A.i,Shape.i,AllowZero.i)
+  Protected extent.i=0
+  Protected Dim dims.i(8)
+  Protected i.i=0
+  Protected n.i=1
+  Protected unknown.i=-1
+  Protected rank.i=Dt(Shape)\Count
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If rank>8
+    DFail("Reshape rank exceeds eight.")
+    ProcedureReturn
+  EndIf
+  For i=0 To rank-1
+    dims(i)=DInt(Shape,i)
+    If dims(i)=0 And AllowZero=0
+      If i>=Dt(A)\Rank
+        DFail("Reshape zero axis is missing.")
+        ProcedureReturn
+      EndIf
+      dims(i)=DDims((A)*8+(i))
+    EndIf
+    If dims(i)=-1
+      If unknown>=0
+        DFail("Reshape has multiple inferred axes.")
+        ProcedureReturn
+      EndIf
+      unknown=i
+    Else
+      extent=dims(i)
+      If extent<0
+        DFail("Reshape extent is negative.")
+        ProcedureReturn
+      EndIf
+      If extent>0
+        If n>DLimit/extent
+          DFail("Reshape extent overflow.")
+          ProcedureReturn
+        EndIf
+      EndIf
+      n*dims(i)
+    EndIf
+  Next
+  If unknown>=0
+    If n<=0 Or (Dt(A)\Count % n)<>0
+      DFail("Reshape inferred extent is invalid.")
+      ProcedureReturn
+    EndIf
+    dims(unknown)=Dt(A)\Count/n
+    n=Dt(A)\Count
+  EndIf
+  If n<>Dt(A)\Count
+    DFail("Reshape changes the element count.")
+    ProcedureReturn
+  EndIf
+  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))
+    DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+  EndIf
+EndProcedure
+
+Procedure DViewAxes(Y.i,A.i,Axes.i,Unsqueeze.i)
+  Protected Dim dims.i(8)
+  Protected Dim mask.i(8)
+  Protected i.i=0
+  Protected ax.i=0
+  Protected j.i=0
+  Protected rank.i=Dt(A)\Rank
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  DZero(@mask(0),8*#PMD_NATIVE_BYTES)
+  If Unsqueeze
+    rank+Dt(Axes)\Count
+  EndIf
+  If rank>8
+    DFail("View rank exceeds eight.")
+    ProcedureReturn
+  EndIf
+  If Axes=0 And Unsqueeze=0
+    For i=0 To rank-1
+      mask(i)=Bool(DDims((A)*8+(i))=1)
+    Next
+  EndIf
+  For i=0 To Dt(Axes)\Count-1
+    ax=DInt(Axes,i)
+    If ax<0
+      ax+rank
+    EndIf
+    If ax<0 Or ax>=rank Or mask(ax)<>0
+      DFail("View axis is invalid.")
+      ProcedureReturn
+    EndIf
+    mask(ax)=1
+  Next
+  If Unsqueeze
+    For i=0 To rank-1
+      If mask(i)
+        dims(i)=1
+      Else
+        dims(i)=DDims((A)*8+(j))
+        j+1
+      EndIf
+    Next
+  Else
+    For i=0 To rank-1
+      If mask(i)
+        If DDims((A)*8+(i))<>1
+          DFail("Cannot squeeze a non-unit axis.")
+          ProcedureReturn
+        EndIf
+      Else
+        dims(j)=DDims((A)*8+(i))
+        j+1
+      EndIf
+    Next
+    rank=j
+  EndIf
+  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))
+    DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+  EndIf
+EndProcedure
+
+Procedure DTranspose(Y.i,A.i,Perm.i)
+  Protected Dim dims.i(8)
+  Protected Dim axes.i(8)
+  Protected Dim strides.i(8)
+  Protected Dim seen.i(8)
+  Protected i.i=0
+  Protected j.i=0
+  Protected n.i=0
+  Protected coord.i=0
+  Protected src.i=0
+  Protected size.i=DSize(Dt(A)\Kind)
+  Protected rank.i=Dt(A)\Rank
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  DZero(@axes(0),8*#PMD_NATIVE_BYTES)
+  DZero(@strides(0),8*#PMD_NATIVE_BYTES)
+  DZero(@seen(0),8*#PMD_NATIVE_BYTES)
+  For i=0 To rank-1
+    If PeekA(Perm)=0
+      axes(i)=rank-i-1
+    Else
+      axes(i)=DListValue(Perm,i+1)
+    EndIf
+    If axes(i)<0 Or axes(i)>=rank
+      DFail("Invalid transpose permutation.")
+      ProcedureReturn
+    EndIf
+    If seen(axes(i))
+      DFail("Transpose permutation has a duplicate axis.")
+      ProcedureReturn
+    EndIf
+    seen(axes(i))=1
+    dims(i)=DDims((A)*8+(axes(i)))
+    strides(i)=DProduct(A,axes(i)+1,rank-1)
+  Next
+  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(Y)\Count-1
+    n=i
+    src=0
+    For j=rank-1 To 0 Step -1
+      coord=n % dims(j)
+      n/dims(j)
+      src+coord*strides(j)
+    Next
+    DCopy(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
+  Next
+EndProcedure
+
+Procedure DGather(Y.i,A.i,Indices.i,Axis.i)
+  Protected Dim dims.i(8)
+  Protected rank.i=Dt(A)\Rank+Dt(Indices)\Rank-1
+  Protected i.i=0
+  Protected j.i=0
+  Protected k.i=0
+  Protected p.i=0
+  Protected idx.i=0
+  Protected inner.i=0
+  Protected outer.i=0
+  Protected size.i=DSize(Dt(A)\Kind)
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Axis<0
+    Axis+Dt(A)\Rank
+  EndIf
+  If rank>8 Or Axis<0 Or Axis>=Dt(A)\Rank
+    DFail("Invalid Gather rank or axis.")
+    ProcedureReturn
+  EndIf
+  For i=0 To Axis-1
+    dims(p)=DDims((A)*8+(i))
+    p+1
+  Next
+  For i=0 To Dt(Indices)\Rank-1
+    dims(p)=DDims((Indices)*8+(i))
+    p+1
+  Next
+  For i=Axis+1 To Dt(A)\Rank-1
+    dims(p)=DDims((A)*8+(i))
+    p+1
+  Next
+  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  inner=DProduct(A,Axis+1,Dt(A)\Rank-1)
+  outer=DProduct(A,0,Axis-1)
+  For i=0 To outer-1
+    For j=0 To Dt(Indices)\Count-1
+      idx=DInt(Indices,j)
+      If idx<0
+        idx+DDims((A)*8+(Axis))
+      EndIf
+      If idx<0 Or idx>=DDims((A)*8+(Axis))
+        DFail("Gather index is out of bounds.")
+        ProcedureReturn
+      EndIf
+      DCopy(Dt(A)\Data+(i*DDims((A)*8+(Axis))+idx)*inner*size,Dt(Y)\Data+(i*Dt(Indices)\Count+j)*inner*size,inner*size)
+    Next
+  Next
+EndProcedure
+
+Procedure DConcat(Y.i,Inputs.i,Axis.i)
+  Protected Dim dims.i(8)
+  Protected count.i=DListCount(Inputs)
+  Protected a.i=DListValue(Inputs,1)
+  Protected i.i=0
+  Protected j.i=0
+  Protected outer.i=0
+  Protected inner.i=0
+  Protected offset.i=0
+  Protected span.i=0
+  Protected size.i=DSize(Dt(a)\Kind)
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Axis<0
+    Axis+Dt(a)\Rank
+  EndIf
+  If Axis<0 Or Axis>=Dt(a)\Rank
+    DFail("Invalid Concat axis.")
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(a)\Rank-1
+    dims(i)=DDims((a)*8+(i))
+  Next
+  dims(Axis)=0
+  For i=1 To count
+    a=DListValue(Inputs,i)
+    If Dt(a)\Rank<>Dt(DListValue(Inputs,1))\Rank Or DSize(Dt(a)\Kind)<>size
+      DFail("Concat rank/type mismatch.")
+      ProcedureReturn
+    EndIf
+    For j=0 To Dt(a)\Rank-1
+      If j<>Axis And DDims((a)*8+(j))<>dims(j)
+        DFail("Concat non-axis extent mismatch.")
+        ProcedureReturn
+      EndIf
+    Next
+    dims(Axis)=dims(Axis)+DDims((a)*8+(Axis))
+  Next
+  If DAlloc(Y,Dt(a)\Kind,Dt(a)\Rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  outer=DProduct(Y,0,Axis-1)
+  inner=DProduct(Y,Axis+1,Dt(Y)\Rank-1)
+  For j=0 To outer-1
+    offset=j*dims(Axis)*inner
+    For i=1 To count
+      a=DListValue(Inputs,i)
+      span=DDims((a)*8+(Axis))*inner
+      DCopy(Dt(a)\Data+j*span*size,Dt(Y)\Data+offset*size,span*size)
+      offset+span
+    Next
+  Next
+EndProcedure
+
+Procedure DSlice(Y.i,A.i,Starts.i,Ends.i,Axes.i,Steps.i)
+  Protected Dim dims.i(8)
+  Protected Dim start.i(8)
+  Protected Dim stepv.i(8)
+  Protected Dim stride.i(8)
+  Protected i.i=0
+  Protected j.i=0
+  Protected ax.i=0
+  Protected s.i=0
+  Protected e.i=0
+  Protected st.i=0
+  Protected n.i=0
+  Protected src.i=0
+  Protected c.i=0
+  Protected size.i=DSize(Dt(A)\Kind)
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  DZero(@start(0),8*#PMD_NATIVE_BYTES)
+  DZero(@stepv(0),8*#PMD_NATIVE_BYTES)
+  DZero(@stride(0),8*#PMD_NATIVE_BYTES)
+  For i=0 To Dt(A)\Rank-1
+    dims(i)=DDims((A)*8+(i))
+    stepv(i)=1
+    stride(i)=DProduct(A,i+1,Dt(A)\Rank-1)
+  Next
+  For i=0 To Dt(Starts)\Count-1
+    ax=i
+    If Axes
+      ax=DInt(Axes,i)
+    EndIf
+    If ax<0
+      ax+Dt(A)\Rank
+    EndIf
+    If ax<0 Or ax>=Dt(A)\Rank
+      DFail("Invalid Slice axis.")
+      ProcedureReturn
+    EndIf
+    n=DDims((A)*8+(ax))
+    s=DInt(Starts,i)
+    e=DInt(Ends,i)
+    st=1
+    If Steps
+      st=DInt(Steps,i)
+    EndIf
+    If st=0
+      DFail("Slice step is zero.")
+      ProcedureReturn
+    EndIf
+    If s<0
+      s+n
+    EndIf
+    If e<0
+      e+n
+    EndIf
+    If st>0
+      s=DMax(0,DMin(n,s))
+      e=DMax(0,DMin(n,e))
+      dims(ax)=DMax(0,(e-s+st-1)/st)
+    Else
+      s=DMax(-1,DMin(n-1,s))
+      e=DMax(-1,DMin(n-1,e))
+      dims(ax)=DMax(0,(s-e-st-1)/(-st))
+    EndIf
+    start(ax)=s
+    stepv(ax)=st
+  Next
+  If DAlloc(Y,Dt(A)\Kind,Dt(A)\Rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(Y)\Count-1
+    n=i
+    src=0
+    For j=Dt(Y)\Rank-1 To 0 Step -1
+      c=n % dims(j)
+      n/dims(j)
+      src+(start(j)+c*stepv(j))*stride(j)
+    Next
+    DCopy(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
+  Next
+EndProcedure
+
+Procedure DExpand(Y.i,A.i,Shape.i)
+  Protected Dim dims.i(8)
+  Protected i.i=0
+  Protected rank.i=Dt(Shape)\Count
+  Protected size.i=DSize(Dt(A)\Kind)
+  Protected ax.i=0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If rank>8 Or rank<Dt(A)\Rank
+    DFail("Invalid Expand rank.")
+    ProcedureReturn
+  EndIf
+  For i=0 To rank-1
+    dims(i)=DInt(Shape,i)
+    ax=i-rank+Dt(A)\Rank
+    If ax>=0
+      If dims(i)=1
+        dims(i)=DDims((A)*8+(ax))
+      EndIf
+      If dims(i)<>DDims((A)*8+(ax)) And DDims((A)*8+(ax))<>1
+        DFail("Invalid Expand extent.")
+        ProcedureReturn
+      EndIf
+    EndIf
+  Next
+  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(Y)\Count-1
+    DCopy(Dt(A)\Data+DBroadcastIndex(i,Y,A)*size,Dt(Y)\Data+i*size,size)
+  Next
+EndProcedure
+
+Procedure DConstantShape(Y.i,Shape.i,Kind.i,Value.f)
+  Protected Dim dims.i(8)
+  Protected i.i=0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Dt(Shape)\Count>8
+    DFail("ConstantOfShape rank exceeds eight.")
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(Shape)\Count-1
+    dims(i)=DInt(Shape,i)
+  Next
+  If DAlloc(Y,Kind,Dt(Shape)\Count,@dims(0))
+    For i=0 To Dt(Y)\Count-1
+      DPut(Y,i,Value)
+    Next
+  EndIf
+EndProcedure
+
+Procedure DRange(Y.i,A.i,B.i,C.i)
+  Protected first.i=0
+  Protected final.i=0
+  Protected stepInteger.i=0
+  Protected distance.i=0
+  Protected quotient.i=0
+  Protected lastValue.i=0
+  Protected start.f=DGet(A,0)
+  Protected stop.f=DGet(B,0)
+  Protected stepv.f=DGet(C,0)
+  Protected n.i=0
+  Protected i.i=0
+  Protected extent.f=0.0
+  If Dt(A)\Kind<>Dt(B)\Kind Or Dt(A)\Kind<>Dt(C)\Kind Or Dt(A)\Count<>1 Or Dt(B)\Count<>1 Or Dt(C)\Count<>1
+    DFail("Range requires three scalars of the same type.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind<>1
+    first=DInt(A,0)
+    final=DInt(B,0)
+    stepInteger=DInt(C,0)
+    If stepInteger=0
+      DFail("Integer Range step is zero.")
+      ProcedureReturn
+    EndIf
+    n=0
+    If stepInteger>0 And first<final
+      distance=DIntegerOp(final,first,1)
+      quotient=distance/stepInteger
+      n=quotient
+      If distance%stepInteger<>0
+        n=n+1
+      EndIf
+    ElseIf stepInteger<0 And first>final
+      distance=DIntegerOp(first,final,1)
+      stepInteger=DIntegerOp(0,stepInteger,1)
+      If DError<>0
+        ProcedureReturn
+      EndIf
+      n=distance/stepInteger
+      If distance%stepInteger<>0
+        n=n+1
+      EndIf
+      stepInteger=-stepInteger
+    EndIf
+    If DError<>0
+      ProcedureReturn
+    EndIf
+    If DShape(Y,Dt(A)\Kind,1,n,0,0,0)=0
+      ProcedureReturn
+    EndIf
+    lastValue=first
+    For i=0 To n-1
+      If Dt(A)\Kind=7
+        DWriteI64(Dt(Y)\Data+i*8,lastValue)
+      Else
+        PokeL(Dt(Y)\Data+i*4,lastValue)
+      EndIf
+      If i<n-1
+        lastValue=DIntegerOp(lastValue,stepInteger,0)
+      EndIf
+    Next
+    ProcedureReturn
+  EndIf
+  If stepv=0
+    DFail("Range step is zero.")
+    ProcedureReturn
+  EndIf
+  extent=(stop-start)/stepv
+  If (PeekL(@extent) & $7F800000)=$7F800000 Or extent>DFloat(DLimit/DSize(Dt(A)\Kind))
+    DFail("Range exceeds finite memory bounds.")
+    ProcedureReturn
+  EndIf
+  n=Int(extent)
+  If DFloat(n)<extent
+    n=n+1
+  EndIf
+  n=DMax(0,n)
+  If DShape(Y,Dt(A)\Kind,1,n,0,0,0)
+    For i=0 To n-1
+      DPut(Y,i,start+DFloat(i)*stepv)
+    Next
+  EndIf
+EndProcedure
+
+Procedure DWhere(Y.i,Cond.i,A.i,B.i)
+  Protected i.i=0
+  Protected src.i=0
+  Protected index.i=0
+  Protected size.i=DSize(Dt(A)\Kind)
+  Protected ax.i=0
+  If DBroadcast(Y,A,B,0)=0
+    ProcedureReturn
+  EndIf
+  If Dt(Cond)\Rank>Dt(Y)\Rank
+    DFail("Where condition expands beyond the data shape.")
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(Cond)\Rank-1
+    ax=i+Dt(Y)\Rank-Dt(Cond)\Rank
+    If DDims((Cond)*8+(i))<>1 And DDims((Cond)*8+(i))<>DDims((Y)*8+(ax))
+      DFail("Where condition broadcast mismatch.")
+      ProcedureReturn
+    EndIf
+  Next
+  For i=0 To Dt(Y)\Count-1
+    If DGet(Cond,DBroadcastIndex(i,Y,Cond))
+      src=A
+    Else
+      src=B
+    EndIf
+    index=DBroadcastIndex(i,Y,src)
+    DCopy(Dt(src)\Data+index*size,Dt(Y)\Data+i*size,size)
+  Next
+EndProcedure
+
+Procedure DNonZero(Y.i,A.i)
+  Protected i.i=0
+  Protected j.i=0
+  Protected count.i=0
+  Protected n.i=0
+  Protected col.i=0
+  Protected c.i=0
+  For i=0 To Dt(A)\Count-1
+    If DGet(A,i)<>0
+      count+1
+    EndIf
+  Next
+  If DShape(Y,7,2,Dt(A)\Rank,count,0,0)=0
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(A)\Count-1
+    If DGet(A,i)<>0
+      n=i
+      For j=Dt(A)\Rank-1 To 0 Step -1
+        c=n % DDims((A)*8+(j))
+        n/DDims((A)*8+(j))
+        DWriteI64(Dt(Y)\Data+(j*count+col)*8,c)
+      Next
+      col+1
+    EndIf
+  Next
+EndProcedure
+
+Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
+  Protected k.i=0
+  Protected i.i=0
+  Protected j.i=0
+  Protected offset.i=0
+  Protected idx.i=0
+  Protected block.i=0
+  Protected size.i=DSize(Dt(A)\Kind)
+  Protected tuples.i=0
+  If Dt(Indices)\Rank<1
+    DFail("ScatterND indices need a tuple axis.")
+    ProcedureReturn
+  EndIf
+  k=DDims((Indices)*8+(Dt(Indices)\Rank-1))
+  If k<=0 Or k>Dt(A)\Rank
+    DFail("Invalid ScatterND tuple width.")
+    ProcedureReturn
+  EndIf
+  block=DProduct(A,k,Dt(A)\Rank-1)
+  tuples=Dt(Indices)\Count/k
+  If Dt(Updates)\Count<>tuples*block
+    DFail("ScatterND update count mismatch.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y,A,0)=0
+    ProcedureReturn
+  EndIf
+  DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+  For i=0 To tuples-1
+    offset=0
+    For j=0 To k-1
+      idx=DInt(Indices,i*k+j)
+      If idx<0
+        idx+DDims((A)*8+(j))
+      EndIf
+      If idx<0 Or idx>=DDims((A)*8+(j))
+        DFail("ScatterND index is out of bounds.")
+        ProcedureReturn
+      EndIf
+      offset=offset*DDims((A)*8+(j))+idx
+    Next
+    DCopy(Dt(Updates)\Data+i*block*size,Dt(Y)\Data+offset*block*size,block*size)
+  Next
+EndProcedure
+
+Procedure DPad(Y.i,A.i,Pads.i,Value.i,Mode.i)
+  Protected Dim dims.i(8)
+  Protected Dim starts.i(8)
+  Protected Dim strides.i(8)
+  Protected i.i=0
+  Protected j.i=0
+  Protected n.i=0
+  Protected c.i=0
+  Protected src.i=0
+  Protected outside.i=0
+  Protected size.i=DSize(Dt(A)\Kind)
+  Protected v.f=0.0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  DZero(@starts(0),8*#PMD_NATIVE_BYTES)
+  DZero(@strides(0),8*#PMD_NATIVE_BYTES)
+  If Dt(Pads)\Count<>Dt(A)\Rank*2
+    DFail("Pad extent count mismatch.")
+    ProcedureReturn
+  EndIf
+  If Value
+    v=DGet(Value,0)
+  EndIf
+  For i=0 To Dt(A)\Rank-1
+    starts(i)=DInt(Pads,i)
+    dims(i)=DDims((A)*8+(i))+starts(i)+DInt(Pads,i+Dt(A)\Rank)
+    strides(i)=DProduct(A,i+1,Dt(A)\Rank-1)
+  Next
+  If DAlloc(Y,Dt(A)\Kind,Dt(A)\Rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(Y)\Count-1
+    n=i
+    src=0
+    outside=0
+    For j=Dt(A)\Rank-1 To 0 Step -1
+      c=n % dims(j)-starts(j)
+      n/dims(j)
+      If c<0 Or c>=DDims((A)*8+(j))
+        If Mode=1
+          If DDims((A)*8+(j))<2
+            DFail("Reflect padding requires extent above one.")
+            ProcedureReturn
+          EndIf
+          While c<0 Or c>=DDims((A)*8+(j))
+            If c<0
+              c=-c
+            Else
+              c=2*DDims((A)*8+(j))-2-c
+            EndIf
+          Wend
+        Else
+          outside=1
+        EndIf
+      EndIf
+      src+c*strides(j)
+    Next
+    If outside
+      DPut(Y,i,v)
+    Else
+      DCopy(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
+    EndIf
+  Next
+EndProcedure
+
+Procedure DMatMul(Y.i,A.i,B.i)
+  Protected Dim dims.i(8)
+  Protected rank.i=DMax(Dt(A)\Rank,Dt(B)\Rank)
+  Protected i.i=0
+  Protected ai.i=0
+  Protected bi.i=0
+  Protected ad.i=0
+  Protected bd.i=0
+  Protected m.i=0
+  Protected k.i=0
+  Protected n.i=0
+  Protected batches.i=0
+  Protected batch.i=0
+  Protected aoff.i=0
+  Protected boff.i=0
+  Protected idx.i=0
+  Protected c.i=0
+  Protected astride.i=0
+  Protected bstride.i=0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Dt(A)\Kind<>1 Or (Dt(B)\Kind<>1 And Dt(B)\Kind<>3)
+    DFail("MatMul requires FLOAT activations and FLOAT or INT8 weights.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Rank<2 Or Dt(B)\Rank<2 Or rank>8
+    DFail("MatMul requires rank two or above.")
+    ProcedureReturn
+  EndIf
+  m=DDims((A)*8+(Dt(A)\Rank-2))
+  k=DDims((A)*8+(Dt(A)\Rank-1))
+  n=DDims((B)*8+(Dt(B)\Rank-1))
+  If k<>DDims((B)*8+(Dt(B)\Rank-2))
+    DFail("MatMul contraction mismatch.")
+    ProcedureReturn
+  EndIf
+  If Dt(B)\Kind=3 And (Dt(B)\Scales=0 Or k>133144)
+    DFail("INT8 MatMul scales are missing or its reduction exceeds the INT32 bound.")
+    ProcedureReturn
+  EndIf
+  batches=1
+  For i=0 To rank-3
+    ai=i-rank+Dt(A)\Rank
+    bi=i-rank+Dt(B)\Rank
+    ad=1
+    bd=1
+    If ai>=0
+      ad=DDims((A)*8+(ai))
+    EndIf
+    If bi>=0
+      bd=DDims((B)*8+(bi))
+    EndIf
+    If ad<>bd And ad<>1 And bd<>1
+      DFail("MatMul batch mismatch.")
+      ProcedureReturn
+    EndIf
+    dims(i)=DMax(ad,bd)
+    batches*dims(i)
+  Next
+  dims(rank-2)=m
+  dims(rank-1)=n
+  If DAlloc(Y,1,rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  For batch=0 To batches-1
+    idx=batch
+    aoff=0
+    boff=0
+    astride=m*k
+    bstride=k*n
+    For i=rank-3 To 0 Step -1
+      c=idx % dims(i)
+      idx/dims(i)
+      ai=i-rank+Dt(A)\Rank
+      bi=i-rank+Dt(B)\Rank
+      If ai>=0
+        If DDims((A)*8+(ai))<>1
+          aoff+c*astride
+        EndIf
+        astride*DDims((A)*8+(ai))
+      EndIf
+      If bi>=0
+        If DDims((B)*8+(bi))<>1
+          boff+c*bstride
+        EndIf
+        bstride*DDims((B)*8+(bi))
+      EndIf
+    Next
+    If Dt(B)\Kind=3
+      If DInt8Begin(Dt(A)\Data+aoff*4,m*k,0)=0
+        ProcedureReturn
+      EndIf
+      PmTensorMatMul2Int8(Dt(A)\Data+aoff*4,Dt(B)\Data+boff,Dt(Y)\Data+batch*m*n*4,m,k,n,Dt(B)\Scales)
+      DInt8End()
+    Else
+      PmFastGemm(Dt(A)\Data+aoff*4,Dt(B)\Data+boff*4,Dt(Y)\Data+batch*m*n*4,m,k,n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure DGemm(Y.i,A.i,B.i,C.i,TransA.i,TransB.i,Alpha.f,Beta.f)
+  Protected g.PmTensorGemmArgs
+  DZero(@g,SizeOf(PmTensorGemmArgs))
+  If Dt(A)\Kind<>1 Or (Dt(B)\Kind<>1 And Dt(B)\Kind<>3) Or (C<>0 And Dt(C)\Kind<>1) Or TransA<0 Or TransA>1 Or TransB<0 Or TransB>1
+    DFail("Gemm requires FLOAT activations, FLOAT/INT8 weights and valid transpose flags.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Rank<>2 Or Dt(B)\Rank<>2
+    DFail("Gemm requires matrices.")
+    ProcedureReturn
+  EndIf
+  g\M=DDims((A)*8+(TransA))
+  g\K=DDims((A)*8+(1-TransA))
+  g\N=DDims((B)*8+(1-TransB))
+  If g\K<>DDims((B)*8+(TransB))
+    DFail("Gemm contraction mismatch.")
+    ProcedureReturn
+  EndIf
+  If DShape(Y,1,2,g\M,g\N,0,0)=0
+    ProcedureReturn
+  EndIf
+  g\A=Dt(A)\Data
+  g\B=Dt(B)\Data
+  g\C=Dt(C)\Data
+  g\Dst=Dt(Y)\Data
+  g\CCount=Dt(C)\Count
+  g\TransA=TransA
+  g\TransB=TransB
+  g\Alpha=Alpha
+  g\Beta=Beta
+  If Dt(B)\Kind=3
+    If Dt(B)\Scales=0 Or g\K>133144
+      DFail("INT8 Gemm scales are missing or its reduction exceeds the INT32 bound.")
+      ProcedureReturn
+    EndIf
+    If DInt8Begin(g\A,g\M*g\K,0)=0
+      ProcedureReturn
+    EndIf
+    g\WeightScales=Dt(B)\Scales
+  EndIf
+  PmTensorGemm(@g)
+  If Dt(B)\Kind=3
+    DInt8End()
+  EndIf
+EndProcedure
+
+Procedure DReduce(Y.i,A.i,Axes.i,Keep.i,Mean.i)
+  Protected Dim dims.i(8)
+  Protected i.i=0
+  Protected axis.i=DInt(Axes,0)
+  Protected rank.i=Dt(A)\Rank
+  Protected width.i=0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If axis<0
+    axis+rank
+  EndIf
+  If Dt(Axes)\Count<>1 Or axis<>rank-1
+    DFail("Reduction currently requires one final axis.")
+    ProcedureReturn
+  EndIf
+  For i=0 To rank-1
+    dims(i)=DDims((A)*8+(i))
+  Next
+  width=dims(rank-1)
+  If Keep
+    dims(rank-1)=1
+  Else
+    rank-1
+  EndIf
+  If width<=0
+    DFail("Reduction width is empty.")
+    ProcedureReturn
+  EndIf
+  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind<>1
+    DFail("Reduction requires FLOAT.")
+    ProcedureReturn
+  EndIf
+  PmFastReduce(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count/width,width,Mean)
+EndProcedure
+
+Procedure DSoftmax(Y.i,A.i,Axis.i)
+  Protected width.i=0
+  If Dt(A)\Rank<1 Or Dt(A)\Kind<>1
+    DFail("Softmax requires a FLOAT tensor with an axis.")
+    ProcedureReturn
+  EndIf
+  width=DDims((A)*8+(Dt(A)\Rank-1))
+  If Axis<0
+    Axis+Dt(A)\Rank
+  EndIf
+  If Axis<>Dt(A)\Rank-1 Or width<=0
+    DFail("Softmax requires a nonempty final axis.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y,A,0)
+    PmTensorSoftmaxLast(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count/width,width)
+  EndIf
+EndProcedure
+
+Procedure DLayerNorm(Y.i,A.i,Scale.i,Bias.i,Epsilon.f)
+  Protected width.i=0
+  If Dt(A)\Rank<1 Or Dt(A)\Kind<>1 Or Dt(Scale)\Kind<>1 Or (Bias<>0 And Dt(Bias)\Kind<>1)
+    DFail("Layer normalization requires FLOAT tensors.")
+    ProcedureReturn
+  EndIf
+  width=DDims((A)*8+(Dt(A)\Rank-1))
+  If width<=0 Or Dt(Scale)\Count<>width
+    DFail("Layer normalization width mismatch.")
+    ProcedureReturn
+  EndIf
+  If Bias<>0 And Dt(Bias)\Count<>width
+    DFail("Layer normalization bias width mismatch.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y,A,0)
+    PmTensorLayerNormLast(Dt(A)\Data,Dt(Scale)\Data,Dt(Bias)\Data,Dt(Y)\Data,Dt(A)\Count/width,width,Epsilon)
+  EndIf
+EndProcedure
+
+Procedure DCumSum(Y.i,A.i,AxisTensor.i,Exclusive.i,Reverse.i)
+  Protected axis.i=DInt(AxisTensor,0)
+  Protected outer.i=0
+  Protected inner.i=0
+  Protected width.i=0
+  If Dt(A)\Kind<>1 And Dt(A)\Kind<>7
+    DFail("CumSum requires FLOAT or INT64.")
+    ProcedureReturn
+  EndIf
+  If axis<0
+    axis+Dt(A)\Rank
+  EndIf
+  If axis<0 Or axis>=Dt(A)\Rank
+    DFail("CumSum axis is invalid.")
+    ProcedureReturn
+  EndIf
+  outer=DProduct(A,0,axis-1)
+  inner=DProduct(A,axis+1,Dt(A)\Rank-1)
+  width=DDims((A)*8+(axis))
+  If DLike(Y,A,0)=0
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind=7
+    PmTensorCumSumI64(Dt(A)\Data,Dt(Y)\Data,outer,width,inner,Exclusive,Reverse)
+  Else
+    PmTensorCumSumF32(Dt(A)\Data,Dt(Y)\Data,outer,width,inner,Exclusive,Reverse)
+  EndIf
+EndProcedure
+
+Procedure DClip(Y.i,A.i,Lo.i,Hi.i)
+  Protected low.f=-3.402823466e38
+  Protected high.f=3.402823466e38
+  If Dt(A)\Kind<>1
+    DFail("Clip requires FLOAT input.")
+    ProcedureReturn
+  EndIf
+  If Lo
+    low=DGet(Lo,0)
+  EndIf
+  If Hi
+    high=DGet(Hi,0)
+  EndIf
+  If DLike(Y,A,0)
+    PmTensorClip(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count,low,high)
+  EndIf
+EndProcedure
+
+Procedure DConv()
+  Protected Y.i=DCall(0)
+  Protected A.i=DCall(1)
+  Protected W.i=DCall(2)
+  Protected B.i=DCall(3)
+  Protected PadLeft.i=DCall(4)
+  Protected PadRight.i=DCall(5)
+  Protected Stride.i=DCall(6)
+  Protected Dilation.i=DCall(7)
+  Protected Groups.i=DCall(8)
+  Protected g.PmTensorConv1DArgs
+  DZero(@g,SizeOf(PmTensorConv1DArgs))
+  If Dt(A)\Kind<>1 Or (Dt(W)\Kind<>1 And Dt(W)\Kind<>3) Or (B<>0 And Dt(B)\Kind<>1)
+    DFail("Conv requires FLOAT activations and FLOAT/INT8 weights.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Rank<>3 Or Dt(W)\Rank<>3 Or Stride<=0 Or Groups<=0
+    DFail("Invalid Conv1D shape or attributes.")
+    ProcedureReturn
+  EndIf
+  g\Batches=DDims((A)*8+(0))
+  g\InChannels=DDims((A)*8+(1))
+  g\InWidth=DDims((A)*8+(2))
+  g\OutChannels=DDims((W)*8+(0))
+  g\Kernel=DDims((W)*8+(2))
+  g\OutWidth=(g\InWidth+PadLeft+PadRight-Dilation*(g\Kernel-1)-1)/Stride+1
+  If g\InChannels<>DDims((W)*8+(1))*Groups Or (g\OutChannels % Groups)<>0
+    DFail("Conv group/channel mismatch.")
+    ProcedureReturn
+  EndIf
+  If B<>0 And Dt(B)\Count<>g\OutChannels
+    DFail("Conv bias width mismatch.")
+    ProcedureReturn
+  EndIf
+  If DShape(Y,1,3,g\Batches,g\OutChannels,g\OutWidth,0)=0
+    ProcedureReturn
+  EndIf
+  g\Src=Dt(A)\Data
+  g\Weight=Dt(W)\Data
+  g\Bias=Dt(B)\Data
+  g\Dst=Dt(Y)\Data
+  g\PadLeft=PadLeft
+  g\Stride=Stride
+  g\Dilation=Dilation
+  g\Groups=Groups
+  If Dt(W)\Kind=3
+    If Dt(W)\Scales=0 Or g\InChannels/Groups*g\Kernel>133144
+      DFail("INT8 Conv scales are missing or its reduction exceeds the INT32 bound.")
+      ProcedureReturn
+    EndIf
+    If DInt8Begin(g\Src,Dt(A)\Count,0)=0
+      ProcedureReturn
+    EndIf
+    g\WeightScales=Dt(W)\Scales
+    CompilerIf #PMD_NATIVE_BYTES = 8
+    PmTensorConv1DNeon(@g)
+    CompilerElse
+    PmTensorConv1D(@g)
+    CompilerEndIf
+    DInt8End()
+  Else
+    If PmFastConv(@g,DLimit-DLive)=0
+      DFail("Convolution scratch exceeds available working memory.")
+    EndIf
+  EndIf
+EndProcedure
+
+Procedure DConvTranspose()
+  Protected Y.i=DCall(0)
+  Protected A.i=DCall(1)
+  Protected W.i=DCall(2)
+  Protected B.i=DCall(3)
+  Protected PadLeft.i=DCall(4)
+  Protected PadRight.i=DCall(5)
+  Protected Stride.i=DCall(6)
+  Protected Dilation.i=DCall(7)
+  Protected Groups.i=DCall(8)
+  Protected OutputPad.i=DCall(9)
+  Protected g.PmTensorConvTranspose1DArgs
+  DZero(@g,SizeOf(PmTensorConvTranspose1DArgs))
+  If Dt(A)\Kind<>1 Or Dt(W)\Kind<>1 Or (B<>0 And Dt(B)\Kind<>1)
+    DFail("Transposed Conv requires FLOAT tensors.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Rank<>3 Or Dt(W)\Rank<>3 Or Stride<=0 Or Groups<=0
+    DFail("Invalid transposed convolution.")
+    ProcedureReturn
+  EndIf
+  g\Batches=DDims((A)*8+(0))
+  g\InChannels=DDims((A)*8+(1))
+  g\InWidth=DDims((A)*8+(2))
+  g\OutChannels=DDims((W)*8+(1))*Groups
+  g\Kernel=DDims((W)*8+(2))
+  g\OutWidth=(g\InWidth-1)*Stride-PadLeft-PadRight+Dilation*(g\Kernel-1)+1+OutputPad
+  If g\InChannels<>DDims((W)*8+(0)) Or (g\InChannels % Groups)<>0
+    DFail("Transposed Conv channel mismatch.")
+    ProcedureReturn
+  EndIf
+  If B<>0 And Dt(B)\Count<>g\OutChannels
+    DFail("Transposed Conv bias width mismatch.")
+    ProcedureReturn
+  EndIf
+  If DShape(Y,1,3,g\Batches,g\OutChannels,g\OutWidth,0)=0
+    ProcedureReturn
+  EndIf
+  g\Src=Dt(A)\Data
+  g\Weight=Dt(W)\Data
+  g\Bias=Dt(B)\Data
+  g\Dst=Dt(Y)\Data
+  g\PadLeft=PadLeft
+  g\Stride=Stride
+  g\Dilation=Dilation
+  g\Groups=Groups
+  If PmFastConvTranspose(@g,DLimit-DLive)=0
+    DFail("Transposed convolution scratch exceeds available working memory.")
+  EndIf
+EndProcedure
+
+Procedure DResize(Y.i,A.i,Scales.i,Sizes.i,Mode.i,Coordinate.i)
+  Protected Dim dims.i(8)
+  Protected i.i=0
+  Protected last.i=Dt(A)\Rank-1
+  Protected scale.f=0.0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If last<0 Or Dt(A)\Kind<>1
+    DFail("Resize requires a FLOAT tensor with an axis.")
+    ProcedureReturn
+  EndIf
+  For i=0 To last
+    If Sizes
+      dims(i)=DInt(Sizes,i)
+    Else
+      dims(i)=Int(DFloat(DDims((A)*8+(i)))*DGet(Scales,i))
+    EndIf
+    If i<last And dims(i)<>DDims((A)*8+(i))
+      DFail("Resize supports the final axis only.")
+      ProcedureReturn
+    EndIf
+  Next
+  If DDims((A)*8+(last))<=0 Or dims(last)<=0
+    DFail("Resize has an empty width.")
+    ProcedureReturn
+  EndIf
+  scale=DFloat(dims(last))/DFloat(DDims((A)*8+(last)))
+  If Scales
+    scale=DGet(Scales,last)
+  EndIf
+  If DAlloc(Y,1,Dt(A)\Rank,@dims(0))
+    PmTensorResize1D(Dt(A)\Data,Dt(Y)\Data,DProduct(A,0,last-1),DDims((A)*8+(last)),dims(last),Mode,Coordinate,scale)
+  EndIf
+EndProcedure
+
+Procedure DLstm()
+  Protected Y.i=DCall(0)
+  Protected YH.i=DCall(1)
+  Protected YC.i=DCall(2)
+  Protected X.i=DCall(3)
+  Protected W.i=DCall(4)
+  Protected R.i=DCall(5)
+  Protected B.i=DCall(6)
+  Protected Seq.i=DCall(7)
+  Protected IH.i=DCall(8)
+  Protected IC.i=DCall(9)
+  Protected Hidden.i=DCall(10)
+  Protected Directions.i=DCall(11)
+  Protected g.PmTensorLstmArgs
+  Protected seq64.i=0
+  Protected i.i=0
+  Protected valid.i=0
+  Protected seqBytes.i=0
+  DZero(@g,SizeOf(PmTensorLstmArgs))
+  If Dt(X)\Rank<>3 Or Dt(W)\Rank<>3 Or Dt(R)\Rank<>3 Or Dt(X)\Kind<>1 Or (Dt(W)\Kind<>1 And Dt(W)\Kind<>3) Or (Dt(R)\Kind<>1 And Dt(R)\Kind<>3)
+    DFail("LSTM requires FLOAT activations and rank-three FLOAT/INT8 weights.")
+    ProcedureReturn
+  EndIf
+  g\Sequence=DDims((X)*8+(0))
+  g\Batch=DDims((X)*8+(1))
+  g\InputSize=DDims((X)*8+(2))
+  g\Hidden=Hidden
+  g\Directions=Directions
+  If Hidden<=0 Or Hidden>4096 Or Directions<1 Or Directions>2
+    DFail("LSTM dimensions are invalid.")
+    ProcedureReturn
+  EndIf
+  If DDims((W)*8+(0))<>Directions Or DDims((W)*8+(1))<>4*Hidden Or DDims((W)*8+(2))<>g\InputSize Or DDims((R)*8+(0))<>Directions Or DDims((R)*8+(1))<>4*Hidden Or DDims((R)*8+(2))<>Hidden
+    DFail("LSTM weight dimensions do not match the input and hidden state.")
+    ProcedureReturn
+  EndIf
+  If B<>0 And (Dt(B)\Kind<>1 Or Dt(B)\Count<>Directions*8*Hidden)
+    DFail("LSTM bias dimensions are invalid.")
+    ProcedureReturn
+  EndIf
+  If Seq<>0 And (Dt(Seq)\Kind<>6 Or Dt(Seq)\Count<>g\Batch)
+    DFail("LSTM sequence lengths must be INT32 per batch.")
+    ProcedureReturn
+  EndIf
+  If IH<>0 And (Dt(IH)\Kind<>1 Or Dt(IH)\Count<>Directions*g\Batch*Hidden)
+    DFail("LSTM initial hidden state is invalid.")
+    ProcedureReturn
+  EndIf
+  If IC<>0 And (Dt(IC)\Kind<>1 Or Dt(IC)\Count<>Directions*g\Batch*Hidden)
+    DFail("LSTM initial cell state is invalid.")
+    ProcedureReturn
+  EndIf
+  If DShape(Y,1,4,g\Sequence,Directions,g\Batch,Hidden)=0
+    ProcedureReturn
+  EndIf
+  If DShape(YH,1,3,Directions,g\Batch,Hidden,0)=0
+    ProcedureReturn
+  EndIf
+  If DShape(YC,1,3,Directions,g\Batch,Hidden,0)=0
+    ProcedureReturn
+  EndIf
+  g\X=Dt(X)\Data
+  g\W=Dt(W)\Data
+  g\R=Dt(R)\Data
+  g\B=Dt(B)\Data
+  g\SeqLens=Dt(Seq)\Data
+  g\InitialH=Dt(IH)\Data
+  g\InitialC=Dt(IC)\Data
+  g\Y=Dt(Y)\Data
+  g\YH=Dt(YH)\Data
+  g\YC=Dt(YC)\Data
+  If 1 ; portable scalar LSTM consumes INT64 sequence metadata for both precisions
+    If (Dt(W)\Kind=3 And Dt(W)\Scales=0) Or (Dt(R)\Kind=3 And Dt(R)\Scales=0) Or g\InputSize>133144
+      DFail("INT8 LSTM scales are missing or reduction is too large.")
+      ProcedureReturn
+    EndIf
+    If Seq
+      seqBytes=g\Batch*8
+      If seqBytes>DLimit-DLive
+        DFail("LSTM sequence metadata exceeds available memory.")
+        ProcedureReturn
+      EndIf
+      seq64=DAcquire(seqBytes)
+      If seq64=0
+        DFail("LSTM sequence metadata allocation failed.")
+        ProcedureReturn
+      EndIf
+      For i=0 To g\Batch-1
+        valid=PeekL(Dt(Seq)\Data+i*4)
+        If valid<0 Or valid>g\Sequence
+          DFree(seq64)
+          DFail("LSTM sequence length is out of bounds.")
+          ProcedureReturn
+        EndIf
+        DWriteI64(seq64+i*8,valid)
+      Next
+      DLive+seqBytes
+      DPeak=DMax(DPeak,DLive)
+      g\SeqLens=seq64
+    EndIf
+    If DInt8Begin(g\X,g\InputSize,g\Hidden)
+      g\WScales=Dt(W)\Scales
+      g\RScales=Dt(R)\Scales
+      PmTensorLstm(@g)
+      DInt8End()
+    EndIf
+    If seq64
+      DFree(seq64)
+      DLive-seqBytes
+    EndIf
+  Else
+    PmTensorLstm(@g)
+  EndIf
+EndProcedure
+
+Procedure DStft(Y.i,A.i,StepTensor.i,Window.i,LengthTensor.i,OneSided.i)
+  Protected g.PmTensorStftArgs
+  Protected complex.i=1
+  DZero(@g,SizeOf(PmTensorStftArgs))
+  If Dt(A)\Kind<>1 Or Dt(A)\Rank<2 Or Dt(A)\Rank>3
+    DFail("STFT requires real FLOAT batches.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Rank=3 And DDims((A)*8+(2))<>1
+    DFail("Complex STFT input is not implemented.")
+    ProcedureReturn
+  EndIf
+  g\Batches=DDims((A)*8+(0))
+  g\SignalLength=DDims((A)*8+(1))
+  g\FrameStep=DInt(StepTensor,0)
+  If LengthTensor
+    g\FrameLength=DInt(LengthTensor,0)
+  Else
+    g\FrameLength=Dt(Window)\Count
+  EndIf
+  If g\FrameStep<=0 Or g\FrameLength<=0 Or g\FrameLength>65536
+    DFail("STFT frame parameters are invalid.")
+    ProcedureReturn
+  EndIf
+  If Window<>0 And (Dt(Window)\Kind<>1 Or Dt(Window)\Count<>g\FrameLength)
+    DFail("STFT window length/type mismatch.")
+    ProcedureReturn
+  EndIf
+  g\Frames=(g\SignalLength-g\FrameLength)/g\FrameStep+1
+  g\Bins=g\FrameLength
+  If OneSided
+    g\Bins=g\FrameLength/2+1
+  EndIf
+  If DShape(Y,1,4,g\Batches,g\Frames,g\Bins,2)=0
+    ProcedureReturn
+  EndIf
+  While complex<2*g\FrameLength-1
+    complex*2
+  Wend
+  If complex>(DLimit-DLive)/40
+    DFail("STFT scratch exceeds the working-memory limit.")
+    ProcedureReturn
+  EndIf
+  g\ScratchComplex=complex
+  g\Scratch=DAcquire(complex*40)
+  If g\Scratch=0
+    DFail("STFT scratch allocation failed.")
+    ProcedureReturn
+  EndIf
+  g\Signal=Dt(A)\Data
+  g\Window=Dt(Window)\Data
+  g\Dst=Dt(Y)\Data
+  If PmTensorStft(@g)=0
+    DFail("STFT execution failed.")
+  EndIf
+  DFree(g\Scratch)
+EndProcedure

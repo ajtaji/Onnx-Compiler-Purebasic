@@ -1,0 +1,1053 @@
+; ======================================================================
+; math.pico2 - the desktop BASIC maths functions, in 32-bit binary float,
+;              ON THE RP2350
+; ----------------------------------------------------------------------
+;
+;     EnableFloatingPoint                       ; REQUIRED - see below
+;     XIncludeFile "RP2350/Lib/math.pico2"
+;
+;     Procedure Main()
+;       Protected h.f
+;       h = Sqr(3.0 * 3.0 + 4.0 * 4.0)          ; 5.0
+;       h = Sin(Radian(30.0))                   ; 0.5
+;       h = ATan2(1.0, 1.0)                     ; 0.7853982  (45 degrees)
+;       h = Pow(2.0, 10.0)                      ; 1024.0
+;     EndProcedure
+;
+; Sqr Pow Sin Cos Tan ATan2 Log Exp Int Degree Radian Sign, plus the four
+; special-value helpers NaN Infinity IsNaN IsInfinity that the domain
+; answers below are stated in terms of.
+;
+; ======================================================================
+; THE PORT OF RP2040/Lib/math.pico, AND THE ONE THING THAT WAS CHECKED
+; ======================================================================
+; Every executable line below is character-for-character the RP2040
+; file's. That is a RESULT, not a starting assumption: the vault ruled on
+; 2026-08-02 that the RP2350 never shares RP2040/Lib, because a file that
+; pokes RP2040 addresses and a file that is genuinely portable read the
+; same from the include line. So this one was read whole and searched for
+; the specific chip fact it was most likely to be smuggling.
+;
+; THE SIO HARDWARE DIVIDER, AND WHY IT TURNED OUT NOT TO MATTER HERE.
+; The RP2040 has a hardware divider in SIO at $D0000060..$D0000078. The
+; RP2350 HAS NONE - that address range is reserved on this chip
+; (Help/RP2350.txt, corrected 2026-08-06; the M33 divides with its own
+; udiv/sdiv instructions, which this backend does not emit yet either).
+; So a ported file that reached the divider would compile or refuse
+; depending on how it reached it, and the frightening case would be a
+; silent wrong answer.
+;
+; It cannot happen, for two independent reasons, and BOTH were checked
+; rather than reasoned about:
+;
+;   1. NOTHING IN THIS FILE NAMES THE DIVIDER. sio_divide() and
+;      sio_modulo() appear nowhere in it, and nowhere in any of the nine
+;      libraries ported alongside it. The RP2040 callers of those
+;      intrinsics are elsewhere - MathLib/q16.pico's QDiv,
+;      q16_random.pico, and the Pico_HardwareDivide example - and none of
+;      them is this file.
+;
+;   2. '/' AND '%' NEVER LOWERED ONTO THE DIVIDER ANYWAY, on either chip.
+;      RP2040/the compiler's RP2040IntMath module says so in its own banner: the hardware
+;      divide block "is still dormant", and "'/' and '%' lower to
+;      __pm_divmod, the software restoring loop in the compiler's ARMFloatHelpers module, on
+;      every RP2040 program." The RP2350 reuses that same emitter. So the
+;      operators in this file mean the same instructions on both parts.
+;
+;   And the failure mode if either had been wrong is the good one:
+;   sio_divide and sio_modulo are declared in rp2040_hardware.def and are
+;   ABSENT from RP2350/Intrinsics/rp2350_hardware.def, so naming one here
+;   stops the build by name. There is no way to reach a divider that is
+;   not there and get a plausible number back.
+;
+; NOTHING ELSE IN THIS FILE TOUCHES HARDWARE. It is .f arithmetic, bit
+; patterns read through PeekL/PokeL of a local, and polynomials.
+;
+; ======================================================================
+; REQUIRES
+; ======================================================================
+;   EnableFloatingPoint, in YOUR file, ABOVE the XIncludeFile line.
+;
+;   Includes no other file (house rule: a library never includes a
+;   library - the MAIN file lists them). It needs none: .f arithmetic is
+;   built into the compiler on this target, so everything here is
+;   ordinary code. It compiles standalone for rp2350 when the pragma is
+;   supplied.
+;
+;   The pragma is not optional and the error you get without it does not
+;   say so. This file is .f arithmetic throughout and contains about
+;   ninety fractional literals. Without the pragma each one is typed as
+;   Q32.32 FIXED-POINT - that is the default - and cannot be combined
+;   with the .f variables here, so the build stops with a message about
+;   mixing .fx and .f that names a line INSIDE THIS LIBRARY and mentions
+;   nothing you wrote. serial_print_f32 on the AVR line has the identical
+;   requirement for the identical reason.
+;
+;   .fx IS REFUSED OUTRIGHT ON THIS TARGET - Help/RP2350.txt lists
+;   ".fx / .q / .dec / .d (8-byte types are not lowered on ARM)" among
+;   the refusals - so on the Pico 2 a missing pragma is even more likely
+;   to produce a message about a type you never asked for.
+;
+; ======================================================================
+; WHY THIS IS A SEPARATE FILE AND NOT PART OF A WIRING LIBRARY
+; ======================================================================
+; wiring.pico2 carries min/max/abs/constrain/map: the Arduino surface,
+; whole numbers, no pragma, cheap enough that a blink sketch can carry
+; them. Everything here is binary32 and needs EnableFloatingPoint. Fold
+; the two together and every program that only wanted constrain() starts
+; paying the float pragma and the float helpers.
+;
+; It is also a different NAMESPACE with different rules. These are the
+; desktop BASIC's names and the desktop BASIC's exact semantics, argument
+; order included - ATan2 takes x FIRST, which is the reverse of the C
+; function of the same name and is the single most likely thing to be
+; got wrong here. Mixing that contract into a file documented as "the
+; Arduino API" would leave a reader with no way to know which set of
+; rules a given name follows.
+;
+; ======================================================================
+; Abs IS DELIBERATELY ABSENT
+; ======================================================================
+; The RP2040's wiring.pico defines abs(v.i) and identifiers fold case, so
+; an Abs(x.f) here would make the two files refuse to be included
+; together - for one function that is two lines to write inline:
+;
+;     If v < 0.0 : v = 0.0 - v : EndIf
+;
+; Same reasoning wiring_math.avrb gives for leaving bitSet() to bits.avrb,
+; and the same reason bits.pico2 next door does not define one either.
+;
+; ======================================================================
+; SINGLE PRECISION ONLY, AND WHAT THAT COSTS YOU
+; ======================================================================
+; The desktop BASIC computes these in DOUBLE and offers a .d overload.
+; This language has .f and no .d on this target - and .d is refused
+; outright here, see REQUIRES - so every function is binary32 in and
+; binary32 out. binary32 carries about 7 significant decimal digits. A
+; result that agrees with the desktop to 7 digits is agreeing as closely
+; as the type can.
+;
+; THE RP2350 HAS AN FPU AND THIS FILE DOES NOT USE IT. The Cortex-M33 on
+; this part has single-precision floating point in hardware; Help/
+; RP2350.txt lists "the FPU" among the things this target does NOT yet
+; use, because the backend reuses the RP2040's Thumb-1 encoder and
+; Thumb-1 has no VFP encodings. So every .f operation below goes through
+; the same software helpers in the compiler's ARMFloatHelpers module that serve the RP2040.
+; That is slower than the silicon can go, and it is the reason the
+; accuracy table below transfers - see ACCURACY.
+;
+; Where a function CANNOT match the desktop it is written down here and
+; in that function's own comment, never left to be discovered:
+;
+;   Int()    returns a 32-bit value; the desktop returns the machine's
+;            native integer, which is 64-bit on a 64-bit build. Magnitudes
+;            above 2147483647 saturate here. (32 bits is the pointer and
+;            integer width on this chip too - 520 KB of SRAM instead of
+;            264 KB moves the address RANGE, not the WIDTH.)
+;   Sin Cos  refuse an argument beyond 12867 radians instead of returning
+;   Tan      a plausible number. The desktop keeps answering; its answers
+;            out there are wrong too, just quietly. See TRIG below.
+;   Pow      for a non-integer exponent is exp(y*log(x)) and carries that
+;            composition's error, about 7e-6 relative rather than the
+;            type's own 6e-8 - see the 113 ULP figure under ACCURACY.
+;            An INTEGER exponent up to +/-64 takes a repeated-squaring
+;            path instead. A NEGATIVE base is refused past that bound -
+;            see Pow(), where the measurement is.
+;
+; ======================================================================
+; DOMAIN ERRORS - EVERY ONE HAS A DEFINED, DOCUMENTED ANSWER
+; ======================================================================
+; These match the desktop BASIC, which was RUN to establish them rather
+; than read out of a manual:
+;
+;     Sqr(-1)          NaN            Log(0)        -Infinity
+;     Sqr(-0.0)        -0.0           Log(-1)       NaN
+;     Sqr(+Inf)        +Infinity      Log(+Inf)     +Infinity
+;     Exp(1000)        +Infinity      Exp(-1000)    0.0
+;     Pow(0, 0)        1.0            Pow(0, -1)    +Infinity
+;     Pow(-2, 3)       -8.0           Pow(-2, 0.5)  NaN
+;     Pow(x, 0)        1.0 always     ATan2(0, 0)   0.0
+;     Sign(NaN)        0              anything(NaN) NaN
+;
+; Every one of those rows is an ASSERTION in
+; RP2350/Examples/Verification/rp2350LibSelfTest.pico2, checked on this
+; target rather than inherited on trust.
+;
+; The two places this file DIFFERS from the desktop, both deliberate:
+;
+;   Int(NaN) is 0 here. The desktop returns the CPU's "integer
+;   indefinite" (-9223372036854775808), which is a plausible-looking
+;   number that is not an answer. 0 is not an answer either, but it is
+;   not a number anyone will mistake for one - and Sign()/IsNaN() are
+;   right there if you need to ask.
+;
+;   Sin/Cos/Tan return NaN beyond 12867 radians. See TRIG.
+;
+; ======================================================================
+; TRIG: THE RANGE LIMIT IS A REFUSAL, AND IT IS THE POINT
+; ======================================================================
+; Reducing an angle modulo pi/2 is where a float trig function actually
+; goes wrong. pi/2 is carried here in THREE pieces so that each product
+; n*piece is exact:
+;
+;     A = 1.5703125                    = 201 * 2^-7,  8 significant bits
+;     B = 0.0004837512969970703125     11 significant bits
+;     C = 0.0000000754979012640433     the remainder
+;
+; n*A stays exact while 201*|n| < 2^24 and n*B while 2029*|n| < 2^24. The
+; second is the binding one: |n| < 8267, i.e. |x| < about 12986 radians.
+; Past that the reduction quietly loses bits and the error grows with no
+; outward sign at all, so beyond 12867 radians (2048 whole turns) these
+; return NaN. A NaN propagates and can be tested for; a sine that is
+; wrong in the fourth digit cannot.
+;
+; If you are accumulating an angle in a loop, wrap it as you go rather
+; than letting it grow - Radian(deg % 360) costs nothing.
+;
+; ======================================================================
+; NO GLOBALS, SO THESE ARE REENTRANT
+; ======================================================================
+; Every value lives in a Protected local, including the ones only there
+; to be looked at bit by bit. That is not free - it costs a frame slot
+; and a couple of instructions per call - and it is bought deliberately:
+; a maths function that keeps its scratch in a file-level global cannot
+; be called from an interrupt while the main program is inside it, and
+; the failure when you do is a wrong number rather than a crash.
+;
+; ON THIS PART IT BUYS A SECOND THING, and it is worth naming because the
+; RP2350 file is where it first matters: interrupts WORK on this target
+; (Help/RP2350.txt - first interrupt on silicon 2026-08-06,
+; rp2350SysTickTest.pico2), with 52 IRQ lines and the M33's own system
+; exception slots. A handler that wants a square root can have one.
+; string_f32.pico2's StrF is the counter-example next door: it keeps its
+; scratch at file level and says so, and must not be called from a
+; handler while the foreground is inside it.
+;
+; serial_print_f32.avrb keeps its scratch in globals for a reason that no
+; longer applies: taking '@' of a frame-relative local was not known to
+; work on that backend. It was measured on all three backends on
+; 2026-08-03 and works everywhere, which is what made this file possible.
+;
+; ======================================================================
+; WHAT IT COSTS
+; ======================================================================
+; The RP2040 measurement was:
+;
+;     a program with none of this               1900 bytes
+;     the same program including this file     10704 bytes   (+8804)
+;     ... and calling Sqr as well              10724 bytes   (+20)
+;
+; READ THAT SECOND NUMBER CAREFULLY: on this backend the include costs
+; the WHOLE FILE whether you call anything or not, and the call itself is
+; then nearly free. Dead-code stripping exists in this compiler but only
+; the AVR backends have opted into it, so what you include here is what
+; you get. Roughly nine kilobytes is 0.2% of the 4 MB flash the RP2350
+; images are linked against and does not matter; the same file is refused
+; on an ATmega328P for exactly the reason this number would matter there.
+;
+; The figures above are the RP2040's and have NOT been re-run on this
+; part. The exact byte count on the Pico 2 is whatever the build says;
+; the shape of the statement - all of it, always - is what carries over,
+; and that is a property of the compiler, not of the chip.
+;
+; ======================================================================
+; ACCURACY, MEASURED - ON THE RP2040, AND WHY THAT TRANSFERS
+; ======================================================================
+; READ THE PROVENANCE BEFORE THE NUMBERS. Every figure below came from
+; RUNNING the compiled image ON THE RP2040 and scoring the printed bit
+; patterns against the same expression in double precision - 1300
+; pseudo-random arguments per line, not a handful of hand-picked ones.
+; NONE OF IT HAS BEEN RE-RUN ON A PICO 2, and this file does not claim
+; otherwise.
+;
+; What makes them transferable is not optimism, it is that the ARITHMETIC
+; IS THE SAME OBJECT CODE: this target does not use the M33's FPU (see
+; SINGLE PRECISION above), so every add, multiply, divide and compare
+; below goes through the identical software routines in
+; the compiler's ARMFloatHelpers module that produced these numbers on the RP2040. Same
+; helpers, same polynomial, same binary32 grid - the results are bit
+; patterns, and bit patterns do not depend on how fast the core is.
+;
+; That is an argument, and the project's own rule is that an argument is
+; not a measurement. So the self-test checks the ANSWERS this file
+; promises - the whole DOMAIN ERRORS table, Sqr(2), Sin/Cos/Tan at known
+; angles, Pow's two paths, the trig refusal past 12867 - on this part.
+; What it does NOT re-establish is the ULP tables; the day somebody wants
+; those on a Pico 2, the 1300-argument harness has to be run here.
+;
+;     Sqr        1 ULP     x spread over the whole finite positive range
+;     Exp        1 ULP     -87 <= x <= 88
+;     Log        1 ULP     x spread over the whole finite positive range
+;     Sin Cos    1 ULP     |x| <= 2*pi, and also |x| <= 12867
+;     Tan        3 ULP     |x| <= 1.4
+;     ATan2      1 ULP     both arguments spread over 1e-9 .. 1e+9,
+;                          all four quadrants
+;     Pow        9 ULP     whole-number exponent, |y| <= 20
+;                113 ULP   fractional exponent - 7.2e-06 RELATIVE, which
+;                          is the honest way to read it. See Pow().
+;
+; TRIG NEAR A ZERO IS THE ONE PLACE ULPs MISLEAD, so it is measured
+; separately: with arguments deliberately placed within 0.001 radians of
+; a multiple of pi, out to 4000*pi, Sin is 52 ULP and Cos 974 ULP - and
+; the ABSOLUTE error at those points is 1.4e-10 and 2.1e-10. Both
+; statements are true and they are about the same numbers: a result of
+; 3e-7 has almost no significant bits left, so a fixed absolute error
+; counts as an enormous number of steps. If you are testing sin(x) for a
+; zero crossing, compare against a small absolute tolerance and not
+; against 0.0 - which is true of every implementation of these functions
+; and not a property of this one.
+;
+; NOTHING IN THIS FILE HAS RUN ON SILICON. It compiles for rp2350 and its
+; answers are checked by rp2350LibSelfTest.pico2 under tools/arm_run.exe.
+; ======================================================================
+; ----------------------------------------------------------------------
+; FloatBits(x) - the raw IEEE-754 binary32 bit pattern of x, as a signed
+; 32-bit value. Nothing is converted: FloatBits(1.5) is 1069547520, not 1.
+; This is how every classification in this file is done - a NaN or an
+; infinity has to be recognised from its bits, because arithmetic on one
+; produces another one and tells you nothing.
+; ----------------------------------------------------------------------
+Procedure.l FloatBits(x.f)
+  Protected t.f
+  t = x
+  ProcedureReturn PeekL(@t)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; FloatFromBits(b) - the binary32 value whose bit pattern is b. The exact
+; inverse of FloatBits, and again nothing is converted: FloatFromBits(1)
+; is the smallest subnormal, not 1.0.
+; ----------------------------------------------------------------------
+Procedure.f FloatFromBits(b.l)
+  Protected t.f
+  PokeL(@t, b)
+  ProcedureReturn t
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Infinity() - positive infinity, 0x7F800000. Negate it for the other one.
+; ----------------------------------------------------------------------
+Procedure.f Infinity()
+  ProcedureReturn FloatFromBits(2139095040)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; NaN() - a quiet Not-a-Number. Every domain error in this file returns
+; this one bit pattern, 0x7FC00000.
+; ----------------------------------------------------------------------
+Procedure.f NaN()
+  ProcedureReturn FloatFromBits(2143289344)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; IsNaN(x) - 1 if x is Not-a-Number, else 0.
+; Do NOT test for a NaN with '=': a NaN compares unequal to everything
+; including itself, so "If x = NaN()" is false even when x IS a NaN. That
+; property is in fact what this uses - x <> x is true for a NaN and for
+; nothing else - but relying on it in your own code reads as a typo, so
+; call this instead.
+; ----------------------------------------------------------------------
+Procedure.l IsNaN(x.f)
+  If x <> x
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; IsInfinity(x) - 1 for +Infinity, -1 for -Infinity, 0 for anything else
+; including NaN. The desktop BASIC only promises "nonzero", so a program
+; that just tests truth is portable; the sign is extra.
+; ----------------------------------------------------------------------
+Procedure.l IsInfinity(x.f)
+  Protected b.l
+  b = FloatBits(x)
+  If b = 2139095040
+    ProcedureReturn 1
+  EndIf
+  If b = -8388608                   ; 0xFF800000 read as a signed .l
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Sign(x) - -1 if x is negative, +1 if positive, 0 if zero.
+; Returns an INTEGER, as the desktop's does. Sign(-0.0) is 0 and
+; Sign(NaN) is 0; both were checked against the desktop rather than
+; assumed.
+; ----------------------------------------------------------------------
+Procedure.l Sign(x.f)
+  If x <> x                         ; NaN - not positive, not negative
+    ProcedureReturn 0
+  EndIf
+  If x > 0.0
+    ProcedureReturn 1
+  EndIf
+  If x < 0.0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Int(x) - the integer part of x, TRUNCATED toward zero. Int(10.565) is
+; 10 and Int(-10.565) is -10, which is the desktop's rule and NOT the
+; older BASIC floor() rule that would give -11. There is no rounding.
+;
+; TWO DIFFERENCES FROM THE DESKTOP, both forced:
+;   - the result is 32-bit. A magnitude beyond 2147483647 saturates at
+;     +/-2147483647 rather than wrapping, because a wrapped answer looks
+;     like a real one. The desktop returns a 64-bit value and its IntQ()
+;     has no counterpart here.
+;   - Int(NaN) is 0. The desktop hands back the CPU's integer-indefinite
+;     value, -9223372036854775808, which is not an answer either but is
+;     far more likely to be mistaken for one.
+; ----------------------------------------------------------------------
+Procedure.l Int(x.f)
+  Protected n.l
+  If x <> x
+    ProcedureReturn 0
+  EndIf
+  If x >= 2147483648.0
+    ProcedureReturn 2147483647
+  EndIf
+  If x <= -2147483648.0
+    ProcedureReturn -2147483647
+  EndIf
+  n = x                             ; the backend's f32->s32 truncates toward zero
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Degree(x) - an angle in radians converted to degrees. Degree(#PI/4) is
+; 45.0. There is NO normalisation: an input above 2*pi gives a result
+; above 360, and a negative input gives a negative result, exactly as the
+; desktop does.
+; ----------------------------------------------------------------------
+Procedure.f Degree(x.f)
+  ProcedureReturn x * 57.29577951308232
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Radian(x) - an angle in degrees converted to radians. Radian(90) is
+; 1.5707964. No normalisation, same as Degree().
+; ----------------------------------------------------------------------
+Procedure.f Radian(x.f)
+  ProcedureReturn x * 0.017453292519943295
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MathNearestInt(t) - t rounded to the NEAREST integer, halves away from
+; zero. Used by the range reductions below, where an off-by-one quadrant
+; is a sign error rather than a rounding error.
+;
+; It is spelled out through a local rather than written as
+; "ProcedureReturn t + 0.5" because the conversion then happens at the
+; return, and a float-to-int conversion buried in a return statement is
+; the shape that used to be silently skipped on the ARM backends. Being
+; explicit costs nothing and cannot be misread.
+; ----------------------------------------------------------------------
+Procedure.l MathNearestInt(t.f)
+  Protected u.f
+  Protected n.l
+  If t >= 0.0
+    u = t + 0.5
+  Else
+    u = t - 0.5
+  EndIf
+  n = u
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MathPow2i(n) - 2 raised to an INTEGER power, built directly from the
+; exponent field rather than by multiplying. Exact for -126 <= n <= 127;
+; 0.0 below that and +Infinity above. Exp() and Sqr() use it to apply a
+; power-of-two scaling, which is the one scaling that costs no accuracy
+; at all.
+; ----------------------------------------------------------------------
+Procedure.f MathPow2i(n.l)
+  If n > 127
+    ProcedureReturn FloatFromBits(2139095040)
+  EndIf
+  If n < -126
+    ProcedureReturn 0.0
+  EndIf
+  ProcedureReturn FloatFromBits((n + 127) << 23)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Sqr(x) - the square root of x.
+;
+;     Sqr(-1)     NaN          Sqr(0.0)     0.0
+;     Sqr(-0.0)   -0.0         Sqr(+Inf)    +Infinity
+;
+; MEASURED 1 ULP worst case over 1300 arguments spread across the whole
+; finite positive range.
+;
+; METHOD. A first estimate is read straight out of the exponent field:
+; halving a float's bit pattern halves its exponent, which is most of a
+; square root already, and the additive constant 532487669 is the offset
+; that minimises the leading error of what is left (about 3.5%). Three
+; Newton-Raphson steps y = (y + x/y)/2 follow, each roughly doubling the
+; correct digits: 3.5% -> 6e-4 -> 2e-7 -> below one ULP. A fourth step
+; would change nothing a binary32 can hold.
+;
+; A SUBNORMAL INPUT IS SCALED FIRST. Below 1.18e-38 the exponent field is
+; 0 and the bit trick has nothing to halve, so the estimate is garbage
+; and Newton converges to garbage - silently, because every step still
+; looks like it is converging. Multiplying by 2^40 first and the result
+; by 2^-20 is exact both ways (powers of two) and puts the value back in
+; the range the estimate was fitted for.
+; ----------------------------------------------------------------------
+Procedure.f Sqr(x.f)
+  Protected b.l
+  Protected v.f
+  Protected y.f
+  Protected q.f
+  Protected scale.f
+  If x <> x                         ; NaN in, NaN out
+    ProcedureReturn x
+  EndIf
+  If x < 0.0
+    ProcedureReturn FloatFromBits(2143289344)
+  EndIf
+  If x = 0.0                        ; returns x, so -0.0 stays -0.0
+    ProcedureReturn x
+  EndIf
+  b = FloatBits(x)
+  If b = 2139095040                 ; +Infinity
+    ProcedureReturn x
+  EndIf
+  v = x
+  scale = 1.0
+  If b < 8388608                    ; subnormal - see the note above
+    v = v * 1099511627776.0         ; 2^40
+    scale = 0.00000095367431640625  ; 2^-20
+    b = FloatBits(v)
+  EndIf
+  y = FloatFromBits((b >> 1) + 532487669)
+  q = v / y
+  y = (y + q) * 0.5
+  q = v / y
+  y = (y + q) * 0.5
+  q = v / y
+  y = (y + q) * 0.5
+  ProcedureReturn y * scale
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Exp(x) - e raised to the power x. The inverse of Log().
+;
+;     Exp(0)      1.0          Exp(1000)    +Infinity
+;     Exp(-1000)  0.0          Exp(NaN)     NaN
+;
+; MEASURED 1 ULP worst case over 1300 arguments in -87 <= x <= 88.
+;
+; METHOD. x is split as x = n*ln2 + r with n whole and |r| <= ln2/2, so
+; e^x = 2^n * e^r and only the small factor needs a polynomial. ln2 is
+; carried in two pieces - 0.693359375 is 355/512, nine significant bits,
+; so n*it is EXACT for every n that can occur here, and the tiny
+; correction 0.00021219444005469057 restores the rest. Subtracting one
+; exact product loses nothing; subtracting a single rounded ln2 would
+; lose about a bit per unit of |x|, which is the usual way this function
+; is got wrong.
+;
+; e^r on |r| <= 0.3466 is a degree-7 minimax polynomial evaluated as
+; 1 + r + p(r)*r^2, where p is the degree-5 Horner chain below - which
+; keeps the two dominant terms exact and lets the polynomial carry only
+; the small remainder.
+;
+; The 2^n factor is applied last with MathPow2i, one exact multiply. When
+; n is below -126 the answer is subnormal and 2^n is not representable,
+; so the scaling is done in two steps rather than flushed to zero -
+; without that, exp(-90) would come out as 0 instead of 8.2e-40.
+; ----------------------------------------------------------------------
+Procedure.f Exp(x.f)
+  Protected n.l
+  Protected t.f
+  Protected nf.f
+  Protected r.f
+  Protected z.f
+  Protected p.f
+  Protected v.f
+  If x <> x
+    ProcedureReturn x
+  EndIf
+  If x > 88.72283                   ; the largest x with a finite e^x
+    ProcedureReturn FloatFromBits(2139095040)
+  EndIf
+  If x < -103.9721                  ; below the smallest subnormal
+    ProcedureReturn 0.0
+  EndIf
+  t = x * 1.4426950408889634        ; x / ln2
+  n = MathNearestInt(t)
+  nf = n
+  r = x - nf * 0.693359375          ; exact: 355/512
+  r = r + nf * 0.00021219444005469057
+  p = 0.000198756915
+  p = p * r + 0.0013981999507
+  p = p * r + 0.0083334519073
+  p = p * r + 0.041665795894
+  p = p * r + 0.16666665459
+  p = p * r + 0.50000001201
+  z = r * r
+  v = 1.0 + r
+  v = v + p * z
+  If n < -126
+    v = v * MathPow2i(n + 60)
+    ProcedureReturn v * MathPow2i(-60)
+  EndIf
+  ProcedureReturn v * MathPow2i(n)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Log(x) - the natural logarithm (base e) of x. The inverse of Exp().
+;
+;     Log(1)      0.0          Log(0)       -Infinity
+;     Log(-1)     NaN          Log(+Inf)    +Infinity
+;
+; MEASURED 1 ULP worst case over 1300 arguments spread across the whole
+; finite positive range.
+;
+; METHOD. x is split into m * 2^e with m in [sqrt(1/2), sqrt(2)) - the
+; exponent comes straight out of the bit pattern, so that half is exact -
+; and log(x) = e*ln2 + log(m). log(m) is then evaluated as the atanh
+; series in s = (m-1)/(m+1):
+;
+;     log(m) = 2s * (1 + s^2/3 + s^4/5 + s^6/7 + s^8/9)
+;
+; which is used instead of a series in (m-1) because |s| <= 0.1716 while
+; |m-1| can reach 0.414 - the terms fall away about six times faster, so
+; five of them reach 7e-10 where a direct series would need fifteen.
+; Centring m on 1 rather than leaving it in [1,2) is what buys that; it
+; costs one comparison and one exact halving.
+;
+; A SUBNORMAL INPUT is scaled up by 2^40 first and 40*ln2 subtracted from
+; the exponent term afterwards, for the same reason as in Sqr(): a
+; subnormal has no exponent field to read.
+; ----------------------------------------------------------------------
+Procedure.f Log(x.f)
+  Protected b.l
+  Protected e.l
+  Protected v.f
+  Protected m.f
+  Protected s.f
+  Protected z.f
+  Protected p.f
+  Protected ef.f
+  If x <> x
+    ProcedureReturn x
+  EndIf
+  If x < 0.0
+    ProcedureReturn FloatFromBits(2143289344)
+  EndIf
+  If x = 0.0
+    ProcedureReturn FloatFromBits(-8388608)     ; -Infinity
+  EndIf
+  b = FloatBits(x)
+  If b = 2139095040
+    ProcedureReturn x
+  EndIf
+  v = x
+  e = 0
+  If b < 8388608                    ; subnormal - see the note above
+    v = v * 1099511627776.0         ; 2^40
+    e = -40
+    b = FloatBits(v)
+  EndIf
+  e = e + ((b >> 23) & 255) - 127
+  m = FloatFromBits((b & 8388607) | 1065353216)   ; mantissa, exponent forced to 0
+  If m > 1.4142135623730951
+    m = m * 0.5
+    e = e + 1
+  EndIf
+  s = (m - 1.0) / (m + 1.0)
+  z = s * s
+  p = 0.1111111111111111
+  p = p * z + 0.14285714285714285
+  p = p * z + 0.2
+  p = p * z + 0.3333333333333333
+  p = p * z + 1.0
+  ef = e
+  ProcedureReturn ef * 0.6931471805599453 + 2.0 * s * p
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MathSinCos(x, wantCos) - the shared core of Sin() and Cos().
+; wantCos of 0 gives sin(x), anything else gives cos(x).
+;
+; Both are one function because the argument reduction IS the function -
+; the polynomial afterwards is a few instructions and the reduction is
+; everything that decides whether the answer is right. Two copies of it
+; would be two things to keep in step, and the one that drifts would go
+; wrong only at large arguments, which is exactly where nobody looks.
+;
+; A cosine is a sine one quadrant along, so wantCos simply adds 1 to the
+; quadrant count. The quadrant then selects sin(r) or cos(r) of the
+; reduced argument and whether to negate it.
+; ----------------------------------------------------------------------
+Procedure.f MathSinCos(x.f, wantCos.l)
+  Protected a.f
+  Protected t.f
+  Protected nf.f
+  Protected r.f
+  Protected z.f
+  Protected p.f
+  Protected v.f
+  Protected n.l
+  Protected q.l
+  If x <> x
+    ProcedureReturn x
+  EndIf
+  a = x
+  If a < 0.0
+    a = 0.0 - a
+  EndIf
+  If a > 12867.0                    ; the reduction stops being exact - refuse
+    ProcedureReturn FloatFromBits(2143289344)
+  EndIf
+  t = x * 0.6366197723675814        ; x * 2/pi - which quadrant
+  n = MathNearestInt(t)
+  nf = n
+  r = x - nf * 1.5703125            ; pi/2 in three exact pieces
+  r = r - nf * 0.0004837512969970703125
+  r = r - nf * 0.0000000754979012640433
+  q = n & 3
+  If wantCos <> 0
+    q = (q + 1) & 3
+  EndIf
+  z = r * r
+  If q = 1 Or q = 3
+    ; cos(r) = 1 - r^2/2 + r^4/24 - ... , Taylor to r^10; the truncated
+    ; term is (pi/4)^12/479001600, about 1.2e-10, well under one ULP.
+    p = -0.0000002755731922398589
+    p = p * z + 0.0000248015873015873
+    p = p * z + -0.001388888888888889
+    p = p * z + 0.041666666666666664
+    p = p * z + -0.5
+    v = 1.0 + p * z
+  Else
+    ; sin(r) = r - r^3/6 + r^5/120 - ... , Taylor to r^9; the truncated
+    ; term is (pi/4)^11/39916800, about 1.9e-09.
+    p = 0.0000027557319223985893
+    p = p * z + -0.0001984126984126984
+    p = p * z + 0.008333333333333333
+    p = p * z + -0.16666666666666666
+    v = r + r * (p * z)
+  EndIf
+  If q >= 2
+    ProcedureReturn 0.0 - v
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Sin(x) - the sine of an angle given in RADIANS. Use Radian() to convert
+; from degrees. The result is between -1.0 and 1.0.
+;
+;     Sin(0)          0.0
+;     Sin(Radian(30)) 0.5
+;     Sin(NaN)        NaN
+;     |x| > 12867     NaN     - a refusal, not a failure. See TRIG above.
+;
+; MEASURED 1 ULP worst case over 1300 arguments in |x| <= 2*pi and 1300
+; more in |x| <= 12867. Within 0.001 radians of a multiple of pi the
+; ABSOLUTE error is 1.4e-10 and the ULP count is meaningless - see the
+; note at the top of the file.
+; ----------------------------------------------------------------------
+Procedure.f Sin(x.f)
+  ProcedureReturn MathSinCos(x, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Cos(x) - the cosine of an angle given in RADIANS. Result -1.0 to 1.0.
+; Same accuracy, same 12867-radian refusal and same reasoning as Sin().
+; ----------------------------------------------------------------------
+Procedure.f Cos(x.f)
+  ProcedureReturn MathSinCos(x, 1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Tan(x) - the tangent of an angle given in RADIANS.
+;
+; Computed as Sin(x)/Cos(x), and the consequences of that are worth
+; stating rather than hiding. Near a pole (an odd multiple of pi/2) the
+; cosine is tiny and its few remaining significant bits decide the whole
+; answer, so accuracy degrades steadily as you approach one - away from a
+; pole this is about 3 ULP, at 1e-4 radians from a pole it is nearer 1e-3
+; relative. That is the identity's arithmetic, not a defect, and the
+; desktop BASIC behaves the same way: it returns 37320540 for
+; Tan(1.5707963) because that argument is not exactly pi/2 either.
+;
+; Cos(x) can never be exactly 0 for a representable x, since pi/2 is not
+; representable - but if it ever were, the answer would be the correctly
+; signed Infinity, which is also right.
+;
+;     Tan(0)       0.0        |x| > 12867   NaN
+; ----------------------------------------------------------------------
+Procedure.f Tan(x.f)
+  Protected s.f
+  Protected c.f
+  s = MathSinCos(x, 0)
+  c = MathSinCos(x, 1)
+  ProcedureReturn s / c
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MathATan(t) - arctangent of t, in radians, over the whole real line.
+; Result between -pi/2 and +pi/2. Internal; ATan2() is the public one.
+;
+; The argument is folded twice before the polynomial so that it only ever
+; has to cover |z| <= tan(pi/8) = 0.4142:
+;
+;     |t| > 2.4142   z = -1/t      and add pi/2   (atan t = pi/2 - atan 1/t)
+;     |t| > 0.4142   z = (t-1)/(t+1) and add pi/4
+;
+; Both identities are exact rearrangements, and folding twice is what
+; makes a four-coefficient minimax fit enough. Without it the series near
+; |t| = 1 converges so slowly that fifteen terms would not do.
+; ----------------------------------------------------------------------
+Procedure.f MathATan(t.f)
+  Protected a.f
+  Protected z.f
+  Protected w.f
+  Protected p.f
+  Protected y0.f
+  Protected v.f
+  Protected neg.l
+  neg = 0
+  a = t
+  If a < 0.0
+    a = 0.0 - a
+    neg = 1
+  EndIf
+  If a > 2.414213562373095
+    z = -1.0 / a
+    y0 = 1.5707963267948966
+  ElseIf a > 0.4142135623730950
+    z = (a - 1.0) / (a + 1.0)
+    y0 = 0.7853981633974483
+  Else
+    z = a
+    y0 = 0.0
+  EndIf
+  w = z * z
+  p = 0.0805374449538
+  p = p * w + -0.138776856032
+  p = p * w + 0.199777106478
+  p = p * w + -0.333329491539
+  v = y0 + (z + z * (p * w))
+  If neg <> 0
+    ProcedureReturn 0.0 - v
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ATan2(x, y) - the angle in radians between the x axis and the direction
+; (x, y). Result between -pi and +pi.
+;
+; ================ THE X COMES FIRST. READ THIS TWICE. =================
+; The desktop BASIC spells this ATan2(x, y) and computes the arctangent
+; of y/x. Every C library, and everything that copies C, spells the same
+; function atan2(y, x) - the arguments the other way round. This file
+; follows the desktop, because that is the language these names come
+; from. Swapping them does not fail; it silently reflects every angle
+; about the 45-degree line, which is a bug people find on a robot rather
+; than on a bench.
+;
+;     ATan2(1, 0)   0.0            ATan2(0, 1)    +pi/2
+;     ATan2(-1, 0)  +pi            ATan2(0, -1)   -pi/2
+;     ATan2(10, 10) +pi/4          ATan2(0, 0)    0.0
+;
+; ATan2(0, 0) is 0.0, which is a DEFINITION, not a computation - the
+; direction of a zero-length vector is not a question with an answer, and
+; 0.0 is the answer the desktop gives, so it is the answer given here.
+;
+; Infinite arguments are handled explicitly rather than left to fall out
+; of the division: y/x with both infinite is a NaN, and a NaN there would
+; be a wrong answer for a direction that is perfectly well defined.
+;
+; MEASURED 1 ULP worst case over 1300 argument pairs, all four quadrants,
+; magnitudes from 1e-9 to 1e+9.
+; ----------------------------------------------------------------------
+Procedure.f ATan2(x.f, y.f)
+  Protected ix.l
+  Protected iy.l
+  Protected r.f
+  If x <> x
+    ProcedureReturn x
+  EndIf
+  If y <> y
+    ProcedureReturn y
+  EndIf
+  ix = IsInfinity(x)
+  iy = IsInfinity(y)
+  If ix <> 0 Or iy <> 0
+    If ix > 0 And iy = 0
+      ProcedureReturn 0.0
+    EndIf
+    If ix < 0 And iy = 0
+      If y < 0.0
+        ProcedureReturn -3.141592653589793
+      EndIf
+      ProcedureReturn 3.141592653589793
+    EndIf
+    If ix = 0 And iy > 0
+      ProcedureReturn 1.5707963267948966
+    EndIf
+    If ix = 0 And iy < 0
+      ProcedureReturn -1.5707963267948966
+    EndIf
+    ; both infinite: the direction is one of the four diagonals
+    If ix > 0 And iy > 0
+      ProcedureReturn 0.7853981633974483
+    EndIf
+    If ix > 0 And iy < 0
+      ProcedureReturn -0.7853981633974483
+    EndIf
+    If ix < 0 And iy > 0
+      ProcedureReturn 2.356194490192345
+    EndIf
+    ProcedureReturn -2.356194490192345
+  EndIf
+  If x = 0.0
+    If y > 0.0
+      ProcedureReturn 1.5707963267948966
+    EndIf
+    If y < 0.0
+      ProcedureReturn -1.5707963267948966
+    EndIf
+    ProcedureReturn 0.0             ; ATan2(0, 0) - defined as 0.0
+  EndIf
+  r = MathATan(y / x)
+  If x > 0.0
+    ProcedureReturn r
+  EndIf
+  If y < 0.0
+    ProcedureReturn r - 3.141592653589793
+  EndIf
+  ProcedureReturn r + 3.141592653589793
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MathPowInt(x, k) - x raised to a whole number power, by repeated
+; squaring. Internal; Pow() routes to it whenever it can.
+; k may be negative; k of 0 gives 1.0.
+; ----------------------------------------------------------------------
+Procedure.f MathPowInt(x.f, k.l)
+  Protected base.f
+  Protected acc.f
+  Protected e.l
+  acc = 1.0
+  base = x
+  e = k
+  If e < 0
+    e = 0 - e
+  EndIf
+  While e > 0
+    If (e & 1) <> 0
+      acc = acc * base
+    EndIf
+    base = base * base
+    e = e >> 1
+  Wend
+  If k < 0
+    ProcedureReturn 1.0 / acc
+  EndIf
+  ProcedureReturn acc
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Pow(x, y) - x raised to the power y. There is no '^' operator in this
+; language, which is what this function is for.
+;
+;     Pow(2, 10)    1024.0       Pow(0, 0)     1.0
+;     Pow(-2, 3)    -8.0         Pow(0, -1)    +Infinity
+;     Pow(-2, 0.5)  NaN          Pow(x, 0)     1.0, always
+;     Pow(27, 0.3333333) about 3.0
+;     Pow(-2, 100)  NaN          - NOT 1.27e30. See THE BOUND below.
+;
+; A NEGATIVE BASE NEEDS A WHOLE-NUMBER EXPONENT. Pow(-8, 1/3) is NaN
+; here and NaN on the desktop: (-8)^(1/3) has no real value, and the
+; cube root a reader is thinking of is a different function. This is a
+; refusal, not a limitation.
+;
+; TWO PATHS, and which one you get changes the accuracy:
+;
+;   y is a whole number with |y| <= 64  ->  repeated squaring. Exact
+;     where the answer is exact, 9 ULP worst case otherwise (MEASURED,
+;     |y| <= 20 - see ACCURACY at the top), and this is where a negative
+;     base is allowed. Pow(2,10) is exactly 1024.0.
+;
+;   otherwise  ->  Exp(y * Log(x)), which is the only general method
+;     available and carries the error of the composition: about 7e-06
+;     relative, roughly a hundred times the type's own resolution - that
+;     is the 113 ULP in the ACCURACY table, read the other way round.
+;     That is inherent - a 1-ULP error in Log(x) is multiplied by y
+;     before Exp() ever sees it - and the whole-number path exists
+;     precisely because it is the case where that price need not be paid.
+;
+; THE BOUND. For a POSITIVE base, |y| <= 64 is only a cost decision:
+; x^64 already overflows binary32 for any base of 4 or more (4^64 is
+; 2^128, which IS the overflow point), and below that the general path
+; still answers, just less accurately.
+;
+; FOR A NEGATIVE BASE IT IS A CORRECTNESS BOUND, and that is the sharp
+; edge in this function. Past |y| = 64 a negative base falls through to
+; the general path, which refuses it - so Pow(-2, 100) is NaN even
+; though the true answer, 1.2676506e30, is an ordinary representable
+; binary32. MEASURED - on the RP2040 when this was written, and again
+; here: rp2350LibSelfTest.pico2 asserts IsNaN(Pow(-2.0, 100.0)) = 1 on
+; this target, so the sharp edge is confirmed on the Pico 2 build rather
+; than inherited. If you need a negative base with a large whole
+; exponent, call MathPowInt(x, k) directly: it has no bound and is what
+; the short path uses.
+; ----------------------------------------------------------------------
+Procedure.f Pow(x.f, y.f)
+  Protected k.l
+  Protected kf.f
+  Protected a.f
+  Protected r.f
+  If y = 0.0                        ; even Pow(NaN, 0) is 1.0 - the desktop agrees
+    ProcedureReturn 1.0
+  EndIf
+  If x <> x
+    ProcedureReturn x
+  EndIf
+  If y <> y
+    ProcedureReturn y
+  EndIf
+  If x = 1.0
+    ProcedureReturn 1.0
+  EndIf
+  ; a whole-number exponent small enough to reach by squaring
+  If y >= -64.0 And y <= 64.0
+    k = Int(y)
+    kf = k
+    If kf = y
+      If x = 0.0
+        If k < 0
+          ProcedureReturn FloatFromBits(2139095040)   ; +Infinity
+        EndIf
+        ProcedureReturn 0.0
+      EndIf
+      ProcedureReturn MathPowInt(x, k)
+    EndIf
+  EndIf
+  If x = 0.0
+    If y < 0.0
+      ProcedureReturn FloatFromBits(2139095040)
+    EndIf
+    ProcedureReturn 0.0
+  EndIf
+  If x < 0.0
+    ; a negative base with a fractional exponent has no real value
+    ProcedureReturn FloatFromBits(2143289344)
+  EndIf
+  a = Log(x)
+  r = y * a
+  ProcedureReturn Exp(r)
+EndProcedure

@@ -1,0 +1,512 @@
+; ======================================================================
+; kokoro_g2p.pmi - native US-English text frontend for Kokoro.
+; ----------------------------------------------------------------------
+; Include tensor_fp32.pmi and kokoro_assets.pmi first. The immutable
+; PMG2P pack is built from the pinned Apache-2.0 Misaki gold and silver
+; dictionaries. Prepared assets are external; see docs/KOKORO.md.
+;
+; Plain input is ASCII English. Exact dictionary spelling is tried first,
+; then lowercase, then dictionary-backed regular inflections. Unknown words
+; are spoken as letters instead of vanishing.
+; Digits are spoken individually. Text between /slashes/ is treated as an
+; explicit UTF-8 Kokoro phoneme override and fully vocabulary-validated.
+; ======================================================================
+
+#PMK_G2P_HEADER = 256
+#PMK_G2P_SLOT_BYTES = 16
+#PMK_G2P_MAX_WORD = 63
+#PMK_G2P_FILE_BYTES = 12613954
+#PMK_G2P_SLOTS = 524288
+#PMK_G2P_ENTRIES = 183561
+#PMK_G2P_KEY_BYTES = 1624349
+#PMK_G2P_PHONEME_BYTES = 2600741
+#PMK_G2P_PAYLOAD_CRC32 = $F0BE2D51
+; Conversion diagnostics describe the most recent request, in UTF-8 byte offsets.
+Global PmKokoroG2pError.i
+Global PmKokoroG2pErrorAt.i
+Global PmKokoroG2pSpelledCount.i
+Global Dim PmKokoroG2pSpelledAt.i(7)
+
+Procedure.i PmKokoroG2pSourceIdentity(*pack)
+  ; SHA-256(us_gold.json), SHA-256(us_silver.json), then the exact
+  ; 40-byte Misaki revision. Constants are little-endian 32-bit words.
+  If PeekN(*pack + 80) <> $131139A1 Or PeekN(*pack + 84) <> $8F2C704E : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 88) <> $A49ED7D1 Or PeekN(*pack + 92) <> $F164DC7C : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 96) <> $DEC1AE46 Or PeekN(*pack + 100) <> $8A63F4AB : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 104) <> $71DD8C9A Or PeekN(*pack + 108) <> $A3875BDA : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 112) <> $9F62D8A7 Or PeekN(*pack + 116) <> $CD1426F0 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 120) <> $447F8337 Or PeekN(*pack + 124) <> $85001FC4 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 128) <> $4FED5BF5 Or PeekN(*pack + 132) <> $69C1B20E : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 136) <> $77004F96 Or PeekN(*pack + 140) <> $6B2D10BB : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 176) <> $31616266 Or PeekN(*pack + 180) <> $35363332 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 184) <> $32663539 Or PeekN(*pack + 188) <> $66623264 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 192) <> $34643132 Or PeekN(*pack + 196) <> $61623431 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 200) <> $37356536 Or PeekN(*pack + 204) <> $32353264 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 208) <> $66613635 Or PeekN(*pack + 212) <> $33616461 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmKokoroG2pValidate(*pack, bytes.i)
+  Protected slots.i
+  Protected slotOffset.i
+  Protected keyOffset.i
+  Protected keyBytes.i
+  Protected phonemeOffset.i
+  Protected phonemeBytes.i
+  Protected i.i
+  If *pack = 0 Or bytes <> #PMK_G2P_FILE_BYTES : ProcedureReturn 0 : EndIf
+  If PeekA(*pack + 0) <> 80 Or PeekA(*pack + 1) <> 77 : ProcedureReturn 0 : EndIf
+  If PeekA(*pack + 2) <> 71 Or PeekA(*pack + 3) <> 50 : ProcedureReturn 0 : EndIf
+  If PeekA(*pack + 4) <> 80 Or PeekA(*pack + 5) <> 85 : ProcedureReturn 0 : EndIf
+  If PeekA(*pack + 6) <> 83 Or PeekA(*pack + 7) <> 0 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack + 8) <> 1 Or PeekN(*pack + 12) <> #PMK_G2P_HEADER : ProcedureReturn 0 : EndIf
+  If PeekI(*pack + 16) <> bytes : ProcedureReturn 0 : EndIf
+  slots = PeekN(*pack + 24) & $FFFFFFFF
+  If slots <> #PMK_G2P_SLOTS Or PeekN(*pack + 28) <> #PMK_G2P_ENTRIES : ProcedureReturn 0 : EndIf
+  slotOffset = PeekI(*pack + 32)
+  keyOffset = PeekI(*pack + 40)
+  keyBytes = PeekI(*pack + 48)
+  phonemeOffset = PeekI(*pack + 56)
+  phonemeBytes = PeekI(*pack + 64)
+  If keyBytes <> #PMK_G2P_KEY_BYTES Or phonemeBytes <> #PMK_G2P_PHONEME_BYTES : ProcedureReturn 0 : EndIf
+  If slotOffset <> #PMK_G2P_HEADER : ProcedureReturn 0 : EndIf
+  If keyOffset <> slotOffset + slots * #PMK_G2P_SLOT_BYTES : ProcedureReturn 0 : EndIf
+  If phonemeOffset <> keyOffset + keyBytes : ProcedureReturn 0 : EndIf
+  If phonemeOffset + phonemeBytes <> bytes : ProcedureReturn 0 : EndIf
+  If PmKokoroG2pSourceIdentity(*pack) = 0 : ProcedureReturn 0 : EndIf
+  If PmKokoroVocabHash(*pack + 144) = 0 : ProcedureReturn 0 : EndIf
+  i = 216
+  While i < #PMK_G2P_HEADER
+    If PeekA(*pack + i) <> 0 : ProcedureReturn 0 : EndIf
+    i = i + 1
+  Wend
+  If PeekN(*pack + 72) <> #PMK_G2P_PAYLOAD_CRC32 : ProcedureReturn 0 : EndIf
+  If PmTensorCrc32(*pack + #PMK_G2P_HEADER, bytes - #PMK_G2P_HEADER) <> #PMK_G2P_PAYLOAD_CRC32
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmKokoroG2pHash(*word, bytes.i)
+  Protected i.i
+  Protected value.i
+  value = 2166136261
+  i = 0
+  While i < bytes
+    value = ((value ! (PeekA(*word + i) & 255)) * 16777619) & $FFFFFFFF
+    i = i + 1
+  Wend
+  If value = 0 : value = 1 : EndIf
+  ProcedureReturn value
+EndProcedure
+
+Procedure.i PmKokoroG2pKeyEqual(*a, *b, bytes.i)
+  Protected i.i
+  i = 0
+  While i < bytes
+    If PeekA(*a + i) <> PeekA(*b + i) : ProcedureReturn 0 : EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; The pack must already have passed PmKokoroG2pValidate. On success, writes
+; the pronunciation pointer and byte count through the final two arguments.
+Procedure.i PmKokoroG2pLookupExact(*pack, *word, wordBytes.i, *result, *resultBytes)
+  Protected slots.i
+  Protected mask.i
+  Protected index.i
+  Protected probes.i
+  Protected hashed.i
+  Protected slot.i
+  Protected slotHash.i
+  Protected keyOffset.i
+  Protected phonemeOffset.i
+  Protected keyAt.i
+  Protected phonemeAt.i
+  Protected keyLength.i
+  Protected phonemeLength.i
+  If *pack = 0 Or *word = 0 Or *result = 0 Or *resultBytes = 0 : ProcedureReturn 0 : EndIf
+  If wordBytes <= 0 Or wordBytes > #PMK_G2P_MAX_WORD : ProcedureReturn 0 : EndIf
+  slots = PeekN(*pack + 24) & $FFFFFFFF
+  mask = slots - 1
+  keyOffset = PeekI(*pack + 40)
+  phonemeOffset = PeekI(*pack + 56)
+  hashed = PmKokoroG2pHash(*word, wordBytes)
+  index = hashed & mask
+  probes = 0
+  While probes < slots
+    slot = *pack + #PMK_G2P_HEADER + index * #PMK_G2P_SLOT_BYTES
+    slotHash = PeekN(slot) & $FFFFFFFF
+    If slotHash = 0 : ProcedureReturn 0 : EndIf
+    If slotHash = hashed
+      keyLength = PeekW(slot + 12) & $FFFF
+      If keyLength = wordBytes
+        keyAt = *pack + keyOffset + (PeekN(slot + 4) & $FFFFFFFF)
+        If PmKokoroG2pKeyEqual(keyAt, *word, wordBytes) <> 0
+          phonemeLength = PeekW(slot + 14) & $FFFF
+          phonemeAt = *pack + phonemeOffset + (PeekN(slot + 8) & $FFFFFFFF)
+          PokeI(*result, phonemeAt)
+          PokeI(*resultBytes, phonemeLength)
+          ProcedureReturn 1
+        EndIf
+      EndIf
+    EndIf
+    index = (index + 1) & mask
+    probes = probes + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+XIncludeFile "kokoro_g2p_extra.pmi"
+
+Procedure.i PmKokoroG2pAppend(*dst, capacity.i, *length, *src, bytes.i)
+  Protected i.i
+  Protected used.i
+  If *dst = 0 Or *length = 0 Or *src = 0 Or bytes < 0 : ProcedureReturn 0 : EndIf
+  used = PeekI(*length)
+  If used < 0 Or used + bytes > capacity : ProcedureReturn 0 : EndIf
+  i = 0
+  While i < bytes
+    PokeA(*dst + used + i, PeekA(*src + i))
+    i = i + 1
+  Wend
+  PokeI(*length, used + bytes)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmKokoroG2pAppendByte(*dst, capacity.i, *length, value.i)
+  Protected used.i
+  If *dst = 0 Or *length = 0 : ProcedureReturn 0 : EndIf
+  used = PeekI(*length)
+  If used < 0 Or used >= capacity : ProcedureReturn 0 : EndIf
+  PokeA(*dst + used, value)
+  PokeI(*length, used + 1)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure PmKokoroG2pLower(*word, bytes.i)
+  Protected i.i
+  Protected value.i
+  i = 0
+  While i < bytes
+    value = PeekA(*word + i) & 255
+    If value >= 65 And value <= 90 : PokeA(*word + i, value + 32) : EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i PmKokoroG2pLookup(*pack, *word, wordBytes.i, *scratch, scratchBytes.i, *result, *resultBytes)
+  Protected i.i
+  If PmKokoroG2pLookupExact(*pack, *word, wordBytes, *result, *resultBytes) <> 0 : ProcedureReturn 1 : EndIf
+  If PmKokoroG2pLookupExtra(*word,wordBytes,*result,*resultBytes)<>0 : ProcedureReturn 1 : EndIf
+  If *scratch = 0 Or scratchBytes < wordBytes : ProcedureReturn 0 : EndIf
+  i = 0
+  While i < wordBytes
+    PokeA(*scratch + i, PeekA(*word + i))
+    i = i + 1
+  Wend
+  PmKokoroG2pLower(*scratch, wordBytes)
+  If PmKokoroG2pLookupExact(*pack,*scratch,wordBytes,*result,*resultBytes)<>0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn PmKokoroG2pLookupExtra(*scratch,wordBytes,*result,*resultBytes)
+EndProcedure
+
+; Stem candidates reuse the caller's bounded word scratch. Returned phonemes
+; still point into the immutable pack, never into temporary word storage.
+Procedure.i PmKokoroG2pTryStem(*pack, *word, prefixBytes.i, tail.i, *scratch, *spoken, *spokenBytes)
+  Protected i.i
+  Protected bytes.i
+  If prefixBytes<2 Or prefixBytes>=#PMK_G2P_MAX_WORD : ProcedureReturn 0 : EndIf
+  i=0
+  While i<prefixBytes
+    PokeA(*scratch+i,PeekA(*word+i))
+    i=i+1
+  Wend
+  bytes=prefixBytes
+  If tail<>0
+    PokeA(*scratch+bytes,tail)
+    bytes=bytes+1
+  EndIf
+  If PmKokoroG2pLookupExact(*pack,*scratch,bytes,*spoken,*spokenBytes)<>0 : ProcedureReturn 1 : EndIf
+  PmKokoroG2pLower(*scratch,bytes)
+  ProcedureReturn PmKokoroG2pLookupExact(*pack,*scratch,bytes,*spoken,*spokenBytes)
+EndProcedure
+
+; Return 1 for -s, 2 for -ed, 3 for -ing; zero means no known stem.
+; These are spelling reversals, not a speculative pronunciation of an unknown
+; word. Exact full-word entries are checked before this procedure is called.
+Procedure.i PmKokoroG2pStem(*pack, *word, bytes.i, *scratch, *spoken, *spokenBytes)
+  Protected last.i
+  Protected previous.i
+  Protected third.i
+  Protected base.i
+  Protected letter.i
+  If bytes<3 Or bytes>#PMK_G2P_MAX_WORD : ProcedureReturn 0 : EndIf
+  last=(PeekA(*word+bytes-1) & 255) | 32
+  previous=(PeekA(*word+bytes-2) & 255) | 32
+  third=(PeekA(*word+bytes-3) & 255) | 32
+  If last=115
+    If previous<>115 And previous<>39
+      If PmKokoroG2pTryStem(*pack,*word,bytes-1,0,*scratch,*spoken,*spokenBytes)<>0 : ProcedureReturn 1 : EndIf
+    EndIf
+    If previous=39 Or (previous=101 And third<>105 And bytes>4)
+      If PmKokoroG2pTryStem(*pack,*word,bytes-2,0,*scratch,*spoken,*spokenBytes)<>0 : ProcedureReturn 1 : EndIf
+    EndIf
+    If bytes>4 And previous=101 And third=105
+      If PmKokoroG2pTryStem(*pack,*word,bytes-3,121,*scratch,*spoken,*spokenBytes)<>0 : ProcedureReturn 1 : EndIf
+    EndIf
+  ElseIf last=100 And previous=101 And bytes>=4
+    If PmKokoroG2pTryStem(*pack,*word,bytes-1,0,*scratch,*spoken,*spokenBytes)<>0 : ProcedureReturn 2 : EndIf
+    If bytes>4 And third<>101
+      If PmKokoroG2pTryStem(*pack,*word,bytes-2,0,*scratch,*spoken,*spokenBytes)<>0 : ProcedureReturn 2 : EndIf
+    EndIf
+    If bytes>4 And third=105
+      If PmKokoroG2pTryStem(*pack,*word,bytes-3,121,*scratch,*spoken,*spokenBytes)<>0 : ProcedureReturn 2 : EndIf
+    EndIf
+    base=bytes-2
+  ElseIf last=103 And previous=110 And third=105 And bytes>=5
+    If bytes>5
+      If PmKokoroG2pTryStem(*pack,*word,bytes-3,0,*scratch,*spoken,*spokenBytes)<>0 : ProcedureReturn 3 : EndIf
+    EndIf
+    If PmKokoroG2pTryStem(*pack,*word,bytes-3,101,*scratch,*spoken,*spokenBytes)<>0 : ProcedureReturn 3 : EndIf
+    base=bytes-3
+  EndIf
+  ; Undo doubled final consonants: stopped/stopping, planned/planning.
+  If base>2
+    letter=(PeekA(*word+base-1) & 255) | 32
+    If letter=((PeekA(*word+base-2) & 255) | 32)
+      If letter=98 Or letter=99 Or letter=100 Or letter=103 Or letter=107 Or letter=108 Or letter=109 Or letter=110 Or letter=112 Or letter=114 Or letter=115 Or letter=116 Or letter=118 Or letter=120 Or letter=122
+          If PmKokoroG2pTryStem(*pack,*word,base-1,0,*scratch,*spoken,*spokenBytes)<>0
+            If last=100 : ProcedureReturn 2 : Else : ProcedureReturn 3 : EndIf
+          EndIf
+      EndIf
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Select a small ASCII word without needing a string runtime.
+Procedure.i PmKokoroG2pDigit(*scratch, digit.i)
+  Select digit
+    Case 0
+      PokeA(*scratch + 0, 122) : PokeA(*scratch + 1, 101) : PokeA(*scratch + 2, 114) : PokeA(*scratch + 3, 111)
+      ProcedureReturn 4
+    Case 1
+      PokeA(*scratch + 0, 111) : PokeA(*scratch + 1, 110) : PokeA(*scratch + 2, 101)
+      ProcedureReturn 3
+    Case 2
+      PokeA(*scratch + 0, 116) : PokeA(*scratch + 1, 119) : PokeA(*scratch + 2, 111)
+      ProcedureReturn 3
+    Case 3
+      PokeA(*scratch + 0, 116) : PokeA(*scratch + 1, 104) : PokeA(*scratch + 2, 114) : PokeA(*scratch + 3, 101) : PokeA(*scratch + 4, 101)
+      ProcedureReturn 5
+    Case 4
+      PokeA(*scratch + 0, 102) : PokeA(*scratch + 1, 111) : PokeA(*scratch + 2, 117) : PokeA(*scratch + 3, 114)
+      ProcedureReturn 4
+    Case 5
+      PokeA(*scratch + 0, 102) : PokeA(*scratch + 1, 105) : PokeA(*scratch + 2, 118) : PokeA(*scratch + 3, 101)
+      ProcedureReturn 4
+    Case 6
+      PokeA(*scratch + 0, 115) : PokeA(*scratch + 1, 105) : PokeA(*scratch + 2, 120)
+      ProcedureReturn 3
+    Case 7
+      PokeA(*scratch + 0, 115) : PokeA(*scratch + 1, 101) : PokeA(*scratch + 2, 118) : PokeA(*scratch + 3, 101) : PokeA(*scratch + 4, 110)
+      ProcedureReturn 5
+    Case 8
+      PokeA(*scratch + 0, 101) : PokeA(*scratch + 1, 105) : PokeA(*scratch + 2, 103) : PokeA(*scratch + 3, 104) : PokeA(*scratch + 4, 116)
+      ProcedureReturn 5
+    Case 9
+      PokeA(*scratch + 0, 110) : PokeA(*scratch + 1, 105) : PokeA(*scratch + 2, 110) : PokeA(*scratch + 3, 101)
+      ProcedureReturn 4
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PmKokoroG2pLetter(*scratch, letter.i)
+  ; The pinned Misaki dictionaries have exact entries A through Z.  Looking
+  ; those up is both smaller and more reliable than inventing lowercase word
+  ; keys such as "ef", "ar", "u", or "doubleu", which are not present.
+  If letter < 97 Or letter > 122 : ProcedureReturn 0 : EndIf
+  PokeA(*scratch, letter - 32)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmKokoroG2pAppendSpoken(*dst, capacity.i, *length, *spoken, spokenBytes.i, *pendingSpace)
+  If PeekI(*pendingSpace) <> 0 And PeekI(*length) > 0
+    If PmKokoroG2pAppendByte(*dst, capacity, *length, 32) = 0 : ProcedureReturn 0 : EndIf
+  EndIf
+  If PmKokoroG2pAppend(*dst, capacity, *length, *spoken, spokenBytes) = 0 : ProcedureReturn 0 : EndIf
+  PokeI(*pendingSpace, 0)
+  ProcedureReturn 1
+EndProcedure
+
+; Append a regular suffix using the final SOUND, not the final written letter.
+; US unstressed vowel U+1D7B and ING U+026A/U+014B are Kokoro vocabulary items.
+Procedure.i PmKokoroG2pAppendInflected(*out, capacity.i, *length, *spoken, bytes.i, *pendingSpace, kind.i)
+  Protected index.i
+  Protected nextIndex.i
+  Protected last.i
+  Protected suffix.i
+  Protected vowel.i
+  index=0
+  last=0
+  vowel=0
+  While index<bytes
+    last=PmKokoroUtf8Next(*spoken,index,bytes,@nextIndex)
+    If last<0 : ProcedureReturn 0 : EndIf
+    index=nextIndex
+  Wend
+  If PmKokoroG2pAppendSpoken(*out,capacity,*length,*spoken,bytes,*pendingSpace)=0 : ProcedureReturn 0 : EndIf
+  If kind=3
+    If PmKokoroG2pAppendByte(*out,capacity,*length,$C9)=0 : ProcedureReturn 0 : EndIf
+    If PmKokoroG2pAppendByte(*out,capacity,*length,$AA)=0 : ProcedureReturn 0 : EndIf
+    If PmKokoroG2pAppendByte(*out,capacity,*length,$C5)=0 : ProcedureReturn 0 : EndIf
+    ProcedureReturn PmKokoroG2pAppendByte(*out,capacity,*length,$8B)
+  ElseIf kind=1
+    suffix=122
+    If last=112 Or last=116 Or last=107 Or last=102 Or last=$03B8 : suffix=115 : EndIf
+    If last=115 Or last=122 Or last=$0283 Or last=$0292 Or last=$02A7 Or last=$02A4 : vowel=1 : EndIf
+  Else
+    suffix=100
+    If last=116 Or last=100 : vowel=1 : EndIf
+    If last=112 Or last=107 Or last=102 Or last=$03B8 Or last=$0283 Or last=115 Or last=$02A7 : suffix=116 : EndIf
+  EndIf
+  If vowel<>0
+    If PmKokoroG2pAppendByte(*out,capacity,*length,$E1)=0 : ProcedureReturn 0 : EndIf
+    If PmKokoroG2pAppendByte(*out,capacity,*length,$B5)=0 : ProcedureReturn 0 : EndIf
+    If PmKokoroG2pAppendByte(*out,capacity,*length,$BB)=0 : ProcedureReturn 0 : EndIf
+  EndIf
+  ProcedureReturn PmKokoroG2pAppendByte(*out,capacity,*length,suffix)
+EndProcedure
+
+; Returns UTF-8 phoneme bytes (without a trailing NUL) or zero on a malformed
+; input, missing/corrupt pack, or insufficient output/scratch space.
+; Internal resident entry: caller must validate and retain an immutable pack.
+; Public one-shot callers use PmKokoroG2pEnglish below, which validates first.
+Procedure.i PmKokoroG2pEnglishValidated(*pack, *text, textBytes.i, *out, outBytes.i, *scratch, scratchBytes.i)
+  Protected index.i
+  Protected start.i
+  Protected length.i
+  Protected wordBytes.i
+  Protected value.i
+  Protected lower.i
+  Protected pendingSpace.i
+  Protected spoken.i
+  Protected spokenBytes.i
+  Protected letterBytes.i
+  Protected nextIndex.i
+  Protected codepoint.i
+  Protected inflection.i
+  Protected closing.i
+  Protected override.i
+  PmKokoroG2pErrorAt=0 : PmKokoroG2pSpelledCount=0
+  PmKokoroG2pError=20
+  If *text = 0 Or textBytes <= 0 Or *out = 0 Or outBytes <= 0 : ProcedureReturn 0 : EndIf
+  If *scratch = 0 Or scratchBytes < #PMK_G2P_MAX_WORD : ProcedureReturn 0 : EndIf
+  index = 0 : length = 0 : pendingSpace = 0
+  While index < textBytes
+    PmKokoroG2pError=40 : PmKokoroG2pErrorAt=index
+    value = PeekA(*text + index) & 255
+    If value = 32 Or value = 9 Or value = 10 Or value = 13
+      pendingSpace = 1
+      index = index + 1
+    ElseIf value = 47
+      ; An override starts at a word boundary and has a closing slash. A slash
+      ; inside ordinary text (set/clr, up/down) is spoken, never parsed as IPA.
+      override=0
+      If index=0
+        override=1
+      ElseIf (PeekA(*text+index-1) & 255)<=32
+        override=1
+      EndIf
+      closing=index+1
+      While closing<textBytes And (PeekA(*text+closing) & 255)<>47 : closing=closing+1 : Wend
+      If override=0 Or closing>=textBytes
+        PokeA(*scratch,115) : PokeA(*scratch+1,108) : PokeA(*scratch+2,97)
+        PokeA(*scratch+3,115) : PokeA(*scratch+4,104)
+        If PmKokoroG2pLookupExact(*pack,*scratch,5,@spoken,@spokenBytes)=0 : ProcedureReturn 0 : EndIf
+        pendingSpace=1
+        If PmKokoroG2pAppendSpoken(*out,outBytes,@length,spoken,spokenBytes,@pendingSpace)=0 : ProcedureReturn 0 : EndIf
+        pendingSpace=1 : index=index+1 : Continue
+      EndIf
+      ; Explicit /phoneme/ override retained for advanced pronunciation input.
+      start = index + 1
+      index = start
+      While index < textBytes And (PeekA(*text + index) & 255) <> 47
+        codepoint = PmKokoroUtf8Next(*text, index, textBytes, @nextIndex)
+        If codepoint < 0 Or PmKokoroTokenForCodepoint(codepoint) < 0
+          PmKokoroG2pError=31 : PmKokoroG2pErrorAt=index : ProcedureReturn 0
+        EndIf
+        index = nextIndex
+      Wend
+      If index >= textBytes Or index = start : PmKokoroG2pError=31 : ProcedureReturn 0 : EndIf
+      If PmKokoroG2pAppendSpoken(*out, outBytes, @length, *text + start, index - start, @pendingSpace) = 0
+        ProcedureReturn 0
+      EndIf
+      index = index + 1
+    ElseIf (value >= 65 And value <= 90) Or (value >= 97 And value <= 122) Or value = 39
+      start = index
+      While index < textBytes
+        value = PeekA(*text + index) & 255
+        If Not ((value >= 65 And value <= 90) Or (value >= 97 And value <= 122) Or value = 39) : Break : EndIf
+        index = index + 1
+      Wend
+      wordBytes = index - start
+      If wordBytes > #PMK_G2P_MAX_WORD : PmKokoroG2pError=21 : PmKokoroG2pErrorAt=start : ProcedureReturn 0 : EndIf
+      If PmKokoroG2pLookup(*pack, *text + start, wordBytes, *scratch, scratchBytes, @spoken, @spokenBytes) <> 0
+        If PmKokoroG2pAppendSpoken(*out, outBytes, @length, spoken, spokenBytes, @pendingSpace) = 0 : ProcedureReturn 0 : EndIf
+      Else
+        inflection=PmKokoroG2pStem(*pack,*text+start,wordBytes,*scratch,@spoken,@spokenBytes)
+        If inflection<>0
+          If PmKokoroG2pAppendInflected(*out,outBytes,@length,spoken,spokenBytes,@pendingSpace,inflection)=0 : ProcedureReturn 0 : EndIf
+          Continue
+        EndIf
+        ; Deterministic OOV fallback: spell the word, never silently erase it.
+        If PmKokoroG2pSpelledCount<8 : PmKokoroG2pSpelledAt(PmKokoroG2pSpelledCount)=start : EndIf
+        PmKokoroG2pSpelledCount=PmKokoroG2pSpelledCount+1
+        lower = start
+        While lower < index
+          value = PeekA(*text + lower) & 255
+          If value >= 65 And value <= 90 : value = value + 32 : EndIf
+          If value <> 39
+            letterBytes = PmKokoroG2pLetter(*scratch, value)
+            If letterBytes = 0 : ProcedureReturn 0 : EndIf
+            If PmKokoroG2pLookupExact(*pack, *scratch, letterBytes, @spoken, @spokenBytes) = 0 : ProcedureReturn 0 : EndIf
+            If PmKokoroG2pAppendSpoken(*out, outBytes, @length, spoken, spokenBytes, @pendingSpace) = 0 : ProcedureReturn 0 : EndIf
+            pendingSpace = 1
+          EndIf
+          lower = lower + 1
+        Wend
+        pendingSpace = 0
+      EndIf
+    ElseIf value >= 48 And value <= 57
+      wordBytes = PmKokoroG2pDigit(*scratch, value - 48)
+      If wordBytes = 0 Or PmKokoroG2pLookupExact(*pack, *scratch, wordBytes, @spoken, @spokenBytes) = 0
+        ProcedureReturn 0
+      EndIf
+      If PmKokoroG2pAppendSpoken(*out, outBytes, @length, spoken, spokenBytes, @pendingSpace) = 0 : ProcedureReturn 0 : EndIf
+      pendingSpace = 1
+      index = index + 1
+    ElseIf value = 45
+      ; ASCII hyphen becomes Kokoro's em-dash pause token (UTF-8 E2 80 94).
+      If PmKokoroG2pAppendByte(*out, outBytes, @length, $E2) = 0 : ProcedureReturn 0 : EndIf
+      If PmKokoroG2pAppendByte(*out, outBytes, @length, $80) = 0 : ProcedureReturn 0 : EndIf
+      If PmKokoroG2pAppendByte(*out, outBytes, @length, $94) = 0 : ProcedureReturn 0 : EndIf
+      index = index + 1
+    ElseIf value = 33 Or value = 34 Or value = 40 Or value = 41 Or value = 44 Or value = 46 Or value = 58 Or value = 59 Or value = 63
+      If PmKokoroG2pAppendByte(*out, outBytes, @length, value) = 0 : ProcedureReturn 0 : EndIf
+      index = index + 1
+    Else
+      PmKokoroG2pError=30
+      ProcedureReturn 0
+    EndIf
+  Wend
+  PmKokoroG2pError=0
+  ProcedureReturn length
+EndProcedure
+
+Procedure.i PmKokoroG2pEnglish(*pack, packBytes.i, *text, textBytes.i, *out, outBytes.i, *scratch, scratchBytes.i)
+  PmKokoroG2pError=10 : PmKokoroG2pErrorAt=0 : PmKokoroG2pSpelledCount=0
+  If PmKokoroG2pValidate(*pack,packBytes)=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn PmKokoroG2pEnglishValidated(*pack,*text,textBytes,*out,outBytes,*scratch,scratchBytes)
+EndProcedure
