@@ -68,6 +68,37 @@ perform a separate application build.
 
 ## Output and redistribution
 
+### Optional private release destination
+
+A source checkout can be the authority for a separate product's executables.
+For that developer workflow only, an ignored `build.local.ini` may select a
+private PowerShell release-build script:
+
+```ini
+[Build]
+ReleaseScript = C:\YourProduct\tools\build_onnx.ps1
+```
+
+When this file exists, `Build.pb` delegates to that script with `-SourceRoot`
+pointing to this checkout and `-Compiler` pointing to the running PureBasic
+installation. The script owns building both tools, provenance checks, signing,
+and installing them in the product's release directory. An optional `ReleaseHost`
+entry selects the absolute path of the PowerShell executable used by that private
+workflow; otherwise Windows PowerShell is used. A nonzero script exit
+is a failed build. A missing/invalid configured script fails rather than quietly
+building elsewhere. Review and trust any script you configure here.
+
+Without the local file, the ordinary Python-free `bin/` build above is unchanged.
+The local file, private integration tools, signing material, and machine paths
+do not belong in the public repository. This is a developer build hook only;
+the model generator still never invokes a downstream language compiler.
+
+The generator recognizes both this checkout's runtime layout and an installed
+PureMetal runtime layout when locating optional speech assets. Its embedded
+execution sources always come from the repository used to build it.
+
+### Published files
+
 The repository tracks source and documentation, not executable builds, signing
 credentials, model weights, or local settings. `bin/` and generated `output/`
 files are ignored by Git. This checkout does not need files from another project

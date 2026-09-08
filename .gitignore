@@ -1,5 +1,6 @@
 # Build products and local model data are not source.
 /bin/
+/build.local.ini
 /tests/
 /build/
 /output/

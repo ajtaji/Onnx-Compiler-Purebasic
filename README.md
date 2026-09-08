@@ -58,6 +58,8 @@ prerequisite. No model, Python package, ONNX Runtime DLL, or PureMetal installat
 is needed to build the generator.
 
 Prefer building each entry point manually? See [build instructions](docs/BUILD.md).
+Private product integrations can configure an ignored local release-build hook
+to keep executables in their existing packaging directory; see the same guide.
 Linux/macOS hosts have **not** been validated; the current GUI and Windows runtime
 contain Windows-specific APIs.
 

@@ -107,7 +107,7 @@ Procedure.s PmoCompileProjectRoot()
   Protected Index.i
   If Right(Candidate, 1) <> "\" : Candidate + "\" : EndIf
   For Index = 0 To 8
-    If FileSize(Candidate + "runtime\tensor_fp32.pmi") > 0
+    If FileSize(Candidate + "runtime\tensor_fp32.pmi") > 0 Or FileSize(Candidate + "MathLib\onnx\tensor_fp32.pmi") > 0
       ProcedureReturn Candidate
     EndIf
     Candidate = PmoCompileParent(Candidate)
@@ -115,7 +115,7 @@ Procedure.s PmoCompileProjectRoot()
   Next
   Candidate = GetPathPart(ProgramFilename())
   For Index = 0 To 8
-    If FileSize(Candidate + "runtime\tensor_fp32.pmi") > 0
+    If FileSize(Candidate + "runtime\tensor_fp32.pmi") > 0 Or FileSize(Candidate + "MathLib\onnx\tensor_fp32.pmi") > 0
       ProcedureReturn Candidate
     EndIf
     Candidate = PmoCompileParent(Candidate)
