@@ -24,6 +24,45 @@ Global DHeap.i
 Global DHeapBytes.i
 Global DHeapUsed.i
 Global DHeapPeak.i
+; Optional caller-owned progress callback: (phase,node) -> nonzero to continue.
+; It is called synchronously at bind/node boundaries only. It must not call
+; back into any model or tensor procedure; doing so is rejected as re-entry.
+#PMD_PROGRESS_BIND_BEFORE=1
+#PMD_PROGRESS_BIND_AFTER=2
+#PMD_PROGRESS_NODE_BEFORE=3
+#PMD_PROGRESS_NODE_AFTER=4
+Global *DProgressCallback
+Global DProgressActive.i
+
+Procedure.i DRejectProgressReentry()
+  If DProgressActive<>0
+    DCancel=1
+    DFail("Progress callback re-entered the model runtime.")
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DSetProgressCallback(*callback)
+  If DProgressActive<>0
+    DCancel=1
+    ProcedureReturn DFail("Progress callback cannot replace itself while running.")
+  EndIf
+  *DProgressCallback=*callback
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DPoll(Phase.i,Node.i)
+  Protected keepGoing.i
+  If DCancel<>0 : ProcedureReturn 0 : EndIf
+  If *DProgressCallback=0 : ProcedureReturn 1 : EndIf
+  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
+  DProgressActive=1
+  keepGoing=DProgressCallback(Phase,Node)
+  DProgressActive=0
+  If keepGoing=0 Or DCancel<>0 : DCancel=1 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
 
 Procedure.i DMax(A.i,B.i)
   If A>B
@@ -505,7 +544,11 @@ Procedure PmFastTrig(Source.i,Destination.i,Count.i,Op.i)
   PmTensorTrig(Source,Destination,Count,Op)
 EndProcedure
 Procedure.i PmFastConv(*g.PmTensorConv1DArgs,Available.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  PmTensorConv1DFp32Neon(*g)
+  CompilerElse
   PmTensorConv1D(*g)
+  CompilerEndIf
   ProcedureReturn 1
 EndProcedure
 Procedure.i PmFastConvTranspose(*g.PmTensorConvTranspose1DArgs,Available.i)

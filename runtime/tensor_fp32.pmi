@@ -43,11 +43,48 @@ Procedure PmTensorCrcInit()
   PmTensorCrcReady = 1
 EndProcedure
 
+CompilerIf #PMO_INT8_BACKEND = 1
+Procedure.i PmTensorCrc32A64(*data.i, bytes.i, *table.i)
+  ASM
+    adrp x9, pmtensorcrc32a64_data
+    add x9, x9, #:lo12:pmtensorcrc32a64_data
+    ldr x0, [x9]
+    adrp x9, pmtensorcrc32a64_bytes
+    add x9, x9, #:lo12:pmtensorcrc32a64_bytes
+    ldr x1, [x9]
+    adrp x9, pmtensorcrc32a64_table
+    add x9, x9, #:lo12:pmtensorcrc32a64_table
+    ldr x2, [x9]
+    movz w3, #0xffff
+    movk w3, #0xffff, lsl #16
+    cmp x1, #0
+    b.le pmoCrc32A64Done
+pmoCrc32A64Loop:
+    ldrb w4, [x0]
+    add x0, x0, #1
+    eor w4, w4, w3
+    uxtb w4, w4
+    lsr w3, w3, #8
+    lsl x6, x4, #3
+    add x6, x2, x6
+    ldr x5, [x6]
+    eor w3, w3, w5
+    subs x1, x1, #1
+    b.ne pmoCrc32A64Loop
+pmoCrc32A64Done:
+    mvn w0, w3
+  EndASM
+EndProcedure
+CompilerEndIf
+
 Procedure.i PmTensorCrc32(*data.i, bytes.i)
   Protected i.i
   Protected index.i
   Protected crc.i
   PmTensorCrcInit()
+  CompilerIf #PMO_INT8_BACKEND = 1
+  ProcedureReturn PmTensorCrc32A64(*data,bytes,@PmTensorCrcTable(0))
+  CompilerElse
   crc = $FFFFFFFF
   i = 0
   While i < bytes
@@ -56,6 +93,7 @@ Procedure.i PmTensorCrc32(*data.i, bytes.i)
     i = i + 1
   Wend
   ProcedureReturn (crc ! $FFFFFFFF) & $FFFFFFFF
+  CompilerEndIf
 EndProcedure
 
 Procedure.f PmTensorGet(*base.i, index.i)

@@ -59,6 +59,9 @@ Procedure.i PmKokoroTextNormalize(*text,bytes.i)
 EndProcedure
 
 Procedure PmKokoroTextClose()
+  If DRejectProgressReentry()
+    ProcedureReturn
+  EndIf
   PmKokoroTextPack=0
   PmKokoroTextVoice=0
   PmKokoroTextTokenCount=0
@@ -69,6 +72,7 @@ EndProcedure
 ; Validate on attachment, never CRC-scan the dictionaries per sentence.
 ; Extra may be (0,0), but the expanded dictionary is recommended.
 Procedure.i PmKokoroTextBind(*pack,packBytes.i,*extra,extraBytes.i,*voice,voiceBytes.i)
+  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
   PmKokoroTextClose()
   PmKokoroTextError=2
   If PmKokoroG2pValidate(*pack,packBytes)=0 : ProcedureReturn 0 : EndIf
@@ -87,6 +91,7 @@ EndProcedure
 
 ; Invalid replacement clears the previous voice: never silently speak with it.
 Procedure.i PmKokoroTextSetVoice(*voice,voiceBytes.i)
+  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
   PmKokoroTextVoice=0
   PmKokoroTextError=4
   If PmKokoroValidateVoice(*voice,voiceBytes)=0 : ProcedureReturn 0 : EndIf
@@ -105,6 +110,7 @@ Procedure.i PmKokoroTextPrepare(*text,textBytes.i,speed.f)
   Protected row.i
   Protected id.i
   Protected i.i
+  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
   PmModelResetRequest()
   DError=0
   DCancel=0
@@ -157,6 +163,7 @@ EndProcedure
 Procedure.i PmKokoroTextRender(*text,textBytes.i,speed.f)
   Protected output.i
   Protected i.i
+  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
   If PmKokoroTextPrepare(*text,textBytes,speed)=0 : ProcedureReturn 0 : EndIf
   PmKokoroTextError=9
   If PmModelExecute()=0 : Goto PmKokoroTextRenderFailed : EndIf

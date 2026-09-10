@@ -23,6 +23,15 @@ EndStructure
 Global Dim Dt.PmDynamicTensor(#PMD_TENSOR_COUNT)
 Global DError.s, DNode.i, DCancel.i
 Global DLive.i, DPeak.i, DLimit.i = 1024 * 1024 * 1024
+; Optional caller-owned synchronous boundary callback. It must not re-enter
+; model/tensor code. Zero preserves the historical no-callback behaviour.
+#PMD_PROGRESS_BIND_BEFORE=1
+#PMD_PROGRESS_BIND_AFTER=2
+#PMD_PROGRESS_NODE_BEFORE=3
+#PMD_PROGRESS_NODE_AFTER=4
+Prototype.i DProgressProcedure(Phase.i,Node.i)
+Global DProgressCallback.DProgressProcedure
+Global DProgressActive.i
 CompilerIf Defined(PMD_PROFILE,#PB_Constant)=0
   #PMD_PROFILE=0
 CompilerEndIf
@@ -43,6 +52,36 @@ EndProcedure
 Procedure.i DFail(Message.s)
   If DError = "" : DError = "Node " + Str(DNode) + ": " + Message : EndIf
   ProcedureReturn 0
+EndProcedure
+
+Procedure.i DRejectProgressReentry()
+  If DProgressActive
+    DCancel=1
+    DFail("Progress callback re-entered the model runtime.")
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DSetProgressCallback(Callback.DProgressProcedure)
+  If DProgressActive
+    DCancel=1
+    ProcedureReturn DFail("Progress callback cannot replace itself while running.")
+  EndIf
+  DProgressCallback=Callback
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DPoll(Phase.i,Node.i)
+  Protected keepGoing.i
+  If DCancel : ProcedureReturn 0 : EndIf
+  If DProgressCallback=0 : ProcedureReturn 1 : EndIf
+  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
+  DProgressActive=1
+  keepGoing=DProgressCallback(Phase,Node)
+  DProgressActive=0
+  If keepGoing=0 Or DCancel : DCancel=1 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
 EndProcedure
 
 Procedure.i DSize(Kind.i)

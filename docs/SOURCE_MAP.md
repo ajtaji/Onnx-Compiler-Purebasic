@@ -16,6 +16,7 @@ No Python files or proprietary language compiler implementation are included.
 | [PureMetalOnnxCompilerUI.pb](../src/PureMetalOnnxCompilerUI.pb) | Graphical entry point and its native include closure. |
 | [CreateDemoModels.pb](../examples/CreateDemoModels.pb) | Creates the arithmetic demo models from embedded protobuf bytes. |
 | [RunTwiceWindows.pb](../examples/RunTwiceWindows.pb) | Complete consumer of a resident generated Windows model, with changing input lengths. |
+| [ResidentProgress.md](ResidentProgress.md) | Developer contract for resident progress callbacks, cancellation, non-reentry, and platform service boundaries. |
 
 ## Compiler modules
 
