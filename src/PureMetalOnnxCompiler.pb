@@ -23,6 +23,7 @@ XIncludeFile "compiler/onnx_emit.pbi"
 XIncludeFile "compiler/onnx_compile.pbi"
 XIncludeFile "compiler/onnx_dynamic_emit.pbi"
 XIncludeFile "compiler/onnx_kokoro.pbi"
+XIncludeFile "compiler/kokoro_asset_pack.pbi"
 XIncludeFile "compiler/onnx_ui.pbi"
 
 Procedure PrintUsage()
@@ -42,6 +43,8 @@ Procedure PrintUsage()
   PrintN("  Every --compile emits a resident reusable library; --speech-ui adds a Windows Kokoro application.")
   PrintN("  Pi 4 / UNO Q: --target pi4|unoq --kokoro-text adds a resident text-to-Kokoro adapter (no board I/O).")
   PrintN("  PureMetalOnnxCompiler.exe --kokoro-prepare model.onnx --text TEXT --g2p FILE --voice FILE --output PREFIX")
+  PrintN("  PureMetalOnnxCompilerCLI.exe --kokoro-pack-voice RAW.bin --output VOICE.pmvoice [--source-sha256 HEX]")
+  PrintN("  PureMetalOnnxCompilerCLI.exe --kokoro-verify-voice VOICE.pmvoice")
   PrintN("")
   PrintN("Run without arguments to open the compiler window (UI wiring follows")
   PrintN("the checked compiler core; it will not shell out to Python).")
@@ -365,6 +368,35 @@ Procedure.i LowerCommand(ModelPath.s)
   ProcedureReturn #False
 EndProcedure
 
+Procedure.i PackVoiceCommand(Source.s)
+  Protected index.i = 2, option.s, value.s, destination.s, expected.s
+  Protected seenOutput.i, seenHash.i
+  While index < CountProgramParameters()
+    option = ProgramParameter(index)
+    If index + 1 >= CountProgramParameters()
+      PrintN("VOICE PACK ERROR: missing value for " + option) : ProcedureReturn #False
+    EndIf
+    value = ProgramParameter(index + 1)
+    Select option
+      Case "--output"
+        If seenOutput : PrintN("VOICE PACK ERROR: duplicate --output") : ProcedureReturn #False : EndIf
+        seenOutput = #True : destination = value
+      Case "--source-sha256"
+        If seenHash : PrintN("VOICE PACK ERROR: duplicate --source-sha256") : ProcedureReturn #False : EndIf
+        seenHash = #True : expected = value
+        If Len(expected) <> 64 : PrintN("VOICE PACK ERROR: SHA-256 must contain 64 hexadecimal digits") : ProcedureReturn #False : EndIf
+      Default
+        PrintN("VOICE PACK ERROR: unknown option " + option) : ProcedureReturn #False
+    EndSelect
+    index + 2
+  Wend
+  If PmoKokoroVoicePack(Source, destination, expected) = 0
+    PrintN("VOICE PACK ERROR: " + PmoKokoroVoicePackError) : ProcedureReturn #False
+  EndIf
+  PrintN("PASS: verified PMVOICE written to " + destination)
+  ProcedureReturn #True
+EndProcedure
+
 Define Mode.s = ProgramParameter(0)
 Define ModelPath.s = ProgramParameter(1)
 
@@ -426,6 +458,17 @@ ElseIf Mode = "--compile" Or Mode = "--compile-reusable"
     PrintN("ONNX COMPILER ERROR: " + PmoCompileError)
     End 1
   EndIf
+  End 0
+ElseIf Mode = "--kokoro-pack-voice"
+  If ModelPath = "" : PrintUsage() : End 2 : EndIf
+  If PackVoiceCommand(ModelPath) = 0 : End 1 : EndIf
+  End 0
+ElseIf Mode = "--kokoro-verify-voice"
+  If CountProgramParameters() <> 2 : PrintUsage() : End 2 : EndIf
+  If PmoKokoroVoiceVerifyFile(ModelPath) = 0
+    PrintN("VOICE PACK ERROR: " + PmoKokoroVoicePackError) : End 1
+  EndIf
+  PrintN("PASS: PMVOICE identity, shape, checksums and finite samples verified")
   End 0
 ElseIf Mode = "--kokoro-prepare"
   If ModelPath = "" : PrintUsage() : End 2 : EndIf

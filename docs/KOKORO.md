@@ -18,8 +18,9 @@ not generate or compile another model per word or sentence.
 
 ## What you must supply separately
 
-**This repository does not contain the model or prepared speech data, and does
-not currently include a PureBasic asset-pack builder.** The compiler is fully
+**This repository does not contain the model or prepared speech data.** A native
+PureBasic voice-pack builder is included; dictionary-pack builders are still
+pending. The compiler is fully
 buildable without them, but the speech demo is not ready to speak from a fresh
 checkout until compatible prepared assets are supplied.
 
@@ -40,6 +41,30 @@ File size alone is not enough: loaders also validate the format and identity.
 Raw upstream voice `.bin` files, dictionary JSON, and arbitrary quantized model
 exports cannot simply be renamed into these formats. Obtain compatible prepared
 packs and keep their accompanying licenses. See [third-party notices](../THIRD_PARTY_NOTICES.md).
+
+### Prepare a voice without Python
+
+Supply a compatible upstream raw voice file: exactly 510 rows of 256
+little-endian FP32 values (522,240 bytes). It must belong to the pinned Kokoro
+model above, not an arbitrary model with the same dimensions. The tool validates
+the data layout and records the pinned model identity; dimensions alone cannot
+prove that an unknown voice is semantically compatible.
+
+```powershell
+.\bin\PureMetalOnnxCompilerCLI.exe --kokoro-pack-voice C:\Models\af_heart.bin --output C:\Models\af_heart.pmvoice
+.\bin\PureMetalOnnxCompilerCLI.exe --kokoro-verify-voice C:\Models\af_heart.pmvoice
+```
+
+Optionally supply `--source-sha256` with the expected raw-file digest from a
+trusted source. Packing rejects NaN/infinity, validates the completed header,
+checksums and payload, and refuses to overwrite an existing destination.
+This only prepares a voice asset: it neither downloads data nor invokes a
+language compiler. Retain the voice's license and attribution.
+
+For a standalone PureBasic entry point, build
+[`examples/KokoroVoicePack.pb`](../examples/KokoroVoicePack.pb) as a console
+application and use `pack RAW OUTPUT [EXPECTED_SHA256]` or `verify PMVOICE`.
+The resulting pack is shared by the Windows and supported bare-metal adapters.
 
 ## Windows reader
 

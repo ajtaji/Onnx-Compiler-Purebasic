@@ -40,6 +40,7 @@ All of these live under `src/compiler/`.
 | [onnx_emit.pbi](../src/compiler/onnx_emit.pbi) | Fixed-shape source generation and the `PmOnnx...` caller-owned-memory API. |
 | [onnx_dynamic_emit.pbi](../src/compiler/onnx_dynamic_emit.pbi) | Runtime-dimension source generation, resident constants, request lifetimes, `PmModel...` API, and embedded runtime export. |
 | [onnx_kokoro.pbi](../src/compiler/onnx_kokoro.pbi) | Native preparation and checking of Kokoro reference inputs; shared text/asset validation. Not a dictionary or voice-pack builder. |
+| [kokoro_asset_pack.pbi](../src/compiler/kokoro_asset_pack.pbi) | Native checked PMVOICE construction from caller-supplied raw voices; payload hashes, CRC, finite-value checks and no-overwrite publication. No download or dictionary construction. |
 | [onnx_ui.pbi](../src/compiler/onnx_ui.pbi) | Model/target/precision controls, generation worker, CLI logging/cancellation, and Kokoro input preparation. |
 
 ## Tensor execution sources
