@@ -110,3 +110,9 @@ generating source for all five profiles. No board was accessed for this export.
 AArch64/Pico source generation is not a downstream firmware build, a boot test,
 or hardware numerical/timing proof. Those belong to the target application's
 integration and test process.
+
+Subsequent bounded Pi 4 resident-model and native-math measurements are recorded
+in [Validation](VALIDATION.md#aarch64-native-math-checks--september-10-2026).
+They do not certify UNO Q or Pico hardware, arbitrary model sizes, or speech
+latency. Regenerate the source closure and separately rebuild your application
+to incorporate runtime changes; an already-built model does not update itself.

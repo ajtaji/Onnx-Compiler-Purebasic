@@ -1435,7 +1435,7 @@ EndProcedure
 ; so the scaling is done in two steps rather than flushed to zero -
 ; without that, exp(-90) would come out as 0 instead of 8.2e-40.
 ; ----------------------------------------------------------------------
-Procedure.f Exp(x.f)
+Procedure.f MathExpSoftA64(x.f)
   Protected n.l
   Protected t.f
   Protected nf.f
@@ -1471,6 +1471,66 @@ Procedure.f Exp(x.f)
     ProcedureReturn MathFMul(v, MathPow2i(-60))
   EndIf
   ProcedureReturn MathFMul(v, MathPow2i(n))
+EndProcedure
+
+; The common A64 path evaluates the SAME reduction and polynomial with the
+; target's binary32 instructions.  It is deliberately a separate procedure:
+; MathExpSoftA64 above remains both the edge-case implementation and an
+; integer-only differential oracle.
+;
+; The dispatcher below admits only finite, normal inputs in -87..88.  Every
+; result in that interval is finite and normal too.  NaNs (including their
+; payloads), infinities, subnormal inputs, overflow and gradual-underflow
+; results therefore retain the old procedure byte-for-byte.  EnableFloatingPoint
+; establishes round-to-nearest-even with FPCR.FZ clear before this file can be
+; used.  Keeping the fast interval away from both rails makes that downstream
+; machine-state contract testable without making an edge answer depend on it.
+;
+; Do not contract the multiply/add pairs into fused operations.  The order and
+; the rounding point after every source statement are part of the existing
+; algorithm and its measured accuracy.
+Procedure.f MathExpNativeA64(x.f)
+  Protected n.l
+  Protected t.f
+  Protected nf.f
+  Protected r.f
+  Protected z.f
+  Protected p.f
+  Protected v.f
+  t = x * 1.4426950408889634
+  If t >= 0.0
+    n = t + 0.5
+  Else
+    n = t - 0.5
+  EndIf
+  nf = n
+  r = x - nf * 0.693359375
+  r = r + nf * 0.00021219444005469057
+  p = 0.000198756915
+  p = p * r + 0.0013981999507
+  p = p * r + 0.0083334519073
+  p = p * r + 0.041665795894
+  p = p * r + 0.16666665459
+  p = p * r + 0.50000001201
+  z = r * r
+  v = 1.0 + r
+  v = v + p * z
+  ProcedureReturn v * MathPow2i(n)
+EndProcedure
+
+Procedure.f Exp(x.f)
+  Protected magnitude.i
+  magnitude = MathBitsOf(x) & 2147483647
+  If magnitude >= 2139095040             ; NaN or infinity
+    ProcedureReturn MathExpSoftA64(x)
+  EndIf
+  If magnitude <> 0 And magnitude < 8388608 ; subnormal input
+    ProcedureReturn MathExpSoftA64(x)
+  EndIf
+  If x < -87.0 Or x > 88.0
+    ProcedureReturn MathExpSoftA64(x)
+  EndIf
+  ProcedureReturn MathExpNativeA64(x)
 EndProcedure
 
 ; ----------------------------------------------------------------------
