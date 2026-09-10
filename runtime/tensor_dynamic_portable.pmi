@@ -552,7 +552,11 @@ Procedure.i PmFastConv(*g.PmTensorConv1DArgs,Available.i)
   ProcedureReturn 1
 EndProcedure
 Procedure.i PmFastConvTranspose(*g.PmTensorConvTranspose1DArgs,Available.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  PmTensorConvTranspose1DFp32Neon(*g)
+  CompilerElse
   PmTensorConvTranspose1D(*g)
+  CompilerEndIf
   ProcedureReturn 1
 EndProcedure
 Procedure.i DProduct(Id.i, First.i, Last.i)

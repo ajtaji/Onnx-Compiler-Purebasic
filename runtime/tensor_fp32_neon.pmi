@@ -272,6 +272,126 @@ Procedure PmTensorConv1DFp32Neon(*g.PmTensorConv1DArgs)
 EndProcedure
 CompilerEndIf
 
+CompilerIf #PMO_USE_CONVTRANSPOSE = 1
+; Fill one output row with the exact FLOAT32 bias bits (or +0).  Direct stores
+; avoid accessor overhead without changing the reference initialization.
+Procedure PmTensorConvTransposeFp32Fill(*dst.i,count.i,bits.i)
+  ASM
+    cbz x1, pmoNeonConvTransposeFillDone
+pmoNeonConvTransposeFillLoop:
+    str w2, [x0]
+    add x0, x0, #4
+    subs x1, x1, #1
+    b.ne pmoNeonConvTransposeFillLoop
+pmoNeonConvTransposeFillDone:
+  EndASM
+EndProcedure
+
+; Scatter one valid contiguous run of kernel taps.  FMUL and FADD are kept
+; separate and taps advance in increasing kx order, matching the reference.
+Procedure PmTensorConvTransposeFp32Row(*weight.i,*dst.i,valueBits.i,count.i,dstStepBytes.i)
+  ASM
+    cbz x3, pmoNeonConvTransposeRowDone
+    fmov s0, w2
+    cmp x4, #4
+    b.ne pmoNeonConvTransposeRowLoop
+    dup v0.4s, v0.s[0]
+pmoNeonConvTransposeRowFourCheck:
+    cmp x3, #4
+    b.lt pmoNeonConvTransposeRowScalarSetup
+    ld1 {v1.4s}, [x0], #16
+    ld1 {v2.4s}, [x1]
+    fmul v1.4s, v0.4s, v1.4s
+    fadd v2.4s, v2.4s, v1.4s
+    st1 {v2.4s}, [x1], #16
+    sub x3, x3, #4
+    b pmoNeonConvTransposeRowFourCheck
+pmoNeonConvTransposeRowScalarSetup:
+    cbz x3, pmoNeonConvTransposeRowDone
+pmoNeonConvTransposeRowLoop:
+    ldr s1, [x0]
+    add x0, x0, #4
+    ldr s2, [x1]
+    fmul s1, s0, s1
+    fadd s2, s2, s1
+    str s2, [x1]
+    add x1, x1, x4
+    subs x3, x3, #1
+    b.ne pmoNeonConvTransposeRowLoop
+pmoNeonConvTransposeRowDone:
+  EndASM
+EndProcedure
+
+Procedure PmTensorConvTranspose1DFp32Neon(*g.PmTensorConvTranspose1DArgs)
+  Protected bn.i
+  Protected ic.i
+  Protected ix.i
+  Protected ocg.i
+  Protected oc.i
+  Protected group.i
+  Protected inPerGroup.i
+  Protected outPerGroup.i
+  Protected baseOx.i
+  Protected firstK.i
+  Protected lastK.i
+  Protected limit.i
+  Protected srcIndex.i
+  Protected weightIndex.i
+  Protected dstIndex.i
+  Protected bits.i
+  If *g=0 Or *g\Batches<=0 Or *g\Groups<=0 Or *g\InChannels<=0 Or *g\OutChannels<=0 Or *g\OutWidth<=0 Or *g\Kernel<=0 Or *g\Dilation<=0
+    ProcedureReturn
+  EndIf
+  inPerGroup=*g\InChannels / *g\Groups
+  outPerGroup=*g\OutChannels / *g\Groups
+  bn=0
+  While bn<*g\Batches
+    oc=0
+    While oc<*g\OutChannels
+      bits=0
+      If *g\Bias<>0 : bits=PeekL(*g\Bias+oc*4) : EndIf
+      dstIndex=(bn* *g\OutChannels+oc)* *g\OutWidth
+      PmTensorConvTransposeFp32Fill(*g\Dst+dstIndex*4,*g\OutWidth,bits)
+      oc+1
+    Wend
+    ic=0
+    While ic<*g\InChannels
+      group=ic/inPerGroup
+      ix=0
+      While ix<*g\InWidth
+        srcIndex=(bn* *g\InChannels+ic)* *g\InWidth+ix
+        bits=PeekL(*g\Src+srcIndex*4)
+        baseOx=ix* *g\Stride-*g\PadLeft
+        firstK=0
+        If baseOx<0 : firstK=(-baseOx+*g\Dilation-1)/ *g\Dilation : EndIf
+        lastK=*g\Kernel
+        limit=*g\OutWidth-1-baseOx
+        If limit<0
+          lastK=0
+        ElseIf limit/ *g\Dilation+1<lastK
+          lastK=limit/ *g\Dilation+1
+        EndIf
+        If firstK<0 : firstK=0 : EndIf
+        If lastK>*g\Kernel : lastK=*g\Kernel : EndIf
+        If firstK<lastK
+          ocg=0
+          While ocg<outPerGroup
+            oc=group*outPerGroup+ocg
+            weightIndex=(ic*outPerGroup+ocg)* *g\Kernel+firstK
+            dstIndex=(bn* *g\OutChannels+oc)* *g\OutWidth+baseOx+firstK* *g\Dilation
+            PmTensorConvTransposeFp32Row(*g\Weight+weightIndex*4,*g\Dst+dstIndex*4,bits,lastK-firstK,*g\Dilation*4)
+            ocg+1
+          Wend
+        EndIf
+        ix+1
+      Wend
+      ic+1
+    Wend
+    bn+1
+  Wend
+EndProcedure
+CompilerEndIf
+
 CompilerIf #PMO_USE_INT8 = 1
 CompilerIf #PMO_USE_CONV = 1
 Structure PmTensorConv1DNeonEightArgs
