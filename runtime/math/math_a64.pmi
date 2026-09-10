@@ -272,9 +272,9 @@
 ;            program that moved between two chips starts disagreeing
 ;            with itself. MathFToInt() below is the unclamped 64-bit
 ;            spelling for anyone who wants the wider answer here.
-;   Sin Cos  refuse an argument beyond 12867 radians instead of returning
-;   Tan      a plausible number. The desktop keeps answering; its answers
-;            out there are wrong too, just quietly. See TRIG below.
+;   Sin Cos  use a fixed-point Payne-Hanek reduction beyond 12867 radians.
+;   Tan      Near a pole, its quotient of those two rounded results carries
+;            the usual rapidly growing relative error. See Tan().
 ;   Pow      for a non-integer exponent is exp(y*log(x)) and carries that
 ;            composition's error. An INTEGER exponent up to +/-64 takes a
 ;            repeated-squaring path instead. A NEGATIVE base is refused
@@ -304,10 +304,10 @@
 ;   not an answer. 0 is not an answer either, but it is not a number
 ;   anyone will mistake for one.
 ;
-;   Sin/Cos/Tan return NaN beyond 12867 radians. See TRIG.
+;   Sin/Cos/Tan accept every finite binary32 argument. Infinities return NaN.
 ;
 ; ======================================================================
-; TRIG: THE RANGE LIMIT IS A REFUSAL, AND IT IS THE POINT
+; TRIG: TWO RANGE REDUCERS
 ; ======================================================================
 ; Reducing an angle modulo pi/2 is where a float trig function actually
 ; goes wrong. pi/2 is carried here in THREE pieces so that each product
@@ -319,10 +319,15 @@
 ;
 ; n*A stays exact while 201*|n| < 2^24 and n*B while 2029*|n| < 2^24. The
 ; second is the binding one: |n| < 8267, i.e. |x| < about 12986 radians.
-; Past that the reduction quietly loses bits and the error grows with no
-; outward sign at all, so beyond 12867 radians (2048 whole turns) these
-; return NaN. A NaN propagates and can be tested for; a sine that is
-; wrong in the fourth digit cannot.
+; This remains the fast path through 12867 radians.
+;
+; Larger finite arguments take a fixed-point Payne-Hanek path. It multiplies
+; the input's exact 24-bit significand by floor((2/pi)*2^264), kept as 22
+; little-endian base-4096 limbs. The product retains the low fraction as
+; limbs too: reducing that fraction to one fixed Q31 word would destroy
+; relative accuracy when the input lies very close to a quadrant boundary.
+; Only after complementing/normalising the complete residual is it rounded
+; to binary32, then multiplied by pi/2 for the same polynomials below.
 ;
 ; If you are accumulating an angle in a loop, wrap it as you go rather
 ; than letting it grow.
@@ -1603,6 +1608,230 @@ Procedure.f Log(x.f)
 EndProcedure
 
 ; ----------------------------------------------------------------------
+; MathTrigReduceLarge(x, *quadrant) - Payne-Hanek reduction for finite
+; binary32 |x| > 12867. Returns r in [-pi/4,pi/4], and writes the low two
+; bits of the nearest multiple of pi/2 to *quadrant.
+;
+; With x = M*2^(e-23), the exact integer product P=M*C represents
+;
+;       |x| * 2/pi = P / 2^S,       S = 287-e,
+;
+; where C=floor((2/pi)*2^264). At binary32's maximum exponent S is still
+; 160, so the 264-bit table leaves ample guard precision. P and the residual
+; are both base-4096 limb arrays; every multiply-accumulate fits in 32 bits.
+; ----------------------------------------------------------------------
+Procedure.f MathTrigReduceLarge(x.f, *quadrant)
+  Protected Dim c.i(22)
+  Protected Dim p.i(24)
+  Protected Dim f.i(24)
+  Protected bits.i
+  Protected exponent.l
+  Protected e.l
+  Protected m.i
+  Protected ml.i
+  Protected i.l
+  Protected j.l
+  Protected k.l
+  Protected v.i
+  Protected carry.i
+  Protected s.l
+  Protected digit.l
+  Protected offset.l
+  Protected guard.l
+  Protected sticky.l
+  Protected roundUp.l
+  Protected q.l
+  Protected top.l
+  Protected topBits.l
+  Protected mask.i
+  Protected leading.l
+  Protected bit.l
+  Protected take.l
+  Protected sig.i
+  Protected shift.l
+  Protected rounded.i
+  Protected residualBits.i
+  Protected residual.f
+  Protected negative.l
+
+  ; floor((2/pi)*2^264), base 4096, least-significant limb first.
+  c(0)=439:c(1)=3158:c(2)=3771:c(3)=2749:c(4)=355:c(5)=4069
+  c(6)=65:c(7)=1081:c(8)=2364:c(9)=2393:c(10)=2914:c(11)=3085
+  c(12)=1245:c(13)=3923:c(14)=2001:c(15)=629:c(16)=2556:c(17)=338
+  c(18)=3652:c(19)=1764:c(20)=2435:c(21)=2607
+
+  bits = MathBitsOf(x)
+  negative = (bits >> 31) & 1
+  bits = bits & $7FFFFFFF
+  exponent = (bits >> 23) & 255
+  e = exponent - 127
+  m = (bits & $7FFFFF) | $800000
+  s = 287 - e
+
+  ; P = M*C. M has two base-4096 limbs and C has twenty-two.
+  i = 0
+  While i < 24
+    p(i) = 0
+    i = i + 1
+  Wend
+  i = 0
+  While i < 2
+    If i = 0
+      ml = m & 4095
+    Else
+      ml = m >> 12
+    EndIf
+    carry = 0
+    j = 0
+    While j < 22
+      k = i + j
+      v = p(k) + ml*c(j) + carry
+      p(k) = v & 4095
+      carry = v >> 12
+      j = j + 1
+    Wend
+    k = i + 22
+    While carry <> 0
+      v = p(k) + carry
+      p(k) = v & 4095
+      carry = v >> 12
+      k = k + 1
+    Wend
+    i = i + 1
+  Wend
+
+  ; Integer low bits and nearest-even decision at the binary point S.
+  digit = s / 12
+  offset = s - digit*12
+  q = (p(digit) >> offset) & 1
+  If offset = 11
+    q = q | ((p(digit+1) & 1) << 1)
+  Else
+    q = q | (((p(digit) >> (offset+1)) & 1) << 1)
+  EndIf
+  guard = (p((s-1)/12) >> ((s-1)-((s-1)/12)*12)) & 1
+  sticky = 0
+  bit = 0
+  While bit < s-1 And sticky = 0
+    If (p(bit/12) & (1 << (bit-(bit/12)*12))) <> 0
+      sticky = 1
+    EndIf
+    bit = bit + 1
+  Wend
+  roundUp = 0
+  If guard <> 0 And (sticky <> 0 Or (q & 1) <> 0)
+    roundUp = 1
+    q = (q + 1) & 3
+  EndIf
+
+  ; Magnitude of the signed fractional residual. On a round-up this is the
+  ; bounded S-bit radix complement 2^S-(P mod 2^S), not a narrow fraction.
+  top = (s-1)/12
+  topBits = s - top*12
+  carry = roundUp
+  i = 0
+  While i <= top
+    If i = top
+      mask = (1 << topBits) - 1
+    Else
+      mask = 4095
+    EndIf
+    If roundUp <> 0
+      v = ((p(i) ! mask) & mask) + carry
+      f(i) = v & mask
+      carry = v >> topBits
+      If i < top
+        carry = v >> 12
+      EndIf
+    Else
+      f(i) = p(i) & mask
+    EndIf
+    i = i + 1
+  Wend
+
+  ; Locate the leading residual bit, then round its significand directly to
+  ; binary32. This preserves relative precision even arbitrarily near a
+  ; quadrant boundary. The subnormal branch rounds in units of 2^-149.
+  leading = top*12 + 11
+  If topBits < 12
+    leading = top*12 + topBits - 1
+  EndIf
+  While leading > 0 And (f(leading/12) & (1 << (leading-(leading/12)*12))) = 0
+    leading = leading - 1
+  Wend
+  e = leading - s
+  If e >= -126
+    shift = leading - 23
+    sig = 0
+    bit = 0
+    While bit < 24
+      sig = sig << 1
+      take = leading - bit
+      If (f(take/12) & (1 << (take-(take/12)*12))) <> 0
+        sig = sig | 1
+      EndIf
+      bit = bit + 1
+    Wend
+    guard = 0
+    sticky = 0
+    If shift > 0
+      guard = (f((shift-1)/12) >> ((shift-1)-((shift-1)/12)*12)) & 1
+      bit = 0
+      While bit < shift-1 And sticky = 0
+        If (f(bit/12) & (1 << (bit-(bit/12)*12))) <> 0
+          sticky = 1
+        EndIf
+        bit = bit + 1
+      Wend
+    EndIf
+    If guard <> 0 And (sticky <> 0 Or (sig & 1) <> 0)
+      sig = sig + 1
+      If sig = $1000000
+        sig = $800000
+        e = e + 1
+      EndIf
+    EndIf
+    residualBits = ((e+127) << 23) | (sig & $7FFFFF)
+  Else
+    shift = s - 149
+    rounded = 0
+    bit = leading
+    While bit >= shift
+      rounded = rounded << 1
+      If (f(bit/12) & (1 << (bit-(bit/12)*12))) <> 0
+        rounded = rounded | 1
+      EndIf
+      bit = bit - 1
+    Wend
+    guard = (f((shift-1)/12) >> ((shift-1)-((shift-1)/12)*12)) & 1
+    sticky = 0
+    bit = 0
+    While bit < shift-1 And sticky = 0
+      If (f(bit/12) & (1 << (bit-(bit/12)*12))) <> 0
+        sticky = 1
+      EndIf
+      bit = bit + 1
+    Wend
+    If guard <> 0 And (sticky <> 0 Or (rounded & 1) <> 0)
+      rounded = rounded + 1
+    EndIf
+    residualBits = rounded
+  EndIf
+
+  ; A negative argument negates both the nearest quadrant and residual.
+  If negative <> 0
+    q = (0-q) & 3
+    roundUp = 1-roundUp
+  EndIf
+  If roundUp <> 0
+    residualBits = residualBits | $80000000
+  EndIf
+  PokeL(*quadrant, q)
+  residual = MathFromBits(residualBits)
+  ProcedureReturn residual * 1.5707963267948966
+EndProcedure
+
+; ----------------------------------------------------------------------
 ; MathSinCos(x, wantCos) - the shared core of Sin() and Cos().
 ; wantCos of 0 gives sin(x), anything else gives cos(x).
 ;
@@ -1632,44 +1861,59 @@ Procedure.f MathSinCos(x.f, wantCos.l)
   Protected v.f
   Protected n.l
   Protected q.l
+  Protected bits.i
   If MathFIsNaNB(MathBitsOf(x)) = 1
     ProcedureReturn x
   EndIf
   a = MathFAbs(x)
-  If MathFGt(a, 12867.0) = 1              ; reduction stops being exact
+  bits = MathBitsOf(a)
+  If bits = 0
+    If wantCos <> 0
+      ProcedureReturn 1.0
+    EndIf
+    ProcedureReturn x
+  EndIf
+  If bits = $7F800000
     ProcedureReturn MathFromBits(2143289344)
   EndIf
-  t = MathFMul(x, 0.6366197723675814) ; x * 2/pi - which quadrant
-  n = MathNearestInt(t)
-  nf = MathFFromInt(n)
-  r = MathFSub(x, MathFMul(nf, 1.5703125))    ; pi/2 in three exact pieces
-  r = MathFSub(r, MathFMul(nf, 0.0004837512969970703125))
-  r = MathFSub(r, MathFMul(nf, 0.0000000754979012640433))
-  q = n & 3
+  If MathFGt(a, 12867.0) = 1
+    r = MathTrigReduceLarge(x, @q)
+  Else
+    t = MathFMul(x, 0.6366197723675814) ; x * 2/pi - which quadrant
+    n = MathNearestInt(t)
+    nf = MathFFromInt(n)
+    r = MathFSub(x, MathFMul(nf, 1.5703125))  ; pi/2 in three exact pieces
+    r = MathFSub(r, MathFMul(nf, 0.0004837512969970703125))
+    r = MathFSub(r, MathFMul(nf, 0.0000000754979012640433))
+    q = n & 3
+  EndIf
   If wantCos <> 0
     q = (q + 1) & 3
   EndIf
-  z = MathFMul(r, r)
+  ; These are native binary32 operations on the current A64 backend. Keeping
+  ; every Horner step on its own line also keeps the established unfused
+  ; rounding points of the original MathF* spelling.
+  z = r * r
   If q = 1 Or q = 3
     ; cos(r) = 1 - r^2/2 + r^4/24 - ... , Taylor to r^10; the truncated
     ; term is (pi/4)^12/479001600, about 1.2e-10, well under one ULP.
     p = -0.0000002755731922398589
-    p = MathFAdd(MathFMul(p, z), 0.0000248015873015873)
-    p = MathFAdd(MathFMul(p, z), -0.001388888888888889)
-    p = MathFAdd(MathFMul(p, z), 0.041666666666666664)
-    p = MathFAdd(MathFMul(p, z), -0.5)
-    v = MathFAdd(1.0, MathFMul(p, z))
+    p = p*z + 0.0000248015873015873
+    p = p*z - 0.001388888888888889
+    p = p*z + 0.041666666666666664
+    p = p*z - 0.5
+    v = 1.0 + p*z
   Else
     ; sin(r) = r - r^3/6 + r^5/120 - ... , Taylor to r^9; the truncated
     ; term is (pi/4)^11/39916800, about 1.9e-09.
     p = 0.0000027557319223985893
-    p = MathFAdd(MathFMul(p, z), -0.0001984126984126984)
-    p = MathFAdd(MathFMul(p, z), 0.008333333333333333)
-    p = MathFAdd(MathFMul(p, z), -0.16666666666666666)
-    v = MathFAdd(r, MathFMul(r, MathFMul(p, z)))
+    p = p*z - 0.0001984126984126984
+    p = p*z + 0.008333333333333333
+    p = p*z - 0.16666666666666666
+    v = r + r*(p*z)
   EndIf
   If q >= 2
-    ProcedureReturn MathFSub(0.0, v)
+    ProcedureReturn 0.0-v
   EndIf
   ProcedureReturn v
 EndProcedure
@@ -1681,7 +1925,7 @@ EndProcedure
 ;     Sin(0)          0.0
 ;     Sin(Radian(30)) 0.5
 ;     Sin(NaN)        NaN
-;     |x| > 12867     NaN     - a refusal, not a failure. See TRIG above.
+;     Sin(+Infinity)  NaN        all finite binary32 inputs are accepted.
 ;
 ; Within 0.001 radians of a multiple of pi the ABSOLUTE error is about
 ; 1.4e-10 and the ULP count is meaningless: the answer is near zero, so
@@ -1696,7 +1940,7 @@ EndProcedure
 
 ; ----------------------------------------------------------------------
 ; Cos(x) - the cosine of an angle given in RADIANS. Result -1.0 to 1.0.
-; Same accuracy, same 12867-radian refusal and same reasoning as Sin().
+; Same reduction and finite input range as Sin().
 ; ----------------------------------------------------------------------
 Procedure.f Cos(x.f)
   ProcedureReturn MathSinCos(x, 1)
@@ -1717,7 +1961,7 @@ EndProcedure
 ; representable - but if it ever were, the answer would be the correctly
 ; signed Infinity, which is also right.
 ;
-;     Tan(0)       0.0        |x| > 12867   NaN
+;     Tan(0)       0.0        Tan(+Infinity) NaN
 ; ----------------------------------------------------------------------
 Procedure.f Tan(x.f)
   Protected s.f
