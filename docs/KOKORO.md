@@ -79,6 +79,26 @@ is 24 kHz mono floating-point PCM; playback, device drivers, asset loading, and
 book-sized chunk scheduling belong to the application. Closing the text adapter
 does not free the caller's immutable assets.
 
+### Measured Pi 4 status (2026-09-10)
+
+The generated FP32 runtime at revision `9c6c96e` produced the complete sentence
+“The sky is blue, and the sun is shining.” on a Pi 4 running Anvil, with the
+processor measured at approximately 1.5 GHz. This was resident-model inference,
+not a model recompile or host inference-engine output.
+
+- Output: 68,400 finite FP32 samples, 24 kHz mono, 2.85 seconds of audio.
+- Inference: 433.587 seconds, approximately **152 times slower than real time**.
+- Full-buffer comparison with the pinned model's reference: maximum absolute
+  error 0.092810, RMSE 0.004057, correlation 0.998205; no alignment or trimming.
+- Raw little-endian FP32 output SHA-256:
+  `dd596a19999e0e8017b879a935a98bd18fafb4aaa8a55e60bbc7aabc2dfc8cc4`.
+
+This is a correctness checkpoint, **not usable interactive speech performance**.
+A second, longer request hit the test's combined 900-second deadline; that run
+does not establish two-request completion. Per-operation profiling and further
+kernel work are in progress. These measurements do not establish performance
+or physical execution on UNO Q, Windows, or other targets.
+
 The normal text route is US English. It normalizes common book typography and
 uses the checked dictionaries and supported word rules. Unknown words may be
 spelled out; explicit `/phoneme/` overrides are vocabulary-checked. This is not
