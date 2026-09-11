@@ -31,8 +31,16 @@ Procedure PmFastReduce(*Src,*Dst,Outer.i,Width.i,Mean.i)
   Next
 EndProcedure
 
+; This Select used to have no Default, so a code it did not recognise returned
+; with the destination untouched and nothing said - silent, and indistinguishable
+; from a successful call.  PmTensorTrig in tensor_fp32_windows.pbi owns the op
+; set, so every code this kernel does not compute itself goes there and is
+; refused by clearing PmTensorTrigOk.  Armed here, per call, because this file
+; is included before DError exists and so cannot raise the error itself; DUnary
+; reads the flag back and turns it into a DFail.
 Procedure PmFastTrig(*Src,*Dst,Count.i,Op.i)
   Protected i.i
+  PmTensorTrigOk=1
   Select Op
     Case 0
       For i=0 To Count-1 : PokeF(*Dst+i*4,Sin(PeekF(*Src+i*4))) : Next
@@ -40,6 +48,8 @@ Procedure PmFastTrig(*Src,*Dst,Count.i,Op.i)
       For i=0 To Count-1 : PokeF(*Dst+i*4,Cos(PeekF(*Src+i*4))) : Next
     Case 2
       For i=0 To Count-1 : PokeF(*Dst+i*4,ATan(PeekF(*Src+i*4))) : Next
+    Default
+      PmTensorTrig(*Src,*Dst,Count,Op)
   EndSelect
 EndProcedure
 

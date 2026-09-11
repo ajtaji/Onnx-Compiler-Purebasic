@@ -283,12 +283,47 @@ Procedure PmTensorTanh(*src, *dst, count.i)
   Wend
 EndProcedure
 
-; op: 0 exp, 1 log, 2 sqrt, 3 abs, 4 neg.
+; Refusal signals for the two elementwise kernels whose op sets are closed.
+; Same convention as the portable twin: this file sits UNDER both of its
+; consumers - the dynamic runtime, which has DError, and a statically emitted
+; program, which has PmOnnxRuntimeOk - and can name neither, so a kernel here
+; only ever CLEARS a flag and whoever ran it reads it back and raises that
+; layer's error.  Nothing here ever sets one; the caller arms it per call.
+;
+; These are MIRRORED from tensor_fp32.pmi rather than shared with it.  The two
+; files are never in one build: a Windows program includes this one and a
+; Pi 4 / UNO Q / Pico program includes the portable one, and each is copied
+; whole beside the model it was generated for.  A third file holding the two
+; declarations would have to be added to both targets' copy sets to remove two
+; lines from each, and a generated Windows program would then need a file the
+; portable one also needs but under a different name.  The whole file is
+; already a mirror of tensor_fp32.pmi by design - see the header - so these
+; keep that arrangement rather than inventing a second one for two globals.
+Global PmTensorUnaryMathOk.i
+Global PmTensorTrigOk.i
+
+; Elementwise unary math.
+;
+; THE OP SET IS CLOSED AND EXPLICIT: 0 Exp, 1 Log, 2 Sqrt, 3 Abs, 4 Neg.  Those
+; are the only codes any emitter produces - onnx_emit.pbi writes 0..4 from a
+; Select over Exp/Log/Sqrt/Abs/Neg, and onnx_dynamic_emit.pbi writes the same
+; 0..4 as DUnary codes, which DUnary passes through unchanged.
+;
+; This procedure used to end its chain with a bare Else that NEGATED, so op 5,
+; op 99 or op -1 quietly returned -x and the graph ran on with wrong numbers in
+; it.  Anything outside the set is now REFUSED: the destination is left exactly
+; as the caller left it and PmTensorUnaryMathOk is cleared.  The op is decided
+; once, before the loop, because a per-element test can only ever be a slower
+; way to get the same answer.
 Procedure PmTensorUnaryMath(*src, *dst, count.i, op.i)
   Protected i.i
   Protected ps.i
   Protected pd.i
   Protected v.f
+  If op < 0 Or op > 4
+    PmTensorUnaryMathOk = 0
+    ProcedureReturn
+  EndIf
   i = 0 : ps = *src : pd = *dst
   While i < count
     v = PeekF(ps)
@@ -309,10 +344,26 @@ Procedure PmTensorUnaryMath(*src, *dst, count.i, op.i)
 EndProcedure
 
 ; Transcendentals used by synthesis and signal-processing graphs.
-; op 0=sin, 1=cos, 2=atan. The including math library supplies these.
+;
+; THE OP SET IS CLOSED AND EXPLICIT: 0 Sin, 1 Cos, 2 Atan.  Those are the only
+; codes any emitter produces - onnx_emit.pbi writes them directly, and
+; onnx_dynamic_emit.pbi writes DUnary 5/6/7 which PmFastTrig turns into 0/1/2.
+; The including math library supplies these three.
+;
+; This procedure used to end its chain with a bare Else that computed ATan, so
+; op 3, op 7 or op -1 quietly returned an arctangent and the graph ran on with
+; wrong numbers in it.  Anything outside the set is now REFUSED: the
+; destination is left exactly as the caller left it and PmTensorTrigOk is
+; cleared.  PmFastTrig hands every code it does not own down to here, and
+; DUnary turns a cleared flag into a DError, so the model stops on the node
+; that did it.  The op is decided once, before the loop.
 Procedure PmTensorTrig(*src, *dst, count.i, op.i)
   Protected i.i
   Protected v.f
+  If op < 0 Or op > 2
+    PmTensorTrigOk = 0
+    ProcedureReturn
+  EndIf
   i = 0
   While i < count
     v = PmTensorGet(*src, i)

@@ -284,9 +284,15 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
   Next
 EndProcedure
 
+; The two kernels with closed op sets report by clearing a flag - they sit under
+; this file and cannot name DError - so this dispatcher is what turns a refusal
+; into one. Both flags are armed per DUnary call so a refusal on one node can
+; never be read as a refusal on the next. The Select itself had no Default, so
+; a code above 12 returned with the destination untouched and nothing said.
 Procedure DUnary(Y.i,A.i,Op.i,Alpha.f=0.01)
   If Dt(A)\Kind<>1 : DFail("This unary kernel requires FLOAT input.") : ProcedureReturn : EndIf
   If DLike(Y,A)=0 : ProcedureReturn : EndIf
+  PmTensorUnaryMathOk=1 : PmTensorTrigOk=1
   Select Op
     Case 0 To 4 : PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
     Case 5 To 7 : PmFastTrig(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op-5)
@@ -295,7 +301,10 @@ Procedure DUnary(Y.i,A.i,Op.i,Alpha.f=0.01)
     Case 10 : PmTensorFloor(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
     Case 11 : PmTensorRoundEven(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
     Case 12 : PmTensorLeakyRelu(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Alpha)
+    Default : DFail("Unsupported unary operation code: this dispatcher routes 0 Exp, 1 Log, 2 Sqrt, 3 Abs, 4 Neg, 5 Sin, 6 Cos, 7 Atan, 8 Sigmoid, 9 Tanh, 10 Floor, 11 Round and 12 LeakyRelu only. Check the operator the model emitted for this node.") : ProcedureReturn
   EndSelect
+  If PmTensorUnaryMathOk=0 : DFail("Unsupported unary math operation code: this kernel computes 0 Exp, 1 Log, 2 Sqrt, 3 Abs and 4 Neg only. Check the operator the model emitted for this node.") : EndIf
+  If PmTensorTrigOk=0 : DFail("Unsupported trigonometric operation code: this kernel computes 0 Sin, 1 Cos and 2 Atan only. Check the operator the model emitted for this node.") : EndIf
 EndProcedure
 
 Procedure DCast(Y.i,A.i,Kind.i)

@@ -1083,10 +1083,21 @@ Procedure.i PmoEmitNode(File.i, *Ir.PmoIrModel, *Profile.PmoTargetProfile,
       Case "Abs" : Axis = 3
       Case "Neg" : Axis = 4
     EndSelect
+    ; PmTensorUnaryMath owns a closed op set and refuses anything outside it by
+    ; clearing PmTensorUnaryMathOk and leaving the destination untouched.  A
+    ; statically emitted program has no DError, so the flag is armed before the
+    ; call and folded into PmOnnxRuntimeOk after it - the same hook
+    ; PmTensorInt64Ok uses - and the per-node check emitted at the end of this
+    ; procedure reports the node and stops the graph.  Without this the refusal
+    ; would be silent and the program would run on with a stale destination.
+    PmoEmitLine(File, "  PmTensorUnaryMathOk = 1")
     PmoEmitLine(File, "  PmTensorUnaryMath(" + In(0) + ", " + Out(0) + ", " + Str(Count) + ", " + Str(Axis) + ")")
+    PmoEmitLine(File, "  If PmTensorUnaryMathOk = 0 : PmOnnxRuntimeOk = 0 : EndIf")
   ElseIf Op = "Sin" Or Op = "Cos" Or Op = "Atan"
     Select Op : Case "Sin" : Axis = 0 : Case "Cos" : Axis = 1 : Default : Axis = 2 : EndSelect
+    PmoEmitLine(File, "  PmTensorTrigOk = 1")
     PmoEmitLine(File, "  PmTensorTrig(" + In(0) + ", " + Out(0) + ", " + Str(Count) + ", " + Str(Axis) + ")")
+    PmoEmitLine(File, "  If PmTensorTrigOk = 0 : PmOnnxRuntimeOk = 0 : EndIf")
   ElseIf Op = "Floor"
     PmoEmitLine(File, "  PmTensorFloor(" + In(0) + ", " + Out(0) + ", " + Str(Count) + ")")
   ElseIf Op = "Round"

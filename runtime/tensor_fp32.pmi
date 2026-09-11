@@ -350,12 +350,41 @@ Procedure PmTensorTanh(*src.i, *dst.i, count.i)
   Wend
 EndProcedure
 
-; op: 0 exp, 1 log, 2 sqrt, 3 abs, 4 neg.
+; Refusal signal for PmTensorUnaryMath, the same convention as PmTensorInt64Ok
+; above and PmTensorTrigOk below: this file sits UNDER both of its consumers and
+; can name neither of their error variables, so the kernel only ever CLEARS a
+; flag and whoever ran it reads it back and raises that layer's error.
+;
+; It is a second flag rather than a wider PmTensorTrigOk because the two kernels
+; are reached by different dispatch paths - trig through PmFastTrig, unary math
+; by a direct call - and each refusal has to name its own op set in the message.
+; Nothing here ever sets it; the caller arms it per call, so a refusal on one
+; node can never be read as a refusal on the next.
+Global PmTensorUnaryMathOk.i
+
+; Elementwise unary math.
+;
+; THE OP SET IS CLOSED AND EXPLICIT: 0 Exp, 1 Log, 2 Sqrt, 3 Abs, 4 Neg.  Those
+; are the only codes any emitter produces - onnx_emit.pbi writes 0..4 from a
+; Select over Exp/Log/Sqrt/Abs/Neg, and onnx_dynamic_emit.pbi writes the same
+; 0..4 as DUnary codes, which DUnary passes through unchanged.
+;
+; This procedure used to end its chain with a bare Else that NEGATED, so op 5,
+; op 99 or op -1 quietly returned -x and the graph ran on with wrong numbers in
+; it - the same defect PmTensorTrig had with an arctangent.  Anything outside
+; the set is now REFUSED: the destination is left exactly as the caller left it
+; and PmTensorUnaryMathOk is cleared.  The op is decided once, before the loop,
+; because a per-element test can only ever be a slower way to get the same
+; answer.
 Procedure PmTensorUnaryMath(*src.i, *dst.i, count.i, op.i)
   Protected i.i
   Protected ps.i
   Protected pd.i
   Protected v.f
+  If op < 0 Or op > 4
+    PmTensorUnaryMathOk = 0
+    ProcedureReturn
+  EndIf
   i = 0 : ps = *src : pd = *dst
   While i < count
     v = *ps.f

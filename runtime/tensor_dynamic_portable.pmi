@@ -895,6 +895,13 @@ Procedure DUnary(Y.i,A.i,Op.i,Alpha.f)
   If DLike(Y,A,0)=0
     ProcedureReturn
   EndIf
+  ; PmTensorUnaryMath owns its op set and refuses anything outside 0 Exp,
+  ; 1 Log, 2 Sqrt, 3 Abs, 4 Neg by clearing PmTensorUnaryMathOk.  It cannot
+  ; name DError, so this dispatcher is what turns the refusal into one, the
+  ; same way PmFastTrig does for PmTensorTrigOk.  Armed here, per DUnary call,
+  ; so a refusal on one node is never read as a refusal on the next; only the
+  ; unary-math kernel below ever clears it.
+  PmTensorUnaryMathOk=1
   Select Op
     Case 0
       PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
@@ -922,7 +929,13 @@ Procedure DUnary(Y.i,A.i,Op.i,Alpha.f)
       PmTensorRoundEven(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
     Case 12
       PmTensorLeakyRelu(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Alpha)
+    Default
+      DFail("Unsupported unary operation code: this dispatcher routes 0 Exp, 1 Log, 2 Sqrt, 3 Abs, 4 Neg, 5 Sin, 6 Cos, 7 Atan, 8 Sigmoid, 9 Tanh, 10 Floor, 11 Round and 12 LeakyRelu only. Check the operator the model emitted for this node.")
+      ProcedureReturn
   EndSelect
+  If PmTensorUnaryMathOk=0
+    DFail("Unsupported unary math operation code: this kernel computes 0 Exp, 1 Log, 2 Sqrt, 3 Abs and 4 Neg only. Check the operator the model emitted for this node.")
+  EndIf
 EndProcedure
 
 Procedure DCast(Y.i,A.i,Kind.i)
