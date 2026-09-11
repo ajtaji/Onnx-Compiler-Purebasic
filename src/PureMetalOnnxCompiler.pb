@@ -24,6 +24,7 @@ XIncludeFile "compiler/onnx_compile.pbi"
 XIncludeFile "compiler/onnx_dynamic_emit.pbi"
 XIncludeFile "compiler/onnx_kokoro.pbi"
 XIncludeFile "compiler/kokoro_asset_pack.pbi"
+XIncludeFile "compiler/kokoro_dictionary_pack.pbi"
 XIncludeFile "compiler/onnx_ui.pbi"
 
 Procedure PrintUsage()
@@ -45,6 +46,10 @@ Procedure PrintUsage()
   PrintN("  PureMetalOnnxCompiler.exe --kokoro-prepare model.onnx --text TEXT --g2p FILE --voice FILE --output PREFIX")
   PrintN("  PureMetalOnnxCompilerCLI.exe --kokoro-pack-voice RAW.bin --output VOICE.pmvoice [--source-sha256 HEX]")
   PrintN("  PureMetalOnnxCompilerCLI.exe --kokoro-verify-voice VOICE.pmvoice")
+  PrintN("  PureMetalOnnxCompilerCLI.exe --kokoro-pack-base-dictionary us_gold.json --silver us_silver.json --output BASE.pmg2p")
+  PrintN("  PureMetalOnnxCompilerCLI.exe --kokoro-pack-extra-dictionary cmudict.dict --base BASE.pmg2p --output EXTRA.pmg2p")
+  PrintN("  PureMetalOnnxCompilerCLI.exe --kokoro-verify-base-dictionary BASE.pmg2p")
+  PrintN("  PureMetalOnnxCompilerCLI.exe --kokoro-verify-extra-dictionary EXTRA.pmg2p")
   PrintN("")
   PrintN("Run without arguments to open the compiler window (UI wiring follows")
   PrintN("the checked compiler core; it will not shell out to Python).")
@@ -397,8 +402,60 @@ Procedure.i PackVoiceCommand(Source.s)
   ProcedureReturn #True
 EndProcedure
 
+Procedure.i PackDictionaryCommand(Source.s, Kind.i)
+  Protected index.i = 2, option.s, value.s, destination.s, companion.s
+  Protected seenOutput.i, seenCompanion.i, packed.i
+  Protected companionOption.s = "--silver"
+  If Kind = #PMO_KDP_KIND_EXTRA : companionOption = "--base" : EndIf
+  While index < CountProgramParameters()
+    option = ProgramParameter(index)
+    If index + 1 >= CountProgramParameters()
+      PrintN("DICTIONARY PACK ERROR: " + PmoKdpCode(6001) + "the option " + option + " was given with no value after it. Check the command line for a missing path.")
+      ProcedureReturn #False
+    EndIf
+    value = ProgramParameter(index + 1)
+    If option = "--output"
+      If seenOutput
+        PrintN("DICTIONARY PACK ERROR: " + PmoKdpCode(6002) + "--output was given more than once and one pack has exactly one destination. Check the command line for a repeated option.")
+        ProcedureReturn #False
+      EndIf
+      seenOutput = #True : destination = value
+    ElseIf option = companionOption
+      If seenCompanion
+        PrintN("DICTIONARY PACK ERROR: " + PmoKdpCode(6003) + companionOption + " was given more than once and one pack has exactly one companion source. Check the command line for a repeated option.")
+        ProcedureReturn #False
+      EndIf
+      seenCompanion = #True : companion = value
+    Else
+      PrintN("DICTIONARY PACK ERROR: " + PmoKdpCode(6004) + "the option " + option + " is not one this command accepts. Check the usage text for the options this pack command takes.")
+      ProcedureReturn #False
+    EndIf
+    index + 2
+  Wend
+  If seenCompanion = #False
+    PrintN("DICTIONARY PACK ERROR: " + PmoKdpCode(6005) + companionOption + " is required because a pronunciation pack is built from two pinned inputs. Check the usage text for this pack command.")
+    ProcedureReturn #False
+  EndIf
+  If seenOutput = #False
+    PrintN("DICTIONARY PACK ERROR: " + PmoKdpCode(6006) + "--output is required because the finished pack has nowhere else to go. Check the usage text for this pack command.")
+    ProcedureReturn #False
+  EndIf
+  If Kind = #PMO_KDP_KIND_BASE
+    packed = PmoKokoroDictionaryPackBase(Source, companion, destination)
+  Else
+    packed = PmoKokoroDictionaryPackExtra(Source, companion, destination)
+  EndIf
+  If packed = 0
+    PrintN("DICTIONARY PACK ERROR: " + PmoKokoroDictionaryPackError) : ProcedureReturn #False
+  EndIf
+  PrintN("PASS: verified PMG2P written to " + destination)
+  PrintN("      " + PmoKokoroDictionaryReport)
+  ProcedureReturn #True
+EndProcedure
+
 Define Mode.s = ProgramParameter(0)
 Define ModelPath.s = ProgramParameter(1)
+Define DictionaryKind.i = #PMO_KDP_KIND_BASE
 
 If Mode = ""
   PmoRunUi()
@@ -416,10 +473,14 @@ ElseIf Mode = "--self-test"
     PrintN("FAIL: " + PmoWireError)
     End 1
   EndIf
+  If PmoKokoroDictionarySelfTest() = 0
+    PrintN("FAIL: " + PmoKokoroDictionaryPackError)
+    End 1
+  EndIf
   If ModelPath <> "" And InspectModel(ModelPath, #True) = 0
     End 1
   EndIf
-  PrintN("PASS: bounded protobuf wire reader and native ONNX model inventory")
+  PrintN("PASS: bounded protobuf wire reader, native ONNX model inventory and PMG2P dictionary core")
   End 0
 ElseIf Mode = "--ort-version"
   If PmoOrtLoad(ModelPath) = 0
@@ -469,6 +530,23 @@ ElseIf Mode = "--kokoro-verify-voice"
     PrintN("VOICE PACK ERROR: " + PmoKokoroVoicePackError) : End 1
   EndIf
   PrintN("PASS: PMVOICE identity, shape, checksums and finite samples verified")
+  End 0
+ElseIf Mode = "--kokoro-pack-base-dictionary"
+  If ModelPath = "" : PrintUsage() : End 2 : EndIf
+  If PackDictionaryCommand(ModelPath, #PMO_KDP_KIND_BASE) = 0 : End 1 : EndIf
+  End 0
+ElseIf Mode = "--kokoro-pack-extra-dictionary"
+  If ModelPath = "" : PrintUsage() : End 2 : EndIf
+  If PackDictionaryCommand(ModelPath, #PMO_KDP_KIND_EXTRA) = 0 : End 1 : EndIf
+  End 0
+ElseIf Mode = "--kokoro-verify-base-dictionary" Or Mode = "--kokoro-verify-extra-dictionary"
+  If CountProgramParameters() <> 2 : PrintUsage() : End 2 : EndIf
+  DictionaryKind = #PMO_KDP_KIND_EXTRA
+  If Mode = "--kokoro-verify-base-dictionary" : DictionaryKind = #PMO_KDP_KIND_BASE : EndIf
+  If PmoKokoroDictionaryVerifyFile(ModelPath, DictionaryKind) = 0
+    PrintN("DICTIONARY PACK ERROR: " + PmoKokoroDictionaryPackError) : End 1
+  EndIf
+  PrintN("PASS: PMG2P identity, extents, checksum, hash slots and vocabulary verified")
   End 0
 ElseIf Mode = "--kokoro-prepare"
   If ModelPath = "" : PrintUsage() : End 2 : EndIf

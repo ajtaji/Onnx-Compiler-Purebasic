@@ -18,11 +18,10 @@ not generate or compile another model per word or sentence.
 
 ## What you must supply separately
 
-**This repository does not contain the model or prepared speech data.** A native
-PureBasic voice-pack builder is included; dictionary-pack builders are still
-pending. The compiler is fully
-buildable without them, but the speech demo is not ready to speak from a fresh
-checkout until compatible prepared assets are supplied.
+**This repository does not contain the model or prepared speech data.** Native
+PureBasic voice-pack and pronunciation-pack builders are included. The compiler
+is fully buildable without them, but the speech demo is not ready to speak from
+a fresh checkout until compatible prepared assets are supplied.
 
 | Asset | Contract expected by the current adapter |
 |---|---|
@@ -65,6 +64,33 @@ For a standalone PureBasic entry point, build
 [`examples/KokoroVoicePack.pb`](../examples/KokoroVoicePack.pb) as a console
 application and use `pack RAW OUTPUT [EXPECTED_SHA256]` or `verify PMVOICE`.
 The resulting pack is shared by the Windows and supported bare-metal adapters.
+
+### Prepare the pronunciation packs without Python
+
+Supply the pinned upstream dictionary sources. The base pack is built from the
+Misaki US-English `us_gold.json` and `us_silver.json`; the supplementary pack is
+built from `cmudict.dict` and the finished base pack, which it consults so that
+it only adds words the base pack cannot already answer. Both sources are checked
+by SHA-256 against the pinned revisions before anything is parsed, so a newer or
+re-saved copy is refused rather than quietly producing a different pack.
+
+```powershell
+.\bin\PureMetalOnnxCompilerCLI.exe --kokoro-pack-base-dictionary C:\Misaki\us_gold.json --silver C:\Misaki\us_silver.json --output C:\Assets\kokoro_us_english.pmg2p
+.\bin\PureMetalOnnxCompilerCLI.exe --kokoro-pack-extra-dictionary C:\CMU\cmudict.dict --base C:\Assets\kokoro_us_english.pmg2p --output C:\Assets\kokoro_us_extra.pmg2p
+.\bin\PureMetalOnnxCompilerCLI.exe --kokoro-verify-base-dictionary C:\Assets\kokoro_us_english.pmg2p
+.\bin\PureMetalOnnxCompilerCLI.exe --kokoro-verify-extra-dictionary C:\Assets\kokoro_us_extra.pmg2p
+```
+
+Each pack is deterministic: the same pinned sources always produce the same
+bytes, down to the hash-slot probe order. Packing refuses a malformed lexicon
+line, a repeated word, a pronunciation outside the pinned Kokoro vocabulary, a
+key longer than 63 bytes, and an existing destination; every refusal names its
+numeric code and what to check. The completed header, extents, payload CRC-32,
+every hash slot and every pronunciation codepoint are validated before the
+output is published, and the verify commands re-run those checks on a file at
+rest. `--self-test` also runs the packing core's own checks. This only prepares
+pronunciation assets: it neither downloads data nor invokes a language compiler.
+Retain each dictionary's license and attribution.
 
 ## Windows reader
 
