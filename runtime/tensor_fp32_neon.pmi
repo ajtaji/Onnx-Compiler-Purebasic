@@ -15,6 +15,64 @@
 ; registers across calls. General-purpose state uses caller-saved x0..x17.
 ; ======================================================================
 
+; Final-axis reductions keep the portable kernel's exact FP32 evaluation
+; order while owning their hot loop state in registers.  In particular,
+; these are deliberately scalar reductions: a horizontal vector reduction
+; or several partial accumulators would reassociate non-associative adds.
+Procedure PmTensorReduceMeanLastNeon(*src.i, *dst.i, outer.i, width.i)
+  ASM
+    ; x0=src x1=dst x2=outer x3=width
+    cmp  x2, #0
+    b.le pmoNeonReduceMeanDone
+    cmp  x3, #0
+    b.le pmoNeonReduceMeanDone
+    scvtf s2, x3
+    mov  x4, x2
+pmoNeonReduceMeanRow:
+    fmov s0, wzr
+    mov  x5, x3
+pmoNeonReduceMeanInner:
+    ldr  s1, [x0]
+    add  x0, x0, #4
+pmoNeonReduceMeanAdd:
+    fadd s0, s0, s1
+    subs x5, x5, #1
+    b.ne pmoNeonReduceMeanInner
+    fdiv s0, s0, s2
+    str  s0, [x1]
+    add  x1, x1, #4
+    subs x4, x4, #1
+    b.ne pmoNeonReduceMeanRow
+pmoNeonReduceMeanDone:
+  EndASM
+EndProcedure
+
+Procedure PmTensorReduceSumLastNeon(*src.i, *dst.i, outer.i, width.i)
+  ASM
+    ; x0=src x1=dst x2=outer x3=width
+    cmp  x2, #0
+    b.le pmoNeonReduceSumDone
+    cmp  x3, #0
+    b.le pmoNeonReduceSumDone
+    mov  x4, x2
+pmoNeonReduceSumRow:
+    fmov s0, wzr
+    mov  x5, x3
+pmoNeonReduceSumInner:
+    ldr  s1, [x0]
+    add  x0, x0, #4
+pmoNeonReduceSumAdd:
+    fadd s0, s0, s1
+    subs x5, x5, #1
+    b.ne pmoNeonReduceSumInner
+    str  s0, [x1]
+    add  x1, x1, #4
+    subs x4, x4, #1
+    b.ne pmoNeonReduceSumRow
+pmoNeonReduceSumDone:
+  EndASM
+EndProcedure
+
 ; A is MxK, B is KxN and dst is MxN, all row-major. Four adjacent columns
 ; are one vector. Every scalar A value is broadcast once and every matching
 ; run of four B values is fetched with one vector load.
@@ -110,6 +168,141 @@ Structure PmTensorConv1DFp32FourArgs
   BiasValue.f
 EndStructure
 
+Structure PmTensorConv1DFp32FourByFourArgs
+  Src.i
+  Weight.i
+  Dst.i
+  InWidth.i
+  Kernel.i
+  Dilation.i
+  InPerGroup.i
+  InputChannelBase.i
+  Batch.i
+  InputChannels.i
+  OutputChannel.i
+  OutputX.i
+  OutputWidth.i
+  OutChannels.i
+  PadLeft.i
+  Bias0.f
+  Bias1.f
+  Bias2.f
+  Bias3.f
+EndStructure
+
+; Four adjacent output channels by four fully in-range positions. Kokoro's
+; hot convolutions all have unit stride, so the same contiguous source vector
+; feeds four independent output-channel accumulators. Each accumulator still
+; visits icg then kx in the portable order and uses separate FMUL/FADD.
+Procedure PmTensorConv1DFp32FourByFour(*a.PmTensorConv1DFp32FourByFourArgs)
+  ASM
+    ldr x1, [x0, #0]                 ; source base
+    ldr x2, [x0, #8]                 ; weight base
+    ldr x4, [x0, #24]                ; input width
+    ldr x5, [x0, #32]                ; kernel
+    ldr x6, [x0, #40]                ; dilation
+    ldr x7, [x0, #48]                ; input channels per group
+    ldr x8, [x0, #56]                ; first input channel in group
+    ldr x9, [x0, #64]                ; batch
+    ldr x10, [x0, #72]               ; all input channels
+    mul x9, x9, x10
+    add x9, x9, x8
+    mul x9, x9, x4
+    ldr x10, [x0, #88]               ; first output position
+    add x9, x9, x10
+    ldr x10, [x0, #112]              ; left padding
+    sub x9, x9, x10
+    lsl x9, x9, #2
+    add x1, x1, x9                   ; source channel zero at output x
+
+    ldr x11, [x0, #80]               ; first output channel
+    mul x12, x7, x5                  ; weights per output channel
+    mul x10, x11, x12
+    lsl x10, x10, #2
+    add x13, x2, x10                 ; four weight-row cursors
+    lsl x12, x12, #2
+    add x14, x13, x12
+    add x15, x14, x12
+    add x16, x15, x12
+
+    ldr s16, [x0, #120]
+    ldr s17, [x0, #124]
+    ldr s18, [x0, #128]
+    ldr s19, [x0, #132]
+    dup v16.4s, v16.s[0]
+    dup v17.4s, v17.s[0]
+    dup v18.4s, v18.s[0]
+    dup v19.4s, v19.s[0]
+    lsl x4, x4, #2                  ; bytes between source channels
+    lsl x6, x6, #2                  ; bytes between kernel samples
+    ; Both reduction loops below are do-while, so an empty group or an empty
+    ; kernel would run 2^64 times.  PmTensorConv1D leaves such an output at
+    ; its bias, and so does this: branch straight to the store, where the
+    ; accumulators still hold the broadcast bias.
+    cmp x7, #1
+    b.lt pmoNeonConvFpFourByFourEmpty
+    cmp x5, #1
+    b.lt pmoNeonConvFpFourByFourEmpty
+    mov x8, x7
+pmoNeonConvFpFourByFourChannel:
+    mov x10, x1
+    mov x9, x5
+pmoNeonConvFpFourByFourKernel:
+pmoNeonConvFpFourByFourSource:
+    ld1 {v1.4s}, [x10]
+    ldr s0, [x13]
+    dup v0.4s, v0.s[0]
+    fmul v2.4s, v1.4s, v0.4s
+pmoNeonConvFpFourByFourAdd0:
+    fadd v16.4s, v16.4s, v2.4s
+    ldr s0, [x14]
+    dup v0.4s, v0.s[0]
+    fmul v2.4s, v1.4s, v0.4s
+    fadd v17.4s, v17.4s, v2.4s
+    ldr s0, [x15]
+    dup v0.4s, v0.s[0]
+    fmul v2.4s, v1.4s, v0.4s
+    fadd v18.4s, v18.4s, v2.4s
+    ldr s0, [x16]
+    dup v0.4s, v0.s[0]
+    fmul v2.4s, v1.4s, v0.4s
+    fadd v19.4s, v19.4s, v2.4s
+    add x10, x10, x6
+    add x13, x13, #4
+    add x14, x14, #4
+    add x15, x15, #4
+    add x16, x16, #4
+    subs x9, x9, #1
+    b.ne pmoNeonConvFpFourByFourKernel
+    add x1, x1, x4
+    subs x8, x8, #1
+    b.ne pmoNeonConvFpFourByFourChannel
+
+pmoNeonConvFpFourByFourEmpty:
+    ldr x3, [x0, #16]
+    ldr x9, [x0, #64]
+    ldr x10, [x0, #104]
+    mul x9, x9, x10
+    ldr x11, [x0, #80]
+    add x9, x9, x11
+    ldr x12, [x0, #96]
+    mul x9, x9, x12
+    ldr x11, [x0, #88]
+    add x9, x9, x11
+    lsl x9, x9, #2
+    add x3, x3, x9
+    lsl x12, x12, #2
+pmoNeonConvFpFourByFourStore0:
+    st1 {v16.4s}, [x3]
+    add x3, x3, x12
+    st1 {v17.4s}, [x3]
+    add x3, x3, x12
+    st1 {v18.4s}, [x3]
+    add x3, x3, x12
+    st1 {v19.4s}, [x3]
+  EndASM
+EndProcedure
+
 ; Four fully in-range output positions.  Reduction remains icg-major then
 ; kx-major, and FMUL/FADD remain separate, so every lane follows the scalar
 ; FP32 operation order.  Strided outputs use lane loads because A64 NEON has
@@ -147,6 +340,14 @@ Procedure PmTensorConv1DFp32Four(*a.PmTensorConv1DFp32FourArgs)
     lsl x6, x6, #2
     lsl x7, x7, #2
     lsl x4, x4, #2
+    ; Both loops below are do-while.  An empty group ran one spurious channel
+    ; and read weight word zero of a zero-length weight buffer; an empty kernel
+    ; iterated 2^64 times.  PmTensorConv1D leaves both at the bias, so branch
+    ; to the store, where v16 already holds the broadcast bias.
+    cmp x8, #1
+    b.lt pmoNeonConvFpFourStore
+    cmp x5, #1
+    b.lt pmoNeonConvFpFourStore
     movz x9, #0
 pmoNeonConvFpFourChannel:
     mov x10, x1
@@ -174,6 +375,7 @@ pmoNeonConvFpFourKernel:
     add x9, x9, #1
     cmp x9, x8
     b.lt pmoNeonConvFpFourChannel
+pmoNeonConvFpFourStore:
     ldr x10, [x0, #72]
     ldr x11, [x0, #112]
     mul x10, x10, x11
@@ -233,7 +435,10 @@ Procedure PmTensorConv1DFp32Neon(*g.PmTensorConv1DArgs)
   Protected first.i
   Protected last.i
   Protected lastNumerator.i
+  Protected groupEnd.i
+  Protected lane.i
   Protected four.PmTensorConv1DFp32FourArgs
+  Protected tile.PmTensorConv1DFp32FourByFourArgs
   If *g=0 Or *g\Batches<=0 Or *g\OutChannels<=0 Or *g\OutWidth<=0
     ProcedureReturn
   EndIf
@@ -243,29 +448,56 @@ Procedure PmTensorConv1DFp32Neon(*g.PmTensorConv1DArgs)
   four\Dilation=*g\Dilation : four\InPerGroup=inPerGroup
   four\InputChannels=*g\InChannels : four\OutputWidth=*g\OutWidth
   four\OutChannels=*g\OutChannels : four\PadLeft=*g\PadLeft
+  tile\Src=*g\Src : tile\Weight=*g\Weight : tile\Dst=*g\Dst
+  tile\InWidth=*g\InWidth : tile\Kernel=*g\Kernel : tile\Dilation=*g\Dilation
+  tile\InPerGroup=inPerGroup : tile\InputChannels=*g\InChannels
+  tile\OutputWidth=*g\OutWidth : tile\OutChannels=*g\OutChannels : tile\PadLeft=*g\PadLeft
+  first=(*g\PadLeft+*g\Stride-1)/ *g\Stride
+  If first<0 : first=0 : EndIf
+  lastNumerator=*g\InWidth-1+*g\PadLeft-(*g\Kernel-1)* *g\Dilation
+  If lastNumerator<0
+    last=-1
+  Else
+    last=lastNumerator/ *g\Stride
+  EndIf
+  If last>=*g\OutWidth : last=*g\OutWidth-1 : EndIf
   bn=0
   While bn<*g\Batches
-    four\Batch=bn : oc=0
+    four\Batch=bn : tile\Batch=bn : oc=0
     While oc<*g\OutChannels
-      group=oc/outPerGroup : four\InputChannelBase=group*inPerGroup
-      four\OutputChannel=oc : four\BiasValue=0.0
-      If *g\Bias<>0 : four\BiasValue=PmTensorGet(*g\Bias,oc) : EndIf
-      first=(*g\PadLeft+*g\Stride-1)/ *g\Stride
-      If first<0 : first=0 : EndIf
-      lastNumerator=*g\InWidth-1+*g\PadLeft-(*g\Kernel-1)* *g\Dilation
-      If lastNumerator<0
-        last=-1
+      group=oc/outPerGroup : groupEnd=(group+1)*outPerGroup
+      If *g\Stride=1 And oc+3<groupEnd
+        tile\InputChannelBase=group*inPerGroup : tile\OutputChannel=oc
+        tile\Bias0=0.0 : tile\Bias1=0.0 : tile\Bias2=0.0 : tile\Bias3=0.0
+        If *g\Bias<>0
+          tile\Bias0=PmTensorGet(*g\Bias,oc) : tile\Bias1=PmTensorGet(*g\Bias,oc+1)
+          tile\Bias2=PmTensorGet(*g\Bias,oc+2) : tile\Bias3=PmTensorGet(*g\Bias,oc+3)
+        EndIf
+        ox=0
+        While ox<first And ox<*g\OutWidth
+          lane=0 : While lane<4 : PmTensorConv1DFp32One(*g,bn,oc+lane,ox) : lane+1 : Wend
+          ox+1
+        Wend
+        While ox+3<=last
+          tile\OutputX=ox : PmTensorConv1DFp32FourByFour(@tile) : ox+4
+        Wend
+        While ox<*g\OutWidth
+          lane=0 : While lane<4 : PmTensorConv1DFp32One(*g,bn,oc+lane,ox) : lane+1 : Wend
+          ox+1
+        Wend
+        oc+4
       Else
-        last=lastNumerator/ *g\Stride
+        four\InputChannelBase=group*inPerGroup
+        four\OutputChannel=oc : four\BiasValue=0.0
+        If *g\Bias<>0 : four\BiasValue=PmTensorGet(*g\Bias,oc) : EndIf
+        ox=0
+        While ox<first And ox<*g\OutWidth : PmTensorConv1DFp32One(*g,bn,oc,ox) : ox+1 : Wend
+        While ox+3<=last
+          four\OutputX=ox : PmTensorConv1DFp32Four(@four) : ox+4
+        Wend
+        While ox<*g\OutWidth : PmTensorConv1DFp32One(*g,bn,oc,ox) : ox+1 : Wend
+        oc+1
       EndIf
-      If last>=*g\OutWidth : last=*g\OutWidth-1 : EndIf
-      ox=0
-      While ox<first And ox<*g\OutWidth : PmTensorConv1DFp32One(*g,bn,oc,ox) : ox+1 : Wend
-      While ox+3<=last
-        four\OutputX=ox : PmTensorConv1DFp32Four(@four) : ox+4
-      Wend
-      While ox<*g\OutWidth : PmTensorConv1DFp32One(*g,bn,oc,ox) : ox+1 : Wend
-      oc+1
     Wend
     bn+1
   Wend

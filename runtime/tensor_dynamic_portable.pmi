@@ -636,11 +636,19 @@ Procedure PmFastGemm(A.i,B.i,Destination.i,M.i,K.i,N.i)
   CompilerEndIf
 EndProcedure
 Procedure PmFastReduce(Source.i,Destination.i,Outer.i,Width.i,Mean.i)
-  If Mean
-    PmTensorReduceMeanLast(Source,Destination,Outer,Width)
-  Else
-    PmTensorReduceSumLast(Source,Destination,Outer,Width)
-  EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+    If Mean
+      PmTensorReduceMeanLastNeon(Source,Destination,Outer,Width)
+    Else
+      PmTensorReduceSumLastNeon(Source,Destination,Outer,Width)
+    EndIf
+  CompilerElse
+    If Mean
+      PmTensorReduceMeanLast(Source,Destination,Outer,Width)
+    Else
+      PmTensorReduceSumLast(Source,Destination,Outer,Width)
+    EndIf
+  CompilerEndIf
 EndProcedure
 Procedure PmFastTrig(Source.i,Destination.i,Count.i,Op.i)
   PmTensorTrig(Source,Destination,Count,Op)
