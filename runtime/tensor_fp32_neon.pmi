@@ -2377,3 +2377,515 @@ Procedure PmTensorGemmNeon(*g.PmTensorGemmArgs)
   EndIf
   PmTensorGemmExactEpilogue(*g)
 EndProcedure
+
+; ======================================================================
+; Pow with a WHOLE-NUMBER exponent, four lanes at a time.  Appended
+; 2026-09-11.
+; ----------------------------------------------------------------------
+; NUMERICAL CONTRACT - this kernel IS bit-identical to the scalar Pow in
+; runtime/math/math_a64.pmi, and it is allowed to claim that because it
+; runs the SAME ALGORITHM, not an approximation of it.
+;
+; Pow(x, y) (math_a64.pmi:2184) chooses its path from y ALONE:
+;
+;     y = 0                        -> 1.0, for every x, NaN included
+;     x is NaN                     -> x, unchanged, payload and all
+;     x = 1.0                      -> 1.0
+;     y whole and -64 <= y <= 64   -> MathPowInt(x, Int(y)), which is
+;                                     repeated squaring in binary32:
+;                                       acc = 1.0 : base = x : e = |k|
+;                                       while e: if e&1: acc = acc*base
+;                                                base = base*base
+;                                                e = e >> 1
+;                                       k < 0 -> 1.0 / acc
+;                                     with x = +-0 answered first:
+;                                       k < 0 -> +Infinity, else +0.0
+;     anything else                -> Exp(y * Log(x)), which this kernel
+;                                     does NOT compute and never reaches.
+;
+; Every MathFMul in that loop is the correctly-rounded binary32 product
+; (math_a64.pmi's software core, which pi4FpGate.pi4 checks the FPU
+; against bit for bit), so `fmul Vd.4S` is the same single rounding per
+; lane, and `fdiv Vd.4S` is the same one for the k < 0 reciprocal.  The
+; loop's trip count and its acc-multiply decisions come from k, which is
+; ONE broadcast value for the whole call, so no lane ever takes a
+; different branch from its neighbours and there is nothing to mask but
+; the value specials.  Those are done with FCMEQ and BSL, not branches:
+;
+;     x == +-0   -> the k-dependent answer (+0.0 or +Infinity)
+;     x is NaN   -> x itself, so a signalling NaN stays signalling; an
+;                   FMUL would have quieted it
+;
+; The x = 1.0 early exit is deliberately NOT reproduced, because it
+; cannot be observed: squaring 1.0 gives 1.0 for every k and 1.0/1.0 is
+; 1.0.  The owning gate proves that rather than asserting it.
+;
+; WHAT THE CALLER MUST HAVE ESTABLISHED, because this kernel checks none
+; of it - DBinary does, through DPowWholeExponent, and routes everything
+; else to the scalar Pow:
+;   *a, *destination      FLOAT32, and *destination contiguous
+;   *b                    ONE FLOAT32 exponent, broadcast to every
+;                         element; it is a whole number and |y| <= 64
+;   aStride               1 for a contiguous base, 0 for one broadcast
+;                         element; nothing else
+;   destination           may be exactly *a when *a is contiguous; it may
+;                         not partially overlap either operand
+; count <= 0 writes nothing.  A trailing one, two or three elements run
+; the SAME instruction sequence with the upper three lanes loaded as
+; +0.0 by `ldr s0`, and only the low lane is stored - so the tail cannot
+; drift away from the body, because it IS the body.
+;
+; Int(y) below is the same conversion Pow uses one line above its call to
+; MathPowInt.  It is not a second opinion about whether y qualifies: the
+; caller has already decided that, and this reads the value it promised.
+;
+; Only caller-saved registers are touched: x0..x10 and v0..v7.
+Procedure PmTensorPowIntFp32NeonBody(*a.i, *destination.i, count.i, aStride.i, k.i, oneBits.i, zeroBits.i)
+  ASM
+    ; x0=a x1=destination x2=count x3=aStride x4=k x5=oneBits x6=zeroBits
+    cmp  x2, #0
+    b.le pmoNeonPowDone
+    dup  v3.4s, w5
+    dup  v4.4s, w6
+    movi v5.4s, #0
+    ; w7 = |k|, from -k: it is positive exactly when k is negative, which is
+    ; also the test, and it is written on -k rather than on k so that the
+    ; ONE other place the sign of k is read - the reciprocal below - is a
+    ; different instruction and can be mutated on its own.
+    sub  w7, wzr, w4
+    cmp  w7, #0
+    b.gt pmoNeonPowHaveE
+    mov  w7, w4
+pmoNeonPowHaveE:
+    cbnz w7, pmoNeonPowNext
+    ; k = 0. Pow returns 1.0 before it has looked at x at all, so this is
+    ; the one case the specials below must not touch.
+pmoNeonPowOnesFour:
+    cmp  x2, #4
+    b.lt pmoNeonPowOnesOne
+    st1  { v3.4s }, [x1]
+    add  x1, x1, #16
+    sub  x2, x2, #4
+    b    pmoNeonPowOnesFour
+pmoNeonPowOnesOne:
+    cbz  x2, pmoNeonPowDone
+    str  s3, [x1]
+    add  x1, x1, #4
+    sub  x2, x2, #1
+    b    pmoNeonPowOnesOne
+pmoNeonPowNext:
+    cbz  x2, pmoNeonPowDone
+    cmp  x2, #4
+    b.lt pmoNeonPowLoadOne
+    cbz  x3, pmoNeonPowLoadFourBroadcast
+    ld1  { v0.4s }, [x0]
+    add  x0, x0, #16
+    movz w9, #4
+    b    pmoNeonPowBody
+pmoNeonPowLoadFourBroadcast:
+    ld1r { v0.4s }, [x0]
+    movz w9, #4
+    b    pmoNeonPowBody
+pmoNeonPowLoadOne:
+    ldr  s0, [x0]
+    movz w9, #1
+pmoNeonPowBody:
+    mov  v1.16b, v0.16b
+    mov  v2.16b, v3.16b
+    mov  w8, w7
+pmoNeonPowSquare:
+    ; `e & 1`, written as a shift because this assembler's `and` has no
+    ; immediate form - the same reason PmTensorZeroFillNeon tests its
+    ; alignment that way.
+    lsl  w10, w8, #31
+    cbz  w10, pmoNeonPowSkipAcc
+    fmul v2.4s, v2.4s, v1.4s
+pmoNeonPowSkipAcc:
+    fmul v1.4s, v1.4s, v1.4s
+    lsr  w8, w8, #1
+    cbnz w8, pmoNeonPowSquare
+    cmp  w4, #0
+    b.ge pmoNeonPowSpecials
+    fdiv v2.4s, v3.4s, v2.4s
+pmoNeonPowSpecials:
+    fcmeq v6.4s, v0.4s, v5.4s
+    bsl  v6.16b, v4.16b, v2.16b
+    fcmeq v7.4s, v0.4s, v0.4s
+    bsl  v7.16b, v6.16b, v0.16b
+    cmp  w9, #4
+    b.lt pmoNeonPowStoreOne
+    st1  { v7.4s }, [x1]
+    add  x1, x1, #16
+    sub  x2, x2, #4
+    b    pmoNeonPowNext
+pmoNeonPowStoreOne:
+    str  s7, [x1]
+    add  x1, x1, #4
+    cbz  x3, pmoNeonPowStoreOneNext
+    add  x0, x0, #4
+pmoNeonPowStoreOneNext:
+    sub  x2, x2, #1
+    b    pmoNeonPowNext
+pmoNeonPowDone:
+  EndASM
+EndProcedure
+
+; The one float the body cannot build for itself: 1.0, and the answer for
+; a zero base, which is +Infinity for a negative exponent and +0.0
+; otherwise.  Both are constants in the host language rather than a
+; movi/fmov immediate, so the bit patterns are readable here and the body
+; has no encoded constants at all.
+Procedure PmTensorPowIntFp32Neon(*a.i, *b.i, *destination.i, count.i, aStride.i)
+  Protected k.i=0
+  Protected zeroBits.i=0
+  If count<=0
+    ProcedureReturn
+  EndIf
+  k=Int(PmTensorGet(*b,0))
+  If k<0
+    zeroBits=2139095040
+  EndIf
+  PmTensorPowIntFp32NeonBody(*a,*destination,count,aStride,k,1065353216,zeroBits)
+EndProcedure
+
+CompilerIf #PMO_USE_LSTM = 1
+; ======================================================================
+; LSTM: the transposed weight layout, and four or sixteen units per load.
+; Appended 2026-09-11.
+; ----------------------------------------------------------------------
+; PmTensorLstm (tensor_fp32.pmi:2030) computes, for one direction, one
+; timestep, one batch row and one unit, four dot products through
+; PmTensorLstmFloatFour: the FOUR GATES are the four lanes, and lane g
+; reads W[(dir*4*Hidden) + (g*Hidden + unit)][i].  Those four addresses are
+; Hidden*Count*4 bytes apart - 640 KB in Kokoro - and the three single-lane
+; `ld1 {v1.s}[n]` inserts that gather them, all serialised on one register,
+; are the cost: fifteen instructions and four open streams buy four
+; multiply-accumulates.
+;
+; THE FIX IS THE LAYOUT, NOT THE ARITHMETIC.  Four ADJACENT UNITS of one
+; gate are one 16-byte load if the weights are stored [gate][inner][unit]
+; instead of [gate][unit][inner].  DLstm makes that copy once per call into
+; the arena - it budgets the bytes there and refuses loudly when they will
+; not fit - and hands the two buffers here.
+;
+; NUMERICAL CONTRACT - bit-identical to PmTensorLstm, and it is the same
+; arithmetic that makes it so rather than a bound:
+;
+;   * Each LANE is a DIFFERENT UNIT's own dot product.  Nothing is ever
+;     split across lanes and folded, so no sum is reassociated: lane u
+;     accumulates sum = sum + A[i]*W[...][i] for i ascending from +0.0,
+;     with a separate FMUL and FADD, which is PmTensorLstmFloatFour's
+;     sequence for that unit, instruction for instruction.
+;   * The accumulators start at +0.0 (movi), as the reference's do, and a
+;     Count of zero stores +0.0 without entering the loop, as it does.
+;   * The gate order, the bias pairing, the two roundings of
+;     (bias + Wx) + Rh, the sigmoid and tanh calls, the newC expression and
+;     the deferred H copy-back are PmTensorLstm's own, reproduced below in
+;     the reference's order.
+;   * ALL the recurrent dot products of one timestep read the SAME H,
+;     because the reference copies Y into YH only after every unit of that
+;     timestep is finished.  That is what lets the 4*Hidden dots be taken
+;     in one blocked pass before the unit loop instead of one unit at a
+;     time, and it is a fact about the reference, not an assumption.
+;
+; Anything this does not cover - an INT8 weight set, a missing transposed
+; buffer - stays with PmTensorLstm, which remains the definition of the
+; answer.
+;
+; THE ROW IS PADDED TO A MULTIPLE OF FOUR UNITS, AND THAT IS AN ALIGNMENT
+; DECISION, NOT A CONVENIENCE.  With the MMU off every access on this part
+; is Device memory, and the vault's 2026-08-27 note records that an
+; unaligned wide access there is a SILENT RUNAWAY rather than a message -
+; the same reason PmTensorZeroFillNeon aligns before its first wide store.
+; A Hidden of 5 would put the second gate's rows at 20-byte spacing and
+; every `ld1 {v.4s}` after the first at a 4-byte-aligned address.  Padding
+; the stride to (Hidden + 3) & -4 makes every vector address a multiple of
+; 16 by construction, for every Hidden, with no test to get wrong; the
+; padded columns are zero because DAcquire zero-fills, and nothing reads
+; the dots computed for them.  It also removes the scalar tail body
+; entirely: after the sixteen-unit blocks, the four-unit body finishes the
+; row exactly.
+;
+; The sixteen-unit body exists for the cache, not for the instruction
+; count: the transposed rows are Stride*4 bytes apart, so four units read
+; 16 of every 64-byte line and sixteen units read all of it.
+Structure PmTensorLstmDotsArgs
+  A.i
+  WT.i
+  Dst.i
+  Count.i
+  Stride.i
+EndStructure
+
+; All four gates of one direction: Dst[gate*Stride + unit] = sum over inner
+; of A[i] * WT[((gate*Count) + i)*Stride + unit], for every unit in the
+; padded row.  Stride is a multiple of four.
+; Only caller-saved registers are touched: x1..x15 and v0, v4..v7, v16..v19.
+Procedure PmTensorLstmDotsNeon(*t.PmTensorLstmDotsArgs)
+  ASM
+    ldr x1, [x0, #0]                 ; A, the input or hidden vector
+    ldr x2, [x0, #8]                 ; WT, gate 0 of this direction
+    ldr x3, [x0, #16]                ; Dst, gate 0 of this direction
+    ldr x4, [x0, #24]                ; Count, the inner length
+    ldr x5, [x0, #32]                ; Stride, units per row, a multiple of 4
+    lsl x6, x5, #2                   ; bytes from one inner row to the next
+    mul x7, x4, x6                   ; bytes from one gate plane to the next
+    movz x8, #0
+pmoLstmDotsGate:
+    cmp x8, #4
+    b.ge pmoLstmDotsDone
+    mul x9, x8, x7
+    add x9, x2, x9                   ; this gate's weight plane
+    mul x10, x8, x6
+    add x10, x3, x10                 ; this gate's output row
+    movz x11, #0
+pmoLstmDotsSixteen:
+    add x12, x11, #16
+    cmp x12, x5
+    b.gt pmoLstmDotsFour
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    lsl x13, x11, #2
+    add x13, x9, x13
+    mov x14, x1
+    mov x15, x4
+    cmp x15, #0
+    b.le pmoLstmDotsSixteenStore
+pmoLstmDotsSixteenLoop:
+    ld1r { v0.4s }, [x14]
+    add x14, x14, #4
+    ld1 { v4.16b, v5.16b, v6.16b, v7.16b }, [x13]
+    add x13, x13, x6
+    fmul v4.4s, v0.4s, v4.4s
+    fadd v16.4s, v16.4s, v4.4s
+    fmul v5.4s, v0.4s, v5.4s
+    fadd v17.4s, v17.4s, v5.4s
+    fmul v6.4s, v0.4s, v6.4s
+    fadd v18.4s, v18.4s, v6.4s
+    fmul v7.4s, v0.4s, v7.4s
+    fadd v19.4s, v19.4s, v7.4s
+    subs x15, x15, #1
+    b.ne pmoLstmDotsSixteenLoop
+pmoLstmDotsSixteenStore:
+    lsl x13, x11, #2
+    add x13, x10, x13
+    st1 { v16.16b, v17.16b, v18.16b, v19.16b }, [x13]
+    add x11, x11, #16
+    b   pmoLstmDotsSixteen
+pmoLstmDotsFour:
+    cmp x11, x5
+    b.ge pmoLstmDotsNextGate
+    movi v16.4s, #0
+    lsl x13, x11, #2
+    add x13, x9, x13
+    mov x14, x1
+    mov x15, x4
+    cmp x15, #0
+    b.le pmoLstmDotsFourStore
+pmoLstmDotsFourLoop:
+    ld1r { v0.4s }, [x14]
+    add x14, x14, #4
+    ld1 { v4.16b }, [x13]
+    add x13, x13, x6
+    fmul v4.4s, v0.4s, v4.4s
+    fadd v16.4s, v16.4s, v4.4s
+    subs x15, x15, #1
+    b.ne pmoLstmDotsFourLoop
+pmoLstmDotsFourStore:
+    lsl x13, x11, #2
+    add x13, x10, x13
+    st1 { v16.16b }, [x13]
+    add x11, x11, #4
+    b   pmoLstmDotsFour
+pmoLstmDotsNextGate:
+    add x8, x8, #1
+    b   pmoLstmDotsGate
+pmoLstmDotsDone:
+  EndASM
+EndProcedure
+
+; ONE ROW of the transpose: `units` words read srcStep bytes apart and
+; written contiguously.  Six instructions per word, against roughly thirty
+; for the same line in the host language, which carries two multiplies per
+; element.  This matters more than it looks: the transpose is a FIXED cost
+; per LSTM call, so it is the whole of the answer to "how many timesteps
+; does the new layout take to pay for itself".  Measured on the gate's
+; T2 shapes the host-language loop was most of the call.
+;
+; A word at a time and through general registers, not a vector gather:
+; there is no such instruction here, and building one out of single-lane
+; `ld1 {v.s}[n]` inserts is exactly the shape this whole change exists to
+; get rid of.
+Procedure PmTensorLstmGatherUnitsNeon(*src.i, *destination.i, units.i, srcStep.i)
+  ASM
+    ; x0=src x1=destination x2=units x3=srcStep
+    cmp  x2, #0
+    b.le pmoLstmGatherDone
+pmoLstmGatherLoop:
+    ldr  w9, [x0]
+    add  x0, x0, x3
+    str  w9, [x1]
+    add  x1, x1, #4
+    subs x2, x2, #1
+    b.ne pmoLstmGatherLoop
+pmoLstmGatherDone:
+  EndASM
+EndProcedure
+
+; [planes][units][inner] -> [planes][inner][stride], with stride >= units;
+; the padding columns are left as the arena handed them over, which is zero.
+; The DESTINATION is walked in order so the writes are sequential and only
+; the reads stride; a strided write costs a read-for-ownership of a line
+; that is about to be overwritten anyway.  The word move is an integer one,
+; so a NaN payload and a signed zero survive the copy unchanged - this is a
+; relabelling of the same weights, not an arithmetic pass over them.
+Procedure PmTensorLstmTransposeWeights(*src.i, *destination.i, planes.i, units.i, inner.i, stride.i)
+  Protected plane.i=0
+  Protected i.i=0
+  Protected source.i=0
+  Protected target.i=0
+  Protected innerBytes.i=0
+  innerBytes=inner*4
+  For plane=0 To planes-1
+    source=*src+plane*units*inner*4
+    target=*destination+plane*inner*stride*4
+    For i=0 To inner-1
+      PmTensorLstmGatherUnitsNeon(source+i*4,target+i*stride*4,units,innerBytes)
+    Next
+  Next
+EndProcedure
+
+; PmTensorLstm's driver, with the four per-unit dot products replaced by two
+; blocked passes over the transposed weights.  Every line that is not those
+; two passes is the reference's, in the reference's order.
+Procedure PmTensorLstmFp32Neon(*g.PmTensorLstmArgs, WT.i, RT.i, Dots.i, Stride.i)
+  Protected dir.i=0
+  Protected step.i=0
+  Protected t.i=0
+  Protected bn.i=0
+  Protected unit.i=0
+  Protected k.i=0
+  Protected stateIndex.i=0
+  Protected xIndex.i=0
+  Protected bBase.i=0
+  Protected yIndex.i=0
+  Protected valid.i=0
+  Protected iv.f=0.0
+  Protected ov.f=0.0
+  Protected fv.f=0.0
+  Protected cv.f=0.0
+  Protected previousC.f=0.0
+  Protected newC.f=0.0
+  Protected wDots.i=0
+  Protected rDots.i=0
+  Protected d.PmTensorLstmDotsArgs
+
+  wDots=Dots
+  rDots=Dots+4*Stride*4
+
+  ; Initial state becomes the mutable final-state buffers.
+  dir = 0
+  While dir < *g\Directions
+    bn = 0
+    While bn < *g\Batch
+      unit = 0
+      While unit < *g\Hidden
+        stateIndex = (dir * *g\Batch + bn) * *g\Hidden + unit
+        If *g\InitialH <> 0
+          PmTensorPut(*g\YH, stateIndex, PmTensorGet(*g\InitialH, stateIndex))
+        Else
+          PmTensorPut(*g\YH, stateIndex, 0.0)
+        EndIf
+        If *g\InitialC <> 0
+          PmTensorPut(*g\YC, stateIndex, PmTensorGet(*g\InitialC, stateIndex))
+        Else
+          PmTensorPut(*g\YC, stateIndex, 0.0)
+        EndIf
+        unit = unit + 1
+      Wend
+      bn = bn + 1
+    Wend
+    dir = dir + 1
+  Wend
+
+  dir = 0
+  While dir < *g\Directions
+    step = 0
+    While step < *g\Sequence
+      bn = 0
+      While bn < *g\Batch
+        valid = *g\Sequence
+        If *g\SeqLens <> 0 : valid = PmTensorGetI64(*g\SeqLens, bn) : EndIf
+        If dir = 0
+          t = step
+        Else
+          t = valid - 1 - step
+        EndIf
+        If step < valid
+          xIndex = (t * *g\Batch + bn) * *g\InputSize
+          stateIndex = (dir * *g\Batch + bn) * *g\Hidden
+          k = xIndex : k = k * 4
+          d\A = *g\X + k
+          k = dir : k = k * 4 : k = k * *g\InputSize : k = k * Stride : k = k * 4
+          d\WT = WT + k
+          d\Dst = wDots
+          d\Count = *g\InputSize
+          d\Stride = Stride
+          PmTensorLstmDotsNeon(@d)
+          k = stateIndex : k = k * 4
+          d\A = *g\YH + k
+          k = dir : k = k * 4 : k = k * *g\Hidden : k = k * Stride : k = k * 4
+          d\WT = RT + k
+          d\Dst = rDots
+          d\Count = *g\Hidden
+          d\Stride = Stride
+          PmTensorLstmDotsNeon(@d)
+          unit = 0
+          While unit < *g\Hidden
+            iv = 0.0 : ov = 0.0 : fv = 0.0 : cv = 0.0
+            bBase = dir * 8 * *g\Hidden
+            If *g\B <> 0
+              iv = PmTensorGet(*g\B, bBase + unit) + PmTensorGet(*g\B, bBase + 4 * *g\Hidden + unit)
+              ov = PmTensorGet(*g\B, bBase + *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 5 * *g\Hidden + unit)
+              fv = PmTensorGet(*g\B, bBase + 2 * *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 6 * *g\Hidden + unit)
+              cv = PmTensorGet(*g\B, bBase + 3 * *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 7 * *g\Hidden + unit)
+            EndIf
+            iv = iv + PmTensorGet(wDots, unit)
+            ov = ov + PmTensorGet(wDots, Stride + unit)
+            fv = fv + PmTensorGet(wDots, 2 * Stride + unit)
+            cv = cv + PmTensorGet(wDots, 3 * Stride + unit)
+            iv = iv + PmTensorGet(rDots, unit)
+            ov = ov + PmTensorGet(rDots, Stride + unit)
+            fv = fv + PmTensorGet(rDots, 2 * Stride + unit)
+            cv = cv + PmTensorGet(rDots, 3 * Stride + unit)
+            stateIndex = (dir * *g\Batch + bn) * *g\Hidden + unit
+            previousC = PmTensorGet(*g\YC, stateIndex)
+            iv = PmTensorSigmoidValue(iv)
+            ov = PmTensorSigmoidValue(ov)
+            fv = PmTensorSigmoidValue(fv)
+            cv = PmTensorTanhValue(cv)
+            newC = fv * previousC + iv * cv
+            PmTensorPut(*g\YC, stateIndex, newC)
+            yIndex = ((t * *g\Directions + dir) * *g\Batch + bn) * *g\Hidden + unit
+            PmTensorPut(*g\Y, yIndex, ov * PmTensorTanhValue(newC))
+            unit = unit + 1
+          Wend
+          ; Copy the completed timestep only after all recurrent reads used H(t-1).
+          unit = 0
+          While unit < *g\Hidden
+            stateIndex = (dir * *g\Batch + bn) * *g\Hidden + unit
+            yIndex = ((t * *g\Directions + dir) * *g\Batch + bn) * *g\Hidden + unit
+            PmTensorPut(*g\YH, stateIndex, PmTensorGet(*g\Y, yIndex))
+            unit = unit + 1
+          Wend
+        EndIf
+        bn = bn + 1
+      Wend
+      step = step + 1
+    Wend
+    dir = dir + 1
+  Wend
+EndProcedure
+CompilerEndIf

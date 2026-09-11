@@ -530,7 +530,18 @@ Procedure PmFastBinary(A.i,B.i,Destination.i,Count.i,AStride.i,BStride.i,Op.i)
   ; FLOAT operands, a contiguous destination, Op 0..3 and AStride/BStride as
   ; Boolean 0/1 - the kernel's stated contract - and the scalar body below
   ; remains the definition of the answer for every other target.
-  PmTensorBinaryFp32Neon(A,B,Destination,Count,AStride,BStride,Op)
+  ;
+  ; Op 4 is Pow, and it is here on the same terms as the other four: for the
+  ; rows DBinary sends this way it has already established through
+  ; DPowWholeExponent that B is ONE broadcast exponent (so BStride is 0) and
+  ; that it is a whole number with |y| <= 64 - the case where Pow is repeated
+  ; binary32 squaring, which is the same arithmetic per lane.  Every other
+  ; exponent keeps the scalar Pow in DBinary; nothing is approximated here.
+  If Op=4
+    PmTensorPowIntFp32Neon(A,B,Destination,Count,AStride)
+  Else
+    PmTensorBinaryFp32Neon(A,B,Destination,Count,AStride,BStride,Op)
+  EndIf
   CompilerElse
   Protected i.i=0
   Protected av.f=0.0
@@ -548,6 +559,8 @@ Procedure PmFastBinary(A.i,B.i,Destination.i,Count.i,AStride.i,BStride.i,Op.i)
         value=av*bv
       Case 3
         value=av/bv
+      Case 4
+        value=Pow(av,bv)
     EndSelect
     DWriteF(Destination+i*4,value)
   Next
@@ -596,6 +609,82 @@ Procedure PmFastTrig(Source.i,Destination.i,Count.i,Op.i)
   If PmTensorTrigOk=0
     DFail("Unsupported trigonometric operation code: this kernel computes 0 Sin, 1 Cos and 2 Atan only. Check the operator the model emitted for this node.")
   EndIf
+EndProcedure
+; The A64 LSTM kernel reads W and R as [gate][inner][unit] so that four
+; adjacent UNITS of one gate are one 16-byte load; the model's weights are
+; [gate][unit][inner], where the four lanes the reference gathers are
+; Hidden*Count*4 bytes apart.  The copy is made here, once per LSTM call,
+; because this file owns the arena and tensor_fp32_neon.pmi must not.
+;
+; THE ROW IS PADDED so that every vector address in the kernel is a
+; multiple of sixteen whatever Hidden is: stride = (Hidden + 3) & -4.  The
+; reason is in the kernel's header - with the MMU off this part's memory is
+; Device, and an unaligned wide access there is a silent runaway.
+;
+; THE BUDGET, per node, in bytes, with stride = (Hidden + 3) & -4:
+;
+;     W'      Directions * 4 * stride * InputSize * 4
+;     R'      Directions * 4 * stride * Hidden    * 4
+;     sums    8 * stride * 4          (the 4*Hidden W.x and 4*Hidden R.h
+;                                      dots of one timestep)
+;
+; Kokoro's six LSTMs are Directions 2, Hidden 256, InputSize 512 at the
+; first and 640 at the other five, and 256 needs no padding: 6.0 MiB and
+; 7.0 MiB respectively, plus 8 KiB of sums.  They are acquired and released
+; inside one call, so the arena's peak rises by ONE node's copy, not by
+; six.  The emitted working memory limit on this target is a flat 1 GiB
+; (onnx_dynamic_emit.pbi:456), which is where the headroom comes from.
+;
+; A shortfall is a REFUSAL and not a quiet fall back to the reference: a
+; model that silently runs several times slower than the export promised is
+; the performance shape of a silent wrong answer, and the caller cannot see
+; it happen.  The reference still owns every case this kernel does not
+; claim - an INT8 weight set, and every non-A64 target.
+Procedure PmFastLstm(*g.PmTensorLstmArgs)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected planes.i=0
+  Protected stride.i=0
+  Protected wtBytes.i=0
+  Protected rtBytes.i=0
+  Protected sumBytes.i=0
+  Protected total.i=0
+  Protected wt.i=0
+  Protected rt.i=0
+  Protected sums.i=0
+  If *g\WScales=0 And *g\RScales=0
+    planes=*g\Directions*4
+    stride=(*g\Hidden+3) & -4
+    wtBytes=planes * stride * *g\InputSize * 4
+    rtBytes=planes * stride * *g\Hidden * 4
+    sumBytes=8 * stride * 4
+    total=wtBytes+rtBytes+sumBytes
+    If total>DLimit-DLive
+      DFail("The LSTM cannot reserve working memory for its transposed weight copy, which is Directions*4*Hidden*(InputSize+Hidden)*4 bytes plus 32*Hidden bytes of gate sums. Raise the model's working memory limit, which is the first thing to check, or export this graph for a smaller hidden size.")
+      ProcedureReturn
+    EndIf
+    wt=DAcquire(wtBytes)
+    rt=DAcquire(rtBytes)
+    sums=DAcquire(sumBytes)
+    If wt=0 Or rt=0 Or sums=0
+      DFree(sums)
+      DFree(rt)
+      DFree(wt)
+      DFail("The LSTM could not acquire its transposed weight buffers from the arena even though the total fits. The arena is fragmented; check what the nodes before this one left live.")
+      ProcedureReturn
+    EndIf
+    DLive+total
+    DPeak=DMax(DPeak,DLive)
+    PmTensorLstmTransposeWeights(*g\W,wt,planes,*g\Hidden,*g\InputSize,stride)
+    PmTensorLstmTransposeWeights(*g\R,rt,planes,*g\Hidden,*g\Hidden,stride)
+    PmTensorLstmFp32Neon(*g,wt,rt,sums,stride)
+    DFree(sums)
+    DFree(rt)
+    DFree(wt)
+    DLive-total
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+  PmTensorLstm(*g)
 EndProcedure
 Procedure.i PmFastConv(*g.PmTensorConv1DArgs,Available.i)
   CompilerIf #PMD_NATIVE_BYTES=8
@@ -684,6 +773,40 @@ Procedure.i DBroadcast(Y.i,A.i,B.i,Kind.i)
   ProcedureReturn DAlloc(Y,Kind,rank,@dims(0))
 EndProcedure
 
+; Pow(x,y) picks its algorithm from y ALONE - see math_a64.pmi:2184 and the
+; same function in math_m0.pmi and math_m33.pmi.  A whole number with
+; |y| <= 64 is MathPowInt, repeated squaring in binary32; everything else is
+; Exp(y*Log(x)).  So when B is one broadcast element the choice is the same
+; for every output element and can be made ONCE, here, instead of inside the
+; loop Count times - which is what lets the whole-number case go down the
+; same four-lane row path ops 0..3 use.
+;
+; This replaced a narrower rewrite that turned Pow(x,2) into DBinary's own
+; multiply by aliasing B to A.  That was the k = 2 case of this and nothing
+; more, it covered none of the other exponents Kokoro emits, and it was not
+; actually the same function: a multiply QUIETS a signalling NaN base and
+; Pow returns it untouched.
+;
+; A NaN exponent is excluded first because Int() has no answer for it; Pow
+; returns the NaN from its own second early exit, on the scalar path below.
+Procedure.i DPowWholeExponent(y.f)
+  Protected k.i=0
+  If y<>y
+    ProcedureReturn 0
+  EndIf
+  If y < -64.0
+    ProcedureReturn 0
+  EndIf
+  If y > 64.0
+    ProcedureReturn 0
+  EndIf
+  k=Int(y)
+  If DFloat(k)<>y
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure DBinary(Y.i,A.i,B.i,Op.i)
   Protected i.i=0
   Protected ai.i=0
@@ -699,11 +822,12 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
   Protected row.i=0
   Protected astep.i=0
   Protected bstep.i=0
+  Protected fastrow.i=0
+  If Op<=3
+    fastrow=1
+  EndIf
   If Op=4 And Dt(A)\Kind=1 And Dt(B)\Kind=1 And Dt(B)\Count=1
-    If DReadF(Dt(B)\Data)=2
-      B=A
-      Op=2
-    EndIf
+    fastrow=DPowWholeExponent(DReadF(Dt(B)\Data))
   EndIf
   If Op>=5
     kind=9
@@ -711,7 +835,7 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
   If DBroadcast(Y,A,B,kind)=0
     ProcedureReturn
   EndIf
-  If kind=1 And Dt(B)\Kind=1 And Op<=3
+  If kind=1 And Dt(B)\Kind=1 And fastrow=1
     width=1
     If Dt(Y)\Rank
       width=DDims((Y)*8+(Dt(Y)\Rank-1))
@@ -733,6 +857,10 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
     Next
     ProcedureReturn
   EndIf
+  ; Pow with one broadcast exponent that is NOT a whole number in [-64,64]:
+  ; Exp(y*Log(x)) per element, which is what Pow computes and the only thing
+  ; that computes it.  The whole-number exponents left through the row path
+  ; above and never arrive here.
   If Op=4 And Dt(A)\Kind=1 And Dt(B)\Kind=1 And Dt(B)\Count=1 And Dt(A)\Count=Dt(Y)\Count
     bv=DReadF(Dt(B)\Data)
     For i=0 To Dt(Y)\Count-1
@@ -2082,7 +2210,7 @@ Procedure DLstm()
     If DInt8Begin(g\X,g\InputSize,g\Hidden)
       g\WScales=Dt(W)\Scales
       g\RScales=Dt(R)\Scales
-      PmTensorLstm(@g)
+      PmFastLstm(@g)
       DInt8End()
     EndIf
     If seq64
@@ -2090,7 +2218,7 @@ Procedure DLstm()
       DLive-seqBytes
     EndIf
   Else
-    PmTensorLstm(@g)
+    PmFastLstm(@g)
   EndIf
 EndProcedure
 
