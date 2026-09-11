@@ -75,10 +75,14 @@ Procedure PmTensorTrigA64(*src.i, *dst.i, count.i, op.i)
     add x9, x9, #:lo12:pmtensortriga64_op
     ldr x3, [x9]
 
-    cmp x2, #0
-    b.le pmoTrigA64Done
+    ; The op is decided BEFORE the count.  Every op this kernel does not own
+    ; goes to PmTensorTrig, which owns the op set and refuses what is not in
+    ; it; leaving early on an empty request would skip that refusal and let a
+    ; wrongly generated program run on silently.
     cmp x3, #1
     b.hi pmoTrigA64Fallback
+    cmp x2, #0
+    b.le pmoTrigA64Done
 
     adrp x9, pmotriga64invpio2
     add x9, x9, #:lo12:pmotriga64invpio2

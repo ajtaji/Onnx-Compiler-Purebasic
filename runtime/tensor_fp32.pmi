@@ -375,13 +375,41 @@ Procedure PmTensorUnaryMath(*src.i, *dst.i, count.i, op.i)
   Wend
 EndProcedure
 
+; Refusal signal for PmTensorTrig, and the same shape as PmTensorInt64Ok
+; above: this file sits UNDER both of its consumers and can name neither of
+; their error variables.  The dynamic runtime has DError; a statically emitted
+; program has PmOnnxRuntimeOk.  A kernel here therefore reports by clearing a
+; flag that whoever ran it reads back, and never by guessing which one exists.
+;
+; Nothing here ever sets it.  The caller that runs the kernel arms it, exactly
+; as the generated program arms PmTensorInt64Ok, so a value left over from an
+; earlier call can never be mistaken for this call's verdict.
+Global PmTensorTrigOk.i
+
 ; Transcendentals used by synthesis and signal-processing graphs.
-; op 0=sin, 1=cos, 2=atan. The including math library supplies these.
+;
+; THE OP SET IS CLOSED AND EXPLICIT: 0 Sin, 1 Cos, 2 Atan.  Those are the only
+; codes any emitter produces - onnx_emit.pbi writes them directly, and
+; onnx_dynamic_emit.pbi writes DUnary 5/6/7 which PmFastTrig turns into 0/1/2.
+; Any other code means the program calling this was generated wrongly, which
+; is not something a kernel can guess its way out of, so it is REFUSED: the
+; destination is left exactly as the caller left it and PmTensorTrigOk is
+; cleared.  PmFastTrig turns that into a DError and the model stops on the
+; node that did it.
+;
+; This procedure used to end its chain with a bare Else that computed MathATan,
+; so op 3, op 7 or op -1 quietly returned an arctangent and the graph ran on
+; with wrong numbers in it.  The op is decided once, before the loop, because
+; a per-element test can only ever be a slower way to get the same answer.
 Procedure PmTensorTrig(*src.i, *dst.i, count.i, op.i)
   Protected i.i
   Protected ps.i
   Protected pd.i
   Protected v.f
+  If op < 0 Or op > 2
+    PmTensorTrigOk = 0
+    ProcedureReturn
+  EndIf
   i = 0 : ps = *src : pd = *dst
   While i < count
     v = *ps.f

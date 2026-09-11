@@ -650,12 +650,22 @@ Procedure PmFastReduce(Source.i,Destination.i,Outer.i,Width.i,Mean.i)
     EndIf
   CompilerEndIf
 EndProcedure
+; PmTensorTrig owns the op set and refuses anything outside 0 Sin, 1 Cos,
+; 2 Atan by clearing PmTensorTrigOk.  It cannot name DError - tensor_fp32.pmi
+; is included before this file and is also used by statically emitted programs
+; that have no DError at all - so the dispatcher that ran it is what turns the
+; refusal into an error, the same way DReadI64 above does for PmTensorInt64Ok.
+; Arming is per call so a refusal cannot be carried over from an earlier node.
 Procedure PmFastTrig(Source.i,Destination.i,Count.i,Op.i)
+  PmTensorTrigOk=1
   CompilerIf #PMD_NATIVE_BYTES=8
   PmTensorTrigA64(Source,Destination,Count,Op)
   CompilerElse
   PmTensorTrig(Source,Destination,Count,Op)
   CompilerEndIf
+  If PmTensorTrigOk=0
+    DFail("Unsupported trigonometric operation code: this kernel computes 0 Sin, 1 Cos and 2 Atan only. Check the operator the model emitted for this node.")
+  EndIf
 EndProcedure
 Procedure.i PmFastConv(*g.PmTensorConv1DArgs,Available.i)
   CompilerIf #PMD_NATIVE_BYTES=8
