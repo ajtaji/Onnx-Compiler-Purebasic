@@ -77,6 +77,9 @@ DataSection
   PmdNeonStart:
   IncludeBinary "../../runtime/tensor_fp32_neon.pmi"
   PmdNeonEnd:
+  PmdTrigA64Start:
+  IncludeBinary "../../runtime/tensor_trig_a64.pmi"
+  PmdTrigA64End:
   PmdMathA64Start:
   IncludeBinary "../../runtime/math/math_a64.pmi"
   PmdMathA64End:
@@ -111,6 +114,7 @@ Procedure.i PmdExportRuntime(Folder.s,Speech.i,TargetIndex.i)
       Case #PMO_TARGET_PI4,#PMO_TARGET_UNOQ
         If PmdWriteSupport(Folder+"math.pmi",?PmdMathA64Start,?PmdMathA64End-?PmdMathA64Start)=0 : ProcedureReturn 0 : EndIf
         If PmdWriteSupport(Folder+"tensor_fp32_neon.pmi",?PmdNeonStart,?PmdNeonEnd-?PmdNeonStart)=0 : ProcedureReturn 0 : EndIf
+        If PmdWriteSupport(Folder+"tensor_trig_a64.pmi",?PmdTrigA64Start,?PmdTrigA64End-?PmdTrigA64Start)=0 : ProcedureReturn 0 : EndIf
       Case #PMO_TARGET_PICO
         If PmdWriteSupport(Folder+"math.pmi",?PmdMathPicoStart,?PmdMathPicoEnd-?PmdMathPicoStart)=0 : ProcedureReturn 0 : EndIf
       Case #PMO_TARGET_PICO2
@@ -491,6 +495,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
     PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\math.pmi"+Chr(34))
     PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_fp32.pmi"+Chr(34))
     If PmoTargets(targetIndex)\NativeIntegerBytes=8 : PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_fp32_neon.pmi"+Chr(34)) : EndIf
+    If PmoTargets(targetIndex)\NativeIntegerBytes=8 : PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_trig_a64.pmi"+Chr(34)) : EndIf
     PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_dynamic_portable.pmi"+Chr(34))
   Else
     PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_dynamic_windows.pbi"+Chr(34))

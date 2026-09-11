@@ -651,7 +651,11 @@ Procedure PmFastReduce(Source.i,Destination.i,Outer.i,Width.i,Mean.i)
   CompilerEndIf
 EndProcedure
 Procedure PmFastTrig(Source.i,Destination.i,Count.i,Op.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  PmTensorTrigA64(Source,Destination,Count,Op)
+  CompilerElse
   PmTensorTrig(Source,Destination,Count,Op)
+  CompilerEndIf
 EndProcedure
 Procedure.i PmFastConv(*g.PmTensorConv1DArgs,Available.i)
   CompilerIf #PMD_NATIVE_BYTES=8

@@ -379,10 +379,12 @@ EndProcedure
 ; op 0=sin, 1=cos, 2=atan. The including math library supplies these.
 Procedure PmTensorTrig(*src.i, *dst.i, count.i, op.i)
   Protected i.i
+  Protected ps.i
+  Protected pd.i
   Protected v.f
-  i = 0
+  i = 0 : ps = *src : pd = *dst
   While i < count
-    v = PmTensorGet(*src, i)
+    v = *ps.f
     If op = 0
       v = Sin(v)
     ElseIf op = 1
@@ -390,8 +392,8 @@ Procedure PmTensorTrig(*src.i, *dst.i, count.i, op.i)
     Else
       v = MathATan(v)
     EndIf
-    PmTensorPut(*dst, i, v)
-    i = i + 1
+    *pd.f = v
+    ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend
 EndProcedure
 
