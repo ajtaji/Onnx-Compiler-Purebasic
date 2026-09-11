@@ -555,7 +555,7 @@ Procedure PmFastBinary(A.i,B.i,Destination.i,Count.i,AStride.i,BStride.i,Op.i)
 EndProcedure
 ; The A64 body is PmTensorMatMul2ExactNeon, which is bit-identical to
 ; PmTensorMatMul2: same sequential inner order, separate FMUL and FADD, one
-; output column per vector lane.  PmTensorMatMul2Neon is NOT dispatched any
+; output column per vector lane.  the retired fused kernel is NOT dispatched any
 ; more - it contracts the multiply and the add into one fmla, so it rounds
 ; once where the reference rounds twice, and it reads B down a column.
 Procedure PmFastGemm(A.i,B.i,Destination.i,M.i,K.i,N.i)
