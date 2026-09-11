@@ -62,18 +62,9 @@
 
 Procedure PmTensorTrigA64(*src.i, *dst.i, count.i, op.i)
   ASM
-    adrp x9, pmtensortriga64_src
-    add x9, x9, #:lo12:pmtensortriga64_src
-    ldr x0, [x9]
-    adrp x9, pmtensortriga64_dst
-    add x9, x9, #:lo12:pmtensortriga64_dst
-    ldr x1, [x9]
-    adrp x9, pmtensortriga64_count
-    add x9, x9, #:lo12:pmtensortriga64_count
-    ldr x2, [x9]
-    adrp x9, pmtensortriga64_op
-    add x9, x9, #:lo12:pmtensortriga64_op
-    ldr x3, [x9]
+    ; The generated receiver homes these four parameters before entering
+    ; the body and preserves x0-x3.  Consume the live entry ABI values: the
+    ; new automatic parameter slots deliberately have no absolute symbols.
 
     ; The op is decided BEFORE the count.  Every op this kernel does not own
     ; goes to PmTensorTrig, which owns the op set and refuses what is not in

@@ -46,15 +46,9 @@ EndProcedure
 CompilerIf #PMO_INT8_BACKEND = 1
 Procedure.i PmTensorCrc32A64(*data.i, bytes.i, *table.i)
   ASM
-    adrp x9, pmtensorcrc32a64_data
-    add x9, x9, #:lo12:pmtensorcrc32a64_data
-    ldr x0, [x9]
-    adrp x9, pmtensorcrc32a64_bytes
-    add x9, x9, #:lo12:pmtensorcrc32a64_bytes
-    ldr x1, [x9]
-    adrp x9, pmtensorcrc32a64_table
-    add x9, x9, #:lo12:pmtensorcrc32a64_table
-    ldr x2, [x9]
+    ; The ordinary A64 receiver homes parameters before the body without
+    ; changing x0-x2.  They remain the live entry ABI values here; automatic
+    ; parameter slots have no absolute symbols to reload.
     movz w3, #0xffff
     movk w3, #0xffff, lsl #16
     cmp x1, #0
@@ -1956,9 +1950,9 @@ EndStructure
 Procedure PmTensorLstmFloatFour(*g.PmTensorLstmFloatFourArgs)
   CompilerIf #PMO_INT8_BACKEND = 1
   ASM
-    adrp x9, pmtensorlstmfloatfour_g
-    add x9, x9, #:lo12:pmtensorlstmfloatfour_g
-    ldr x0, [x9]
+    ; x0 remains the live entry pointer after the generated receiver homes
+    ; it in this invocation's frame.  There is no process-wide parameter
+    ; symbol in the automatic-storage ABI.
     ldr x1, [x0, #0]
     ldr x2, [x0, #8]
     ldr x3, [x0, #16]

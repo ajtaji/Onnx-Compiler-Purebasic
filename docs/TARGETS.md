@@ -103,6 +103,20 @@ Runtime-dependent requests can still fail allocation and require error handling.
 Full Kokoro-82M and its text assets are **not Pico-sized models**, even with reduced
 weight storage. Use the Pico targets for suitably small models.
 
+## AArch64 compiler compatibility
+
+The native CRC32, LSTM and trigonometry routines use PureMetal's invocation-local
+frame calling convention. Their scalar arguments remain live in `x0` through
+`x3` at the first inline-assembly instruction, after generated parameter homing.
+They do not reload parameters from process-wide absolute symbols. Use a matching
+PureMetal compiler; compatibility with older compiler builds is not established.
+
+After updating these runtime sources, rebuild the ONNX generator, regenerate
+the application's complete source/runtime set, and separately rebuild the
+application. Do not mix old generated runtime files with a new compiler ABI.
+Invocation-local frames alone do not make the model's shared runtime state
+safe for concurrent requests; the serialization requirement above still applies.
+
 ## Hardware proof
 
 This export was verified by building and executing Windows examples, and by
