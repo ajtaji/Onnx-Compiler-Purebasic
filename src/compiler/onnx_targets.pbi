@@ -74,7 +74,7 @@ Procedure PmoInitTargets()
     \MathInclude = "runtime/math/math_a64.pmi"
     \TensorInclude = "runtime/tensor_fp32.pmi"
     \AcceleratorInclude = "runtime/tensor_fp32_neon.pmi"
-    \MatMulProcedure = "PmTensorMatMul2Neon"
+    \MatMulProcedure = "PmTensorMatMul2ExactNeon"
     \GemmProcedure = "PmTensorGemmNeon"
     \NativeIntegerBytes = 8
   EndWith
@@ -89,7 +89,7 @@ Procedure PmoInitTargets()
     \MathInclude = "runtime/math/math_a64.pmi"
     \TensorInclude = "runtime/tensor_fp32.pmi"
     \AcceleratorInclude = "runtime/tensor_fp32_neon.pmi"
-    \MatMulProcedure = "PmTensorMatMul2Neon"
+    \MatMulProcedure = "PmTensorMatMul2ExactNeon"
     \GemmProcedure = "PmTensorGemmNeon"
     \NativeIntegerBytes = 8
   EndWith

@@ -73,6 +73,113 @@ pmoNeonReduceSumDone:
   EndASM
 EndProcedure
 
+; ----------------------------------------------------------------------
+; Elementwise FLOAT32 add/subtract/multiply/divide, four lanes at a time.
+;
+; NUMERICAL CONTRACT - this kernel IS bit-identical to the scalar body in
+; PmFastBinary, and unlike the reductions above it is allowed to claim that.
+; Each output element is one FADD/FSUB/FMUL/FDIV of the same two binary32
+; operands in the same order, so it is the same single rounding; nothing is
+; reassociated, contracted into an FMLA, or evaluated in a wider type.  The
+; vector and scalar forms of those four instructions share one FPCR, and
+; EnableFloatingPoint leaves it zero - nearest-even, gradual underflow,
+; default-NaN DISABLED - so signed zeros, infinities, subnormals and the
+; NaN PAYLOAD each op propagates (first source operand first, per
+; FPProcessNaNs) come out the same bits per lane as they do one at a time.
+;
+; WHAT THE CALLER MUST HAVE ESTABLISHED, because this kernel checks none of
+; it - DBinary does, and refuses everything else to the portable path:
+;   *a, *b, *destination  FLOAT32, and *destination contiguous
+;   aStride, bStride      1 for a contiguous operand, 0 for one broadcast
+;                         element; nothing else
+;   op                    0 add, 1 subtract, 2 multiply, 3 divide
+;   destination           may be exactly *a or exactly *b when that operand
+;                         is contiguous; it may NOT alias a BROADCAST
+;                         operand, because the scalar body re-reads that one
+;                         element after the store and this does not, and it
+;                         may not partially overlap either operand.
+; count <= 0 writes nothing.  A trailing one, two or three elements are
+; finished one at a time by the same instructions in scalar form.
+;
+; Parameters arrive in x0..x6 and the prologue has already spilled them to
+; their slots, so they are read here from the registers, the way the
+; reductions above read theirs.  Only caller-saved registers are touched.
+Procedure PmTensorBinaryFp32Neon(*a.i, *b.i, *destination.i, count.i, aStride.i, bStride.i, op.i)
+  ASM
+    ; x0=a x1=b x2=destination x3=count x4=aStride x5=bStride x6=op
+    cmp  x3, #0
+    b.le pmoNeonBinaryDone
+pmoNeonBinaryFour:
+    cmp  x3, #4
+    b.lt pmoNeonBinaryTail
+    cbz  x4, pmoNeonBinaryBroadcastA
+    ld1  {v0.4s}, [x0]
+    add  x0, x0, #16
+    b    pmoNeonBinaryLoadB
+pmoNeonBinaryBroadcastA:
+    ld1r {v0.4s}, [x0]
+pmoNeonBinaryLoadB:
+    cbz  x5, pmoNeonBinaryBroadcastB
+    ld1  {v1.4s}, [x1]
+    add  x1, x1, #16
+    b    pmoNeonBinaryApply
+pmoNeonBinaryBroadcastB:
+    ld1r {v1.4s}, [x1]
+pmoNeonBinaryApply:
+    cbz  x6, pmoNeonBinaryAdd
+    cmp  x6, #1
+    b.eq pmoNeonBinarySub
+    cmp  x6, #2
+    b.eq pmoNeonBinaryMul
+    fdiv v2.4s, v0.4s, v1.4s
+    b    pmoNeonBinaryStore
+pmoNeonBinaryAdd:
+    fadd v2.4s, v0.4s, v1.4s
+    b    pmoNeonBinaryStore
+pmoNeonBinarySub:
+    fsub v2.4s, v0.4s, v1.4s
+    b    pmoNeonBinaryStore
+pmoNeonBinaryMul:
+    fmul v2.4s, v0.4s, v1.4s
+pmoNeonBinaryStore:
+    st1  {v2.4s}, [x2]
+    add  x2, x2, #16
+    sub  x3, x3, #4
+    b    pmoNeonBinaryFour
+pmoNeonBinaryTail:
+    cbz  x3, pmoNeonBinaryDone
+    ldr  s0, [x0]
+    ldr  s1, [x1]
+    cbz  x6, pmoNeonBinaryTailAdd
+    cmp  x6, #1
+    b.eq pmoNeonBinaryTailSub
+    cmp  x6, #2
+    b.eq pmoNeonBinaryTailMul
+    fdiv s2, s0, s1
+    b    pmoNeonBinaryTailStore
+pmoNeonBinaryTailAdd:
+    fadd s2, s0, s1
+    b    pmoNeonBinaryTailStore
+pmoNeonBinaryTailSub:
+    fsub s2, s0, s1
+    b    pmoNeonBinaryTailStore
+pmoNeonBinaryTailMul:
+    fmul s2, s0, s1
+pmoNeonBinaryTailStore:
+    str  s2, [x2]
+    add  x2, x2, #4
+    cbz  x4, pmoNeonBinaryTailBStep
+    add  x0, x0, #4
+pmoNeonBinaryTailBStep:
+    cbz  x5, pmoNeonBinaryTailNext
+    add  x1, x1, #4
+pmoNeonBinaryTailNext:
+    sub  x3, x3, #1
+    b    pmoNeonBinaryTail
+pmoNeonBinaryDone:
+  EndASM
+EndProcedure
+
 ; A is MxK, B is KxN and dst is MxN, all row-major. Four adjacent columns
 ; are one vector. Every scalar A value is broadcast once and every matching
 ; run of four B values is fetched with one vector load.
@@ -1301,5 +1408,359 @@ pmoNeonGemmDone:
 pmoNeonGemmFallback:
     bl   pmtensorgemm
 pmoNeonGemmEnd:
+  EndASM
+EndProcedure
+
+; ======================================================================
+; Exact FP32 MatMul.  Appended 2026-09-11.
+; ----------------------------------------------------------------------
+; PmTensorMatMul2 is the reference:
+;
+;     sum = 0.0
+;     inner = 0 .. k-1:  sum = sum + a[row][inner] * b[inner][col]
+;     dst[row][col] = sum
+;
+; a sequential left-to-right chain from +0.0 with the multiply and the add
+; ROUNDED SEPARATELY.  The bodies below reproduce that chain exactly, so this
+; kernel is bit-identical to the reference and not merely close to it.  Every
+; vector lane is a DIFFERENT OUTPUT COLUMN, never a slice of one column's
+; reduction, so no lane is ever combined with another and nothing is
+; reassociated.  fmla, fmadd and the horizontal reductions are therefore
+; absent by construction and the gate refuses them by name.
+;
+; The multiply keeps the reference's operand ORDER, a then b, because the two
+; orders differ when both operands are NaNs with different payloads.
+;
+; Why this exists beside PmTensorMatMul2Neon: that body contracts the multiply
+; and the add into one fmla, which rounds once where the reference rounds
+; twice, and it walks B down a column, one strided 16-byte read per inner
+; index.  On the measured Kokoro request the n=2048 shapes cost 8.6 ns per
+; multiply-accumulate against 0.95 for the convolution tile; a stride of
+; n*4 = 8192 bytes puts every inner index on the same handful of L1 sets.
+; These bodies read B along its rows instead: one 64-byte line per inner index
+; feeds sixteen columns, and four output rows share it.
+; ----------------------------------------------------------------------
+Structure PmTensorMatMul2ExactArgs
+  A.i                                ; first row of A, at inner = 0
+  B.i                                ; column block of B, at inner = 0
+  Dst.i                              ; first output of the block
+  Count.i                            ; k, the length of the reduction
+  ARowBytes.i                        ; k * 4
+  BRowBytes.i                        ; n * 4
+  DstRowBytes.i                      ; n * 4
+EndStructure
+
+; Four output rows by sixteen adjacent output columns, the whole reduction in
+; registers.  v16..v31 are the sixteen accumulators, v0..v3 hold the sixteen B
+; values for this inner index, v4 the broadcast A value and v5 one product.
+; Only caller-saved vector registers are used.
+Procedure PmTensorMatMul2ExactFourBySixteen(*t.PmTensorMatMul2ExactArgs)
+  ASM
+    ldr  x1, [x0, #0]                ; A row 0 cursor
+    ldr  x2, [x0, #8]                ; B cursor
+    ldr  x4, [x0, #24]               ; k
+    ldr  x5, [x0, #32]               ; bytes between A rows
+    ldr  x6, [x0, #40]               ; bytes between B rows
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    movi v20.4s, #0
+    movi v21.4s, #0
+    movi v22.4s, #0
+    movi v23.4s, #0
+    movi v24.4s, #0
+    movi v25.4s, #0
+    movi v26.4s, #0
+    movi v27.4s, #0
+    movi v28.4s, #0
+    movi v29.4s, #0
+    movi v30.4s, #0
+    movi v31.4s, #0
+    add  x9, x1, x5                  ; A row 1
+    add  x10, x9, x5                 ; A row 2
+    add  x11, x10, x5                ; A row 3
+    ; An empty reduction leaves every output at +0.0, which is what the
+    ; reference stores, and must not enter a bottom-tested loop.
+    cmp  x4, #1
+    b.lt pmoMatMulExactFourStore
+pmoMatMulExactFourLoop:
+pmoMatMulExactFourSource:
+    ld1  {v0.4s-v3.4s}, [x2]
+    ldr  s4, [x1]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+pmoMatMulExactFourAdd0:
+    fadd v16.4s, v16.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v17.4s, v17.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v18.4s, v18.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v19.4s, v19.4s, v5.4s
+    ldr  s4, [x9]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v20.4s, v20.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v21.4s, v21.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v22.4s, v22.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v23.4s, v23.4s, v5.4s
+    ldr  s4, [x10]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v24.4s, v24.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v25.4s, v25.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v26.4s, v26.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v27.4s, v27.4s, v5.4s
+    ldr  s4, [x11]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v28.4s, v28.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v29.4s, v29.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v30.4s, v30.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v31.4s, v31.4s, v5.4s
+    add  x1, x1, #4
+    add  x9, x9, #4
+    add  x10, x10, #4
+    add  x11, x11, #4
+    add  x2, x2, x6
+    subs x4, x4, #1
+    b.ne pmoMatMulExactFourLoop
+pmoMatMulExactFourStore:
+    ldr  x3, [x0, #16]
+    ldr  x7, [x0, #48]
+pmoMatMulExactFourStore0:
+    st1  {v16.4s-v19.4s}, [x3]
+    add  x3, x3, x7
+    st1  {v20.4s-v23.4s}, [x3]
+    add  x3, x3, x7
+    st1  {v24.4s-v27.4s}, [x3]
+    add  x3, x3, x7
+    st1  {v28.4s-v31.4s}, [x3]
+  EndASM
+EndProcedure
+
+; One output row by sixteen adjacent output columns.  This is what a row block
+; with fewer than four rows left uses, so a leftover row keeps the same
+; row-wise B traffic instead of falling back to the scalar body.
+Procedure PmTensorMatMul2ExactOneBySixteen(*t.PmTensorMatMul2ExactArgs)
+  ASM
+    ldr  x1, [x0, #0]
+    ldr  x2, [x0, #8]
+    ldr  x4, [x0, #24]
+    ldr  x6, [x0, #40]
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    cmp  x4, #1
+    b.lt pmoMatMulExactRowStore
+pmoMatMulExactRowLoop:
+pmoMatMulExactRowSource:
+    ld1  {v0.4s-v3.4s}, [x2]
+    ldr  s4, [x1]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+pmoMatMulExactRowAdd0:
+    fadd v16.4s, v16.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v17.4s, v17.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v18.4s, v18.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v19.4s, v19.4s, v5.4s
+    add  x1, x1, #4
+    add  x2, x2, x6
+    subs x4, x4, #1
+    b.ne pmoMatMulExactRowLoop
+pmoMatMulExactRowStore:
+    ldr  x3, [x0, #16]
+pmoMatMulExactRowStore0:
+    st1  {v16.4s-v19.4s}, [x3]
+  EndASM
+EndProcedure
+
+; One output.  Fewer than sixteen columns remain, so there is nothing to put
+; in the other lanes; the chain is the reference's, one scalar at a time.
+Procedure PmTensorMatMul2ExactOneByOne(*t.PmTensorMatMul2ExactArgs)
+  ASM
+    ldr  x1, [x0, #0]
+    ldr  x2, [x0, #8]
+    ldr  x4, [x0, #24]
+    ldr  x6, [x0, #40]
+    fmov s16, wzr
+    cmp  x4, #1
+    b.lt pmoMatMulExactOneStore
+pmoMatMulExactOneLoop:
+pmoMatMulExactOneSource:
+    ldr  s4, [x1]
+    ldr  s0, [x2]
+    fmul s5, s4, s0
+pmoMatMulExactOneAdd0:
+    fadd s16, s16, s5
+    add  x1, x1, #4
+    add  x2, x2, x6
+    subs x4, x4, #1
+    b.ne pmoMatMulExactOneLoop
+pmoMatMulExactOneStore:
+    ldr  x3, [x0, #16]
+pmoMatMulExactOneStore0:
+    str  s16, [x3]
+  EndASM
+EndProcedure
+
+; The general dispatch.  Every output is produced by exactly one body, and
+; each body walks the same inner indices in the same order, so a result never
+; depends on which body its output landed in.  Rows are taken four at a time
+; while four remain and one at a time after that; columns sixteen at a time
+; while sixteen remain and one at a time after that.  Nothing here needs the
+; shape to be a multiple of anything, and an empty matrix writes nothing,
+; exactly as the reference does.
+Procedure PmTensorMatMul2ExactNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i)
+  Protected row.i
+  Protected col.i
+  Protected lane.i
+  Protected rowBlock.i
+  Protected colBlock.i
+  Protected t.PmTensorMatMul2ExactArgs
+  If *a=0 Or *b=0 Or *dst=0 Or m<1 Or n<1
+    ProcedureReturn
+  EndIf
+  ; The two block widths are named rather than written into the tests, so a
+  ; control build can narrow either one and prove the remaining bodies still
+  ; produce the reference's bits on their own.  Both tests are outside the
+  ; reduction, once per block, not once per inner index.
+  rowBlock=4
+  colBlock=16
+  t\Count=k
+  t\ARowBytes=k*4
+  t\BRowBytes=n*4
+  t\DstRowBytes=n*4
+  row=0
+  While row<m
+    If rowBlock>=4 And m-row>=4
+      col=0
+      While colBlock>=16 And n-col>=16
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactFourBySixteen(@t)
+        col+16
+      Wend
+      While col<n
+        lane=0
+        While lane<4
+          t\A=*a+(row+lane)*k*4 : t\B=*b+col*4 : t\Dst=*dst+((row+lane)*n+col)*4
+          PmTensorMatMul2ExactOneByOne(@t)
+          lane+1
+        Wend
+        col+1
+      Wend
+      row+4
+    Else
+      col=0
+      While colBlock>=16 And n-col>=16
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactOneBySixteen(@t)
+        col+16
+      Wend
+      While col<n
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactOneByOne(@t)
+        col+1
+      Wend
+      row+1
+    EndIf
+  Wend
+EndProcedure
+
+; ======================================================================
+; Zero fill - the arena's own primitive.
+; ----------------------------------------------------------------------
+; DAcquire's contract is that a freshly acquired arena block reads as zero
+; over its whole payload, and DAlloc clears its dimension scratch the same
+; way.  Both go through DZero in tensor_dynamic_portable.pmi, which
+; dispatches here under #PMD_NATIVE_BYTES=8 exactly as PmFastBinary and
+; PmFastGemm dispatch to their kernels; the byte loop in that file remains
+; the definition of the answer for every other target.
+;
+; THE ADDRESS IS ALIGNED BEFORE ANY WIDE STORE, and that is not tidiness.
+; With the MMU off every data access on this part is Device-nGnRnE, and an
+; unaligned 2/4/8/16-byte access to Device memory is an Alignment fault
+; whatever SCTLR.A says - with no vector installed it is a silent runaway,
+; not a message.  See the vault note "Unaligned access with the MMU off,
+; 2026-08-27".  The resident model runner turns the MMU on for part of its
+; run and leaves it off for the rest, so the fill has to be correct in both
+; regimes and cannot assume the caller's alignment.  DAcquire's payloads
+; happen to be 16-byte aligned already, so the prologue below costs three
+; instructions there and exists for every other caller.
+;
+; DC ZVA IS DELIBERATELY NOT USED.  It zeroes a block whose size is only
+; discoverable from DCZID_EL0, it is CONSTRAINED UNPREDICTABLE on Device
+; memory - which is what this arena is whenever the runner has not enabled
+; the MMU - and tools/a64/a64_interp.py does not model it at all, so the
+; owning gate could neither execute it nor mutate it.  A store the gate
+; cannot reach is a store nothing proves.
+;
+; Only caller-saved registers are touched: x0..x2 and v0..v3.
+Procedure PmTensorZeroFillNeon(*destination.i, bytes.i)
+  ASM
+    ; x0=destination x1=bytes
+    cmp  x1, #0
+    b.le pmoNeonZeroFillDone
+    movi v0.16b, #0
+    movi v1.16b, #0
+    movi v2.16b, #0
+    movi v3.16b, #0
+    ; Shifting the low four bits to the top is the mask: the result is
+    ; zero exactly when the address is already on a 16-byte boundary.
+    ; This assembler's `and` has no immediate form, and a shift says the
+    ; same thing in one instruction without a scratch constant.
+pmoNeonZeroFillAlign:
+    lsl  x2, x0, #60
+    cbz  x2, pmoNeonZeroFillBlock
+    strb wzr, [x0]
+    add  x0, x0, #1
+    subs x1, x1, #1
+    b.ne pmoNeonZeroFillAlign
+    b    pmoNeonZeroFillDone
+pmoNeonZeroFillBlock:
+    cmp  x1, #64
+    b.lt pmoNeonZeroFillSixteen
+    st1  { v0.16b, v1.16b, v2.16b, v3.16b }, [x0], #64
+    sub  x1, x1, #64
+    b    pmoNeonZeroFillBlock
+pmoNeonZeroFillSixteen:
+    cmp  x1, #16
+    b.lt pmoNeonZeroFillEight
+    st1  { v0.16b }, [x0], #16
+    sub  x1, x1, #16
+    b    pmoNeonZeroFillSixteen
+pmoNeonZeroFillEight:
+    cmp  x1, #8
+    b.lt pmoNeonZeroFillFour
+    str  xzr, [x0]
+    add  x0, x0, #8
+    sub  x1, x1, #8
+pmoNeonZeroFillFour:
+    cmp  x1, #4
+    b.lt pmoNeonZeroFillByte
+    str  wzr, [x0]
+    add  x0, x0, #4
+    sub  x1, x1, #4
+pmoNeonZeroFillByte:
+    cbz  x1, pmoNeonZeroFillDone
+    strb wzr, [x0]
+    add  x0, x0, #1
+    sub  x1, x1, #1
+    b    pmoNeonZeroFillByte
+pmoNeonZeroFillDone:
   EndASM
 EndProcedure

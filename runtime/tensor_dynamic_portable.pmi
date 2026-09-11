@@ -187,12 +187,26 @@ Procedure DCopy(Source.i,Destination.i,Bytes.i)
     i=i+1
   Wend
 EndProcedure
+; DZero is the arena's zero-fill primitive and the only one: DAcquire's
+; contract is that a freshly acquired block reads as zero over its whole
+; payload, and every other caller here clears its dimension scratch through
+; the same procedure.  A64 owns the fill in PmTensorZeroFillNeon
+; (tensor_fp32_neon.pmi), beside the other Advanced SIMD kernels, for the
+; same reason PmFastBinary and PmFastGemm dispatch there: this file is the
+; portable dispatcher and must not carry a target's assembly.  The kernel
+; aligns before any wide store and accepts any address and any length, so
+; there is nothing for a caller to arrange; the byte loop below remains the
+; definition of the answer for every other target.
 Procedure DZero(Address.i,Bytes.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  PmTensorZeroFillNeon(Address,Bytes)
+  CompilerElse
   Protected index.i=0
   While index<Bytes
     PokeA(Address+index,0)
     index=index+1
   Wend
+  CompilerEndIf
 EndProcedure
 Procedure.i DHeapBind(Address.i,Bytes.i)
   If Address=0 Or (Address & 15)<>0 Or Bytes<32 Or Bytes>$7FFFFF00
@@ -212,7 +226,6 @@ Procedure.i DAcquire(Bytes.i)
   Protected span.i=0
   Protected needed.i=0
   Protected address.i=0
-  Protected i.i=0
   If DHeap=0 Or Bytes<0 Or Bytes>DHeapBytes-16
     DFail("Allocation exceeds the bound arena.")
     ProcedureReturn 0
@@ -236,11 +249,14 @@ Procedure.i DAcquire(Bytes.i)
       DHeapUsed=DHeapUsed+span
       DHeapPeak=DMax(DHeapPeak,DHeapUsed)
       address=DHeap+offset+16
-      i=0
-      While i<span-16
-        PokeA(address+i,0)
-        i=i+1
-      Wend
+      ; THE WHOLE PAYLOAD IS ZEROED, NOT ONLY THE REQUESTED BYTES.  An
+      ; acquired block reads as zero: DAlloc's consumers rely on it where a
+      ; kernel writes only part of its output - ONNX LSTM leaves Y at zero
+      ; for every timestep past a batch's sequence length, and the kernel
+      ; skips those stores rather than writing zeros over them - and the
+      ; rounding slack past the requested length is zeroed too so that a
+      ; vector kernel reading a tail never meets a stale bit pattern.
+      DZero(address,span-16)
       ProcedureReturn address
     EndIf
     offset=offset+span
@@ -506,106 +522,15 @@ Procedure.i DListCount(Text.i)
   ProcedureReturn count
 EndProcedure
 Procedure PmFastBinary(A.i,B.i,Destination.i,Count.i,AStride.i,BStride.i,Op.i)
-  CompilerIf #PMO_INT8_BACKEND=1
-  ; A64 fast path. DBinary has already established FLOAT operands, a
-  ; contiguous destination, Op 0..3, and AStride/BStride as Boolean 0/1.
-  ; Load the backend's static parameter slots once, then handle four FP32
-  ; lanes at a time without the scalar DReadF/DWriteF procedure traffic.
-  ASM
-    adrp x9, pmfastbinary_a
-    add x9, x9, #:lo12:pmfastbinary_a
-    ldr x0, [x9]
-    adrp x9, pmfastbinary_b
-    add x9, x9, #:lo12:pmfastbinary_b
-    ldr x1, [x9]
-    adrp x9, pmfastbinary_destination
-    add x9, x9, #:lo12:pmfastbinary_destination
-    ldr x2, [x9]
-    adrp x9, pmfastbinary_count
-    add x9, x9, #:lo12:pmfastbinary_count
-    ldr x3, [x9]
-    adrp x9, pmfastbinary_astride
-    add x9, x9, #:lo12:pmfastbinary_astride
-    ldr x4, [x9]
-    adrp x9, pmfastbinary_bstride
-    add x9, x9, #:lo12:pmfastbinary_bstride
-    ldr x5, [x9]
-    adrp x9, pmfastbinary_op
-    add x9, x9, #:lo12:pmfastbinary_op
-    ldr x6, [x9]
-    cmp x3, #0
-    b.le pmoFastBinaryDone
-pmoFastBinaryFour:
-    cmp x3, #4
-    b.lt pmoFastBinaryTail
-    cbz x4, pmoFastBinaryBroadcastA
-    ld1 {v0.4s}, [x0]
-    add x0, x0, #16
-    b pmoFastBinaryLoadB
-pmoFastBinaryBroadcastA:
-    ldr s0, [x0]
-    dup v0.4s, v0.s[0]
-pmoFastBinaryLoadB:
-    cbz x5, pmoFastBinaryBroadcastB
-    ld1 {v1.4s}, [x1]
-    add x1, x1, #16
-    b pmoFastBinaryApply
-pmoFastBinaryBroadcastB:
-    ldr s1, [x1]
-    dup v1.4s, v1.s[0]
-pmoFastBinaryApply:
-    cbz x6, pmoFastBinaryAdd
-    cmp x6, #1
-    b.eq pmoFastBinarySub
-    cmp x6, #2
-    b.eq pmoFastBinaryMul
-    fdiv v2.4s, v0.4s, v1.4s
-    b pmoFastBinaryStore
-pmoFastBinaryAdd:
-    fadd v2.4s, v0.4s, v1.4s
-    b pmoFastBinaryStore
-pmoFastBinarySub:
-    fsub v2.4s, v0.4s, v1.4s
-    b pmoFastBinaryStore
-pmoFastBinaryMul:
-    fmul v2.4s, v0.4s, v1.4s
-pmoFastBinaryStore:
-    st1 {v2.4s}, [x2]
-    add x2, x2, #16
-    sub x3, x3, #4
-    b pmoFastBinaryFour
-pmoFastBinaryTail:
-    cbz x3, pmoFastBinaryDone
-    ldr s0, [x0]
-    ldr s1, [x1]
-    cbz x6, pmoFastBinaryTailAdd
-    cmp x6, #1
-    b.eq pmoFastBinaryTailSub
-    cmp x6, #2
-    b.eq pmoFastBinaryTailMul
-    fdiv s2, s0, s1
-    b pmoFastBinaryTailStore
-pmoFastBinaryTailAdd:
-    fadd s2, s0, s1
-    b pmoFastBinaryTailStore
-pmoFastBinaryTailSub:
-    fsub s2, s0, s1
-    b pmoFastBinaryTailStore
-pmoFastBinaryTailMul:
-    fmul s2, s0, s1
-pmoFastBinaryTailStore:
-    str s2, [x2]
-    add x2, x2, #4
-    cbz x4, pmoFastBinaryTailBStep
-    add x0, x0, #4
-pmoFastBinaryTailBStep:
-    cbz x5, pmoFastBinaryTailNext
-    add x1, x1, #4
-pmoFastBinaryTailNext:
-    sub x3, x3, #1
-    b pmoFastBinaryTail
-pmoFastBinaryDone:
-  EndASM
+  CompilerIf #PMD_NATIVE_BYTES=8
+  ; A64 owns the elementwise arithmetic in tensor_fp32_neon.pmi, beside the
+  ; other Advanced SIMD kernels, for the same reason PmFastGemm and
+  ; PmFastReduce dispatch there: this file is the portable dispatcher and
+  ; must not carry a target's assembly.  DBinary has already established
+  ; FLOAT operands, a contiguous destination, Op 0..3 and AStride/BStride as
+  ; Boolean 0/1 - the kernel's stated contract - and the scalar body below
+  ; remains the definition of the answer for every other target.
+  PmTensorBinaryFp32Neon(A,B,Destination,Count,AStride,BStride,Op)
   CompilerElse
   Protected i.i=0
   Protected av.f=0.0
@@ -628,9 +553,14 @@ pmoFastBinaryDone:
   Next
   CompilerEndIf
 EndProcedure
+; The A64 body is PmTensorMatMul2ExactNeon, which is bit-identical to
+; PmTensorMatMul2: same sequential inner order, separate FMUL and FADD, one
+; output column per vector lane.  PmTensorMatMul2Neon is NOT dispatched any
+; more - it contracts the multiply and the add into one fmla, so it rounds
+; once where the reference rounds twice, and it reads B down a column.
 Procedure PmFastGemm(A.i,B.i,Destination.i,M.i,K.i,N.i)
   CompilerIf #PMD_NATIVE_BYTES=8
-    PmTensorMatMul2Neon(A,B,Destination,M,K,N)
+    PmTensorMatMul2ExactNeon(A,B,Destination,M,K,N)
   CompilerElse
     PmTensorMatMul2(A,B,Destination,M,K,N)
   CompilerEndIf
