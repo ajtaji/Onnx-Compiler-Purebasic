@@ -168,6 +168,36 @@ Structure PmTensorConv1DFp32FourArgs
   BiasValue.f
 EndStructure
 
+; One output position whose dilated kernel is only partly inside the input.
+; The reference adds nothing at all for a tap outside [0, InWidth), and input x
+; rises monotonically with the tap index, so the taps it keeps are always one
+; contiguous run.  Both bodies below clamp that run once from the position and
+; then reduce over it with no per-tap test, no accessor call and no static-slot
+; traffic, in the same input-channel-major, tap-minor order with the same
+; separate FMUL and FADD as PmTensorConv1D.
+Structure PmTensorConv1DFp32EdgeArgs
+  Src.i
+  Weight.i
+  Dst.i
+  InWidth.i
+  Kernel.i
+  Stride.i
+  Dilation.i
+  InPerGroup.i
+  InputChannelBase.i
+  Batch.i
+  InputChannels.i
+  OutputChannel.i
+  OutputX.i
+  OutputWidth.i
+  OutChannels.i
+  PadLeft.i
+  Bias0.f
+  Bias1.f
+  Bias2.f
+  Bias3.f
+EndStructure
+
 Structure PmTensorConv1DFp32FourByFourArgs
   Src.i
   Weight.i
@@ -391,9 +421,260 @@ pmoNeonConvFpFourStore:
   EndASM
 EndProcedure
 
-; One padded or tail output keeps the reference loop order through the scalar
-; tensor accessors.  The fully in-range four-output body above owns the direct
-; loads and stores used by the hot path.
+; Four adjacent output channels at ONE partly padded position.  The four
+; channels share every source sample, so one broadcast feeds four independent
+; lane accumulators; lanes are never combined and there is no horizontal
+; reduction, so lane n performs exactly the adds PmTensorConv1D performs for
+; output channel oc+n.  The caller guarantees all four channels are in one
+; group and that Dilation >= 1.
+Procedure PmTensorConv1DFp32EdgeFour(*a.PmTensorConv1DFp32EdgeArgs)
+  ASM
+    ldr x4, [x0, #24]                ; input width
+    ldr x6, [x0, #48]                ; dilation
+    ldr x9, [x0, #96]                ; output position
+    ldr x10, [x0, #40]               ; stride
+    mul x9, x9, x10
+    ldr x10, [x0, #120]              ; left padding
+    sub x9, x9, x10                  ; input x of tap zero, unclamped
+    ; First kept tap: the smallest kx with ox*Stride-PadLeft+kx*Dilation >= 0.
+    ; Computed only when tap zero is left of the input, so the division always
+    ; has two positive operands.
+    movz x11, #0
+    cmp x9, #0
+    b.ge pmoNeonConvFpEdgeFourLow
+    sub x10, xzr, x9
+    add x10, x10, x6
+    sub x10, x10, #1
+    udiv x11, x10, x6
+pmoNeonConvFpEdgeFourLow:
+    ; One past the last kept tap, clamped to Kernel.  A negative numerator is
+    ; branched out rather than divided: this divide is unsigned.
+    ldr x8, [x0, #32]                ; kernel
+    mov x12, x8
+    sub x10, x4, #1
+    subs x10, x10, x9
+    b.lt pmoNeonConvFpEdgeFourNone
+    udiv x10, x10, x6
+    add x10, x10, #1
+    cmp x10, x12
+    b.ge pmoNeonConvFpEdgeFourHigh
+    mov x12, x10
+    b pmoNeonConvFpEdgeFourHigh
+pmoNeonConvFpEdgeFourNone:
+    movz x12, #0
+pmoNeonConvFpEdgeFourHigh:
+    ; A position whose whole kernel misses the input leaves the low bound above
+    ; the high one; it keeps no taps and stores the bias, as the reference does.
+    cmp x11, x12
+    b.lt pmoNeonConvFpEdgeFourCount
+    mov x11, x12
+pmoNeonConvFpEdgeFourCount:
+    sub x5, x12, x11                 ; taps kept at this position
+    mul x10, x11, x6
+    add x9, x9, x10                  ; input x of the first kept tap
+
+    ldr x10, [x0, #80]               ; all input channels
+    ldr x17, [x0, #72]               ; batch
+    mul x10, x10, x17
+    ldr x17, [x0, #64]               ; first input channel in group
+    add x10, x10, x17
+    mul x10, x10, x4
+    add x10, x10, x9
+    lsl x10, x10, #2
+    ldr x1, [x0, #0]
+    add x1, x1, x10                  ; source, channel zero, first kept tap
+
+    ldr x7, [x0, #56]                ; input channels per group
+    mul x17, x7, x8                  ; weights per output channel
+    ldr x10, [x0, #88]               ; first output channel
+    mul x10, x10, x17
+    add x10, x10, x11
+    lsl x10, x10, #2
+    ldr x2, [x0, #8]
+    add x13, x2, x10                 ; four weight cursors
+    lsl x17, x17, #2
+    add x14, x13, x17
+    add x15, x14, x17
+    add x16, x15, x17
+
+    sub x12, x8, x5                  ; taps skipped, per input channel
+    lsl x12, x12, #2
+    lsl x4, x4, #2                   ; bytes between source channels
+    lsl x6, x6, #2                   ; bytes between kept taps
+    add x17, x0, #128
+    ld1 { v16.4s }, [x17]            ; one accumulator lane per output channel
+    ; Both loops below are do-while, so an empty group or a position that keeps
+    ; no tap would run 2^64 times.  Branch to the store, where the accumulators
+    ; still hold the bias.
+    cmp x7, #1
+    b.lt pmoNeonConvFpEdgeFourStore
+    cmp x5, #1
+    b.lt pmoNeonConvFpEdgeFourStore
+    mov x8, x7
+pmoNeonConvFpEdgeFourChannel:
+    mov x10, x1
+    mov x9, x5
+pmoNeonConvFpEdgeFourKernel:
+pmoNeonConvFpEdgeFourSource:
+    ldr s1, [x10]
+    dup v1.4s, v1.s[0]
+    ld1 { v0.s }[0], [x13]
+    ld1 { v0.s }[1], [x14]
+    ld1 { v0.s }[2], [x15]
+    ld1 { v0.s }[3], [x16]
+    fmul v2.4s, v1.4s, v0.4s
+pmoNeonConvFpEdgeFourAdd:
+    fadd v16.4s, v16.4s, v2.4s
+    add x10, x10, x6
+    add x13, x13, #4
+    add x14, x14, #4
+    add x15, x15, #4
+    add x16, x16, #4
+    subs x9, x9, #1
+    b.ne pmoNeonConvFpEdgeFourKernel
+    add x1, x1, x4
+    add x13, x13, x12
+    add x14, x14, x12
+    add x15, x15, x12
+    add x16, x16, x12
+    subs x8, x8, #1
+    b.ne pmoNeonConvFpEdgeFourChannel
+pmoNeonConvFpEdgeFourStore:
+    ldr x3, [x0, #16]
+    ldr x9, [x0, #72]                ; batch
+    ldr x10, [x0, #112]              ; all output channels
+    mul x9, x9, x10
+    ldr x11, [x0, #88]
+    add x9, x9, x11
+    ldr x12, [x0, #104]              ; output width
+    mul x9, x9, x12
+    ldr x11, [x0, #96]
+    add x9, x9, x11
+    lsl x9, x9, #2
+    add x3, x3, x9
+    lsl x12, x12, #2
+pmoNeonConvFpEdgeFourStore0:
+    st1 { v16.s }[0], [x3]
+    add x3, x3, x12
+    st1 { v16.s }[1], [x3]
+    add x3, x3, x12
+    st1 { v16.s }[2], [x3]
+    add x3, x3, x12
+    st1 { v16.s }[3], [x3]
+  EndASM
+EndProcedure
+
+; One output channel at one partly padded position.  Same clamp, same order,
+; one scalar accumulator.  This is what a group with fewer than four remaining
+; output channels, and every strided convolution, use for their edges.
+Procedure PmTensorConv1DFp32EdgeOne(*a.PmTensorConv1DFp32EdgeArgs)
+  ASM
+    ldr x4, [x0, #24]                ; input width
+    ldr x6, [x0, #48]                ; dilation
+    ldr x9, [x0, #96]                ; output position
+    ldr x10, [x0, #40]               ; stride
+    mul x9, x9, x10
+    ldr x10, [x0, #120]              ; left padding
+    sub x9, x9, x10                  ; input x of tap zero, unclamped
+    movz x11, #0
+    cmp x9, #0
+    b.ge pmoNeonConvFpEdgeOneLow
+    sub x10, xzr, x9
+    add x10, x10, x6
+    sub x10, x10, #1
+    udiv x11, x10, x6
+pmoNeonConvFpEdgeOneLow:
+    ldr x8, [x0, #32]                ; kernel
+    mov x12, x8
+    sub x10, x4, #1
+    subs x10, x10, x9
+    b.lt pmoNeonConvFpEdgeOneNone
+    udiv x10, x10, x6
+    add x10, x10, #1
+    cmp x10, x12
+    b.ge pmoNeonConvFpEdgeOneHigh
+    mov x12, x10
+    b pmoNeonConvFpEdgeOneHigh
+pmoNeonConvFpEdgeOneNone:
+    movz x12, #0
+pmoNeonConvFpEdgeOneHigh:
+    cmp x11, x12
+    b.lt pmoNeonConvFpEdgeOneCount
+    mov x11, x12
+pmoNeonConvFpEdgeOneCount:
+    sub x5, x12, x11                 ; taps kept at this position
+    mul x10, x11, x6
+    add x9, x9, x10                  ; input x of the first kept tap
+
+    ldr x10, [x0, #80]               ; all input channels
+    ldr x17, [x0, #72]               ; batch
+    mul x10, x10, x17
+    ldr x17, [x0, #64]               ; first input channel in group
+    add x10, x10, x17
+    mul x10, x10, x4
+    add x10, x10, x9
+    lsl x10, x10, #2
+    ldr x1, [x0, #0]
+    add x1, x1, x10                  ; source, channel zero, first kept tap
+
+    ldr x7, [x0, #56]                ; input channels per group
+    mul x17, x7, x8                  ; weights per output channel
+    ldr x10, [x0, #88]               ; output channel
+    mul x10, x10, x17
+    add x10, x10, x11
+    lsl x10, x10, #2
+    ldr x2, [x0, #8]
+    add x13, x2, x10                 ; weight cursor
+
+    sub x12, x8, x5                  ; taps skipped, per input channel
+    lsl x12, x12, #2
+    lsl x4, x4, #2                   ; bytes between source channels
+    lsl x6, x6, #2                   ; bytes between kept taps
+    ldr s16, [x0, #128]              ; bias
+    cmp x7, #1
+    b.lt pmoNeonConvFpEdgeOneStore
+    cmp x5, #1
+    b.lt pmoNeonConvFpEdgeOneStore
+    mov x8, x7
+pmoNeonConvFpEdgeOneChannel:
+    mov x10, x1
+    mov x9, x5
+pmoNeonConvFpEdgeOneKernel:
+pmoNeonConvFpEdgeOneSource:
+    ldr s1, [x10]
+    ldr s0, [x13]
+    fmul s2, s1, s0
+pmoNeonConvFpEdgeOneAdd:
+    fadd s16, s16, s2
+    add x10, x10, x6
+    add x13, x13, #4
+    subs x9, x9, #1
+    b.ne pmoNeonConvFpEdgeOneKernel
+    add x1, x1, x4
+    add x13, x13, x12
+    subs x8, x8, #1
+    b.ne pmoNeonConvFpEdgeOneChannel
+pmoNeonConvFpEdgeOneStore:
+    ldr x3, [x0, #16]
+    ldr x9, [x0, #72]                ; batch
+    ldr x10, [x0, #112]              ; all output channels
+    mul x9, x9, x10
+    ldr x11, [x0, #88]
+    add x9, x9, x11
+    ldr x12, [x0, #104]              ; output width
+    mul x9, x9, x12
+    ldr x11, [x0, #96]
+    add x9, x9, x11
+    lsl x9, x9, #2
+    add x3, x3, x9
+pmoNeonConvFpEdgeOneStore0:
+    str s16, [x3]
+  EndASM
+EndProcedure
+
+; One padded or tail output through the scalar tensor accessors, testing every
+; tap the way the reference does.  The clamped edge bodies above need a
+; positive dilation to clamp with; this is what covers anything else.
 Procedure PmTensorConv1DFp32One(*g.PmTensorConv1DArgs, bn.i, oc.i, ox.i)
   Protected icg.i
   Protected kx.i
@@ -437,11 +718,18 @@ Procedure PmTensorConv1DFp32Neon(*g.PmTensorConv1DArgs)
   Protected lastNumerator.i
   Protected groupEnd.i
   Protected lane.i
+  Protected useEdge.i
   Protected four.PmTensorConv1DFp32FourArgs
   Protected tile.PmTensorConv1DFp32FourByFourArgs
+  Protected edge.PmTensorConv1DFp32EdgeArgs
   If *g=0 Or *g\Batches<=0 Or *g\OutChannels<=0 Or *g\OutWidth<=0
     ProcedureReturn
   EndIf
+  ; The clamped-tap edge bodies divide by Dilation, so they need it positive;
+  ; ONNX requires that.  Anything else keeps PmTensorConv1DFp32One, which tests
+  ; every tap individually and therefore does not care what Dilation is.
+  useEdge=1
+  If *g\Dilation<1 : useEdge=0 : EndIf
   inPerGroup=*g\InChannels / *g\Groups : outPerGroup=*g\OutChannels / *g\Groups
   four\Src=*g\Src : four\Weight=*g\Weight : four\Dst=*g\Dst
   four\InWidth=*g\InWidth : four\Kernel=*g\Kernel : four\Stride=*g\Stride
@@ -452,6 +740,11 @@ Procedure PmTensorConv1DFp32Neon(*g.PmTensorConv1DArgs)
   tile\InWidth=*g\InWidth : tile\Kernel=*g\Kernel : tile\Dilation=*g\Dilation
   tile\InPerGroup=inPerGroup : tile\InputChannels=*g\InChannels
   tile\OutputWidth=*g\OutWidth : tile\OutChannels=*g\OutChannels : tile\PadLeft=*g\PadLeft
+  edge\Src=*g\Src : edge\Weight=*g\Weight : edge\Dst=*g\Dst
+  edge\InWidth=*g\InWidth : edge\Kernel=*g\Kernel : edge\Stride=*g\Stride
+  edge\Dilation=*g\Dilation : edge\InPerGroup=inPerGroup
+  edge\InputChannels=*g\InChannels : edge\OutputWidth=*g\OutWidth
+  edge\OutChannels=*g\OutChannels : edge\PadLeft=*g\PadLeft
   first=(*g\PadLeft+*g\Stride-1)/ *g\Stride
   If first<0 : first=0 : EndIf
   lastNumerator=*g\InWidth-1+*g\PadLeft-(*g\Kernel-1)* *g\Dilation
@@ -463,9 +756,10 @@ Procedure PmTensorConv1DFp32Neon(*g.PmTensorConv1DArgs)
   If last>=*g\OutWidth : last=*g\OutWidth-1 : EndIf
   bn=0
   While bn<*g\Batches
-    four\Batch=bn : tile\Batch=bn : oc=0
+    four\Batch=bn : tile\Batch=bn : edge\Batch=bn : oc=0
     While oc<*g\OutChannels
       group=oc/outPerGroup : groupEnd=(group+1)*outPerGroup
+      edge\InputChannelBase=group*inPerGroup : edge\OutputChannel=oc
       If *g\Stride=1 And oc+3<groupEnd
         tile\InputChannelBase=group*inPerGroup : tile\OutputChannel=oc
         tile\Bias0=0.0 : tile\Bias1=0.0 : tile\Bias2=0.0 : tile\Bias3=0.0
@@ -473,16 +767,26 @@ Procedure PmTensorConv1DFp32Neon(*g.PmTensorConv1DArgs)
           tile\Bias0=PmTensorGet(*g\Bias,oc) : tile\Bias1=PmTensorGet(*g\Bias,oc+1)
           tile\Bias2=PmTensorGet(*g\Bias,oc+2) : tile\Bias3=PmTensorGet(*g\Bias,oc+3)
         EndIf
+        edge\Bias0=tile\Bias0 : edge\Bias1=tile\Bias1
+        edge\Bias2=tile\Bias2 : edge\Bias3=tile\Bias3
         ox=0
         While ox<first And ox<*g\OutWidth
-          lane=0 : While lane<4 : PmTensorConv1DFp32One(*g,bn,oc+lane,ox) : lane+1 : Wend
+          If useEdge
+            edge\OutputX=ox : PmTensorConv1DFp32EdgeFour(@edge)
+          Else
+            lane=0 : While lane<4 : PmTensorConv1DFp32One(*g,bn,oc+lane,ox) : lane+1 : Wend
+          EndIf
           ox+1
         Wend
         While ox+3<=last
           tile\OutputX=ox : PmTensorConv1DFp32FourByFour(@tile) : ox+4
         Wend
         While ox<*g\OutWidth
-          lane=0 : While lane<4 : PmTensorConv1DFp32One(*g,bn,oc+lane,ox) : lane+1 : Wend
+          If useEdge
+            edge\OutputX=ox : PmTensorConv1DFp32EdgeFour(@edge)
+          Else
+            lane=0 : While lane<4 : PmTensorConv1DFp32One(*g,bn,oc+lane,ox) : lane+1 : Wend
+          EndIf
           ox+1
         Wend
         oc+4
@@ -490,12 +794,27 @@ Procedure PmTensorConv1DFp32Neon(*g.PmTensorConv1DArgs)
         four\InputChannelBase=group*inPerGroup
         four\OutputChannel=oc : four\BiasValue=0.0
         If *g\Bias<>0 : four\BiasValue=PmTensorGet(*g\Bias,oc) : EndIf
+        edge\Bias0=four\BiasValue
         ox=0
-        While ox<first And ox<*g\OutWidth : PmTensorConv1DFp32One(*g,bn,oc,ox) : ox+1 : Wend
+        While ox<first And ox<*g\OutWidth
+          If useEdge
+            edge\OutputX=ox : PmTensorConv1DFp32EdgeOne(@edge)
+          Else
+            PmTensorConv1DFp32One(*g,bn,oc,ox)
+          EndIf
+          ox+1
+        Wend
         While ox+3<=last
           four\OutputX=ox : PmTensorConv1DFp32Four(@four) : ox+4
         Wend
-        While ox<*g\OutWidth : PmTensorConv1DFp32One(*g,bn,oc,ox) : ox+1 : Wend
+        While ox<*g\OutWidth
+          If useEdge
+            edge\OutputX=ox : PmTensorConv1DFp32EdgeOne(@edge)
+          Else
+            PmTensorConv1DFp32One(*g,bn,oc,ox)
+          EndIf
+          ox+1
+        Wend
         oc+1
       EndIf
     Wend
