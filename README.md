@@ -22,6 +22,12 @@
   <a href="docs/KOKORO.md">Kokoro speech</a>
 </p>
 
+<p align="center">
+  <a href="https://puremetalforge.ajtaji.com/">PureMetal Forge</a> ·
+  <a href="https://forum.ajtaji.com/category/18/puremetal-forge">Forums</a> ·
+  <a href="https://forum.ajtaji.com/category/123">Links</a>
+</p>
+
 ---
 
 ## What this project does
