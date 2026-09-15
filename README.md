@@ -10,7 +10,8 @@
 </p>
 
 <p align="center">
-  <b>Turn supported ONNX models into readable BASIC source.</b><br>
+  <b>Ahead-of-time ONNX model compiler: turn supported models into readable BASIC source.</b><br>
+  Native Windows applications, or bare-metal programs for Raspberry Pi 4, Arduino UNO Q, Pico and Pico 2 built with <a href="https://puremetalforge.ajtaji.com/">PureMetal Forge</a>.<br>
   Build the model application once. Keep it resident. Submit new inputs.
 </p>
 
