@@ -1,0 +1,457 @@
+@CHAPTER How it is proved
+@INTRO An independent oracle, a bit-identity contract where one is possible, and a plain statement of where the proofs live and why it is not here.
+
+@SECTION The oracle
+
+To know whether a generated model is right you need an answer that did not
+come from the thing being tested. The reference used throughout is an
+independent CPU **ONNX Runtime float32** session over the same model and
+the same inputs, its outputs frozen to disk with their digests recorded
+beside them.
+
+That engine is never linked into anything generated. There is an optional
+bridge in the compiler for host reference and tracing work - pinned to a
+specific C API version, needing a library you supply separately - and
+generated inference does not call it, does not know it exists, and does
+not require it to be present. It is a measuring instrument on the desk.
+
+@FRAG
+--trace-model    model.onnx output.onnx
+--trace-shapes   model.onnx --ort-dll path --trace-input NAME=file.npy ...
+--lower          model.onnx --ort-dll path --trace-input NAME=file.npy ...
+--ort-version    [onnxruntime library]
+--npy-inspect    tensor.npy
+@ENDFRAG
+
+@NOTE The NPY reader is not a Python dependency. The format is parsed
+directly, with unsupported layouts refused rather than guessed at. It
+exists because reference tensors are commonly stored that way.
+
+@SECTION Bit identity, where it can be claimed
+
+Most numerical work is graded with tolerances. A lot of it here is not,
+and the difference is deliberate.
+
+When a kernel is written to replace another - a vector kernel replacing a
+scalar one, a blocked tile replacing a simple loop - the contract is that
+it produces **exactly the same bits**, not a close answer. The kernel
+headers say so in the source:
+
+@FRAG
+; NUMERICAL CONTRACT - this kernel IS bit-identical to the scalar body in
+; PmFastBinary, and unlike the reductions above it is allowed to claim that.
+; Each output element is one FADD/FSUB/FMUL/FDIV of the same two binary32
+; operands in the same order, so it is the same single rounding; nothing is
+; reassociated, contracted into an FMLA, or evaluated in a wider type.
+@ENDFRAG
+
+And where a kernel CANNOT claim it, the source says that too, in the same
+plain way:
+
+@FRAG
+; Vector reduction and FMLA intentionally do not promise bit identity with
+; the scalar FP32 reference. Floating-point addition is non-associative and
+; FMLA rounds once. The board gate therefore retains exact scalar checks and
+; gives optimized runs an explicit numerical contract.
+@ENDFRAG
+
+@TRAP A tolerance is the right instrument for comparing two independent
+implementations of the same mathematics. It is the WRONG instrument for
+checking that an optimization did not change anything, because a tolerance
+will happily accept a kernel that has quietly started computing something
+slightly different, and the difference will grow the next time somebody
+optimizes on top of it. Where the answer should be identical, test for
+identical.
+
+That contract is what the whole speech sequence in chapter 7 rests on.
+Across a run of kernel replacements that took one sentence from 639
+seconds to 88, the two reference waveforms came back **byte for byte
+unchanged** every time. That is a stronger statement than any fixture
+could make, because it is the contract holding at model scale, through
+2,463 nodes, with every intermediate a chance to differ.
+
+@SECTION What the published checks establish, precisely
+
+The publication checks were run on Windows x64 with the native assembly
+backend: no Python, no inference-engine library for the demo, no board.
+
+@FRAG
+build helper and both entry points                         PASS
+CLI bounded-wire self-test and target listing              PASS
+native demo-model creation                                 PASS
+generated Windows Add model, three changing-length requests PASS
+dense INT8 generation for all five profiles                PASS
+internal Windows dynamic-runtime diagnostics               PASS
+internal Windows SIMD diagnostics                          PASS
+@ENDFRAG
+
+Read those as what they say. "Five-target emission" means five source
+closures were written and checked, not that five boards ran anything. The
+Add model check establishes repeated resident execution, correct values,
+request cleanup and final release - on one tiny graph.
+
+The 64-bit Arm work has its own record. The native `Exp` implementation
+was compared against the retained software one across a 791-input
+differential corpus covering both dispatch rails, special bit patterns and
+reduction boundaries: all 723 admitted and 68 fallback cases agree
+**bit for bit**, and five structural negative controls reject changes to
+the fallback, the rails, the rounding, the polynomial and the no-fusion
+contract. A separate high-precision oracle measured a worst error of
+1.167302 ULP on that corpus - which is a sample measurement, and is
+described as one, not as a bound.
+
+The same 791-input probe then passed on Pi 4 silicon, with all three raw
+result arrays read back and compared.
+
+@NOTE The negative controls are the part to notice. A test suite that only
+ever passes is a suite nobody has checked. Deliberately damaging the thing
+under test and confirming the gate catches it is what makes a green run
+mean something. Several of these gates carry named mutants for exactly
+that reason.
+
+@SECTION The node-test score
+
+The checks above prove particular things deeply. They do not say how much
+of ONNX the compiler handles. For that there is one number, measured against
+a corpus nobody here wrote: the official ONNX backend node tests. Each case
+is one small model with its inputs and its expected outputs.
+
+A developer harness in `tests/node_suite/` compiles every case for the
+Windows target, builds one generic driver around the emitted source, runs it
+with the case's inputs, and compares every output: shape and element type
+must match, integers and booleans exactly, floats with the tolerance the
+onnx test loader itself assigns (rtol 1e-3, atol 1e-7). Every case ends in
+exactly one outcome.
+
+@FRAG
+corpus     onnx 1.22.0, 1,765 node cases
+           sha256 4955443be1453848b40f58dd92d8e709907cb73a0141cf17d0a9346cb863ce6b
+scored     964 cases at ai.onnx opset 20 or lower
+compiler   commit 6bd59b0, target windows
+
+PASS           95
+FAIL_NUMERIC   40
+REFUSED       829
+FAIL_SHAPE, FAIL_DTYPE, BUILD_ERROR, RUN_ERROR, HARNESS_ERROR   0
+
+PASS 95 of 135 attempted (70.4%); PASS 95 of 964 scored (9.9%)
+@ENDFRAG
+
+Read the two ratios separately. **Attempted** is the cases the compiler
+accepted, and there 40 answers were wrong: eight defects in operators it
+claims, listed in chapter 4 and filed before anything was changed. A ninth,
+Gemm without a bias producing source that did not build, was fixed at its
+source the same day; before that fix the score was 94 of 135. **Scored** is
+the whole corpus, and there the 829 refusals are the size of the job ahead:
+471 name an operator that is not implemented, 157 are the runtime-dimension
+path accepting only opset 20, 102 come from shape inference inside
+function-expanded tests, 90 are element types, and a handful are old opsets
+and rank forms.
+
+That table is the measurement at that commit and stays as it was measured.
+Since then the eight defects it found have been fixed (forum topics 848 and
+850 to 856) and more operators have landed, and the same corpus and harness
+at commit `8b7d9df` give
+**PASS 166 of 166 attempted (100.0%); PASS 166 of 964 scored (17.2%)**:
+no accepted case computes a wrong answer, 798 cases are refused with a
+sentence, and no case that passed at `6bd59b0` fails.
+
+The per-operator table, every refusal grouped by operator and every failure
+with its detail, for the latest measurement, are committed beside the
+harness, in `tests/node_suite/results/`.
+
+@FRAG
+py -3.12 -m pip install onnx==1.22.0
+py -3.12 tests\node_suite\node_suite.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --from-commit HEAD
+py -3.12 tests\node_suite\node_suite.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --from-commit HEAD --self-check
+@ENDFRAG
+
+`--from-commit` builds the compiler from that commit, so a half-finished
+edit in the working tree is never what gets measured. The harness refuses to
+score a corpus whose onnx version or hash differs from its pin, and refuses
+to write a score while any case ends in HARNESS_ERROR. A full run takes
+about 35 seconds on 16 parallel jobs.
+
+@NOTE The harness is a developer check, and it and the targeted cases beside
+it are the only Python in this repository. Building the compiler and using it
+never need them, and the statement that no Python is required is about
+exactly those two things.
+
+@SECTION Forms the node tests do not reach
+
+Most of the official node tests for Cast, Shape, Conv, ConvTranspose and LSTM
+are generated at opset 22 or 25, above the harness's ceiling, and none of them
+writes an attribute out at its default the way an exporter does. So
+`tests/node_suite/targeted_defaults.py` builds its own opset-20 cases: the
+default-valued attributes of those operators and of LayerNormalization,
+Resize, ScatterND and ReduceSum, the non-default forms that are implemented
+(auto_pad SAME, Shape slices, ScatterND reductions), and the forms that must be
+refused. Each is built twice - extents declared, and one extent symbolic - so
+both emitters answer for it. The expected outputs come from the ONNX reference
+evaluator and are held against ONNX Runtime; where the reference itself departs
+from the specification text (its Conv auto_pad, its ScatterND max and min) the
+case says so and feeds it the specification's arithmetic instead.
+
+@FRAG
+py -3.12 tests\node_suite\targeted_defaults.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --cli bin\PureMetalOnnxCompilerCLI.exe
+targeted: 148 of 148 as expected
+@ENDFRAG
+
+A refusal case passes only if the compiler refuses and the sentence names the
+operator. The same 148 builds on the commit before the attribute work gave 45:
+72 refused because an attribute was merely present, 25 wrong values on the
+fixed-shape path, five forms accepted that should have been refused, and one
+compiler crash.
+
+@TRAP A harness that reports PASS for everything is worse than none, so
+this one has to prove it can say no. `--self-check` nudges one expected
+element to ten times the tolerance and requires FAIL_NUMERIC at that index;
+swaps two same-shape expected outputs and requires a failure while the
+unswapped control passes; compiles a model using an operator that is not
+implemented and requires REFUSED naming it; and runs a known-good case twice
+from nothing and requires identical bytes. All six checks passed on
+`6bd59b0`.
+
+@SECTION Control flow and sequences: forms the node tests do not reach
+
+The official node tests for `If`, `Loop` and the sequence operators are few,
+and the `SplitToSequence` ones are published at opset 24.
+`tests/node_suite/targeted_control.py` re-imports those at opset 20 and
+scores them against their official outputs, and adds the forms a real model
+uses: branches of different rank, a while loop, zero trips, carried values
+that trade places, a loop inside a loop with an `If` reading values two
+scopes out, a sequence grown over 300 trips, and Kitten TTS nano's own
+nodes cut out unchanged. Expected outputs come from ONNX Runtime, checked
+against the ONNX reference evaluator where it runs the model; where the two
+disagree the case is thrown out rather than scored.
+
+@FRAG
+py -3.12 tests\node_suite\targeted_control.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --cli bin\PureMetalOnnxCompilerCLI.exe --kitten kitten_tts_nano_v0_8.onnx
+control: 34 of 34 as expected
+@ENDFRAG
+
+`tests/node_suite/pi4_control_gate.py` takes the same case folders, builds
+each for the Pi 4 around a small returning payload that fills the inputs
+(sequences included) and serialises the outputs, and runs the image in an
+independent A64 instruction interpreter. It found one thing a Windows run
+cannot: a result written four bytes at a time after three BOOL bytes is an
+alignment fault on the Pi 4 with its MMU off. The sequence block keeps
+every field on a 4-byte boundary and every element on an 8-byte one for
+that reason.
+
+@SECTION Where the failure is, and why it is still recorded as a failure
+
+Chapter 7 ends with a passing sentence and a failing one. The failing one
+has been investigated in detail, and the investigation did not produce a
+defect. It is worth summarizing, because it is a good example of how a
+number can be a real failure and still not be a bug.
+
+No operator has been found defective. The divergence starts in the text
+encoder at about 6e-5 - inside the reference engine's own fusion and
+threading noise - and is amplified roughly 3400 times by a chain of
+cumulative-sum, multiply and resize operations. Where the sine is taken,
+97% of its arguments exceed 12,867 radians, and at that magnitude one
+representable float32 step moves the sine by as much as 0.0156. The phase
+is ill-conditioned, and both float32 answers are further from the exact
+sum than they are from each other.
+
+Measured against a double-precision evaluation of the same graph, the
+board is **nearer the mathematical answer than the reference is**, on
+every metric of both sentences. Ten configurations of the reference engine
+span 0.0973 among themselves while the limit is 0.1 - so the reference is
+a point in a cloud rather than a fixed line.
+
+@TRAP None of that makes the failing number a pass, and it is not treated
+as one. "We are closer to the true answer than the yardstick is" is
+evidence about the contract, not compliance with it. The result stays
+recorded as a failure with its evidence beside it until the acceptance
+contract itself is reviewed and settled. Changing a limit because a
+measurement went the wrong way is the one move that would make every
+earlier passing result meaningless.
+
+@SECTION The random operators: the same numbers on every target
+
+The ONNX specification does not say how random values are generated, and a
+reference runtime does not reproduce its own. So the ONNX node tests for
+these operators could only ever check shape and element type - and the onnx
+1.22.0 corpus has none at opset 20 or lower at all (its three Bernoulli
+expansions that use `RandomUniformLike` are opset 22). The contract below is
+this compiler's, it is exact, and it is what the gates hold the code to.
+
+**The generator** is Threefry-2x32 with 20 rounds, the counter-based function
+of the Random123 library and of JAX's `threefry_2x32`. It uses only 32-bit
+addition, rotation and exclusive or, so it needs no multiplier and no 64-bit
+integer, and the same source is exact where the native integer is 32 or 64
+bits.
+
+**The streams.** Each node has its own key, derived from a seed and the
+node's index (its 0-based position in the graph):
+
+@FRAG
+node key  = Threefry(key = (S, 0), counter = (node index, d))
+            S = IEEE-754 bits of the node's FLOAT seed attribute, d = 1, when it has one
+            S = the model seed (32 bits, 0 until set),            d = 0, when it does not
+element i = Threefry(key = node key, counter = (i, request number))  ->  words w0, w1
+@ENDFRAG
+
+A node never consumes another node's draws, so adding a random node leaves
+every other node's values alone - unless it is inserted before them, which
+changes their index and so their key.
+
+**The transforms.** Every floating step is one binary32 addition,
+subtraction, multiplication or division with a correctly rounded result, or
+an exact conversion of an integer below 2^25. No maths library is called:
+the targets' own square root, logarithm and cosine differ by a unit in the
+last place, and one ULP is enough to break a bit-exact contract.
+
+@FRAG
+uniform   out = low + (high - low) * u,      u = (w0 >> 8) * 2^-24 in [0, 1)
+normal    out = mean + scale * (r * c)       Box-Muller, cosine branch
+          u1 = ((w0 >> 8) + 1) * 2^-24 in (0, 1]
+          r  = sqrt(-2 ln u1): ln from an exact power-of-two split and the
+               atanh series; sqrt by a fixed four-step Newton sequence
+          c  = cos(2 pi u2): the top three bits of w1 pick an octant, the
+               next 21 the angle inside it, cosine or sine from Taylor chains
+          |r * c| <= sqrt(48 ln 2) = 5.77
+@ENDFRAG
+
+The uniform output lies in [low, high]: with the default bounds it is below
+1 (at most 1 - 2^-24), and for wide bounds binary32 rounding can return
+`high` itself for the largest `u`. The normal output is truncated at 5.77
+standard deviations, where the true distribution has 8 in a billion of its
+mass.
+
+**What is proven**, by two gates in the private tree:
+
+- The Python reference reproduces the three published Threefry-2x32-20
+  known answers, and two independent Python implementations of the
+  transforms agree bit for bit.
+- The generator source, built for Windows, writes the known answers, 832
+  crafted words covering every octant and every edge of the logarithm, six
+  streams, and two 4,000,000-element streams, all bit-identical to the
+  reference. Built for the Pi 4 and run in the A64 interpreter, and built for
+  the Pico (software binary32 on a Cortex-M0+) and the Pico 2 (Cortex-M33)
+  and run in the ARM emulator, it writes the same known answers, the same 832
+  words and the same six streams, bit for bit. The streams' SHA-256 digests
+  are printed side by side. No board was used.
+- Over the 4,000,000-element streams: the normal mean and variance are within
+  five standard errors of 0 and 1, the uniform mean and variance within five
+  of 1/2 and 1/12, both Kolmogorov-Smirnov distances are below twice the 5%
+  critical value, every uniform value is in range, and changing the model
+  seed, the request number, the node index or the seed source leaves fewer
+  than 0.1% of values equal and no correlation beyond 5/sqrt(N).
+- Six mutants of a copy of the generator - a rotation, a key injection, a
+  series coefficient, the octant fold, the request word, the Newton count -
+  are each rejected.
+- Through the compiler: eight node-test-style cases covering every claimed
+  form on both paths pass the node-test harness's own run and are then
+  compared bit for bit; nine unclaimed forms are refused on three targets
+  with sentences naming the operator, attribute and value; both APIs run a
+  sequence of requests with seed changes and a rebind, bit-identical to the
+  reference; `--random-inputs` passes supplied noise through exactly and
+  refuses a wrong shape; fixed-shape and runtime-dimension Pi 4 builds run
+  in the A64 interpreter bit-identical; Pico, Pico 2 and UNO Q sources are
+  emitted and built in both modes; and the two random nodes of the Kitten
+  speech model, extracted with their consumers and attributes untouched,
+  validate, emit for Windows and the Pi 4 in both modes, and run on Windows
+  in both.
+
+@NOTE The generator is not vectorised. It is cheap beside the operators
+around it in the models that use it, so there is no SIMD or NEON body and
+no second implementation for the contract to hold between.
+
+@SECTION InstanceNormalization: a reference that can be vectorised exactly
+
+The specification says `y = scale * (x - mean) / sqrt(variance + epsilon) + B`
+and says nothing about the order the mean and variance are summed in. A plain
+running sum cannot be computed four elements at a time with the same bits, so
+the reference defines an order that can: four running sums, element k of a
+plane going to sum k mod 4, combined as (s0 + s1) + (s2 + s3). Every other
+step is one binary32 operation in a stated order, and the square root is the
+correctly rounded one. The SSE body on Windows and the Advanced SIMD body on
+the Pi 4 then do exactly those operations a lane at a time, and the contract
+for both is identity, not a tolerance:
+
+@FRAG
+PASS SSE InstanceNormalization: 0 of 14738 elements differ from the scalar reference; a one-unit epsilon change moved 410
+PASS NEON vs scalar InstanceNormalization: 0 of 5166 elements differ
+PASS mutation: NOP at pmtensorinstancenormlanesneon+124 gives 1710 mismatching elements
+@ENDFRAG
+
+The planes those numbers come from are built to be hostile - every width
+from 1 to 41, signed zeros, infinities, subnormals, the largest finite
+values and NaNs with payloads - and the mutation line is the negative
+control: one accumulating instruction removed from the vector body, and the
+comparison notices.
+
+The node tests for InstanceNormalization, TopK, Pad and Identity are all
+published above opset 20, where their later definitions only add element
+types, so `tests/node_suite/targeted_norm_small.py` re-imports them at opset 20
+and scores them against the official outputs unchanged, beside its own cases
+for the forms the Kitten voice uses:
+
+@FRAG
+py -3.12 tests\node_suite\targeted_norm_small.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --cli bin\PureMetalOnnxCompilerCLI.exe
+norm_small: 132 of 132 as expected
+@ENDFRAG
+
+@SECTION Where the gates live, and why not here
+
+`tests/` is **not tracked by this repository**, with one exception. Its
+`.gitignore` excludes it under "build products and local model data are
+not source", and the validation page states that internal diagnostics are
+not part of this export. The exception is `tests/node_suite/`, the node-test
+harness above: it measures against a public corpus, so anyone with this
+checkout can reproduce its number, and it is tracked for that reason.
+
+So the gates - the differential corpora, the mutation suites, the board
+fixtures, the oracle scripts - live in a private tooling tree, where they
+are tracked, pushed and backed up. That is the rule, and it comes from a
+failure worth naming: a gate written into an untracked directory beside
+the code it tests exists on exactly one disk, and survives exactly as long
+as that working directory. The code it proved goes on shipping; the proof
+evaporates. A test in an ignored folder is not a proof.
+
+@NOTE This is also why you cannot reproduce every number in this book from
+this checkout. What you CAN reproduce from this checkout is every command
+in chapters 2 through 6, the whole arithmetic walkthrough, the
+generation of all five source closures, and the node-test score. What needs the private tooling is
+the differential corpora and the board fixtures; what needs hardware is
+anything measured on hardware.
+
+@SECTION The limits, stated together
+
+- A **validated subset** of ONNX, not the specification. Unsupported
+  operators, attributes, element types and shape forms are rejected on
+  purpose. The runtime-dimension path checks its implemented opset 20
+  surface. Eight accepted forms are known to compute wrong answers today;
+  chapter 4 lists them.
+- Windows x64 is the verified host. Other host systems, other versions of
+  the host language, and other backends are not certified by this export.
+- Generating bare-metal source establishes no downstream build, no
+  bootability, no hardware accuracy and no timing. The measured Pi 4
+  results cover their named fixtures, not other boards or other models.
+- A successful generation is not a promise that arbitrary future request
+  sizes will fit. Dynamic requests still need memory and can still fail.
+- INT8 is selective. FP16, BF16 and INT4 reduce storage and do not remove
+  the resident decoded FP32 cost or the activation cost.
+- SIMD paths may change summation order. Do not demand bitwise equality
+  where the execution contract calls for tolerances - and do demand it
+  where the contract calls for identity.
+- Generated models use generated globals. Serialize your calls.
+- Random operators follow this compiler's specified generator, not any
+  other runtime's; their values match a reference only through
+  `--random-inputs`. Only FLOAT output is generated.
+- Format checks are not a security audit. Trust your model sources.
+
+@SECTION Before you trust your own model
+
+Start in FP32 with inputs whose correct outputs you already have. Check
+shapes and element types. Read the manifest's memory accounting and
+compare it with what the target really has. Exercise the error paths.
+Repeat requests and watch live storage return to its baseline. Then
+compare reduced precision on representative data, yourself.
+
+For bare metal, validate on the hardware you intend to use before making
+any correctness or performance claim. Nothing in this book substitutes for
+that, and nothing in it is meant to.

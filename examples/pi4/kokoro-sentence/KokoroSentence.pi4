@@ -1,0 +1,832 @@
+; ============================================================================
+;  KokoroSentence.pi4 - one spoken sentence from the full Kokoro-82M speech
+;  model, on a Raspberry Pi 4 with no operating system, on all four cores.
+;
+;  WHAT THIS IS
+;    The resident runner that produced the requested sentence on 2026-09-16.
+;    It is built as an Anvil payload: the Anvil monitor loads it into memory,
+;    enters it with the monitor's service table in x0, and gets control back
+;    when Main() returns. The x0 it returns is the run's status - 0 is a
+;    clean run, anything else is a KrFinish code listed below.
+;
+;    The payload never touches a file, a network or an audio device. The
+;    weights, the two pronunciation packs and the voice are already in
+;    memory at the addresses below when it starts (the recipe in README.md
+;    puts them there), and the waveform it makes is left in memory for the
+;    host to read back. That is deliberate: every byte that goes in and out
+;    is checked by the monitor's own hash, not by this program.
+;
+;  THE ORDER OF EVENTS IN Main()
+;    1. keep x0, the service table            KrCaptureX0 - it must be first
+;    2. zero the timing rows and trace         KTRC stage 1
+;    3. check the service table, and hand it   KrBindServices ->
+;       to the model runtime                   PmOnnxAnvilEnter: four cores
+;    4. build page tables, turn on the MMU     KTRC stage 2, MmuBuildTables,
+;       and the caches                         MmuEnableCached
+;    5. bind the 324 MB weight pack and the    PmModelBindMemory, KTRC 3 and 4
+;       1 GiB working arena
+;    6. bind the pronunciation packs + voice   PmKokoroTextBind, KTRC stage 5
+;    7. text -> phonemes -> tokens -> model    PmKokoroTextRender, one request
+;       -> 453,000 samples
+;    8. hash the samples and copy them out     KrCapture -> $57400000
+;       of the borrowed output tensor
+;    9. release everything, check nothing      KrFinish, KTRC stage 9
+;       leaked, turn the MMU back off, return
+;
+;  HOW IT IS BUILT (see README.md for the whole recipe)
+;    PureMetalForge.exe --compile KokoroSentence.pi4 -t pi4
+;        --load-addr 0x500000 --bss-addr 0x1000000 --stack-addr 0x7F00000
+;        --entry-returns --wants-services -o build\kokoro-sentence.img
+;    The file that goes to the board is build\kokoro-sentence.img.pmf.
+;    Built against the model emitted by the ONNX compiler at commit 6b6b770,
+;    it is 1,578,488 bytes with sha256 58b402ea88f92c41... - byte for byte
+;    the payload that ran.
+;
+;  WHAT IS STILL IN HERE FROM THE RUNS BEFORE IT, AND WHY IT STAYS
+;    This file grew out of runners that made two and three requests in one
+;    boot, to prove that each kernel change left earlier waveforms
+;    bit-identical. This one makes a single request, request 3. The result
+;    fields for slots 1 and 2, the two earlier texts in the DataSection and
+;    the per-node NaN scan (switched off by #KR_SCAN_INTERMEDIATE_NAN) are
+;    still compiled in, unused, so that this source builds the exact
+;    payload that ran. Removing them is safe; it changes the payload's
+;    bytes, and so its hash.
+;
+;  TO SPEAK A DIFFERENT SENTENCE
+;    Replace the bytes under KrText3 (one Data.a value per UTF-8 byte), set
+;    #KR_TEXT3_BYTES to their count, and set #KR_EXPECT_TOKENS3 to the
+;    sentence's token count. If the count is wrong the model still runs and
+;    the waveform is still copied, and the payload returns 320 instead of 0
+;    with the real count in KrResultTokens3. Keep the sentence under 21.8
+;    seconds of audio: the copy slot holds 2 MiB, 524,288 samples at 24 kHz,
+;    and a longer result is refused with 313 rather than cut short.
+; ============================================================================
+EnableFloatingPoint
+; The Pi 4 memory-management library lives in the Anvil repository. This path
+; assumes the two repositories are checked out side by side:
+;   <folder>\Onnx-Compiler-Purebasic\examples\pi4\kokoro-sentence\ (this file)
+;   <folder>\Anvil\RaspberryPi4\Lib\mmu.pi4
+XIncludeFile "../../../../Anvil/RaspberryPi4/Lib/mmu.pi4"
+; The model, as the ONNX compiler emitted it with
+;   --target pi4 --precision fp32 --kokoro-text --output model\kokoro-pi4
+; The .kokoro.pi4 file includes the model source and the text adapter.
+XIncludeFile "model/kokoro-pi4.kokoro.pi4"
+; Node -> output-tensor table read only by the optional NaN scan below.
+XIncludeFile "node_output_map.pbi"
+
+; ---------------------------------------------------------------------------
+;  THE MEMORY MAP. Every address is chosen against Anvil's `map` on the board:
+;  the low payload window is $00500000..$07EFFFFF and the high window is
+;  $40000000..$FBFFFFFF. Nothing here moves at run time.
+; ---------------------------------------------------------------------------
+; The checked weight pack the ONNX compiler wrote beside the model source.
+; Loaded here before the run, off the USB stick or over the network.
+#KR_PMW_BASE=$40000000
+#KR_PMW_BYTES=324621440
+; The model's working memory: every activation of every node lives here.
+#KR_ARENA_BASE=$60000000
+#KR_ARENA_BYTES=1073741824
+; The base US-English pronunciation pack, kokoro_us_english.pmg2p.
+#KR_G2P_BASE=$54000000
+#KR_G2P_BYTES=12613954
+; The supplementary pronunciation pack, kokoro_us_extra.pmg2p.
+#KR_G2P_EXTRA_BASE=$55000000
+#KR_G2P_EXTRA_BYTES=5397245
+; The voice, af_heart.pmvoice.
+#KR_VOICE_BASE=$56000000
+#KR_VOICE_BYTES=522368
+; Where each request's samples are copied, one 2 MiB slot per request.
+; Request 3 - the only one this runner makes - lands at $57400000.
+#KR_COPY1_BASE=$57000000
+#KR_COPY2_BASE=$57200000
+#KR_COPY3_BASE=$57400000
+; The copy bound IS the slot stride, written as the stride so that the two
+; cannot drift apart. It was once half the stride, which silently refused
+; every request longer than 262,144 samples; a sentence of 18.875 seconds
+; is what found it.
+#KR_COPY_STRIDE=2097152
+#KR_COPY_BYTES=#KR_COPY_STRIDE
+; A word written at the bottom of the stack, checked at the end: if a deep
+; call ran the stack into it, the run returns 94.
+#KR_STACK_LOW=$07EF0000
+#KR_STACK_CANARY=$4B4F4B4F
+; The whole run's ceiling. The monitor's 15-second hardware deadman guards
+; each operator; this payload services it at every node boundary.
+#KR_TIMEOUT_SECONDS=1800
+
+; ---------------------------------------------------------------------------
+;  THE SERVICE TABLE. --wants-services makes Anvil enter the payload with a
+;  pointer to it in x0. Header: magic "ANVS" at +0, ABI major at +4, the
+;  number of slots at +12, then one 8-byte function address per slot from
+;  +16. Slot 6 pets the deadman.
+; ---------------------------------------------------------------------------
+#KR_SVC_MAGIC=$53564E41
+#KR_SVC_ABI_MAJOR=1
+#KR_SVC_HEADER_BYTES=16
+#KR_SVC_SLOT_COUNT_OFFSET=12
+#KR_SVC_PET_SLOT=6
+; Page tables for this payload's own MMU map.
+#KR_MMU_TABLE_BASE=$02000000
+#KR_MMU_TABLE_BYTES=16384
+; The DSI framebuffer the monitor keeps; mapped without the cache.
+#KR_DSI_NC_LOW=$08A00000
+#KR_DSI_NC_HIGH=$09200000
+
+; ---------------------------------------------------------------------------
+;  THE KTRC TRACE. 256 bytes at $57E00000, rewritten at every stage and at
+;  every node boundary, so that a host can read how far a run got even when
+;  the console lost the return line. Layout, little-endian:
+;    +0  "KTRC"      +4  version 1      +8  stage      +12 write counter
+;    +16 phase       +24 node           +32 ticks now  +40 ticks since start
+;    +48 DError      +56 DCancel        +64 service status  +72 result status
+;    +80 requests    +88..+128 slot 1 and 2 bytes/samples/ticks (unused here)
+;  A finished run reads stage 9 at node 2462, status 0, requests 1.
+; ---------------------------------------------------------------------------
+#KR_TRACE_BASE=$57E00000
+#KR_TRACE_BYTES=256
+#KR_NAN_TRACE_BASE=$57E00100
+#KR_NAN_TRACE_BYTES=256
+#KR_NAN_TRACE_MAGIC=$4E414E4B ; KNAN
+; ---------------------------------------------------------------------------
+;  THE TICK ROWS. For each request, one 64-bit count per node of how many
+;  generic-timer ticks (CNTFRQ, 54,000,000 a second on this board) passed
+;  between the node's BEFORE and AFTER callbacks. Three rows of 4,096 slots;
+;  request 3 is row 2, at $57D10000. Summed by operator family, they say
+;  where the seconds went.
+; ---------------------------------------------------------------------------
+#KR_NODE_TICKS_BASE=$57D00000
+#KR_NODE_TICKS_ROW_BYTES=32768
+#KR_NODE_TICKS_BYTES=98304
+#KR_NODE_TICKS_COUNT=2463
+; Zero is the full run. A positive value cancels normally after that node's
+; AFTER callback - a bounded proof of boot, bind, progress and clean-up.
+#KR_STOP_AFTER_NODE=0
+; Set to 1 to scan every node's outputs for NaN and infinity and stop at the
+; first one, with its node, tensor and neighbours in the KNAN record at
+; $57E00100. It is slow; leave it off for timing and audio runs. The final
+; samples are always checked, whatever this says.
+#KR_SCAN_INTERMEDIATE_NAN=0
+#KR_TRACE_MAGIC=$4352544B ; KTRC
+#KR_TRACE_VERSION=1
+; The stages, in the order a clean run passes them.
+#KR_TRACE_COLD=1
+#KR_TRACE_BEFORE_MMU=2
+#KR_TRACE_BEFORE_BIND=3
+#KR_TRACE_AFTER_BIND=4
+#KR_TRACE_AFTER_TEXT_BIND=5
+#KR_TRACE_CALLBACK_BEFORE_PET=6
+#KR_TRACE_CALLBACK_AFTER_PET=7
+#KR_TRACE_STOP_NODE=8
+#KR_TRACE_FINAL=9
+
+; ---------------------------------------------------------------------------
+;  THE TEXT. Byte counts of the three texts in the DataSection, and the
+;  token counts the reference session gave for them. Only text 3 is spoken.
+; ---------------------------------------------------------------------------
+#KR_TEXT1_BYTES=40
+#KR_TEXT2_BYTES=68
+#KR_TEXT3_BYTES=267
+#KR_EXPECT_TOKENS1=41
+#KR_EXPECT_TOKENS2=69
+; 295 boundary-inclusive tokens for the requested sentence, measured with the
+; same two pronunciation packs through ONNX Runtime, not estimated. If the
+; board's count differs, the text adapter and the reference have diverged,
+; which is a finding - so the run returns 320 rather than 0.
+#KR_EXPECT_TOKENS3=295
+
+; ---------------------------------------------------------------------------
+;  THE RESULT BLOCK. Globals the host reads back after the run, by address,
+;  from the .sym file the compiler writes beside the image. For request 3:
+;  KrResultStatus, KrResultTokens3, KrResultSamples3, KrResultTicks3 and
+;  KrResultHash3 (the XOR of all the sample words, computed on the board
+;  before the copy). KrParallelCores records what PmOnnxAnvilEnter returned;
+;  on the 2026-09-16 run it read 1 even though the convolutions ran on four
+;  cores, because it is asked before this payload turns its caches on - the
+;  monitor's dispatch counter (`coretest status`) is the evidence that the
+;  split ran, not this number.
+; ---------------------------------------------------------------------------
+Global KrResultMagic.l
+Global KrResultVersion.l
+Global KrResultStatus.l
+Global KrResultRequests.l
+Global KrResultHz.i
+Global KrResultTotalTicks.i
+Global KrResultPmwFirst.l
+Global KrResultPmwLast.l
+Global KrResultPmwStable.l
+Global KrResultModelBindError.i
+Global KrResultTextBindError.i
+Global KrResultTextBindG2pError.i
+Global KrResultTextBindG2pErrorAt.i
+Global KrResultTextError1.i
+Global KrResultG2pError1.i
+Global KrResultG2pErrorAt1.i
+Global KrResultDError1.i
+Global KrResultTokens1.i
+Global KrResultSamples1.i
+Global KrResultBytes1.i
+Global KrResultTicks1.i
+Global KrResultHeapPeak1.i
+Global KrResultKind1.i
+Global KrResultRank1.i
+Global KrResultDim01.i
+Global KrResultDim11.i
+Global KrResultHash1.l
+Global KrResultMin1.l
+Global KrResultMax1.l
+Global Dim KrResultTokenIds1.q(#PMK_MAX_IDS-1)
+Global KrResultTextError2.i
+Global KrResultG2pError2.i
+Global KrResultG2pErrorAt2.i
+Global KrResultDError2.i
+Global KrResultTokens2.i
+Global KrResultSamples2.i
+Global KrResultBytes2.i
+Global KrResultTicks2.i
+Global KrResultHeapPeak2.i
+Global KrResultKind2.i
+Global KrResultRank2.i
+Global KrResultDim02.i
+Global KrResultDim12.i
+Global KrResultHash2.l
+Global KrResultMin2.l
+Global KrResultMax2.l
+Global Dim KrResultTokenIds2.q(#PMK_MAX_IDS-1)
+Global KrResultTextError3.i
+Global KrResultG2pError3.i
+Global KrResultG2pErrorAt3.i
+Global KrResultDError3.i
+Global KrResultTokens3.i
+Global KrResultSamples3.i
+Global KrResultBytes3.i
+Global KrResultTicks3.i
+Global KrResultHeapPeak3.i
+Global KrResultKind3.i
+Global KrResultRank3.i
+Global KrResultDim03.i
+Global KrResultDim13.i
+Global KrResultHash3.l
+Global KrResultMin3.l
+Global KrResultMax3.l
+Global Dim KrResultTokenIds3.q(#PMK_MAX_IDS-1)
+Global KrResultHeapUsedBeforeClose.i
+Global KrResultHeapUsedAfterClose.i
+Global KrResultModelReadyAfterClose.i
+Global KrResultAdapterPackAfterClose.i
+Global KrResultAdapterVoiceAfterClose.i
+Global KrResultAdapterTokensAfterClose.i
+Global KrResultStackCanary.l
+Global KrSvcTable.i
+; How many cores the monitor said it would run a kernel on. 1 means the
+; single-core path, and is what an older monitor gives. See the note above.
+Global KrParallelCores.i
+Global *KrSvcPet
+Global KrProgressStart.i
+Global KrProgressLast.i
+Global KrResultProgressCalls.i
+Global KrResultProgressPhase.i
+Global KrResultProgressNode.i
+Global KrResultProgressMaxGap.i
+Global KrResultProgressTimedOut.i
+Global KrResultServiceStatus.i
+Global KrTimingRequest.i
+Global KrTimingRequestSeen.i
+Global KrTimingNode.i
+Global KrTimingStarted.i
+Global KrMmuOwned.i
+Global KrResultMmuBuild.i
+Global KrResultMmuBefore.i
+Global KrResultMmuCached.i
+Global KrResultMmuAfter.i
+Global KrTraceCounter.i
+Global KrNanFound.i
+Global KrNanNode.i
+Global KrNanTensor.i
+Global KrNanKind.i
+Global KrNanCount.i
+Global KrNanData.i
+Global KrNanIndex.i
+Global KrNanBits.l
+Global KrNanRank.i
+Global Dim KrNanDims.i(7)
+Global KrNanSpanStart.i
+Global KrNanSpanCount.i
+Global Dim KrNanSpan.l(15)
+
+; x0 still holds the service table when Main()'s first statement runs. Store
+; it before any other call can overwrite the register.
+Procedure KrCaptureX0()
+  ASM
+    adrp x1, global_krsvctable
+    add  x1, x1, #:lo12:global_krsvctable
+    str  x0, [x1]
+  EndASM
+EndProcedure
+
+; The ARM generic timer: the tick counter and its rate.
+Procedure.i KrTicks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i KrHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i KrExpired(start.i)
+  ; The whole run's ceiling. Individual operators remain guarded by Anvil's
+  ; 15-second hardware deadman, not by this check.
+  ProcedureReturn Bool(KrTicks()-start>KrResultHz*#KR_TIMEOUT_SECONDS)
+EndProcedure
+
+; One tick row entry per node: the ticks between the node's BEFORE and AFTER
+; callbacks, written into the row of the request being rendered.
+Procedure KrRecordNodeTicks(phase.i,node.i,now.i)
+  Protected where.i
+  If phase=#PMD_PROGRESS_NODE_BEFORE
+    KrTimingRequestSeen=0
+    KrTimingNode=-1
+    KrTimingStarted=0
+    If KrTimingRequest>=1 And KrTimingRequest<=3 And node>=0 And node<#KR_NODE_TICKS_COUNT
+      KrTimingRequestSeen=KrTimingRequest
+      KrTimingNode=node
+      KrTimingStarted=now
+    EndIf
+  ElseIf phase=#PMD_PROGRESS_NODE_AFTER
+    If KrTimingRequestSeen=KrTimingRequest And KrTimingRequest>=1 And KrTimingRequest<=3 And KrTimingNode=node And node>=0 And node<#KR_NODE_TICKS_COUNT And KrTimingStarted<>0
+      where=#KR_NODE_TICKS_BASE+(KrTimingRequest-1)*#KR_NODE_TICKS_ROW_BYTES+node*8
+      PokeI(where,now-KrTimingStarted)
+    EndIf
+    KrTimingRequestSeen=0
+    KrTimingNode=-1
+    KrTimingStarted=0
+  EndIf
+EndProcedure
+
+; A 32-bit little-endian word of the service table's header.
+Procedure.i KrServiceHeader32(offset.i)
+  ProcedureReturn PeekA(KrSvcTable+offset) | (PeekA(KrSvcTable+offset+1)<<8) | (PeekA(KrSvcTable+offset+2)<<16) | (PeekA(KrSvcTable+offset+3)<<24)
+EndProcedure
+
+; Check the table the monitor handed over, take the deadman slot out of it,
+; and give the table to the model runtime.
+Procedure.i KrBindServices()
+  Protected slots.i
+  If KrSvcTable=0 : ProcedureReturn 0 : EndIf
+  If KrServiceHeader32(0)<>#KR_SVC_MAGIC : ProcedureReturn 0 : EndIf
+  If KrServiceHeader32(4)<>#KR_SVC_ABI_MAJOR : ProcedureReturn 0 : EndIf
+  slots=KrServiceHeader32(#KR_SVC_SLOT_COUNT_OFFSET)
+  If slots<=#KR_SVC_PET_SLOT : ProcedureReturn 0 : EndIf
+  *KrSvcPet=PeekI(KrSvcTable+#KR_SVC_HEADER_BYTES+#KR_SVC_PET_SLOT*8)
+  ; ------------------------------------------------------------------
+  ;  THE LINE THAT PUTS THE CONVOLUTIONS ON FOUR CORES.
+  ;
+  ;  The emitted model source defines PmOnnxAnvilEnter; the host has to
+  ;  CALL it. Without this call every convolution takes the single-core
+  ;  path - producing exactly the same bytes, several times slower - and
+  ;  nothing anywhere reports that, which is how it once went unnoticed.
+  ;
+  ;  It cannot fail: a zero table, a table with fewer than 192 slots, or a
+  ;  board with one core all leave the runtime on the path it was already
+  ;  on. KrSvcTable is the x0 kept by KrCaptureX0, already checked above
+  ;  for magic, major version and a usable slot count.
+  ; ------------------------------------------------------------------
+  KrParallelCores=PmOnnxAnvilEnter(KrSvcTable)
+  ProcedureReturn Bool(*KrSvcPet<>0)
+EndProcedure
+
+; Rewrite the KTRC record (layout above) and make it visible to the monitor:
+; with the payload's own cached MMU on, the range is cleaned to the point of
+; coherency; before that, a barrier is enough.
+Procedure KrTrace(stage.i,phase.i,node.i)
+  Protected now.i=KrTicks()
+  KrTraceCounter=KrTraceCounter+1
+  PokeL(#KR_TRACE_BASE+0,#KR_TRACE_MAGIC)
+  PokeL(#KR_TRACE_BASE+4,#KR_TRACE_VERSION)
+  PokeL(#KR_TRACE_BASE+8,stage)
+  PokeL(#KR_TRACE_BASE+12,KrTraceCounter)
+  PokeI(#KR_TRACE_BASE+16,phase)
+  PokeI(#KR_TRACE_BASE+24,node)
+  PokeI(#KR_TRACE_BASE+32,now)
+  If KrProgressStart<>0
+    PokeI(#KR_TRACE_BASE+40,now-KrProgressStart)
+  Else
+    PokeI(#KR_TRACE_BASE+40,0)
+  EndIf
+  PokeI(#KR_TRACE_BASE+48,DError)
+  PokeI(#KR_TRACE_BASE+56,DCancel)
+  PokeI(#KR_TRACE_BASE+64,KrResultServiceStatus)
+  PokeI(#KR_TRACE_BASE+72,KrResultStatus)
+  PokeI(#KR_TRACE_BASE+80,KrResultRequests)
+  PokeI(#KR_TRACE_BASE+88,KrResultBytes1)
+  PokeI(#KR_TRACE_BASE+96,KrResultSamples1)
+  PokeI(#KR_TRACE_BASE+104,KrResultTicks1)
+  PokeI(#KR_TRACE_BASE+112,KrResultBytes2)
+  PokeI(#KR_TRACE_BASE+120,KrResultSamples2)
+  PokeI(#KR_TRACE_BASE+128,KrResultTicks2)
+  If KrMmuOwned
+    MmuCleanRange(#KR_TRACE_BASE,#KR_TRACE_BYTES)
+  Else
+    MmuBarrier()
+  EndIf
+EndProcedure
+
+; The KNAN record: where the optional scan found its first non-finite value.
+Procedure KrWriteNaNTrace()
+  Protected j.i
+  PokeL(#KR_NAN_TRACE_BASE,#KR_NAN_TRACE_MAGIC)
+  PokeL(#KR_NAN_TRACE_BASE+4,1)
+  PokeI(#KR_NAN_TRACE_BASE+8,KrNanNode)
+  PokeI(#KR_NAN_TRACE_BASE+16,KrNanTensor)
+  PokeI(#KR_NAN_TRACE_BASE+24,KrNanKind)
+  PokeI(#KR_NAN_TRACE_BASE+32,KrNanCount)
+  PokeI(#KR_NAN_TRACE_BASE+40,KrNanData)
+  PokeI(#KR_NAN_TRACE_BASE+48,KrNanIndex)
+  PokeL(#KR_NAN_TRACE_BASE+56,KrNanBits)
+  PokeI(#KR_NAN_TRACE_BASE+64,KrNanRank)
+  j=0
+  While j<8 : PokeI(#KR_NAN_TRACE_BASE+72+j*8,KrNanDims(j)) : j=j+1 : Wend
+  PokeI(#KR_NAN_TRACE_BASE+136,KrNanSpanStart)
+  PokeI(#KR_NAN_TRACE_BASE+144,KrNanSpanCount)
+  j=0
+  While j<16 : PokeL(#KR_NAN_TRACE_BASE+152+j*4,KrNanSpan(j)) : j=j+1 : Wend
+  If KrMmuOwned : MmuCleanRange(#KR_NAN_TRACE_BASE,#KR_NAN_TRACE_BYTES) : Else : MmuBarrier() : EndIf
+EndProcedure
+
+; The optional scan of one node's FLOAT outputs. Returns 1 when clean, 0 when
+; it found a NaN or infinity (and wrote KNAN), -1 when the run's time ran out.
+Procedure.i KrScanNodeNaN(node.i)
+  Protected first.i
+  Protected outputs.i
+  Protected id.i
+  Protected i.i
+  Protected j.i
+  Protected begin.i
+  Protected finish.i
+  Protected bits.l
+  If node<0 Or node>=#KR_NAN_NODE_COUNT : ProcedureReturn 1 : EndIf
+  first=PeekL(?KrNanNodeMap+node*8)
+  outputs=PeekL(?KrNanNodeMap+node*8+4)
+  id=first
+  While id<first+outputs
+    If Dt(id)\Kind=1 And Dt(id)\Count>0 And Dt(id)\Data<>0
+      i=0
+      While i<Dt(id)\Count
+        If (i & 65535)=0
+          If KrTicks()-KrProgressStart>KrResultHz*#KR_TIMEOUT_SECONDS
+            KrResultProgressTimedOut=1
+            ProcedureReturn -1
+          EndIf
+          KrSvcPet()
+        EndIf
+        bits=PeekL(Dt(id)\Data+i*4)
+        If (bits & $7FFFFFFF)>$7F800000
+          KrNanFound=1 : KrNanNode=node : KrNanTensor=id
+          KrNanKind=Dt(id)\Kind : KrNanCount=Dt(id)\Count : KrNanData=Dt(id)\Data
+          KrNanIndex=i : KrNanBits=bits : KrNanRank=Dt(id)\Rank
+          j=0
+          While j<8
+            KrNanDims(j)=DDims(id*8+j)
+            j=j+1
+          Wend
+          begin=i-4 : If begin<0 : begin=0 : EndIf
+          finish=begin+16 : If finish>Dt(id)\Count : finish=Dt(id)\Count : EndIf
+          KrNanSpanStart=begin : KrNanSpanCount=finish-begin
+          j=0
+          While j<KrNanSpanCount
+            KrNanSpan(j)=PeekL(Dt(id)\Data+(begin+j)*4)
+            j=j+1
+          Wend
+          KrWriteNaNTrace()
+          ProcedureReturn 0
+        EndIf
+        i=i+1
+      Wend
+    EndIf
+    id=id+1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; The model runtime calls this before and after every node. It records the
+; node's ticks, rewrites the trace, pets the deadman, enforces the run's
+; ceiling, and returns 0 to cancel the request cleanly or 1 to go on.
+Procedure.i KrProgress(phase.i,node.i)
+  Protected now.i
+  Protected gap.i
+  now=KrTicks()
+  ; BEFORE-to-AFTER includes the runtime's own dispatch and the rest of this
+  ; BEFORE callback (trace and pet) as well as the operator. It deliberately
+  ; does not pretend to be an operator-only cycle counter.
+  KrRecordNodeTicks(phase,node,now)
+  KrResultProgressCalls=KrResultProgressCalls+1
+  KrResultProgressPhase=phase
+  KrResultProgressNode=node
+  KrTrace(#KR_TRACE_CALLBACK_BEFORE_PET,phase,node)
+  If KrProgressStart=0 Or now-KrProgressStart>KrResultHz*#KR_TIMEOUT_SECONDS
+    KrResultProgressTimedOut=1
+    ProcedureReturn 0
+  EndIf
+  If KrProgressLast<>0
+    gap=now-KrProgressLast
+    If gap>KrResultProgressMaxGap : KrResultProgressMaxGap=gap : EndIf
+  EndIf
+  KrProgressLast=now
+  KrSvcPet()
+  KrTrace(#KR_TRACE_CALLBACK_AFTER_PET,phase,node)
+  If #KR_SCAN_INTERMEDIATE_NAN<>0 And phase=#PMD_PROGRESS_NODE_AFTER
+    gap=KrScanNodeNaN(node)
+    If gap<=0 : ProcedureReturn 0 : EndIf
+  EndIf
+  If #KR_STOP_AFTER_NODE>0 And phase=#PMD_PROGRESS_NODE_AFTER And node>=#KR_STOP_AFTER_NODE
+    KrTrace(#KR_TRACE_STOP_NODE,phase,node)
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Check the output tensor, hash and bound its samples, and copy them to the
+; request's slot while the borrowed tensor is still valid. Returns 0, or
+; 1 no such tensor, 2 not a non-empty FLOAT tensor, 3 too many samples for
+; the slot, 4 a NaN or infinity among the samples (nothing is copied then).
+; The hash is the XOR of every sample's 32-bit word: cheap, order-free, and
+; computed here on the board, so a host can check what it read back against
+; a number that never crossed the network.
+Procedure.i KrCapture(id.i,copyBase.i,slot.i)
+  Protected i.i
+  Protected count.i
+  Protected bytes.i
+  Protected bits.l
+  Protected hash.l
+  Protected sample.f
+  Protected minimum.f
+  Protected maximum.f
+  If id<=0 Or id>#PMD_TENSOR_COUNT : ProcedureReturn 1 : EndIf
+  If Dt(id)\Kind<>1 Or Dt(id)\Count<=0 Or Dt(id)\Data=0 : ProcedureReturn 2 : EndIf
+  count=Dt(id)\Count
+  If count>#KR_COPY_BYTES/4 : ProcedureReturn 3 : EndIf
+  bytes=count*4
+  hash=0
+  i=0
+  While i<count
+    bits=PeekL(Dt(id)\Data+i*4)
+    If (bits & $7F800000)=$7F800000 : ProcedureReturn 4 : EndIf
+    sample=PmTensorGet(Dt(id)\Data,i)
+    If i=0 Or sample<minimum : minimum=sample : EndIf
+    If i=0 Or sample>maximum : maximum=sample : EndIf
+    hash=hash ! bits
+    i=i+1
+  Wend
+  ; Copy while this request's borrowed tensor is still valid.
+  DCopy(Dt(id)\Data,copyBase,bytes)
+  If slot=1
+    KrResultSamples1=count : KrResultBytes1=bytes
+    KrResultKind1=Dt(id)\Kind : KrResultRank1=Dt(id)\Rank
+    KrResultDim01=DDims(id*8+0) : KrResultDim11=DDims(id*8+1)
+    KrResultHash1=hash : KrResultMin1=PeekL(@minimum) : KrResultMax1=PeekL(@maximum)
+  ElseIf slot=2
+    KrResultSamples2=count : KrResultBytes2=bytes
+    KrResultKind2=Dt(id)\Kind : KrResultRank2=Dt(id)\Rank
+    KrResultDim02=DDims(id*8+0) : KrResultDim12=DDims(id*8+1)
+    KrResultHash2=hash : KrResultMin2=PeekL(@minimum) : KrResultMax2=PeekL(@maximum)
+  Else
+    KrResultSamples3=count : KrResultBytes3=bytes
+    KrResultKind3=Dt(id)\Kind : KrResultRank3=Dt(id)\Rank
+    KrResultDim03=DDims(id*8+0) : KrResultDim13=DDims(id*8+1)
+    KrResultHash3=hash : KrResultMin3=PeekL(@minimum) : KrResultMax3=PeekL(@maximum)
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; One request: UTF-8 text in, through the pronunciation packs to tokens,
+; through the model to samples, then captured. The adapter's errors and the
+; token ids are recorded whether or not the render succeeded.
+Procedure.i KrRender(*text.i,textBytes.i,copyBase.i,slot.i)
+  Protected i.i
+  Protected started.i
+  Protected id.i
+  Protected status.i
+  KrTimingRequest=slot
+  KrTimingRequestSeen=0
+  KrTimingNode=-1
+  KrTimingStarted=0
+  started=KrTicks()
+  ; Speed 1.0. Returns the output tensor id, or 0 with the reason in
+  ; PmKokoroTextError, PmKokoroG2pError/PmKokoroG2pErrorAt and DError.
+  id=PmKokoroTextRender(*text,textBytes,1.0)
+  KrTimingRequest=0
+  If slot=1
+    KrResultTicks1=KrTicks()-started : KrResultHeapPeak1=DHeapPeak
+    KrResultTokens1=PmKokoroTextTokenCount
+    KrResultTextError1=PmKokoroTextError : KrResultG2pError1=PmKokoroG2pError
+    KrResultG2pErrorAt1=PmKokoroG2pErrorAt : KrResultDError1=DError
+    i=0
+    While i<PmKokoroTextTokenCount And i<#PMK_MAX_IDS
+      KrResultTokenIds1(i)=PmKokoroTextIds(i)
+      i=i+1
+    Wend
+  ElseIf slot=2
+    KrResultTicks2=KrTicks()-started : KrResultHeapPeak2=DHeapPeak
+    KrResultTokens2=PmKokoroTextTokenCount
+    KrResultTextError2=PmKokoroTextError : KrResultG2pError2=PmKokoroG2pError
+    KrResultG2pErrorAt2=PmKokoroG2pErrorAt : KrResultDError2=DError
+    i=0
+    While i<PmKokoroTextTokenCount And i<#PMK_MAX_IDS
+      KrResultTokenIds2(i)=PmKokoroTextIds(i)
+      i=i+1
+    Wend
+  Else
+    KrResultTicks3=KrTicks()-started : KrResultHeapPeak3=DHeapPeak
+    KrResultTokens3=PmKokoroTextTokenCount
+    KrResultTextError3=PmKokoroTextError : KrResultG2pError3=PmKokoroG2pError
+    KrResultG2pErrorAt3=PmKokoroG2pErrorAt : KrResultDError3=DError
+    i=0
+    While i<PmKokoroTextTokenCount And i<#PMK_MAX_IDS
+      KrResultTokenIds3(i)=PmKokoroTextIds(i)
+      i=i+1
+    Wend
+  EndIf
+  If id=0 : ProcedureReturn 1 : EndIf
+  status=KrCapture(id,copyBase,slot)
+  If status<>0 : ProcedureReturn 10+status : EndIf
+  KrResultRequests=KrResultRequests+1
+  ProcedureReturn 0
+EndProcedure
+
+; ---------------------------------------------------------------------------
+;  KrFinish - the one way out, safe from any point. The status it returns is
+;  the payload's x0:
+;     0  clean run
+;     1  the generic timer reports no frequency
+;     2  the emitted model expects a different weight-pack size
+;     3  the model refused its weights or arena (DError in KrResultModelBindError)
+;     4  the text adapter refused the packs or the voice (errors in
+;        KrResultTextBindError, ...G2pError, ...G2pErrorAt)
+;     5  no usable service table in x0: build with --wants-services
+;     6  the runtime refused the progress callback
+;     7  not at EL2 or EL3, or the MMU cannot be built from this state
+;     8  the page tables could not be built
+;     9  the caches did not turn on
+;    90  working memory still in use after close     91  model still bound
+;    92  adapter still holds an asset                93  the weights changed
+;    94  the stack ran into its canary               95  MMU still on at exit
+;   301  the render returned no tensor (see KrResultTextError3, ...G2pError3,
+;        ...DError3)
+;   311..314  KrCapture refused: 1 bad id, 2 not FLOAT, 3 too long for the
+;        copy slot, 4 a non-finite sample
+;   320  the token count differs from #KR_EXPECT_TOKENS3 (the samples were
+;        still copied)
+;   321  the run took longer than #KR_TIMEOUT_SECONDS
+; ---------------------------------------------------------------------------
+Procedure.i KrFinish(status.i)
+  ; Safe whether the failure came before or after either bind.
+  KrResultHeapUsedBeforeClose=DHeapUsed
+  PmModelResetRequest()
+  PmKokoroTextClose()
+  PmModelClose()
+  DSetProgressCallback(0)
+  KrResultHeapUsedAfterClose=DHeapUsed
+  KrResultModelReadyAfterClose=PmModelReady
+  KrResultAdapterPackAfterClose=PmKokoroTextPack
+  KrResultAdapterVoiceAfterClose=PmKokoroTextVoice
+  KrResultAdapterTokensAfterClose=PmKokoroTextTokenCount
+  KrResultPmwStable=Bool(PeekL(#KR_PMW_BASE)=KrResultPmwFirst And PeekL(#KR_PMW_BASE+#KR_PMW_BYTES-4)=KrResultPmwLast)
+  KrResultStackCanary=PeekL(#KR_STACK_LOW)
+  If status=0 And KrResultHeapUsedAfterClose<>0 : status=90 : EndIf
+  If status=0 And KrResultModelReadyAfterClose<>0 : status=91 : EndIf
+  If status=0 And (KrResultAdapterPackAfterClose<>0 Or KrResultAdapterVoiceAfterClose<>0 Or KrResultAdapterTokensAfterClose<>0) : status=92 : EndIf
+  If status=0 And KrResultPmwStable=0 : status=93 : EndIf
+  If status=0 And KrResultStackCanary<>#KR_STACK_CANARY : status=94 : EndIf
+  KrResultMmuCached=MmuSctlr()
+  If KrMmuOwned
+    MmuDisableCachedFlushed()
+    KrMmuOwned=0
+  EndIf
+  KrResultMmuAfter=MmuSctlr()
+  If status=0 And MmuEnabled()<>0 : status=95 : EndIf
+  KrResultStatus=status
+  KrTrace(#KR_TRACE_FINAL,KrResultProgressPhase,KrResultProgressNode)
+  ; On the normal path MmuDisableCachedFlushed() above has already made the
+  ; cached timing rows persistent for the monitor to read back.
+  ASM
+    dmb ish
+  EndASM
+  ProcedureReturn status
+EndProcedure
+
+Procedure.i Main()
+  Protected started.i
+  Protected status.i
+  ; --wants-services puts the service table in x0. This must stay first.
+  KrCaptureX0()
+  KrResultMagic=$4B524252 ; RBRK
+  KrResultVersion=1
+  KrResultStatus=-1
+  KrResultRequests=0
+  KrTimingRequest=0
+  KrTimingRequestSeen=0
+  KrTimingNode=-1
+  KrTimingStarted=0
+  KrTraceCounter=0
+  ; Zero the tick rows and both trace records, so nothing a previous run
+  ; left in memory can be read as this run's.
+  status=0
+  While status<#KR_NODE_TICKS_BYTES
+    PokeA(#KR_NODE_TICKS_BASE+status,0)
+    status=status+1
+  Wend
+  status=0
+  While status<#KR_TRACE_BYTES
+    PokeA(#KR_TRACE_BASE+status,0)
+    PokeA(#KR_NAN_TRACE_BASE+status,0)
+    status=status+1
+  Wend
+  KrTrace(#KR_TRACE_COLD,0,-1)
+  KrResultHz=KrHz()
+  PokeL(#KR_STACK_LOW,#KR_STACK_CANARY)
+  ; The first and last words of the weights, compared again at the end.
+  KrResultPmwFirst=PeekL(#KR_PMW_BASE)
+  KrResultPmwLast=PeekL(#KR_PMW_BASE+#KR_PMW_BYTES-4)
+  If KrResultHz<=0 : ProcedureReturn KrFinish(1) : EndIf
+  If KrBindServices()=0
+    KrResultServiceStatus=1
+    ProcedureReturn KrFinish(5)
+  EndIf
+  KrTrace(#KR_TRACE_BEFORE_MMU,0,-1)
+  KrResultMmuBefore=MmuSctlr()
+  ; Anvil enters a payload at EL3 when the board boots through its own arm
+  ; stub, and at EL2 when it does not; mmu.pi4 has a path for every register
+  ; this payload touches at both levels, so both are accepted. MmuSctlr() is
+  ; the SCTLR of the level actually running, and MmuStubEntered() says it is
+  ; still as the stub left it.
+  If (MmuEl()<>2 And MmuEl()<>3) Or MmuBuildable()=0 Or MmuStubEntered()=0
+    KrResultServiceStatus=3
+    ProcedureReturn KrFinish(7)
+  EndIf
+  ; An identity map of the payload windows, with the DSI framebuffer the
+  ; monitor keeps mapped uncached, then the MMU and caches on.
+  MmuClearNc()
+  MmuAddNc(#KR_DSI_NC_LOW,#KR_DSI_NC_HIGH)
+  KrResultMmuBuild=MmuBuildTables(#KR_MMU_TABLE_BASE)
+  If KrResultMmuBuild<>0
+    KrResultServiceStatus=4
+    ProcedureReturn KrFinish(8)
+  EndIf
+  MmuEnableCached()
+  If (MmuSctlr() & #MMU_SCTLR_MCI)<>#MMU_SCTLR_MCI
+    KrMmuOwned=1
+    KrResultServiceStatus=5
+    ProcedureReturn KrFinish(9)
+  EndIf
+  KrMmuOwned=1
+  KrProgressStart=KrTicks()
+  KrProgressLast=KrProgressStart
+  If DSetProgressCallback(@KrProgress)=0
+    KrResultServiceStatus=2
+    ProcedureReturn KrFinish(6)
+  EndIf
+  If #PMO_WEIGHT_FILE_BYTES<>#KR_PMW_BYTES : ProcedureReturn KrFinish(2) : EndIf
+  KrTrace(#KR_TRACE_BEFORE_BIND,#PMD_PROGRESS_BIND_BEFORE,-1)
+  ; Validates the pack's header, identity and CRC-32, then prepares the
+  ; constants. This is the one-time setup; requests after it reuse it.
+  If PmModelBindMemory(#KR_PMW_BASE,#KR_PMW_BYTES,#KR_ARENA_BASE,#KR_ARENA_BYTES)=0
+    KrResultModelBindError=DError
+    ProcedureReturn KrFinish(3)
+  EndIf
+  KrTrace(#KR_TRACE_AFTER_BIND,#PMD_PROGRESS_BIND_AFTER,-1)
+  ; The packs and the voice stay owned by this program and unchanged until
+  ; the adapter is closed; the adapter validates each one's format and CRC.
+  If PmKokoroTextBind(#KR_G2P_BASE,#KR_G2P_BYTES,#KR_G2P_EXTRA_BASE,#KR_G2P_EXTRA_BYTES,#KR_VOICE_BASE,#KR_VOICE_BYTES)=0
+    KrResultTextBindError=PmKokoroTextError
+    KrResultTextBindG2pError=PmKokoroG2pError
+    KrResultTextBindG2pErrorAt=PmKokoroG2pErrorAt
+    ProcedureReturn KrFinish(4)
+  EndIf
+  KrTrace(#KR_TRACE_AFTER_TEXT_BIND,0,-1)
+  started=KrTicks()
+  ; ONE REQUEST, THE REQUESTED SENTENCE, in slot 3. The two proof texts that
+  ; earlier runners rendered first belong to runs whose point is bit
+  ; identity against an earlier build; here they would only cost board time.
+  status=KrRender(?KrText3,#KR_TEXT3_BYTES,#KR_COPY3_BASE,3)
+  If status<>0 : ProcedureReturn KrFinish(300+status) : EndIf
+  If KrResultTokens3<>#KR_EXPECT_TOKENS3 : ProcedureReturn KrFinish(320) : EndIf
+  If KrExpired(started) : ProcedureReturn KrFinish(321) : EndIf
+  KrResultTotalTicks=KrTicks()-started
+  ProcedureReturn KrFinish(0)
+EndProcedure
+
+DataSection
+KrText1:
+  ; "The sky is blue, and the sun is shining." - not rendered by this runner.
+  Data.a 84,104,101,32,115,107,121,32,105,115,32,98,108,117,101,44,32,97,110,100,32,116,104,101,32,115,117,110,32,105,115,32,115,104,105,110,105,110,103,46
+KrText2:
+  ; "You are hearing a complete sentence produced on this small computer." - not rendered by this runner.
+  Data.a 89,111,117,32,97,114,101,32,104,101,97,114,105,110,103,32,97,32,99,111,109,112,108,101,116,101,32,115,101,110,116,101,110,99,101,32,112,114,111,100,117,99,101,100,32,111,110,32,116,104,105,115,32,115,109,97,108,108,32,99,111,109,112,117,116,101,114,46
+KrText3:
+  ; THE SENTENCE. 267 UTF-8 bytes, 295 tokens, 453,000 samples, 18.875 s:
+  ; I am the kokoro speech AI model on the raspberry Pi 4. How do I sound, good? I am running on bare metal, with no operating system, under Anvil, a mini kernel and boot loader, on all four cores of the Raspberry Pi 4. Both Anvil and I were compiled by Pure Metal Forge.
+  Data.a 73,32,97,109,32,116,104,101,32,107,111,107,111,114,111,32,115,112,101,101,99,104,32,65,73,32,109,111,100,101,108,32,111,110,32,116,104,101,32,114,97,115,112,98,101,114,114,121,32,80,105,32,52,46,32,72,111,119,32,100,111,32,73,32,115,111,117,110,100,44,32,103,111,111,100,63,32,73,32,97,109,32,114,117,110,110,105,110,103,32,111,110,32,98,97,114,101,32,109,101,116,97,108,44,32,119,105,116,104,32,110,111,32,111,112,101,114,97,116,105,110,103,32,115,121,115,116,101,109,44,32,117,110,100,101,114,32,65,110,118,105,108,44,32,97,32,109,105,110,105,32,107,101,114,110,101,108,32,97,110,100,32,98,111,111,116,32,108,111,97,100,101,114,44,32,111,110,32,97,108,108,32,102,111,117,114,32,99,111,114,101,115,32,111,102,32,116,104,101,32,82,97,115,112,98,101,114,114,121,32,80,105,32,52,46,32,66,111,116,104,32,65,110,118,105,108,32,97,110,100,32,73,32,119,101,114,101,32,99,111,109,112,105,108,101,100,32,98,121,32,80,117,114,101,32,77,101,116,97,108,32,70,111,114,103,101,46
+EndDataSection

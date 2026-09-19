@@ -1,0 +1,10 @@
+; Select every optional FP32 tensor family for direct runtime-library tests.
+; Generated ONNX programs define only the families their lowered graph uses.
+#PMO_USE_BATCHNORM = 1
+#PMO_USE_STFT = 1
+#PMO_USE_RESIZE = 1
+#PMO_USE_CONVTRANSPOSE = 1
+#PMO_USE_CONV = 1
+#PMO_USE_LSTM = 1
+#PMO_USE_INT8 = 1
+#PMO_INT64_SPLIT = 0

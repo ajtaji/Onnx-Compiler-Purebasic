@@ -1,0 +1,32 @@
+{
+  "format": "anvil-board-model-run 1",
+  "name": "kokoro-sentence",
+  "text": "I am the kokoro speech AI model on the raspberry Pi 4. How do I sound, good? I am running on bare metal, with no operating system, under Anvil, a mini kernel and boot loader, on all four cores of the Raspberry Pi 4. Both Anvil and I were compiled by Pure Metal Forge.",
+  "base": "kokoro-sentence",
+  "out": "run",
+  "payload": {
+    "file": "build/kokoro-sentence.img.pmf",
+    "sha256": "58b402ea88f92c414a752df39f5ef4b006021a905018f3145df3fb4b02da63b3",
+    "stage": "0x03000000",
+    "expect_x0": "0",
+    "timeout_seconds": 700
+  },
+  "deadman_seconds": 15,
+  "assets": [
+    {"name": "weights", "file": "model/kokoro-pi4.pmw", "address": "0x40000000",
+     "sha256": "a41177210505c80c08836acbb919283d140cb94ddfce89ed2dc732ed8c0d5413"},
+    {"name": "g2p-base", "file": "../../../../assets/kokoro_us_english.pmg2p", "address": "0x54000000",
+     "sha256": "0d791ecc12e11d77b5d961718128cf945a67ab53274816a94b9d8eecddbc0b88"},
+    {"name": "g2p-extra", "file": "../../../../assets/kokoro_us_extra.pmg2p", "address": "0x55000000",
+     "sha256": "73be678aa7d1e8cd1b8f87681f4ee1a14f26ac7298fad1063136813064ea8525"},
+    {"name": "voice", "file": "../../../../assets/af_heart.pmvoice", "address": "0x56000000",
+     "sha256": "79ef729cc9aa7ec47025ece5c3d6fa230404e0f4d061465d47a71afc4b3d06ce"}
+  ],
+  "results": [
+    {"name": "wave", "address": "0x57400000", "bytes": 1812000, "board_sha256": true},
+    {"name": "trace", "address": "0x57E00000", "bytes": 256}
+  ],
+  "post": {
+    "wav": [{"from": "wave", "rate": 24000, "file": "kokoro-sentence.wav"}]
+  }
+}

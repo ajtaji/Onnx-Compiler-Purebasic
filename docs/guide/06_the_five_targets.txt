@@ -1,0 +1,246 @@
+@CHAPTER The five targets
+@INTRO One desktop, two 64-bit Arm boards with a payload contract, and two microcontrollers with a budget that says no.
+
+@SECTION The target is the destination, not the desk
+
+The generator always runs on Windows x64. `--target` picks where the
+SOURCE is going: which dialect is written, which execution sources are
+copied out, which kernels are selected, which launch contract the emitted
+API assumes, and whether a capacity check applies.
+
+A target ID that does not exist is refused by name, before anything is
+read:
+
+@FRAG
+> ... --compile output\twice.onnx --output out\t --target rpi5
+ONNX COMPILER ERROR: unknown target rpi5
+@ENDFRAG
+
+The five that do exist are listed by `--list-targets` in chapter 2.
+
+Generating `pico2` source on a desktop does not need a Pico 2 attached and
+does not produce firmware. It produces source for a firmware you will
+build with a toolchain that is not in this repository.
+
+@SECTION Windows
+
+The only target you can build with nothing beyond the compiler you already
+used in chapter 2. Emits `.pb`, uses native x64 SSE2/AVX kernels with
+threaded dense operations, and takes its weights from a file path.
+
+@FRAG
+| what you build it with  | the host language, x64, thread-safe + optimizer |
+| you supply              | input data, output handling, the .pmw file       |
+| initialization          | PmModelInitialize(weightPath) - it reads the pack |
+@ENDFRAG
+
+Use it as the correctness bench even when the destination is a board. It
+is the fastest place to find out that a graph does what you expected, and
+the answer transfers: the bare-metal kernels are held to bit identity
+against the same portable reference (chapter 9).
+
+@NOTE "SIMD" and "bit-identical" are not automatically compatible. Vector
+paths that change floating-point summation order are documented as
+tolerance-based, not exact. Where a kernel claims bit identity it is
+because it was written to make that claim and proved against the scalar
+reference; where it does not, do not demand it.
+
+@SECTION Pi 4 and UNO Q
+
+Both emit the same 64-bit Arm dialect into a `.pi4` file. They differ in
+how the program is launched: the Pi 4 profile is entered as a bare-metal
+payload with caller-supplied memory; the UNO Q profile is a 64-bit UEFI
+application, and the loader, the weight loading and the device I/O belong
+to your application.
+
+Both select the Advanced SIMD runtime and the 64-bit Arm math template.
+Neither is a companion-microcontroller sketch.
+
+@FRAG
+> ... --compile output\dense.onnx --output out\dense-pi4 --target pi4 --precision int8
+PASS: generated ONNX source for pi4 (int8)
+Source: ...\out/dense-pi4.pi4
+Weights: ...\out/dense-pi4.pmw (196 B)
+Quantized weights: 1 (per-output-channel signed INT8, dynamic activation scales, INT32 accumulation)
+Arena: 192 B including bounded inputs/outputs
+Manifest: ...\out/dense-pi4.json
+Resident model: bind weights/arena once, fill inputs and execute repeatedly, then unbind when finished.
+@ENDFRAG
+
+@SECTION The payload contract, in three lines of your Main
+
+The emitted source says this at the top of the file, on these two targets,
+before anything else:
+
+@FRAG
+; BUILD THIS AS AN ANVIL PAYLOAD WITH --wants-services, and call
+; PmOnnxAnvilEnter(x0) as the first statement of Main. Without both, every
+; convolution runs on one core - the same bytes, several times slower.
+@ENDFRAG
+
+A payload entered by the board monitor with the service flag set is handed
+a service table in `x0`. That table is how the model reaches the other
+cores. The emitted library defines the one call that consumes it:
+
+@FRAG
+; Call this FIRST in Main, with the value the monitor left in x0, when this
+; payload was built --wants-services. Returns the core count; 1 when there
+; is no parallel service. It never fails and never needs checking.
+Procedure.i PmOnnxAnvilEnter(services.i)
+  If PmSetAnvilServices(services) = 0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn PmParallelCores()
+EndProcedure
+@ENDFRAG
+
+Three properties of that call are worth stating plainly, because they are
+what make it safe to have at all.
+
+**It is safe not to call it, and safe to call it with zero.** Either way
+every convolution takes the single-core path and produces **the same
+bytes**. A host application that has not been updated is slower and is
+never wrong. That is the fallback, and it is a real fallback rather than a
+hopeful one.
+
+**It does not go looking for the table by itself.** There is no correct
+value for the library to guess, and guessing an address that is not a
+service table is a wild branch on a machine with no memory protection.
+So the host, which knows, passes it in.
+
+**It cannot fail.** It returns the number of cores a kernel will be run
+on, and 1 when there is no service. There is nothing to check.
+
+@TRAP The source DEFINING `PmOnnxAnvilEnter` is not the same as your
+program CALLING it, and the difference is invisible: a payload that never
+calls it runs perfectly, produces byte-identical output, and is simply
+several times slower. That exact mistake was made on the bench - a host
+runner was built against an emitter that emits the entry, and never added
+the call, so it ran single-core and looked fine. If you expect parallel
+convolution, check the returned core count rather than assuming.
+
+@TRAP Ask for the core count at the right moment. It is **not constant for
+a payload's life**: a payload that asks before it has enabled its own
+memory management and caches can be told 1 and then get more later. Read
+it after your setup, not before.
+
+**Quantized convolution uses the cores too.** It did not always. The
+convolution operator picks its kernel from the weight's element type before
+it reaches the dispatcher that asks for cores, and for a while the quantized
+side of that branch had no split at all - so an INT8 model ran every
+convolution on one core no matter what this call returned. It is the same
+shape of mistake as the trap above, one layer down, and it was equally
+invisible: one core returns the same bytes as four. Both precisions now take
+the same route, with one difference that is forced by the arithmetic - the
+activation scale is computed and the activations quantized once, on the core
+you were entered on, before any partition starts, because that pass covers
+the whole input and writes the buffer every partition then reads.
+
+@NOTE The evidence that a split really ran is the service's dispatch
+counter and the elapsed time, never the number `PmOnnxAnvilEnter` handed
+back. That number is a report; the kernels ask again, later, when they need
+an answer.
+
+@SECTION What the Pi 4 has actually done
+
+This is a real workload on real silicon, and the conditions matter as much
+as the numbers. All of it is the full speech model of chapter 7, running
+resident, on a Pi 4 at approximately 1.5 GHz, timed with the board's own
+54 MHz architected counter.
+
+@FRAG
+Request 2: "You are hearing a complete sentence produced on this small
+computer."  -  69 tokens, 102,000 samples, 4.25 s of audio.
+
+  2026-09-10, first complete run          639.3 s
+  2026-09-11, vector trig + exact MatMul  147.3 s
+  2026-09-15, register-blocked Conv tile   91.6 s
+  2026-09-15, later the same evening       88.1 s
+@ENDFRAG
+
+Inside that last figure, by operator family, read off the board's own
+per-node tick rows:
+
+@FRAG
+  Conv            70.45 s      the 4x16 register-blocked tile
+  everything else 10.80 s
+  MatMul           2.78 s
+  LSTM             1.87 s
+  ConvTranspose    1.80 s   <- untouched between runs: the control
+  Gemm             0.38 s   <- untouched between runs: the control
+@ENDFRAG
+
+@NOTE The two control rows are the most useful numbers in that table.
+ConvTranspose and Gemm were not changed, and they came back identical to
+the millisecond across runs. That is what says the clock, the tick rate
+and the attribution did not move - so the rows that DID change are the
+kernels and not the measurement. A speed table without controls is a
+story.
+
+And the contract held throughout: the waveform digests for the first two
+requests are **bit-identical** across every one of those runs. Faster, and
+the same bytes.
+
+The same request on all four cores, with the call above in the runner,
+took 34.6 s, its convolutions 17.1 s, with the same bytes out. Chapter 11
+is a whole sentence run that way, with the runner and a recipe that
+reproduces its payload byte for byte.
+
+@TRAP Do not read those numbers as a performance claim for your model.
+They are one graph, one board, one clock, one set of texts. What they
+establish is that the kernels moved and the output did not.
+
+@SECTION Pico and Pico 2
+
+Two microcontroller profiles, for small models. The weights are embedded
+in the generated source as a checked array rather than loaded from a file,
+so use the generated symbol and size - never a guessed flash address.
+
+@FRAG
+| target | SRAM   | reserved | flash | reserved |
+| pico   | 264 KiB | 24 KiB  | 2 MiB |  96 KiB  |
+| pico2  | 520 KiB | 40 KiB  | 4 MiB | 128 KiB  |
+@ENDFRAG
+
+The reserve is the tool's allowance for runtime and stack. It is checked
+before anything is emitted, and the refusal does the arithmetic for you:
+
+@FRAG
+> ... --compile big.onnx --output out\big-pico --target pico
+ONNX COMPILER ERROR: model does not fit target pico:
+  SRAM required 805.25 KiB (arena 781.25 KiB + runtime/stack reserve 24.00 KiB), available 264.00 KiB, short by 541.25 KiB
+largest tensors:
+  x [1,100000] = 390.62 KiB [activation]
+  y [1,100000] = 390.62 KiB [activation]
+Try the explicit INT8 option, reduce the bounded graph/model, or choose a larger target. Nothing was truncated or emitted.
+@ENDFRAG
+
+Every part of that is doing work. It names what was required and what was
+available, it shows the arithmetic, it lists the tensors that dominate so
+you know where to look, it suggests the next thing to try - and the last
+sentence tells you that nothing partial was written. There is no truncated
+output to clean up.
+
+@NOTE If the model already uses INT8, the last line changes to say so
+rather than suggesting an option you have taken. An error message that
+recommends something you already did is an error message nobody reads
+twice.
+
+@TRAP **This check does not know about your firmware.** It knows the
+model's arena and the model's pack. It does not know your peripheral
+buffers, your display framebuffer, your network stack, your stacks, or
+your application's own state. Passing the capacity check means the model
+fits the budget the tool was given, not that your finished image fits the
+part. Look at your linker map. Leave room.
+
+@TRAP The full speech model is not a Pico model, with any precision. Its
+weights alone are 324 MB and its text assets are tens of megabytes. The
+speech switches refuse those target combinations outright rather than
+emitting something that could never bind, and chapter 7 shows the exact
+refusal. Use the Pico profiles for models that are genuinely small.
+
+@SECTION One rule for all four bare-metal profiles
+
+Generating source is not a build, not a boot test, and not numerical or
+timing proof. It says the graph was understood and the code was written.
+Everything downstream - the compile, the link, the image, the memory map,
+the numbers on your hardware - belongs to your application's integration
+and test process, and has to be established there.

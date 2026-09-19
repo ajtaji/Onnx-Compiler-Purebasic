@@ -1,0 +1,49 @@
+; Emitted with the target's integer-to-float expression substituted by the
+; native source generator. Caller validated pack identity and buffer bounds.
+Procedure PmWeightDecode(Source.i, Destination.i, Elements.i, Kind.i)
+  Protected index.i
+  Protected bits.i
+  Protected exponent.i
+  Protected mantissa.i
+  Protected sign.i
+  Protected block.i
+  Protected q.i
+  Protected value.f
+  Protected scale.f
+  index=0
+  While index<Elements
+    If Kind=22
+      block=index/32
+      q=(PeekA(Source+block*20+4+(index%32)/2)>>((index & 1)*4)) & 15
+      If q>=8 : q=q-16 : EndIf
+      value=PMO_STORAGE_FLOAT(q)
+      scale=PmTensorGet(Source+block*20,0)
+      PmTensorPut(Destination,index,value*scale)
+    Else
+      bits=PeekW(Source+index*2) & $FFFF
+      If Kind=16
+        bits=bits<<16
+      Else
+        sign=(bits & $8000)<<16
+        exponent=(bits>>10) & 31
+        mantissa=bits & 1023
+        If exponent=0
+          If mantissa=0
+            bits=sign
+          Else
+            exponent=113
+            While (mantissa & 1024)=0
+              mantissa=mantissa<<1
+              exponent=exponent-1
+            Wend
+            bits=sign | (exponent<<23) | ((mantissa & 1023)<<13)
+          EndIf
+        Else
+          bits=sign | ((exponent+112)<<23) | (mantissa<<13)
+        EndIf
+      EndIf
+      PokeL(Destination+index*4,bits)
+    EndIf
+    index=index+1
+  Wend
+EndProcedure

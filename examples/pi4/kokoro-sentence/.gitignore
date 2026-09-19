@@ -1,0 +1,5 @@
+# Everything the recipe produces. None of it is source: the recipe makes it.
+/model/
+/build/
+/run/
+__pycache__/

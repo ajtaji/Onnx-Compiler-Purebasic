@@ -1,0 +1,182 @@
+; Resident Kokoro text adapter for generated 64-bit model libraries.
+; Include AFTER the generated model. No filesystem, audio driver, compiler,
+; board address or allocation service is used. Assets remain caller-owned and
+; immutable until Close/rebind. One model / one serialized request at a time.
+XIncludeFile "kokoro_assets.pmi"
+XIncludeFile "kokoro_g2p.pmi"
+
+#PMK_TEXT_MAX_BYTES=4096
+#PMK_TEXT_PHONEME_BYTES=2048
+Global PmKokoroTextPack.i
+Global PmKokoroTextVoice.i
+Global PmKokoroTextError.i
+Global PmKokoroTextTokenCount.i
+Global Dim PmKokoroTextPhonemes.a(#PMK_TEXT_PHONEME_BYTES-1)
+Global Dim PmKokoroTextIds.q(#PMK_MAX_IDS-1)
+Global Dim PmKokoroTextScratch.a(#PMK_G2P_MAX_WORD-1)
+Global Dim PmKokoroTextNormalized.a(#PMK_TEXT_MAX_BYTES-1)
+Global Dim PmKokoroTextOffsets.i(#PMK_TEXT_MAX_BYTES)
+
+; Normalize common book typography BEFORE word lookup (don't split can't).
+; All replacements shrink, so this never exceeds the original byte count.
+; Unknown UTF-8 is retained for explicit phonemes or a precise refusal.
+Procedure.i PmKokoroTextNormalize(*text,bytes.i)
+  Protected i.i
+  Protected n.i
+  Protected nextByte.i
+  Protected cp.i
+  Protected replacement.i
+  i=0
+  n=0
+  While i<bytes
+    cp=PmKokoroUtf8Next(*text,i,bytes,@nextByte)
+    replacement=0
+    Select cp
+      Case $A0 : replacement=32
+      Case $202F : replacement=32
+      Case $2018 : replacement=39
+      Case $2019 : replacement=39
+      Case $201C : replacement=34
+      Case $201D : replacement=34
+      Case $2013 : replacement=45
+      Case $2014 : replacement=45
+      Case $2026 : replacement=46
+    EndSelect
+    If replacement<>0
+      PmKokoroTextOffsets(n)=i
+      PmKokoroTextNormalized(n)=replacement
+      n=n+1
+      i=nextByte
+    Else
+      PmKokoroTextOffsets(n)=i
+      PmKokoroTextNormalized(n)=PeekA(*text+i)
+      n=n+1
+      i=i+1
+    EndIf
+  Wend
+  PmKokoroTextOffsets(n)=bytes
+  ProcedureReturn n
+EndProcedure
+
+Procedure PmKokoroTextClose()
+  If DRejectProgressReentry()
+    ProcedureReturn
+  EndIf
+  PmKokoroTextPack=0
+  PmKokoroTextVoice=0
+  PmKokoroTextTokenCount=0
+  PmKokoroTextError=0
+  PmKokoroG2pUseExtra(0,0)
+EndProcedure
+
+; Validate on attachment, never CRC-scan the dictionaries per sentence.
+; Extra may be (0,0), but the expanded dictionary is recommended.
+Procedure.i PmKokoroTextBind(*pack,packBytes.i,*extra,extraBytes.i,*voice,voiceBytes.i)
+  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
+  PmKokoroTextClose()
+  PmKokoroTextError=2
+  If PmKokoroG2pValidate(*pack,packBytes)=0 : ProcedureReturn 0 : EndIf
+  PmKokoroTextError=3
+  If PmKokoroG2pUseExtra(*extra,extraBytes)=0 : ProcedureReturn 0 : EndIf
+  PmKokoroTextError=4
+  If PmKokoroValidateVoice(*voice,voiceBytes)=0
+    PmKokoroG2pUseExtra(0,0)
+    ProcedureReturn 0
+  EndIf
+  PmKokoroTextPack=*pack
+  PmKokoroTextVoice=*voice
+  PmKokoroTextError=0
+  ProcedureReturn 1
+EndProcedure
+
+; Invalid replacement clears the previous voice: never silently speak with it.
+Procedure.i PmKokoroTextSetVoice(*voice,voiceBytes.i)
+  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
+  PmKokoroTextVoice=0
+  PmKokoroTextError=4
+  If PmKokoroValidateVoice(*voice,voiceBytes)=0 : ProcedureReturn 0 : EndIf
+  PmKokoroTextVoice=*voice
+  PmKokoroTextError=0
+  ProcedureReturn 1
+EndProcedure
+
+; Returns token count including the two boundary IDs, or zero. A new request
+; invalidates prior output even when conversion fails. DError describes model
+; failures; PmKokoroG2pError/ErrorAt describe conversion failures and unknown
+; word offsets remain available in PmKokoroG2pSpelledAt.
+Procedure.i PmKokoroTextPrepare(*text,textBytes.i,speed.f)
+  Protected bytes.i
+  Protected count.i
+  Protected row.i
+  Protected id.i
+  Protected i.i
+  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
+  PmModelResetRequest()
+  DError=0
+  DCancel=0
+  PmKokoroTextTokenCount=0
+  PmKokoroG2pError=0
+  PmKokoroG2pErrorAt=0
+  PmKokoroG2pSpelledCount=0
+  PmKokoroTextError=1
+  If PmKokoroTextPack=0 Or PmKokoroTextVoice=0 : ProcedureReturn 0 : EndIf
+  PmKokoroTextError=9
+  If PmModelReady=0 : ProcedureReturn 0 : EndIf
+  PmKokoroTextError=5
+  If *text=0 Or textBytes<=0 Or textBytes>#PMK_TEXT_MAX_BYTES : ProcedureReturn 0 : EndIf
+  PmKokoroTextError=6
+  If PmKokoroF32PositiveFinite(@speed)=0 : ProcedureReturn 0 : EndIf
+  PmKokoroTextError=7
+  bytes=PmKokoroTextNormalize(*text,textBytes)
+  bytes=PmKokoroG2pEnglishValidated(PmKokoroTextPack,@PmKokoroTextNormalized(0),bytes,@PmKokoroTextPhonemes(0),#PMK_TEXT_PHONEME_BYTES,@PmKokoroTextScratch(0),#PMK_G2P_MAX_WORD)
+  PmKokoroG2pErrorAt=PmKokoroTextOffsets(PmKokoroG2pErrorAt)
+  i=0
+  While i<PmKokoroG2pSpelledCount And i<8
+    PmKokoroG2pSpelledAt(i)=PmKokoroTextOffsets(PmKokoroG2pSpelledAt(i))
+    i=i+1
+  Wend
+  If bytes=0 : ProcedureReturn 0 : EndIf
+  PmKokoroTextError=8
+  count=PmKokoroEncodePhonemes(@PmKokoroTextPhonemes(0),bytes,@PmKokoroTextIds(0),#PMK_MAX_IDS)
+  If count<3 : ProcedureReturn 0 : EndIf
+  row=PmKokoroTextVoice+#PMK_VOICE_HEADER+(count-3)*#PMK_VOICE_WIDTH*4
+  PmKokoroTextError=9
+  id=PmModelInput(0)
+  If DShape(id,7,2,1,count,0,0)=0 : Goto PmKokoroTextPrepareFailed : EndIf
+  DCopy(@PmKokoroTextIds(0),Dt(id)\Data,count*8)
+  id=PmModelInput(1)
+  If DShape(id,1,2,1,#PMK_VOICE_WIDTH,0,0)=0 : Goto PmKokoroTextPrepareFailed : EndIf
+  DCopy(row,Dt(id)\Data,#PMK_VOICE_WIDTH*4)
+  id=PmModelInput(2)
+  If DShape(id,1,1,1,0,0,0)=0 : Goto PmKokoroTextPrepareFailed : EndIf
+  PmKokoroWriteF32(Dt(id)\Data,speed)
+  PmKokoroTextTokenCount=count
+  PmKokoroTextError=0
+  ProcedureReturn count
+  PmKokoroTextPrepareFailed:
+  PmModelResetRequest()
+  ProcedureReturn 0
+EndProcedure
+
+; Returns output tensor ID: borrowed mono FP32 PCM at 24000 Hz, valid until
+; next Prepare/Render/model reset/close. Copy it before submitting more text.
+Procedure.i PmKokoroTextRender(*text,textBytes.i,speed.f)
+  Protected output.i
+  Protected i.i
+  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
+  If PmKokoroTextPrepare(*text,textBytes,speed)=0 : ProcedureReturn 0 : EndIf
+  PmKokoroTextError=9
+  If PmModelExecute()=0 : Goto PmKokoroTextRenderFailed : EndIf
+  output=PmModelOutput(0)
+  PmKokoroTextError=10
+  If output<=0 Or output>#PMD_TENSOR_COUNT : Goto PmKokoroTextRenderFailed : EndIf
+  If Dt(output)\Kind<>1 Or Dt(output)\Count<=0 : Goto PmKokoroTextRenderFailed : EndIf
+  For i=0 To Dt(output)\Count-1
+    If PmKokoroF32Finite(Dt(output)\Data+i*4)=0 : Goto PmKokoroTextRenderFailed : EndIf
+  Next
+  PmKokoroTextError=0
+  ProcedureReturn output
+  PmKokoroTextRenderFailed:
+  PmModelResetRequest()
+  ProcedureReturn 0
+EndProcedure

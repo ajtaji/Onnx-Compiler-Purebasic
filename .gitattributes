@@ -1,0 +1,6 @@
+* text=auto
+*.pb text eol=crlf
+*.pbi text eol=crlf
+*.pmi text eol=crlf
+*.md text eol=lf
+*.svg text eol=lf

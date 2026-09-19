@@ -1,0 +1,207 @@
+@CHAPTER Contributing
+@INTRO Where the code is, what the numbers are allowed to do, and what it takes for a kernel to be believed.
+
+@SECTION The shape of the tree
+
+@FRAG
+Build.pb              builds the two tools. Not part of the generator.
+src/                  the application entry points
+  compiler/           parser, IR, validation, precision, emitters, window
+runtime/              execution source embedded into the generator and
+  math/               exported beside every generated model
+examples/             model creation and a complete Windows consumer
+docs/                 the reference pages, and this book under docs/guide/
+@ENDFRAG
+
+The compiler modules divide along one seam that is worth learning before
+you change anything: **the parser and the IR own what a graph MEANS; a
+target owns only how it is written down.**
+
+@FRAG
+onnx_wire.pbi          bounded protobuf reader: varints, keys, spans, limits
+onnx_model.pbi         model, graph, node, attribute, shape, tensor parsing
+onnx_ir.pbi            target-neutral graph, constant folding, aliases,
+                       lifetimes, arena planning
+onnx_quant.pbi         eligible INT8 weight conversion, scales, layouts
+onnx_storage.pbi       FP16/BF16/INT4 storage, rounding, decode budgets
+onnx_pack.pbi          deterministic checked weight pack, identity, CRC
+onnx_targets.pbi       the five profiles: dialect, kernels, capacity
+onnx_compile.pbi       coordinator: options, validation, routing, manifests
+onnx_emit.pbi          fixed-shape emission, the PmOnnx... API
+onnx_forms.pbi         attribute forms both emitters accept or refuse,
+                       and the refusal sentence
+onnx_dynamic_emit.pbi  runtime-dimension emission, the PmModel... API,
+                       and the runtime export
+@ENDFRAG
+
+@TRAP Graph semantics must never branch on the target. If you find
+yourself writing "on the Pico this operator means..." you are in the wrong
+file. A target selects a dialect, a kernel and a budget. The moment it
+changes what an operation computes, two targets have silently become two
+compilers and there is no reference left to check either against.
+
+@SECTION Which file should I change
+
+@FRAG
+Add a target               onnx_targets.pbi, then runtime export and launch
+                           handling in both emitters
+Add an operator            parser/IR validation, BOTH applicable emitters,
+                           and BOTH relevant execution runtimes
+Change a precision         onnx_quant.pbi or onnx_storage.pbi, then packing,
+                           the runtime kernel or decoder, and capacity
+Windows tensor speed       tensor_simd_windows.pbi
+64-bit Arm tensor speed    tensor_fp32_neon.pmi
+The generator window       onnx_ui.pbi
+Pronunciation behaviour    kokoro_g2p.pmi, kokoro_g2p_extra.pmi, and the
+                           adapters' normalization boundaries
+@ENDFRAG
+
+"Both emitters" and "both runtimes" are not thoroughness for its own sake.
+A model with a symbolic extent and the same model with every extent pinned
+take different paths through this tree, and an operator added to one of
+them is an operator that works until somebody fixes their shapes.
+
+The complete file-by-file guide is the source map reference page, and it
+covers every published file, including the ones this chapter has not.
+
+@SECTION The numerical contract
+
+This is the part with the least room for judgement, so here it is as
+rules.
+
+**No fused multiply-add.** Not in a kernel that has a scalar reference.
+An FMLA rounds once where the reference rounds twice, and that is a
+different number. It is usually a BETTER number, and it is still a
+different one, and "better" is not the contract.
+
+**No reassociation.** Floating-point addition is not associative. Splitting
+a reduction into four partial accumulators and folding them at the end
+changes the answer. So the reductions in the 64-bit Arm runtime are
+deliberately scalar - that is not a kernel nobody got round to vectorizing,
+it is a kernel that must not be:
+
+@FRAG
+; Final-axis reductions keep the portable kernel's exact FP32 evaluation
+; order while owning their hot loop state in registers.  In particular,
+; these are deliberately scalar reductions: a horizontal vector reduction
+; or several partial accumulators would reassociate non-associative adds.
+@ENDFRAG
+
+**No wider intermediate type.** Evaluating a float32 expression in double
+and rounding at the end is the same class of change as fusing.
+
+**One floating-point control register, and it is left alone.** The
+contract assumes nearest-even, gradual underflow and default-NaN disabled.
+That is what makes signed zeros, infinities, subnormals and NaN payloads
+come out of a vector kernel the same as they do one element at a time.
+
+**Say which kind of kernel you wrote.** If it is bit-identical, claim it in
+the header and prove it. If it cannot be - a vector reduction, a fused
+path - say that in the header too, and make sure the gate keeps exact
+scalar checks alongside.
+
+@SECTION What the caller must have established
+
+A fast kernel gets to skip checks precisely because something above it
+already did them. That contract belongs in the kernel's own header, in
+full, because it is the only place a reader will look:
+
+@FRAG
+; WHAT THE CALLER MUST HAVE ESTABLISHED, because this kernel checks none of
+; it - DBinary does, and refuses everything else to the portable path:
+;   *a, *b, *destination  FLOAT32, and *destination contiguous
+;   aStride, bStride      1 for a contiguous operand, 0 for one broadcast
+;                         element; nothing else
+;   op                    0 add, 1 subtract, 2 multiply, 3 divide
+;   destination           may be exactly *a or exactly *b when that operand
+;                         is contiguous; it may NOT alias a BROADCAST
+;                         operand ... and may not partially overlap either.
+@ENDFRAG
+
+@TRAP Note the aliasing clause and why it exists: the scalar body re-reads
+the broadcast element after each store and the vector body does not. Two
+implementations of "the same" operation differ in a case the caller can
+reach. That is exactly the kind of fact that is obvious for a week and
+invisible forever afterwards, and the only defence is writing it down
+where the next person is already looking.
+
+@SECTION How a kernel is proved
+
+Roughly in this order. Skipping steps is how a fast wrong kernel gets
+shipped.
+
+**1. State the contract first.** Bit-identical to the reference, or a
+tolerance with a stated instrument. Write it in the header before writing
+the kernel, because it determines the kernel's shape.
+
+**2. Differential test against the reference it replaces.** Real inputs,
+plus the awkward ones: zeros of both signs, infinities, NaNs and their
+payloads, subnormals, the reduction boundaries, every alignment, the
+one-two-three-element tails, the broadcast cases, the aliasing cases the
+header permits.
+
+**3. Negative controls.** Damage the kernel on purpose and confirm the
+gate fails. A gate that has never gone red has not been shown to be
+capable of it. Name the mutants; a suite that catches eleven planted
+defects is a suite you can quote.
+
+**4. Run it where it will actually run.** A kernel that passes in an
+instruction interpreter and has never executed on the silicon is a kernel
+with one unproven step left, and it is the step that has surprised people
+before. Where hardware exists, the gate runs on the hardware.
+
+**5. Prove it at model scale.** The fixture says the kernel is right. The
+model says the kernel is right *in this program*. For the speech model
+that means the output waveform's digest, unchanged.
+
+**6. Keep the controls.** When you measure a speedup, leave something
+untouched in the same measurement. Two operator families coming back
+identical to the millisecond is what turns "it got faster" into "these
+kernels got faster".
+
+@TRAP Put the gate somewhere it is tracked. `tests/` in this repository is
+ignored apart from `tests/node_suite/`, so a gate written anywhere else
+there is on one disk and nowhere else - see chapter 8. An operator added or
+fixed should move the node-test score, and the score before and after
+belongs with the change. This is not a filing preference. A proof that does not outlive
+a working directory is not a proof.
+
+@SECTION Licensing and notices
+
+The project source and documentation here are **MIT**: use, modify and
+redistribute, including commercially, keeping the licence notice. The
+software is provided as is, with the licence's limitation of liability.
+
+That licence covers what is in this repository. It does not relicense
+anything you obtain separately, and several things in this book are
+obtained separately:
+
+@FRAG
+the host language   required to build the tools and Windows output
+PureMetal Forge     separate toolchain for the bare-metal dialects
+ONNX Runtime        optional host reference/trace engine only
+Kokoro              optional speech model and voices
+Misaki / CMUdict    source data for the pronunciation packs
+@ENDFRAG
+
+@TRAP A prepared pack is derived data. Turning a dictionary into a
+`.pmg2p` or a raw voice into a `.pmvoice` changes the format, not the
+licence. Keep the notices for the **specific versions** you downloaded,
+transformed or redistributed. This compiler grants you no rights to model
+assets it does not contain.
+
+No proprietary compiler binaries, private keys, model data or signing
+material are in this repository, and none should be added to it.
+
+@SECTION Before you send a change
+
+Rebuild the generator if you touched anything under `runtime/` - the
+generator embeds it, so an unrebuilt tool cannot emit your change.
+Regenerate the demo closures and check that what changed is what you meant
+to change. Run `--self-test`. Run the arithmetic walkthrough end to end.
+
+And if your change alters what a developer DOES - a command, a flag, a
+file format, an emitted API, a capacity rule, an install step - update the
+chapter of this book that describes it and re-render the PDF in the same
+commit. A book that lags its repository is a defect like any other, and
+the rendering command is one line. It is in chapter 10.

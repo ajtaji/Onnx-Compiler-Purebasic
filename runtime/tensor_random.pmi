@@ -1,0 +1,419 @@
+; ======================================================================
+; tensor_random.pmi - the specified generator behind the ONNX random operators
+; ----------------------------------------------------------------------
+; Operators: RandomUniform, RandomUniformLike, RandomNormal, RandomNormalLike
+; (ai.onnx, since version 1; the definitions opset 20 uses).
+;   https://onnx.ai/onnx/operators/onnx__RandomUniform.html
+;   https://onnx.ai/onnx/operators/onnx__RandomUniformLike.html
+;   https://onnx.ai/onnx/operators/onnx__RandomNormal.html
+;   https://onnx.ai/onnx/operators/onnx__RandomNormalLike.html
+; The specification fixes the distribution (uniform by low/high, normal by
+; mean/scale), the element type (dtype) and the shape, and leaves the
+; generator unspecified. This file SPECIFIES it, so that one seed and one
+; shape give the same binary32 values on every target: Windows, Pi 4,
+; UNO Q, Pico and Pico 2. The contract is written out in the book chapter
+; "How it is proved" and in docs/VALIDATION.md; this header is the summary.
+;
+; ONE SOURCE FOR EVERY TARGET. This file is written in the subset both
+; dialects accept and is included, unchanged, by the Windows and the
+; portable model programs. There is no second copy to drift.
+;
+; GENERATOR. Threefry-2x32, 20 rounds (the Random123 / Skein key schedule).
+; It uses only 32-bit addition, rotation and exclusive or, so it needs no
+; multiplier and no 64-bit integer, and every word is masked to 32 bits so
+; the same text is exact where the native integer is 32 or 64 bits wide.
+;
+; STREAMS. The node's key is Threefry(key=(S,0), counter=(node,d)) where
+; node is the node's 0-based position in the top-level graph and
+;   S = IEEE-754 bits of the node's FLOAT seed attribute, d = 1, when the
+;       node has one;
+;   S = the model seed (32 bits, 0 until the caller sets it), d = 0, when
+;       it does not.
+; Element i of request r is Threefry(key=nodeKey, counter=(i,r)). Streams
+; are independent per node: a node never consumes another node's draws.
+; The request number is 0 after the model is bound or its seed is set and
+; rises by one for every execution that starts the graph.
+;
+; TRANSFORMS. Every floating step is ONE binary32 +, -, * or / with a
+; correctly rounded result, or an exact conversion of an integer below
+; 2^25. No library function is called: Sqr, Log and Cos differ between the
+; targets' maths libraries, and a single ULP of difference would break the
+; contract. The constants are loaded from their bit patterns.
+;   uniform  m = w0>>8; u = m*2^-24 in [0,1); out = low + (high-low)*u
+;   normal   Box-Muller, cosine branch: u1 = ((w0>>8)+1)*2^-24 in (0,1];
+;            r = sqrt(-2 ln u1) with ln from the atanh series after an
+;            exact power-of-two split and sqrt from a fixed Newton sequence;
+;            the angle 2*pi*u2 is folded to one octant from the top three
+;            bits of w1 and its cosine or sine taken from Taylor chains;
+;            out = mean + scale*(r*c).
+; |z| is bounded by sqrt(48 ln 2) = 5.77 (u1 >= 2^-24).
+; ======================================================================
+
+Global PmRandomReady.i
+Global PmRandomModelSeed.i
+Global PmRandomRequest.i
+Global PmRandomNextRequest.i
+Global PmRandomW0.i
+Global PmRandomW1.i
+Global PmRandomTwoM24.f
+Global PmRandomLn2.f
+Global PmRandomSqrt2.f
+Global PmRandomTheta.f
+Global PmRandomC3.f
+Global PmRandomC5.f
+Global PmRandomC7.f
+Global PmRandomC9.f
+Global PmRandomH6.f
+Global PmRandomH24.f
+Global PmRandomH120.f
+Global PmRandomH720.f
+Global PmRandomH5040.f
+Global PmRandomH40320.f
+Global PmRandomH362880.f
+Global PmRandomH3628800.f
+
+Procedure PmRandomInit()
+  If PmRandomReady <> 0
+    ProcedureReturn
+  EndIf
+  PokeL(@PmRandomTwoM24, $33800000)
+  PokeL(@PmRandomLn2, $3F317218)
+  PokeL(@PmRandomSqrt2, $3FB504F3)
+  PokeL(@PmRandomTheta, $34C90FDB)
+  PokeL(@PmRandomC3, $3EAAAAAB)
+  PokeL(@PmRandomC5, $3E4CCCCD)
+  PokeL(@PmRandomC7, $3E124925)
+  PokeL(@PmRandomC9, $3DE38E39)
+  PokeL(@PmRandomH6, $3E2AAAAB)
+  PokeL(@PmRandomH24, $3D2AAAAB)
+  PokeL(@PmRandomH120, $3C088889)
+  PokeL(@PmRandomH720, $3AB60B61)
+  PokeL(@PmRandomH5040, $39500D01)
+  PokeL(@PmRandomH40320, $37D00D01)
+  PokeL(@PmRandomH362880, $3638EF1D)
+  PokeL(@PmRandomH3628800, $3493F27E)
+  PmRandomReady = 1
+EndProcedure
+
+; The model seed is 32 bits on every target. A 64-bit caller may pass any
+; value whose upper half is all zeros or all ones (so -1 and $FFFFFFFF are
+; the same seed everywhere); anything wider is refused with 0 rather than
+; silently truncated. Setting the seed restarts the request numbers.
+Procedure.i PmRandomSetSeed(seed.i)
+  Protected high.i
+  high = (seed >> 16) >> 16
+  If high <> 0 And high <> -1
+    ProcedureReturn 0
+  EndIf
+  PmRandomModelSeed = seed & $FFFFFFFF
+  PmRandomRequest = 0
+  PmRandomNextRequest = 0
+  ProcedureReturn 1
+EndProcedure
+
+; Binding a model restarts the request numbers and keeps the seed.
+Procedure PmRandomRestart()
+  PmRandomRequest = 0
+  PmRandomNextRequest = 0
+EndProcedure
+
+Procedure PmRandomBeginRequest()
+  PmRandomRequest = PmRandomNextRequest
+  PmRandomNextRequest = (PmRandomNextRequest + 1) & $FFFFFFFF
+EndProcedure
+
+; Threefry-2x32-20. Rotations 13 15 26 6 / 17 29 16 24; key injection after
+; every fourth round with the round-group number added to the second word.
+; Result in PmRandomW0 / PmRandomW1.
+Procedure PmRandomThreefry(k0.i, k1.i, c0.i, c1.i)
+  Protected k2.i
+  Protected x0.i
+  Protected x1.i
+  k0 = k0 & $FFFFFFFF
+  k1 = k1 & $FFFFFFFF
+  k2 = ($1BD11BDA ! k0 ! k1) & $FFFFFFFF
+  x0 = (c0 + k0) & $FFFFFFFF
+  x1 = (c1 + k1) & $FFFFFFFF
+  ; rounds 1-4
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 13) & $FFFFFFFF) | ((x1 >> 19) & $1FFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 15) & $FFFFFFFF) | ((x1 >> 17) & $7FFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 26) & $FFFFFFFF) | ((x1 >> 6) & $3FFFFFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 6) & $FFFFFFFF) | ((x1 >> 26) & $3F)) ! x0
+  x0 = (x0 + k1) & $FFFFFFFF
+  x1 = (x1 + k2 + 1) & $FFFFFFFF
+  ; rounds 5-8
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 17) & $FFFFFFFF) | ((x1 >> 15) & $1FFFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 29) & $FFFFFFFF) | ((x1 >> 3) & $1FFFFFFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 16) & $FFFFFFFF) | ((x1 >> 16) & $FFFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 24) & $FFFFFFFF) | ((x1 >> 8) & $FFFFFF)) ! x0
+  x0 = (x0 + k2) & $FFFFFFFF
+  x1 = (x1 + k0 + 2) & $FFFFFFFF
+  ; rounds 9-12
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 13) & $FFFFFFFF) | ((x1 >> 19) & $1FFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 15) & $FFFFFFFF) | ((x1 >> 17) & $7FFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 26) & $FFFFFFFF) | ((x1 >> 6) & $3FFFFFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 6) & $FFFFFFFF) | ((x1 >> 26) & $3F)) ! x0
+  x0 = (x0 + k0) & $FFFFFFFF
+  x1 = (x1 + k1 + 3) & $FFFFFFFF
+  ; rounds 13-16
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 17) & $FFFFFFFF) | ((x1 >> 15) & $1FFFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 29) & $FFFFFFFF) | ((x1 >> 3) & $1FFFFFFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 16) & $FFFFFFFF) | ((x1 >> 16) & $FFFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 24) & $FFFFFFFF) | ((x1 >> 8) & $FFFFFF)) ! x0
+  x0 = (x0 + k1) & $FFFFFFFF
+  x1 = (x1 + k2 + 4) & $FFFFFFFF
+  ; rounds 17-20
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 13) & $FFFFFFFF) | ((x1 >> 19) & $1FFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 15) & $FFFFFFFF) | ((x1 >> 17) & $7FFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 26) & $FFFFFFFF) | ((x1 >> 6) & $3FFFFFF)) ! x0
+  x0 = (x0 + x1) & $FFFFFFFF
+  x1 = (((x1 << 6) & $FFFFFFFF) | ((x1 >> 26) & $3F)) ! x0
+  x0 = (x0 + k2) & $FFFFFFFF
+  x1 = (x1 + k0 + 5) & $FFFFFFFF
+  PmRandomW0 = x0
+  PmRandomW1 = x1 & $FFFFFFFF
+EndProcedure
+
+; sqrt(x) for x > 0 by one fixed sequence: scale by exact powers of four
+; into [1,4), start at 0.375x + 0.75 (at most 12.5% off), four Newton
+; steps, scale back by exact powers of two.
+Procedure.f PmRandomSqrt(x.f)
+  Protected k.i
+  Protected y.f
+  Protected q.f
+  Protected n.i
+  k = 0
+  While x >= 4.0
+    x = x * 0.25
+    k = k + 1
+  Wend
+  While x < 1.0
+    x = x * 4.0
+    k = k - 1
+  Wend
+  y = x * 0.375
+  y = y + 0.75
+  n = 0
+  While n < 4
+    q = x / y
+    y = y + q
+    y = y * 0.5
+    n = n + 1
+  Wend
+  While k > 0
+    y = y * 2.0
+    k = k - 1
+  Wend
+  While k < 0
+    y = y * 0.5
+    k = k + 1
+  Wend
+  ProcedureReturn y
+EndProcedure
+
+; One standard normal variate from the two words in PmRandomW0/PmRandomW1.
+Procedure.f PmRandomNormalValue()
+  Protected m.i
+  Protected e.i
+  Protected v.i
+  Protected f.f
+  Protected d.f
+  Protected num.f
+  Protected den.f
+  Protected t.f
+  Protected s.f
+  Protected p.f
+  Protected lnf.f
+  Protected a.f
+  Protected b.f
+  Protected r2.f
+  Protected r.f
+  Protected octant.i
+  Protected j.i
+  Protected theta.f
+  Protected q.f
+  Protected c.f
+  Protected sn.f
+  Protected pick.f
+  m = ((PmRandomW0 >> 8) & $FFFFFF) + 1
+  e = 0
+  v = m
+  If v >= 65536
+    v = v >> 16
+    e = e + 16
+  EndIf
+  If v >= 256
+    v = v >> 8
+    e = e + 8
+  EndIf
+  If v >= 16
+    v = v >> 4
+    e = e + 4
+  EndIf
+  If v >= 4
+    v = v >> 2
+    e = e + 2
+  EndIf
+  If v >= 2
+    e = e + 1
+  EndIf
+  f = m
+  v = 1 << e
+  d = v
+  f = f / d
+  If f >= PmRandomSqrt2
+    f = f * 0.5
+    e = e + 1
+  EndIf
+  num = f - 1.0
+  den = f + 1.0
+  t = num / den
+  s = t * t
+  p = PmRandomC9 * s
+  p = p + PmRandomC7
+  p = p * s
+  p = p + PmRandomC5
+  p = p * s
+  p = p + PmRandomC3
+  p = p * s
+  p = p + 1.0
+  lnf = t * p
+  lnf = lnf + lnf
+  a = 24 - e
+  a = a * PmRandomLn2
+  b = a - lnf
+  r2 = b + b
+  If r2 > 0.0
+    r = PmRandomSqrt(r2)
+  Else
+    r = 0.0
+  EndIf
+  octant = (PmRandomW1 >> 29) & 7
+  j = (PmRandomW1 >> 8) & $1FFFFF
+  If (octant & 1) <> 0
+    j = $200000 - j
+  EndIf
+  theta = j
+  theta = theta * PmRandomTheta
+  q = theta * theta
+  c = 0.0 - PmRandomH3628800
+  c = c * q
+  c = c + PmRandomH40320
+  c = c * q
+  c = c - PmRandomH720
+  c = c * q
+  c = c + PmRandomH24
+  c = c * q
+  c = c - 0.5
+  c = c * q
+  c = c + 1.0
+  sn = PmRandomH362880 * q
+  sn = sn - PmRandomH5040
+  sn = sn * q
+  sn = sn + PmRandomH120
+  sn = sn * q
+  sn = sn - PmRandomH6
+  sn = sn * q
+  sn = sn + 1.0
+  sn = sn * theta
+  Select octant
+    Case 0
+      pick = c
+    Case 1
+      pick = sn
+    Case 2
+      pick = 0.0 - sn
+    Case 3
+      pick = 0.0 - c
+    Case 4
+      pick = 0.0 - c
+    Case 5
+      pick = 0.0 - sn
+    Case 6
+      pick = sn
+    Default
+      pick = c
+  EndSelect
+  ProcedureReturn r * pick
+EndProcedure
+
+; Fill count FLOAT elements at dst for graph node `node`.
+;   kind 0 uniform (p1 low,  p2 high)
+;   kind 1 normal  (p1 mean, p2 scale)
+; hasSeed/seedBits carry the node's seed attribute (bits of the FLOAT).
+; Returns 0 for a kind outside 0..1 or an element count beyond 2^32, and
+; writes nothing; 1 otherwise.
+Procedure.i PmRandomNode(dst.i, count.i, node.i, hasSeed.i, seedBits.i, kind.i, p1.f, p2.f)
+  Protected n0.i
+  Protected n1.i
+  Protected i.i
+  Protected m.i
+  Protected u.f
+  Protected span.f
+  Protected z.f
+  Protected value.f
+  If kind < 0 Or kind > 1 Or count < 0
+    ProcedureReturn 0
+  EndIf
+  If ((count >> 16) >> 16) <> 0
+    ProcedureReturn 0
+  EndIf
+  PmRandomInit()
+  If hasSeed <> 0
+    PmRandomThreefry(seedBits, 0, node, 1)
+  Else
+    PmRandomThreefry(PmRandomModelSeed, 0, node, 0)
+  EndIf
+  n0 = PmRandomW0
+  n1 = PmRandomW1
+  span = p2 - p1
+  i = 0
+  While i < count
+    PmRandomThreefry(n0, n1, i, PmRandomRequest)
+    If kind = 0
+      m = (PmRandomW0 >> 8) & $FFFFFF
+      u = m
+      u = u * PmRandomTwoM24
+      value = span * u
+      value = p1 + value
+    Else
+      z = PmRandomNormalValue()
+      value = p2 * z
+      value = p1 + value
+    EndIf
+    PmTensorPut(dst, i, value)
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; The same fill with low/high or mean/scale passed as their IEEE-754 bit
+; patterns. Generated programs call this one: an attribute written as a
+; decimal literal would have to survive two decimal conversions, and the
+; contract is the attribute's exact value.
+Procedure.i PmRandomNodeBits(dst.i, count.i, node.i, hasSeed.i, seedBits.i, kind.i, p1Bits.i, p2Bits.i)
+  Protected p1.f
+  Protected p2.f
+  PokeL(@p1, p1Bits)
+  PokeL(@p2, p2Bits)
+  ProcedureReturn PmRandomNode(dst, count, node, hasSeed, seedBits, kind, p1, p2)
+EndProcedure

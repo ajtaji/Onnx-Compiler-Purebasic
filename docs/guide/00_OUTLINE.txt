@@ -1,0 +1,85 @@
+; ======================================================================
+; docs/guide/ - THE ONNX COMPILER GUIDE, the book.
+;
+; Files whose names start with 00_ are documentation OF the book and are
+; never rendered. The markup is the same @-markup the PureMetal Forge
+; books use; this book does not redefine it.
+;
+;   @CHAPTER <title>   starts a chapter. One per file.
+;   @INTRO   <text>    one line under the chapter title.
+;   @SECTION <title>   a heading inside the chapter.
+;   @FRAG .. @ENDFRAG  a fragment shown as code. Nothing compiles it.
+;   @CODE .. @ENDCODE  a COMPLETE compilable program.
+;   @TRAP <text>       a red callout: the mistake people actually make.
+;   @NOTE <text>       a blue callout: worth knowing, not dangerous.
+;   <anything else>    a paragraph. A blank line starts a new one.
+;   ; <text>           a comment. Never shown.
+;
+; WHAT THIS BOOK IS
+;   The book for this repository. It is for a developer who has an ONNX
+;   model and wants to know what this tool will and will not do with it,
+;   in what order, and what the result is made of. It assumes the reader
+;   can build a program and read source, and assumes nothing at all about
+;   ONNX internals, bare-metal work, or speech synthesis.
+;
+; THE RULES OF THIS BOOK
+;   1. EVERY COMMAND PRINTED HERE WAS RUN, or was copied verbatim from
+;      the tool's own `--help`. Nothing is composed from what a flag
+;      ought to be called. Every refusal message quoted in chapter 4 is
+;      the exact text the tool printed when the mistake was made on
+;      purpose.
+;   2. EVERY BOARD NUMBER COMES FROM A REAL RUN, with the conditions it
+;      was measured under printed beside it. A measurement without its
+;      conditions is not a measurement, and a number nobody can reproduce
+;      is worse than no number.
+;   3. THE BOOK STATES WHAT IS TRUE TODAY. Work that is under way is
+;      named as under way, in the same sentence as the thing it will
+;      change. A book that quietly describes the plan instead of the
+;      product is how a reader loses an afternoon.
+;   4. NOTHING IS SOLD. Where the honest answer is "this is 32 times
+;      slower than real time and here is the measurement", that is the
+;      sentence. Where a check passes, the book says what the check
+;      actually establishes and not one step more.
+;   5. Every @CODE block in the @-markup books elsewhere is compiled by
+;      a checker. NOTHING IN THIS BOOK IS COMPILED, because every block
+;      here is either a command line, an excerpt of emitted source, or a
+;      fragment of a program the reader writes around a model this
+;      repository does not contain. So every block is @FRAG, honestly,
+;      rather than @CODE dressed up to look checked.
+;   6. A commit that changes what a developer does - a command, a flag,
+;      a file format, an emitted API, a capacity rule - updates the
+;      chapter that describes it and re-renders the PDF in the same
+;      commit. The rendering command is in chapter 10.
+;
+; CHAPTER PLAN - one file each, numbered, titles final
+;   01_what_this_compiler_is   Ahead of time, source out, not binaries.
+;                              What it refuses to do, and the four
+;                              products the source is for.
+;   02_building_the_tool       The build helper, the two executables,
+;                              what bin/ holds, checking the result.
+;   03_your_first_model        The two demo models, one --compile, one
+;                              application build, three requests.
+;   04_reading_a_model         The operator subset, shapes and runtime
+;                              dimensions, what is refused and how the
+;                              refusal reads, the five precisions.
+;   05_what_comes_out          The emitted source, the weight pack, the
+;                              manifest, the runtime folder, and the
+;                              resident lifecycle the API is shaped by.
+;   06_the_five_targets        Windows; Pi 4 and UNO Q and the payload
+;                              contract; Pico and Pico 2 and their
+;                              capacity rules.
+;   07_speech_end_to_end       The pinned speech model, the assets and
+;                              the pack/verify commands, the text
+;                              adapter, and the measured speed today.
+;   08_how_it_is_proved        The oracle, bit identity, where the gates
+;                              live and why they are not in this tree.
+;   09_contributing            The source map, the numerical contract,
+;                              how a kernel is proved, licensing.
+;   10_where_everything_is     The reference pages, and how this book is
+;                              rendered and kept current.
+;   11_the_kokoro_sentence_on_the_pi4
+;                              The Pi 4 example: the runner, the host
+;                              tools, the recipe from a clean checkout,
+;                              and the measured sentence. Numbered after
+;                              chapter 10 so no chapter reference moves.
+; ======================================================================

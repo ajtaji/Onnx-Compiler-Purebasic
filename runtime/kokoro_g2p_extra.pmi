@@ -1,0 +1,41 @@
+; Checked supplementary pronunciations. Included after the base hash lookup.
+; CMUdict-derived packs are external assets; retain their accompanying licence.
+; The caller owns the immutable memory until detaching with (0,0).
+#PMK_EXTRA_BYTES=5397245
+Global PmKokoroG2pExtraPack.i
+
+Procedure.i PmKokoroG2pUseExtra(*pack,bytes.i)
+  Protected i.i
+  PmKokoroG2pExtraPack=0
+  If *pack=0 And bytes=0 : ProcedureReturn 1 : EndIf
+  If *pack=0 Or bytes<>#PMK_EXTRA_BYTES : ProcedureReturn 0 : EndIf
+  If PeekN(*pack)<>$32474D50 Or PeekN(*pack+4)<>$00005850 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack+8)<>1 Or PeekN(*pack+12)<>256 Or PeekI(*pack+16)<>bytes : ProcedureReturn 0 : EndIf
+  If PeekN(*pack+24)<>262144 Or PeekN(*pack+28)<>66305 Or PeekI(*pack+32)<>256 : ProcedureReturn 0 : EndIf
+  If PeekI(*pack+40)<>4194560 Or PeekI(*pack+48)<>468193 : ProcedureReturn 0 : EndIf
+  If PeekI(*pack+56)<>4662753 Or PeekI(*pack+64)<>734492 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack+72)<>$2641725D Or PeekN(*pack+76)<>0 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack+80)<>$43789181 Or PeekN(*pack+84)<>$E24CF4C7 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack+88)<>$63AC94B0 Or PeekN(*pack+92)<>$7A2C3C87 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack+96)<>$0402F84C Or PeekN(*pack+100)<>$55C49207 : ProcedureReturn 0 : EndIf
+  If PeekN(*pack+104)<>$06A43CBA Or PeekN(*pack+108)<>$223D1C89 : ProcedureReturn 0 : EndIf
+  If PmKokoroVocabHash(*pack+144)=0 : ProcedureReturn 0 : EndIf
+  i=112
+  While i<144
+    If PeekA(*pack+i)<>0 : ProcedureReturn 0 : EndIf
+    i=i+1
+  Wend
+  i=216
+  While i<256
+    If PeekA(*pack+i)<>0 : ProcedureReturn 0 : EndIf
+    i=i+1
+  Wend
+  If PmTensorCrc32(*pack+256,bytes-256)<>$2641725D : ProcedureReturn 0 : EndIf
+  PmKokoroG2pExtraPack=*pack
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmKokoroG2pLookupExtra(*word,bytes.i,*spoken,*spokenBytes)
+  If PmKokoroG2pExtraPack=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn PmKokoroG2pLookupExact(PmKokoroG2pExtraPack,*word,bytes,*spoken,*spokenBytes)
+EndProcedure

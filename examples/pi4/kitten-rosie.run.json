@@ -1,0 +1,30 @@
+{
+  "format": "anvil-board-model-run 1",
+  "name": "kitten-rosie",
+  "text": "I am the kitten speech AI model on the raspberry Pi 4. How do I sound, good? I am running on bare metal, with no operating system, under Anvil, a mini kernel and boot loader, on all four cores of the Raspberry Pi 4. Both Anvil and I were compiled by Pure Metal Forge.",
+  "base": "kitten-nano-0.8",
+  "out": "pi4-rosie/board-model-run",
+  "payload": {
+    "file": "pi4-rosie/kitten-rosie.img.pmf",
+    "sha256": "6e0c2bd0fa3a43339acfccf703d59a4ecccfcb47aab07a41de5029a333b95333",
+    "stage": "0x03000000",
+    "expect_x0": "0",
+    "timeout_seconds": 900
+  },
+  "deadman_seconds": 15,
+  "assets": [
+    {"name": "weights", "file": "pi4/kitten.pmw", "address": "0x40000000",
+     "sha256": "173baffd6c4ee47a15742dcd39caebef041865392f2b92e374d6cbe61b44f8ff"},
+    {"name": "noise", "file": "pi4-rosie/kitten-rosie-noise.f32", "address": "0x54000000",
+     "sha256": "9fcf65495f754bb0927055026dc46584077e299e1af9055b5b7bad844c1386d4"}
+  ],
+  "results": [
+    {"name": "wave", "address": "0x57000000", "bytes": 2382400, "board_sha256": true},
+    {"name": "trace", "address": "0x57E00000", "bytes": 256},
+    {"name": "ticks", "address": "0x57D00000", "bytes": 131072},
+    {"name": "bss", "address": "0x01000000", "bytes": 334080}
+  ],
+  "post": {
+    "wav": [{"from": "wave", "rate": 24000, "file": "kitten-rosie.wav"}]
+  }
+}

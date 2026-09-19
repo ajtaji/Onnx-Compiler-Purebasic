@@ -1,0 +1,484 @@
+; ======================================================================
+; tensor_dynamic_norm_small_portable.pmi - runtime-dimension wrappers for
+; InstanceNormalization, TopK, ScatterElements, ReduceMax, ReduceProd, Not,
+; Identity and Pad in caller-owned arena memory.
+; ----------------------------------------------------------------------
+; Include tensor_norm_small.pmi and tensor_dynamic_portable.pmi first. Each
+; wrapper checks the shapes and element types the ONNX specification
+; requires, allocates its outputs and hands addresses to the kernels in
+; tensor_norm_small.pmi. A form this runtime cannot compute is refused with
+; DFail naming the operator; nothing is approximated.
+; ======================================================================
+
+; Temporary arena memory counted against the request's working limit.
+Procedure.i DNsScratch(Bytes.i)
+  Protected address.i=0
+  If Bytes<1
+    Bytes=1
+  EndIf
+  If Bytes>DLimit-DLive
+    DFail("Operator scratch exceeds the bound working-memory limit.")
+    ProcedureReturn 0
+  EndIf
+  address=DAcquire(Bytes)
+  If address=0
+    ProcedureReturn 0
+  EndIf
+  DLive=DLive+Bytes
+  DPeak=DMax(DPeak,DLive)
+  ProcedureReturn address
+EndProcedure
+
+Procedure DNsScratchFree(Address.i,Bytes.i)
+  If Address=0
+    ProcedureReturn
+  EndIf
+  If Bytes<1
+    Bytes=1
+  EndIf
+  DFree(Address)
+  DLive=DLive-Bytes
+EndProcedure
+
+; InstanceNormalization-6: y = scale * (x - mean) / sqrt(variance + epsilon) + B
+; per instance per channel over an (N x C x D1 ... Dn) FLOAT input.
+Procedure DInstanceNorm(Y.i,A.i,Scale.i,Bias.i,Epsilon.f)
+  Protected channels.i=0
+  If A=0 Or Scale=0 Or Bias=0
+    DFail("InstanceNormalization requires input, scale and B.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind<>1 Or Dt(Scale)\Kind<>1 Or Dt(Bias)\Kind<>1
+    DFail("InstanceNormalization computes FLOAT input, scale and B only.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Rank<3
+    DFail("InstanceNormalization requires an input of rank three or more, N x C x D1 ... Dn.")
+    ProcedureReturn
+  EndIf
+  channels=DDims((A)*8+(1))
+  If Dt(Scale)\Rank<>1 Or Dt(Scale)\Count<>channels Or Dt(Bias)\Rank<>1 Or Dt(Bias)\Count<>channels
+    DFail("InstanceNormalization scale and B must each be one-dimensional with C elements.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y,A,0)=0
+    ProcedureReturn
+  EndIf
+  PmTensorInstanceNorm(Dt(A)\Data,Dt(Scale)\Data,Dt(Bias)\Data,Dt(Y)\Data,DDims((A)*8+(0)),channels,DProduct(A,2,Dt(A)\Rank-1),Epsilon)
+EndProcedure
+
+; TopK-11: the k largest (or smallest) elements along Axis and their INT64
+; indices; equal elements keep index order.
+Global DNsTopK.PmTensorTopKArgs
+
+Procedure DTopK(Values.i,Indices.i,A.i,K.i,Axis.i,Largest.i,Sorted.i)
+  Protected Dim dims.i(8)
+  Protected i.i=0
+  Protected kept.i=0
+  Protected width.i=0
+  Protected rank.i=0
+  Protected count.i=1
+  Protected valuesAt.i=0
+  Protected indicesAt.i=0
+  Protected orderAt.i=0
+  Protected valueBytes.i=0
+  Protected indexBytes.i=0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If A=0 Or K=0
+    DFail("TopK requires X and K.")
+    ProcedureReturn
+  EndIf
+  rank=Dt(A)\Rank
+  If rank<1
+    DFail("TopK requires an input of rank one or more.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind<>1 And Dt(A)\Kind<>6 And Dt(A)\Kind<>7
+    DFail("TopK computes FLOAT, INT32 and INT64 input only.")
+    ProcedureReturn
+  EndIf
+  If Dt(K)\Kind<>7 Or Dt(K)\Count<>1
+    DFail("TopK K must be a one-element INT64 tensor.")
+    ProcedureReturn
+  EndIf
+  If Axis<0
+    Axis=Axis+rank
+  EndIf
+  If Axis<0 Or Axis>=rank
+    DFail("TopK axis is outside the input rank.")
+    ProcedureReturn
+  EndIf
+  kept=DInt(K,0)
+  width=DDims((A)*8+(Axis))
+  If kept<0 Or kept>width
+    DFail("TopK K is negative or larger than the extent of its axis.")
+    ProcedureReturn
+  EndIf
+  For i=0 To rank-1
+    dims(i)=DDims((A)*8+(i))
+  Next
+  dims(Axis)=kept
+  For i=0 To rank-1
+    count=count*dims(i)
+  Next
+  valueBytes=count*DSize(Dt(A)\Kind)
+  indexBytes=count*8
+  If Values
+    If DAlloc(Values,Dt(A)\Kind,rank,@dims(0))=0
+      ProcedureReturn
+    EndIf
+    valuesAt=Dt(Values)\Data
+  Else
+    valuesAt=DNsScratch(valueBytes)
+    If valuesAt=0
+      ProcedureReturn
+    EndIf
+  EndIf
+  If Indices
+    If DAlloc(Indices,7,rank,@dims(0))=0
+      If Values=0
+        DNsScratchFree(valuesAt,valueBytes)
+      EndIf
+      ProcedureReturn
+    EndIf
+    indicesAt=Dt(Indices)\Data
+  Else
+    indicesAt=DNsScratch(indexBytes)
+    If indicesAt=0
+      If Values=0
+        DNsScratchFree(valuesAt,valueBytes)
+      EndIf
+      ProcedureReturn
+    EndIf
+  EndIf
+  If count>0
+    orderAt=DNsScratch(2*width*#PMD_NATIVE_BYTES)
+    If orderAt
+      DNsTopK\Src=Dt(A)\Data
+      DNsTopK\Values=valuesAt
+      DNsTopK\Indices=indicesAt
+      DNsTopK\Order=orderAt
+      DNsTopK\Outer=DProduct(A,0,Axis-1)
+      DNsTopK\Width=width
+      DNsTopK\Inner=DProduct(A,Axis+1,rank-1)
+      DNsTopK\K=kept
+      DNsTopK\Largest=Bool(Largest<>0)
+      DNsTopK\Kind=Dt(A)\Kind
+      PmTensorTopK(@DNsTopK)
+      DNsScratchFree(orderAt,2*width*#PMD_NATIVE_BYTES)
+    EndIf
+  EndIf
+  If Values=0
+    DNsScratchFree(valuesAt,valueBytes)
+  EndIf
+  If Indices=0
+    DNsScratchFree(indicesAt,indexBytes)
+  EndIf
+EndProcedure
+
+; ScatterElements-18: a copy of data with updates written (Reduction 0) or
+; combined by 1 add, 2 mul, 3 max, 4 min at the positions indices name along
+; Axis.
+Global DNsScatter.PmTensorScatterElementsArgs
+
+Procedure DScatterElements(Y.i,A.i,Indices.i,Updates.i,Axis.i,Reduction.i)
+  Protected rank.i=0
+  Protected d.i=0
+  Protected status.i=0
+  If A=0 Or Indices=0 Or Updates=0
+    DFail("ScatterElements requires data, indices and updates.")
+    ProcedureReturn
+  EndIf
+  rank=Dt(A)\Rank
+  If rank<1
+    DFail("ScatterElements requires data of rank one or more.")
+    ProcedureReturn
+  EndIf
+  If PmNsElementBytes(Dt(A)\Kind)=0
+    DFail("ScatterElements computes FLOAT, INT32, INT64 and BOOL data only.")
+    ProcedureReturn
+  EndIf
+  If Dt(Updates)\Kind<>Dt(A)\Kind
+    DFail("ScatterElements updates must have the element type of data.")
+    ProcedureReturn
+  EndIf
+  If Dt(Indices)\Kind<>6 And Dt(Indices)\Kind<>7
+    DFail("ScatterElements indices must be INT32 or INT64.")
+    ProcedureReturn
+  EndIf
+  If Dt(Indices)\Rank<>rank Or Dt(Updates)\Rank<>rank
+    DFail("ScatterElements requires data, indices and updates of the same rank.")
+    ProcedureReturn
+  EndIf
+  If Axis<0
+    Axis=Axis+rank
+  EndIf
+  If Axis<0 Or Axis>=rank
+    DFail("ScatterElements axis is outside the data rank.")
+    ProcedureReturn
+  EndIf
+  For d=0 To rank-1
+    If DDims((Updates)*8+(d))<>DDims((Indices)*8+(d))
+      DFail("ScatterElements updates must have the shape of indices.")
+      ProcedureReturn
+    EndIf
+    If d<>Axis And DDims((Indices)*8+(d))>DDims((A)*8+(d))
+      DFail("ScatterElements indices extend past data on an axis other than the scatter axis.")
+      ProcedureReturn
+    EndIf
+  Next
+  If DLike(Y,A,0)=0
+    ProcedureReturn
+  EndIf
+  DNsScatter\Data=Dt(A)\Data
+  DNsScatter\Indices=Dt(Indices)\Data
+  DNsScatter\Updates=Dt(Updates)\Data
+  DNsScatter\Dst=Dt(Y)\Data
+  DNsScatter\Rank=rank
+  DNsScatter\Axis=Axis
+  DNsScatter\Reduction=Reduction
+  DNsScatter\Kind=Dt(A)\Kind
+  DNsScatter\IndexKind=Dt(Indices)\Kind
+  DNsScatter\DataDims=@DDims((A)*8+(0))
+  DNsScatter\IndexDims=@DDims((Indices)*8+(0))
+  status=PmTensorScatterElements(@DNsScatter)
+  If status=1
+    DFail("ScatterElements index is outside [-s, s-1] for an axis of extent s.")
+  ElseIf status=2
+    DFail("ScatterElements reduction add and mul are not defined for BOOL data.")
+  EndIf
+EndProcedure
+
+; ReduceMax-20 (Op 0) and ReduceProd-18 (Op 1), with axes from the input
+; tensor Axes (opset 18 and later) or from the comma-separated attribute
+; list AxesList (earlier opsets); an empty axes set reduces everything
+; unless NoopEmpty.
+Global DNsReduce.PmTensorReduceArgs
+
+Procedure DReduceSelect(Y.i,A.i,Axes.i,AxesList.i,Keep.i,NoopEmpty.i,Op.i)
+  Protected Dim dims.i(8)
+  Protected rank.i=0
+  Protected count.i=0
+  Protected i.i=0
+  Protected axis.i=0
+  Protected mask.i=0
+  Protected j.i=0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If A=0
+    DFail("A reduction requires data.")
+    ProcedureReturn
+  EndIf
+  rank=Dt(A)\Rank
+  If Op=0 And Dt(A)\Kind<>1 And Dt(A)\Kind<>6 And Dt(A)\Kind<>7 And Dt(A)\Kind<>9
+    DFail("ReduceMax computes FLOAT, INT32, INT64 and BOOL data only.")
+    ProcedureReturn
+  EndIf
+  If Op=1 And Dt(A)\Kind<>1 And Dt(A)\Kind<>6 And Dt(A)\Kind<>7
+    DFail("ReduceProd computes FLOAT, INT32 and INT64 data only.")
+    ProcedureReturn
+  EndIf
+  If Axes
+    If Dt(Axes)\Kind<>7 Or Dt(Axes)\Rank>1
+      DFail("ReduceMax and ReduceProd axes must be a one-dimensional INT64 tensor.")
+      ProcedureReturn
+    EndIf
+    count=Dt(Axes)\Count
+  ElseIf PeekA(AxesList)<>0
+    count=DListCount(AxesList)
+  EndIf
+  For i=0 To count-1
+    If Axes
+      axis=DInt(Axes,i)
+    Else
+      axis=DListValue(AxesList,i+1)
+    EndIf
+    If axis<0
+      axis=axis+rank
+    EndIf
+    If axis<0 Or axis>=rank
+      DFail("ReduceMax and ReduceProd axis is outside the data rank.")
+      ProcedureReturn
+    EndIf
+    If ((mask>>axis)&1)<>0
+      DFail("ReduceMax and ReduceProd axes name the same axis twice.")
+      ProcedureReturn
+    EndIf
+    mask=mask|(1<<axis)
+  Next
+  If count=0
+    If NoopEmpty
+      If DLike(Y,A,0)
+        DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+      EndIf
+      ProcedureReturn
+    EndIf
+    mask=(1<<rank)-1
+  EndIf
+  For i=0 To rank-1
+    If ((mask>>i)&1)<>0
+      If Keep
+        dims(j)=1
+        j=j+1
+      EndIf
+    Else
+      dims(j)=DDims((A)*8+(i))
+      j=j+1
+    EndIf
+  Next
+  If DAlloc(Y,Dt(A)\Kind,j,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  DNsReduce\Src=Dt(A)\Data
+  DNsReduce\Dst=Dt(Y)\Data
+  DNsReduce\Rank=rank
+  DNsReduce\Dims=@DDims((A)*8+(0))
+  DNsReduce\Mask=mask
+  DNsReduce\Op=Op
+  DNsReduce\Kind=Dt(A)\Kind
+  PmTensorReduce(@DNsReduce)
+EndProcedure
+
+; Not-1 over BOOL.
+Procedure DNot(Y.i,A.i)
+  If A=0
+    DFail("Not requires a BOOL tensor.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind<>9
+    DFail("Not requires a BOOL tensor.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y,A,0)
+    PmTensorNot(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count)
+  EndIf
+EndProcedure
+
+; Identity: a tensor copied into a new tensor of the same type and shape.
+Procedure DIdentity(Y.i,A.i)
+  If A=0
+    DFail("Identity has no input tensor.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Data=0
+    DFail("Identity has no input tensor.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y,A,0)
+    DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+  EndIf
+EndProcedure
+
+; Pad-19 with an optional Axes input (Pad-18 and later). Mode 0 constant,
+; 1 reflect, 2 edge, 3 wrap.
+Global DNsPad.PmTensorPadArgs
+
+Procedure DPadAxes(Y.i,A.i,Pads.i,Value.i,Axes.i,Mode.i)
+  Protected Dim dims.i(8)
+  Protected Dim begins.i(8)
+  Protected rank.i=0
+  Protected count.i=0
+  Protected i.i=0
+  Protected axis.i=0
+  Protected seen.i=0
+  Protected width.i=1
+  Protected mapAt.i=0
+  Protected status.i=0
+  Protected ends.i=0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  DZero(@begins(0),8*#PMD_NATIVE_BYTES)
+  If A=0 Or Pads=0
+    DFail("Pad requires data and pads.")
+    ProcedureReturn
+  EndIf
+  rank=Dt(A)\Rank
+  If PmNsElementBytes(Dt(A)\Kind)=0
+    DFail("Pad computes FLOAT, INT32, INT64 and BOOL data only.")
+    ProcedureReturn
+  EndIf
+  If Dt(Pads)\Kind<>7
+    DFail("Pad pads must be an INT64 tensor.")
+    ProcedureReturn
+  EndIf
+  If Mode<0 Or Mode>3
+    DFail("Pad mode must be constant, reflect, edge or wrap.")
+    ProcedureReturn
+  EndIf
+  count=rank
+  If Axes
+    If Dt(Axes)\Kind<>6 And Dt(Axes)\Kind<>7
+      DFail("Pad axes must be INT32 or INT64.")
+      ProcedureReturn
+    EndIf
+    count=Dt(Axes)\Count
+  EndIf
+  If Dt(Pads)\Count<>2*count
+    DFail("Pad pads must hold two counts for every padded axis.")
+    ProcedureReturn
+  EndIf
+  For i=0 To rank-1
+    dims(i)=DDims((A)*8+(i))
+  Next
+  For i=0 To count-1
+    axis=i
+    If Axes
+      axis=DInt(Axes,i)
+    EndIf
+    If axis<0
+      axis=axis+rank
+    EndIf
+    If axis<0 Or axis>=rank
+      DFail("Pad axis is outside the data rank.")
+      ProcedureReturn
+    EndIf
+    If ((seen>>axis)&1)<>0
+      DFail("Pad axes name the same axis twice.")
+      ProcedureReturn
+    EndIf
+    seen=seen|(1<<axis)
+    begins(axis)=DInt(Pads,i)
+    ends=DInt(Pads,i+count)
+    dims(axis)=DDims((A)*8+(axis))+begins(axis)+ends
+    If dims(axis)<0
+      DFail("Pad removes more elements than an axis holds.")
+      ProcedureReturn
+    EndIf
+  Next
+  If Value<>0 And Mode=0
+    If Dt(Value)\Kind<>Dt(A)\Kind Or Dt(Value)\Count<1
+      DFail("Pad constant_value must be one element of the data's element type.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  If rank>0
+    width=dims(rank-1)
+  EndIf
+  mapAt=DNsScratch(DMax(width,1)*#PMD_NATIVE_BYTES)
+  If mapAt=0
+    ProcedureReturn
+  EndIf
+  DNsPad\Src=Dt(A)\Data
+  DNsPad\Dst=Dt(Y)\Data
+  DNsPad\Rank=rank
+  DNsPad\SrcDims=@DDims((A)*8+(0))
+  DNsPad\DstDims=@dims(0)
+  DNsPad\Begins=@begins(0)
+  DNsPad\Mode=Mode
+  DNsPad\Kind=Dt(A)\Kind
+  DNsPad\Value=0
+  DNsPad\Map=mapAt
+  If Value<>0 And Mode=0
+    DNsPad\Value=Dt(Value)\Data
+  EndIf
+  status=PmTensorPad(@DNsPad)
+  DNsScratchFree(mapAt,DMax(width,1)*#PMD_NATIVE_BYTES)
+  If status<>0
+    DFail("Pad reflect, edge and wrap need at least one element left on every padded axis.")
+  EndIf
+EndProcedure
+
+Procedure DPad(Y.i,A.i,Pads.i,Value.i,Mode.i)
+  DPadAxes(Y,A,Pads,Value,0,Mode)
+EndProcedure

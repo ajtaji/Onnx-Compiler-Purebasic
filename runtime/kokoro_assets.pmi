@@ -1,0 +1,389 @@
+; ======================================================================
+; kokoro_assets.pmi - portable Kokoro token, voice and job preparation.
+; ----------------------------------------------------------------------
+; Include tensor_fp32.pmi first. This file knows the fixed PMVOICE and
+; PMKJOB binary ABIs. Prepared assets are external; see docs/KOKORO.md. It does not
+; parse ONNX, JSON, protobuf, or a filesystem, and it names no board.
+;
+; The caller owns every buffer. All text passed here is UTF-8. The token
+; vocabulary and model identity are pinned to full-precision Kokoro 82M
+; v1.0. Unknown, malformed, overlong, surrogate and out-of-range Unicode
+; is rejected rather than silently dropped.
+; ======================================================================
+
+#PMK_VOICE_HEADER = 128
+#PMK_VOICE_BYTES = 522368
+#PMK_VOICE_ROWS = 510
+#PMK_VOICE_WIDTH = 256
+
+; Bit-preserving helpers keep this asset layer source-compatible with both
+; PureMetal Forge and the desktop host build without relying on different typed
+; pointer-dereference spellings.
+Procedure.f PmKokoroReadF32(*address)
+  Protected value.f
+  PokeL(@value, PeekN(*address))
+  ProcedureReturn value
+EndProcedure
+
+Procedure PmKokoroWriteF32(*address, value.f)
+  PokeL(*address, PeekL(@value))
+EndProcedure
+#PMK_JOB_HEADER = 192
+#PMK_MAX_PHONEMES = 510
+#PMK_MAX_IDS = 512
+
+Procedure.i PmKokoroF32Finite(*value)
+  Protected bits.i
+  If *value = 0 : ProcedureReturn 0 : EndIf
+  bits = PeekN(*value) & $FFFFFFFF
+  If (bits & $7F800000) = $7F800000 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmKokoroF32PositiveFinite(*value)
+  Protected bits.i
+  If PmKokoroF32Finite(*value) = 0 : ProcedureReturn 0 : EndIf
+  bits = PeekN(*value) & $FFFFFFFF
+  If (bits & $80000000) <> 0 Or (bits & $7FFFFFFF) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmKokoroModelHash(*hash)
+  If PeekN(*hash + 0) <> $1EA5BE8F : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 4) <> $AFF211A7 : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 8) <> $C8882E38 : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 12) <> $88E2D933 : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 16) <> $CE82DCC6 : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 20) <> $1E42985E : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 24) <> $8C051CA6 : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 28) <> $CB341AE2 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmKokoroVocabHash(*hash)
+  If PeekN(*hash + 0) <> $E201BB5A : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 4) <> $2B073B40 : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 8) <> $FD043DF0 : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 12) <> $3E4460E1 : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 16) <> $0D7A9D20 : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 20) <> $23A449AD : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 24) <> $6B1915BE : ProcedureReturn 0 : EndIf
+  If PeekN(*hash + 28) <> $7FC1439B : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmKokoroHashEqual(*a, *b)
+  Protected i.i
+  i = 0
+  While i < 32
+    If PeekA(*a + i) <> PeekA(*b + i) : ProcedureReturn 0 : EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmKokoroValidateVoice(*voice, bytes.i)
+  Protected i.i
+  If *voice = 0 Or bytes <> #PMK_VOICE_BYTES : ProcedureReturn 0 : EndIf
+  If PeekA(*voice + 0) <> 80 Or PeekA(*voice + 1) <> 77 : ProcedureReturn 0 : EndIf
+  If PeekA(*voice + 2) <> 86 Or PeekA(*voice + 3) <> 79 : ProcedureReturn 0 : EndIf
+  If PeekA(*voice + 4) <> 73 Or PeekA(*voice + 5) <> 67 : ProcedureReturn 0 : EndIf
+  If PeekA(*voice + 6) <> 69 Or PeekA(*voice + 7) <> 0 : ProcedureReturn 0 : EndIf
+  If PeekN(*voice + 8) <> 1 Or PeekN(*voice + 12) <> #PMK_VOICE_HEADER : ProcedureReturn 0 : EndIf
+  If PeekI(*voice + 16) <> bytes : ProcedureReturn 0 : EndIf
+  If PeekN(*voice + 24) <> #PMK_VOICE_ROWS : ProcedureReturn 0 : EndIf
+  If PeekN(*voice + 28) <> #PMK_VOICE_WIDTH : ProcedureReturn 0 : EndIf
+  If PeekN(*voice + 36) <> 0 : ProcedureReturn 0 : EndIf
+  If PmKokoroModelHash(*voice + 72) = 0 : ProcedureReturn 0 : EndIf
+  i = 104
+  While i < #PMK_VOICE_HEADER
+    If PeekA(*voice + i) <> 0 : ProcedureReturn 0 : EndIf
+    i = i + 1
+  Wend
+  If PmTensorCrc32(*voice + #PMK_VOICE_HEADER, bytes - #PMK_VOICE_HEADER) <> PeekN(*voice + 32)
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < #PMK_VOICE_ROWS * #PMK_VOICE_WIDTH
+    If PmKokoroF32Finite(*voice + #PMK_VOICE_HEADER + i * 4) = 0 : ProcedureReturn 0 : EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmKokoroVoiceRow(*voice, bytes.i, row.i)
+  If row < 0 Or row >= #PMK_VOICE_ROWS : ProcedureReturn 0 : EndIf
+  If PmKokoroValidateVoice(*voice, bytes) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn *voice + #PMK_VOICE_HEADER + row * #PMK_VOICE_WIDTH * 4
+EndProcedure
+
+Procedure.i PmKokoroTokenForCodepoint(codepoint.i)
+  Select codepoint
+    Case 32 : ProcedureReturn 16
+    Case 33 : ProcedureReturn 5
+    Case 34 : ProcedureReturn 11
+    Case 40 : ProcedureReturn 12
+    Case 41 : ProcedureReturn 13
+    Case 44 : ProcedureReturn 3
+    Case 46 : ProcedureReturn 4
+    Case 58 : ProcedureReturn 2
+    Case 59 : ProcedureReturn 1
+    Case 63 : ProcedureReturn 6
+    Case 65 : ProcedureReturn 24
+    Case 73 : ProcedureReturn 25
+    Case 79 : ProcedureReturn 31
+    Case 81 : ProcedureReturn 33
+    Case 83 : ProcedureReturn 35
+    Case 84 : ProcedureReturn 36
+    Case 87 : ProcedureReturn 39
+    Case 89 : ProcedureReturn 41
+    Case 97 : ProcedureReturn 43
+    Case 98 : ProcedureReturn 44
+    Case 99 : ProcedureReturn 45
+    Case 100 : ProcedureReturn 46
+    Case 101 : ProcedureReturn 47
+    Case 102 : ProcedureReturn 48
+    Case 104 : ProcedureReturn 50
+    Case 105 : ProcedureReturn 51
+    Case 106 : ProcedureReturn 52
+    Case 107 : ProcedureReturn 53
+    Case 108 : ProcedureReturn 54
+    Case 109 : ProcedureReturn 55
+    Case 110 : ProcedureReturn 56
+    Case 111 : ProcedureReturn 57
+    Case 112 : ProcedureReturn 58
+    Case 113 : ProcedureReturn 59
+    Case 114 : ProcedureReturn 60
+    Case 115 : ProcedureReturn 61
+    Case 116 : ProcedureReturn 62
+    Case 117 : ProcedureReturn 63
+    Case 118 : ProcedureReturn 64
+    Case 119 : ProcedureReturn 65
+    Case 120 : ProcedureReturn 66
+    Case 121 : ProcedureReturn 67
+    Case 122 : ProcedureReturn 68
+    Case 230 : ProcedureReturn 72
+    Case 231 : ProcedureReturn 78
+    Case 240 : ProcedureReturn 81
+    Case 248 : ProcedureReturn 116
+    Case 331 : ProcedureReturn 112
+    Case 339 : ProcedureReturn 120
+    Case 592 : ProcedureReturn 70
+    Case 593 : ProcedureReturn 69
+    Case 594 : ProcedureReturn 71
+    Case 596 : ProcedureReturn 76
+    Case 597 : ProcedureReturn 77
+    Case 598 : ProcedureReturn 80
+    Case 601 : ProcedureReturn 83
+    Case 602 : ProcedureReturn 85
+    Case 603 : ProcedureReturn 86
+    Case 604 : ProcedureReturn 87
+    Case 607 : ProcedureReturn 90
+    Case 609 : ProcedureReturn 92
+    Case 611 : ProcedureReturn 139
+    Case 612 : ProcedureReturn 140
+    Case 613 : ProcedureReturn 99
+    Case 616 : ProcedureReturn 101
+    Case 618 : ProcedureReturn 102
+    Case 623 : ProcedureReturn 110
+    Case 624 : ProcedureReturn 111
+    Case 626 : ProcedureReturn 114
+    Case 627 : ProcedureReturn 113
+    Case 628 : ProcedureReturn 115
+    Case 632 : ProcedureReturn 118
+    Case 633 : ProcedureReturn 123
+    Case 635 : ProcedureReturn 126
+    Case 637 : ProcedureReturn 129
+    Case 638 : ProcedureReturn 125
+    Case 641 : ProcedureReturn 128
+    Case 642 : ProcedureReturn 130
+    Case 643 : ProcedureReturn 131
+    Case 648 : ProcedureReturn 132
+    Case 650 : ProcedureReturn 135
+    Case 651 : ProcedureReturn 136
+    Case 652 : ProcedureReturn 138
+    Case 654 : ProcedureReturn 143
+    Case 658 : ProcedureReturn 147
+    Case 660 : ProcedureReturn 148
+    Case 669 : ProcedureReturn 103
+    Case 675 : ProcedureReturn 18
+    Case 676 : ProcedureReturn 82
+    Case 677 : ProcedureReturn 19
+    Case 678 : ProcedureReturn 20
+    Case 679 : ProcedureReturn 133
+    Case 680 : ProcedureReturn 21
+    Case 688 : ProcedureReturn 162
+    Case 690 : ProcedureReturn 164
+    Case 712 : ProcedureReturn 156
+    Case 716 : ProcedureReturn 157
+    Case 720 : ProcedureReturn 158
+    Case 771 : ProcedureReturn 17
+    Case 946 : ProcedureReturn 75
+    Case 952 : ProcedureReturn 119
+    Case 967 : ProcedureReturn 142
+    Case 7498 : ProcedureReturn 42
+    Case 7517 : ProcedureReturn 22
+    Case 7547 : ProcedureReturn 177
+    Case 8212 : ProcedureReturn 9
+    Case 8220 : ProcedureReturn 14
+    Case 8221 : ProcedureReturn 15
+    Case 8230 : ProcedureReturn 10
+    Case 8594 : ProcedureReturn 171
+    Case 8595 : ProcedureReturn 169
+    Case 8599 : ProcedureReturn 172
+    Case 8600 : ProcedureReturn 173
+    Case 43879 : ProcedureReturn 23
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; Decode one Unicode scalar. Returns -1 for malformed UTF-8 and stores the
+; next byte offset through *nextIndex only on success.
+Procedure.i PmKokoroUtf8Next(*text, index.i, bytes.i, *nextIndex)
+  Protected b0.i
+  Protected b1.i
+  Protected b2.i
+  Protected b3.i
+  Protected codepoint.i
+  If *text = 0 Or *nextIndex = 0 Or index < 0 Or index >= bytes : ProcedureReturn -1 : EndIf
+  b0 = PeekA(*text + index) & 255
+  If b0 < $80
+    PokeI(*nextIndex, index + 1)
+    ProcedureReturn b0
+  EndIf
+  If b0 >= $C2 And b0 <= $DF
+    If index + 1 >= bytes : ProcedureReturn -1 : EndIf
+    b1 = PeekA(*text + index + 1) & 255
+    If b1 < $80 Or b1 > $BF : ProcedureReturn -1 : EndIf
+    PokeI(*nextIndex, index + 2)
+    ProcedureReturn ((b0 & $1F) << 6) | (b1 & $3F)
+  EndIf
+  If b0 >= $E0 And b0 <= $EF
+    If index + 2 >= bytes : ProcedureReturn -1 : EndIf
+    b1 = PeekA(*text + index + 1) & 255
+    b2 = PeekA(*text + index + 2) & 255
+    If b1 < $80 Or b1 > $BF Or b2 < $80 Or b2 > $BF : ProcedureReturn -1 : EndIf
+    If b0 = $E0 And b1 < $A0 : ProcedureReturn -1 : EndIf
+    If b0 = $ED And b1 >= $A0 : ProcedureReturn -1 : EndIf
+    codepoint = ((b0 & $0F) << 12) | ((b1 & $3F) << 6) | (b2 & $3F)
+    PokeI(*nextIndex, index + 3)
+    ProcedureReturn codepoint
+  EndIf
+  If b0 >= $F0 And b0 <= $F4
+    If index + 3 >= bytes : ProcedureReturn -1 : EndIf
+    b1 = PeekA(*text + index + 1) & 255
+    b2 = PeekA(*text + index + 2) & 255
+    b3 = PeekA(*text + index + 3) & 255
+    If b1 < $80 Or b1 > $BF Or b2 < $80 Or b2 > $BF Or b3 < $80 Or b3 > $BF : ProcedureReturn -1 : EndIf
+    If b0 = $F0 And b1 < $90 : ProcedureReturn -1 : EndIf
+    If b0 = $F4 And b1 > $8F : ProcedureReturn -1 : EndIf
+    codepoint = ((b0 & 7) << 18) | ((b1 & $3F) << 12) | ((b2 & $3F) << 6) | (b3 & $3F)
+    PokeI(*nextIndex, index + 4)
+    ProcedureReturn codepoint
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+; Return the exact model input-ID count, including BOS and EOS, or zero.
+Procedure.i PmKokoroEncodePhonemes(*text, bytes.i, *ids, maxIds.i)
+  Protected index.i
+  Protected nextIndex.i
+  Protected codepoint.i
+  Protected token.i
+  Protected count.i
+  If *text = 0 Or *ids = 0 Or bytes <= 0 Or maxIds < 3 : ProcedureReturn 0 : EndIf
+  PmTensorPutI64(*ids, 0, 0)
+  index = 0 : count = 1
+  While index < bytes
+    codepoint = PmKokoroUtf8Next(*text, index, bytes, @nextIndex)
+    If codepoint < 0 : ProcedureReturn 0 : EndIf
+    token = PmKokoroTokenForCodepoint(codepoint)
+    If token < 0 Or count >= maxIds - 1 Or count > #PMK_MAX_PHONEMES
+      ProcedureReturn 0
+    EndIf
+    PmTensorPutI64(*ids, count, token)
+    count = count + 1
+    index = nextIndex
+  Wend
+  If count <= 1 : ProcedureReturn 0 : EndIf
+  PmTensorPutI64(*ids, count, 0)
+  ProcedureReturn count + 1
+EndProcedure
+
+Procedure.i PmKokoroValidateJob(*job, bytes.i)
+  Protected i.i
+  Protected payloadBytes.i
+  Protected phonemes.i
+  Protected ids.i
+  Protected idBytes.i
+  Protected textBytes.i
+  Protected speed.f
+  Protected speedPointer.i
+  If *job = 0 Or bytes < #PMK_JOB_HEADER : ProcedureReturn 0 : EndIf
+  If PeekA(*job + 0) <> 80 Or PeekA(*job + 1) <> 77 : ProcedureReturn 0 : EndIf
+  If PeekA(*job + 2) <> 75 Or PeekA(*job + 3) <> 74 : ProcedureReturn 0 : EndIf
+  If PeekA(*job + 4) <> 79 Or PeekA(*job + 5) <> 66 : ProcedureReturn 0 : EndIf
+  If PeekA(*job + 6) <> 0 Or PeekA(*job + 7) <> 0 : ProcedureReturn 0 : EndIf
+  If PeekN(*job + 8) <> 1 Or PeekN(*job + 12) <> #PMK_JOB_HEADER : ProcedureReturn 0 : EndIf
+  If PeekI(*job + 16) <> bytes : ProcedureReturn 0 : EndIf
+  If PmKokoroModelHash(*job + 24) = 0 Or PmKokoroVocabHash(*job + 56) = 0 : ProcedureReturn 0 : EndIf
+  phonemes = PeekN(*job + 120) & $FFFFFFFF
+  ids = PeekN(*job + 124) & $FFFFFFFF
+  If phonemes <= 0 Or phonemes > #PMK_MAX_PHONEMES Or ids <> phonemes + 2 : ProcedureReturn 0 : EndIf
+  If (PeekN(*job + 128) & $FFFFFFFF) <> phonemes - 1 : ProcedureReturn 0 : EndIf
+  speedPointer = *job + 132
+  speed = PmKokoroReadF32(speedPointer)
+  If PmKokoroF32PositiveFinite(speedPointer) = 0 : ProcedureReturn 0 : EndIf
+  idBytes = PeekN(*job + 136) & $FFFFFFFF
+  textBytes = PeekN(*job + 140) & $FFFFFFFF
+  If idBytes <> ids * 8 : ProcedureReturn 0 : EndIf
+  payloadBytes = bytes - #PMK_JOB_HEADER
+  If idBytes + textBytes <> payloadBytes Or textBytes <= 0 : ProcedureReturn 0 : EndIf
+  If PeekN(*job + 148) <> 0 : ProcedureReturn 0 : EndIf
+  i = 152
+  While i < #PMK_JOB_HEADER
+    If PeekA(*job + i) <> 0 : ProcedureReturn 0 : EndIf
+    i = i + 1
+  Wend
+  If PmTensorCrc32(*job + #PMK_JOB_HEADER, payloadBytes) <> PeekN(*job + 144)
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Validate both assets, re-tokenize the recorded UTF-8 phonemes, compare the
+; recorded IDs, select len(phonemes)-1 from the voice, and copy the three ONNX
+; inputs into caller buffers. Returns the input-ID count or zero.
+Procedure.i PmKokoroPrepareJob(*job, jobBytes.i, *voice, voiceBytes.i, *ids, maxIds.i, *style, *speed)
+  Protected count.i
+  Protected i.i
+  Protected storedCount.i
+  Protected idBytes.i
+  Protected textBytes.i
+  Protected *storedIds
+  Protected *text
+  Protected *voiceRow
+  Protected jobSpeed.i
+  If *ids = 0 Or *style = 0 Or *speed = 0 : ProcedureReturn 0 : EndIf
+  If PmKokoroValidateJob(*job, jobBytes) = 0 : ProcedureReturn 0 : EndIf
+  If PmKokoroValidateVoice(*voice, voiceBytes) = 0 : ProcedureReturn 0 : EndIf
+  If PmKokoroHashEqual(*job + 88, *voice + 40) = 0 : ProcedureReturn 0 : EndIf
+  storedCount = PeekN(*job + 124) & $FFFFFFFF
+  idBytes = PeekN(*job + 136) & $FFFFFFFF
+  textBytes = PeekN(*job + 140) & $FFFFFFFF
+  *storedIds = *job + #PMK_JOB_HEADER
+  *text = *storedIds + idBytes
+  count = PmKokoroEncodePhonemes(*text, textBytes, *ids, maxIds)
+  If count <> storedCount : ProcedureReturn 0 : EndIf
+  i = 0
+  While i < count
+    If PmTensorGetI64(*ids, i) <> PmTensorGetI64(*storedIds, i) : ProcedureReturn 0 : EndIf
+    i = i + 1
+  Wend
+  *voiceRow = PmKokoroVoiceRow(*voice, voiceBytes, PeekN(*job + 128) & $FFFFFFFF)
+  If *voiceRow = 0 : ProcedureReturn 0 : EndIf
+  PmTensorCopy(*voiceRow, *style, #PMK_VOICE_WIDTH)
+  jobSpeed = *job + 132
+  PmKokoroWriteF32(*speed, PmKokoroReadF32(jobSpeed))
+  ProcedureReturn count
+EndProcedure

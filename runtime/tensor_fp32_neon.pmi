@@ -1,0 +1,5017 @@
+; ======================================================================
+; tensor_fp32_neon.pmi - AArch64 Advanced SIMD acceleration for ONNX.
+; ----------------------------------------------------------------------
+; Include tensor_fp32.pmi first. A target profile selects these procedures
+; behind the ordinary PMTensor ABI; neither ONNX
+; lowering nor a model knows that this implementation uses Advanced SIMD.
+;
+; Vector reduction and FMLA intentionally do not promise bit identity with
+; the scalar FP32 reference. Floating-point addition is non-associative and
+; FMLA rounds once. The board gate therefore retains exact scalar checks and
+; gives optimized runs an explicit numerical contract.
+;
+; Only caller-saved vector registers are used (v0..v7, v16..v31), so this
+; remains safe when Forge eventually keeps language float values in FP/SIMD
+; registers across calls. General-purpose state uses caller-saved x0..x17.
+; ======================================================================
+
+; Final-axis reductions keep the portable kernel's exact FP32 evaluation
+; order while owning their hot loop state in registers.  In particular,
+; these are deliberately scalar reductions: a horizontal vector reduction
+; or several partial accumulators would reassociate non-associative adds.
+Procedure PmTensorReduceMeanLastNeon(*src.i, *dst.i, outer.i, width.i)
+  ASM
+    ; x0=src x1=dst x2=outer x3=width
+    cmp  x2, #0
+    b.le pmoNeonReduceMeanDone
+    cmp  x3, #0
+    b.le pmoNeonReduceMeanDone
+    scvtf s2, x3
+    mov  x4, x2
+pmoNeonReduceMeanRow:
+    fmov s0, wzr
+    mov  x5, x3
+pmoNeonReduceMeanInner:
+    ldr  s1, [x0]
+    add  x0, x0, #4
+pmoNeonReduceMeanAdd:
+    fadd s0, s0, s1
+    subs x5, x5, #1
+    b.ne pmoNeonReduceMeanInner
+    fdiv s0, s0, s2
+    str  s0, [x1]
+    add  x1, x1, #4
+    subs x4, x4, #1
+    b.ne pmoNeonReduceMeanRow
+pmoNeonReduceMeanDone:
+  EndASM
+EndProcedure
+
+Procedure PmTensorReduceSumLastNeon(*src.i, *dst.i, outer.i, width.i)
+  ASM
+    ; x0=src x1=dst x2=outer x3=width
+    cmp  x2, #0
+    b.le pmoNeonReduceSumDone
+    cmp  x3, #0
+    b.le pmoNeonReduceSumDone
+    mov  x4, x2
+pmoNeonReduceSumRow:
+    fmov s0, wzr
+    mov  x5, x3
+pmoNeonReduceSumInner:
+    ldr  s1, [x0]
+    add  x0, x0, #4
+pmoNeonReduceSumAdd:
+    fadd s0, s0, s1
+    subs x5, x5, #1
+    b.ne pmoNeonReduceSumInner
+    str  s0, [x1]
+    add  x1, x1, #4
+    subs x4, x4, #1
+    b.ne pmoNeonReduceSumRow
+pmoNeonReduceSumDone:
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Elementwise FLOAT32 add/subtract/multiply/divide, four lanes at a time.
+;
+; NUMERICAL CONTRACT - this kernel IS bit-identical to the scalar body in
+; PmFastBinary, and unlike the reductions above it is allowed to claim that.
+; Each output element is one FADD/FSUB/FMUL/FDIV of the same two binary32
+; operands in the same order, so it is the same single rounding; nothing is
+; reassociated, contracted into an FMLA, or evaluated in a wider type.  The
+; vector and scalar forms of those four instructions share one FPCR, and
+; EnableFloatingPoint leaves it zero - nearest-even, gradual underflow,
+; default-NaN DISABLED - so signed zeros, infinities, subnormals and the
+; NaN PAYLOAD each op propagates (first source operand first, per
+; FPProcessNaNs) come out the same bits per lane as they do one at a time.
+;
+; WHAT THE CALLER MUST HAVE ESTABLISHED, because this kernel checks none of
+; it - DBinary does, and refuses everything else to the portable path:
+;   *a, *b, *destination  FLOAT32, and *destination contiguous
+;   aStride, bStride      1 for a contiguous operand, 0 for one broadcast
+;                         element; nothing else
+;   op                    0 add, 1 subtract, 2 multiply, 3 divide
+;   destination           may be exactly *a or exactly *b when that operand
+;                         is contiguous; it may NOT alias a BROADCAST
+;                         operand, because the scalar body re-reads that one
+;                         element after the store and this does not, and it
+;                         may not partially overlap either operand.
+; count <= 0 writes nothing.  A trailing one, two or three elements are
+; finished one at a time by the same instructions in scalar form.
+;
+; Parameters arrive in x0..x6 and the prologue has already spilled them to
+; their slots, so they are read here from the registers, the way the
+; reductions above read theirs.  Only caller-saved registers are touched.
+Procedure PmTensorBinaryFp32Neon(*a.i, *b.i, *destination.i, count.i, aStride.i, bStride.i, op.i)
+  ASM
+    ; x0=a x1=b x2=destination x3=count x4=aStride x5=bStride x6=op
+    cmp  x3, #0
+    b.le pmoNeonBinaryDone
+pmoNeonBinaryFour:
+    cmp  x3, #4
+    b.lt pmoNeonBinaryTail
+    cbz  x4, pmoNeonBinaryBroadcastA
+    ld1  {v0.4s}, [x0]
+    add  x0, x0, #16
+    b    pmoNeonBinaryLoadB
+pmoNeonBinaryBroadcastA:
+    ld1r {v0.4s}, [x0]
+pmoNeonBinaryLoadB:
+    cbz  x5, pmoNeonBinaryBroadcastB
+    ld1  {v1.4s}, [x1]
+    add  x1, x1, #16
+    b    pmoNeonBinaryApply
+pmoNeonBinaryBroadcastB:
+    ld1r {v1.4s}, [x1]
+pmoNeonBinaryApply:
+    cbz  x6, pmoNeonBinaryAdd
+    cmp  x6, #1
+    b.eq pmoNeonBinarySub
+    cmp  x6, #2
+    b.eq pmoNeonBinaryMul
+    fdiv v2.4s, v0.4s, v1.4s
+    b    pmoNeonBinaryStore
+pmoNeonBinaryAdd:
+    fadd v2.4s, v0.4s, v1.4s
+    b    pmoNeonBinaryStore
+pmoNeonBinarySub:
+    fsub v2.4s, v0.4s, v1.4s
+    b    pmoNeonBinaryStore
+pmoNeonBinaryMul:
+    fmul v2.4s, v0.4s, v1.4s
+pmoNeonBinaryStore:
+    st1  {v2.4s}, [x2]
+    add  x2, x2, #16
+    sub  x3, x3, #4
+    b    pmoNeonBinaryFour
+pmoNeonBinaryTail:
+    cbz  x3, pmoNeonBinaryDone
+    ldr  s0, [x0]
+    ldr  s1, [x1]
+    cbz  x6, pmoNeonBinaryTailAdd
+    cmp  x6, #1
+    b.eq pmoNeonBinaryTailSub
+    cmp  x6, #2
+    b.eq pmoNeonBinaryTailMul
+    fdiv s2, s0, s1
+    b    pmoNeonBinaryTailStore
+pmoNeonBinaryTailAdd:
+    fadd s2, s0, s1
+    b    pmoNeonBinaryTailStore
+pmoNeonBinaryTailSub:
+    fsub s2, s0, s1
+    b    pmoNeonBinaryTailStore
+pmoNeonBinaryTailMul:
+    fmul s2, s0, s1
+pmoNeonBinaryTailStore:
+    str  s2, [x2]
+    add  x2, x2, #4
+    cbz  x4, pmoNeonBinaryTailBStep
+    add  x0, x0, #4
+pmoNeonBinaryTailBStep:
+    cbz  x5, pmoNeonBinaryTailNext
+    add  x1, x1, #4
+pmoNeonBinaryTailNext:
+    sub  x3, x3, #1
+    b    pmoNeonBinaryTail
+pmoNeonBinaryDone:
+  EndASM
+EndProcedure
+
+
+; ======================================================================
+;  ANVIL'S SERVICE TABLE - ABOVE THE PER-OPERATOR GUARDS ON PURPOSE.
+;
+;  This is how a payload asks the monitor what it may use; it is not about
+;  convolution and it must not sit inside #PMO_USE_CONV. A model with no
+;  Conv node is still an Anvil payload, still calls PmOnnxAnvilEnter as
+;  the first statement of its Main, and would otherwise find the procedure
+;  it was told to call had not been compiled.
+; ======================================================================
+; The service table's numbers, restated. A payload cannot include Anvil's
+; half of the ABI and must not; what crosses the seam is the numbers.
+#PMP_SVC_MAGIC           = $53564E41  ; 'ANVS'
+#PMP_SVC_MAJOR           = 1
+#PMP_SVC_HDR_BYTES       = 16
+#PMP_SVC_SLOT_PAR_CORES  = 184
+#PMP_SVC_SLOT_PAR_RUN    = 185
+#PMP_SVC_NEED_COUNT      = 192        ; entry_count at ABI 1.3, when 184 opened
+#PMP_SVC_OK              = 0
+
+Global PmAnvilServices.i
+Global *pmSvcParCores
+Global *pmSvcParRun
+
+Procedure.i pmAnvilHdr32(off.i)
+  ; The four header fields are at +0, +4, +8 and +12, and two of those are
+  ; not 8-byte aligned, so they are read a byte at a time. PeekA and not
+  ; PeekB: PeekB sign-extends on this target and would poison the shift.
+  ProcedureReturn PeekA(PmAnvilServices+off) | (PeekA(PmAnvilServices+off+1)<<8) | (PeekA(PmAnvilServices+off+2)<<16) | (PeekA(PmAnvilServices+off+3)<<24)
+EndProcedure
+
+Procedure.i pmAnvilSlot(index.i)
+  If PmAnvilServices=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekI(PmAnvilServices+#PMP_SVC_HDR_BYTES+index*8)
+EndProcedure
+
+; THE ONE WAY THE TABLE IS SET, and it validates before it believes. A
+; program entered with --wants-services calls this with x0 as its first
+; statement; anything else leaves it zero and every convolution below
+; takes the single-core path. An older monitor announces itself by its
+; entry_count, which is why that is checked rather than the minor.
+Procedure.i PmSetAnvilServices(table.i)
+  PmAnvilServices=0
+  *pmSvcParCores=0
+  *pmSvcParRun=0
+  If table=0
+    ProcedureReturn 0
+  EndIf
+  PmAnvilServices=table
+  If pmAnvilHdr32(0)<>#PMP_SVC_MAGIC Or pmAnvilHdr32(4)<>#PMP_SVC_MAJOR Or pmAnvilHdr32(12)<#PMP_SVC_NEED_COUNT
+    PmAnvilServices=0
+    ProcedureReturn 0
+  EndIf
+  *pmSvcParCores=pmAnvilSlot(#PMP_SVC_SLOT_PAR_CORES)
+  *pmSvcParRun=pmAnvilSlot(#PMP_SVC_SLOT_PAR_RUN)
+  If *pmSvcParCores=0 Or *pmSvcParRun=0
+    PmAnvilServices=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; How many cores a kernel will actually be run on. 1 when there is no
+; service table, when the table is older than the parallel group, or when
+; the board has one core - and 1 is a real answer rather than a failure, so
+; a caller that divides work by it is correct everywhere. The emitted
+; PmOnnxAnvilEnter hands this straight back to the host.
+Procedure.i PmParallelCores()
+  If PmAnvilServices=0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn pmSvcParCores()
+EndProcedure
+
+CompilerIf #PMO_USE_CONV = 1
+Structure PmTensorConv1DFp32FourArgs
+  Src.i
+  Weight.i
+  Dst.i
+  InWidth.i
+  Kernel.i
+  Stride.i
+  Dilation.i
+  InPerGroup.i
+  InputChannelBase.i
+  Batch.i
+  InputChannels.i
+  OutputChannel.i
+  OutputX.i
+  OutputWidth.i
+  OutChannels.i
+  PadLeft.i
+  BiasValue.f
+EndStructure
+
+; One output position whose dilated kernel is only partly inside the input.
+; The reference adds nothing at all for a tap outside [0, InWidth), and input x
+; rises monotonically with the tap index, so the taps it keeps are always one
+; contiguous run.  Both bodies below clamp that run once from the position and
+; then reduce over it with no per-tap test, no accessor call and no static-slot
+; traffic, in the same input-channel-major, tap-minor order with the same
+; separate FMUL and FADD as PmTensorConv1D.
+Structure PmTensorConv1DFp32EdgeArgs
+  Src.i
+  Weight.i
+  Dst.i
+  InWidth.i
+  Kernel.i
+  Stride.i
+  Dilation.i
+  InPerGroup.i
+  InputChannelBase.i
+  Batch.i
+  InputChannels.i
+  OutputChannel.i
+  OutputX.i
+  OutputWidth.i
+  OutChannels.i
+  PadLeft.i
+  Bias0.f
+  Bias1.f
+  Bias2.f
+  Bias3.f
+EndStructure
+
+Structure PmTensorConv1DFp32FourByFourArgs
+  Src.i
+  Weight.i
+  Dst.i
+  InWidth.i
+  Kernel.i
+  Dilation.i
+  InPerGroup.i
+  InputChannelBase.i
+  Batch.i
+  InputChannels.i
+  OutputChannel.i
+  OutputX.i
+  OutputWidth.i
+  OutChannels.i
+  PadLeft.i
+  Bias0.f
+  Bias1.f
+  Bias2.f
+  Bias3.f
+EndStructure
+
+; Four adjacent output channels by four fully in-range positions. Kokoro's
+; hot convolutions all have unit stride, so the same contiguous source vector
+; feeds four independent output-channel accumulators. Each accumulator still
+; visits icg then kx in the portable order and uses separate FMUL/FADD.
+Procedure PmTensorConv1DFp32FourByFour(*a.PmTensorConv1DFp32FourByFourArgs)
+  ASM
+    ldr x1, [x0, #0]                 ; source base
+    ldr x2, [x0, #8]                 ; weight base
+    ldr x4, [x0, #24]                ; input width
+    ldr x5, [x0, #32]                ; kernel
+    ldr x6, [x0, #40]                ; dilation
+    ldr x7, [x0, #48]                ; input channels per group
+    ldr x8, [x0, #56]                ; first input channel in group
+    ldr x9, [x0, #64]                ; batch
+    ldr x10, [x0, #72]               ; all input channels
+    mul x9, x9, x10
+    add x9, x9, x8
+    mul x9, x9, x4
+    ldr x10, [x0, #88]               ; first output position
+    add x9, x9, x10
+    ldr x10, [x0, #112]              ; left padding
+    sub x9, x9, x10
+    lsl x9, x9, #2
+    add x1, x1, x9                   ; source channel zero at output x
+
+    ldr x11, [x0, #80]               ; first output channel
+    mul x12, x7, x5                  ; weights per output channel
+    mul x10, x11, x12
+    lsl x10, x10, #2
+    add x13, x2, x10                 ; four weight-row cursors
+    lsl x12, x12, #2
+    add x14, x13, x12
+    add x15, x14, x12
+    add x16, x15, x12
+
+    ldr s16, [x0, #120]
+    ldr s17, [x0, #124]
+    ldr s18, [x0, #128]
+    ldr s19, [x0, #132]
+    dup v16.4s, v16.s[0]
+    dup v17.4s, v17.s[0]
+    dup v18.4s, v18.s[0]
+    dup v19.4s, v19.s[0]
+    lsl x4, x4, #2                  ; bytes between source channels
+    lsl x6, x6, #2                  ; bytes between kernel samples
+    ; Both reduction loops below are do-while, so an empty group or an empty
+    ; kernel would run 2^64 times.  PmTensorConv1D leaves such an output at
+    ; its bias, and so does this: branch straight to the store, where the
+    ; accumulators still hold the broadcast bias.
+    cmp x7, #1
+    b.lt pmoNeonConvFpFourByFourEmpty
+    cmp x5, #1
+    b.lt pmoNeonConvFpFourByFourEmpty
+    mov x8, x7
+pmoNeonConvFpFourByFourChannel:
+    mov x10, x1
+    mov x9, x5
+pmoNeonConvFpFourByFourKernel:
+pmoNeonConvFpFourByFourSource:
+    ld1 {v1.4s}, [x10]
+    ldr s0, [x13]
+    dup v0.4s, v0.s[0]
+    fmul v2.4s, v1.4s, v0.4s
+pmoNeonConvFpFourByFourAdd0:
+    fadd v16.4s, v16.4s, v2.4s
+    ldr s0, [x14]
+    dup v0.4s, v0.s[0]
+    fmul v2.4s, v1.4s, v0.4s
+    fadd v17.4s, v17.4s, v2.4s
+    ldr s0, [x15]
+    dup v0.4s, v0.s[0]
+    fmul v2.4s, v1.4s, v0.4s
+    fadd v18.4s, v18.4s, v2.4s
+    ldr s0, [x16]
+    dup v0.4s, v0.s[0]
+    fmul v2.4s, v1.4s, v0.4s
+    fadd v19.4s, v19.4s, v2.4s
+    add x10, x10, x6
+    add x13, x13, #4
+    add x14, x14, #4
+    add x15, x15, #4
+    add x16, x16, #4
+    subs x9, x9, #1
+    b.ne pmoNeonConvFpFourByFourKernel
+    add x1, x1, x4
+    subs x8, x8, #1
+    b.ne pmoNeonConvFpFourByFourChannel
+
+pmoNeonConvFpFourByFourEmpty:
+    ldr x3, [x0, #16]
+    ldr x9, [x0, #64]
+    ldr x10, [x0, #104]
+    mul x9, x9, x10
+    ldr x11, [x0, #80]
+    add x9, x9, x11
+    ldr x12, [x0, #96]
+    mul x9, x9, x12
+    ldr x11, [x0, #88]
+    add x9, x9, x11
+    lsl x9, x9, #2
+    add x3, x3, x9
+    lsl x12, x12, #2
+pmoNeonConvFpFourByFourStore0:
+    st1 {v16.4s}, [x3]
+    add x3, x3, x12
+    st1 {v17.4s}, [x3]
+    add x3, x3, x12
+    st1 {v18.4s}, [x3]
+    add x3, x3, x12
+    st1 {v19.4s}, [x3]
+  EndASM
+EndProcedure
+
+; Four adjacent output channels by SIXTEEN fully in-range positions - the
+; register-blocked tile, and the one the model's convolutions actually run in.
+;
+; It holds sixteen accumulator vectors, one per (output channel, position
+; quad): v16..v19 are output channel oc+0 at positions ox+0..15, v20..v23 are
+; oc+1, v24..v27 oc+2, v28..v31 oc+3.  Per (input channel, tap) step the whole
+; body is
+;
+;   ld1 {v0-v3}, [src], dilation*4     one 64-byte load, sixteen positions
+;   ld1r {v4}, [weight_oc], #4   x4    one broadcast per output channel
+;   fmul/fadd                    x32   sixteen products and sixteen adds
+;   subs / b.ne                        two
+;
+; which is 39 instructions for 64 multiply-accumulates - 0.61 instructions per
+; MAC against the 4x4 tile's 1.50, and five load instructions (eight 16-byte
+; load-pipe accesses) per 64 MACs against the 4x4 tile's five per 16.  Thirty-
+; two of the thirty-nine instructions are the arithmetic itself, so on a core
+; with two SIMD floating-point pipes and no fused multiply-add the loop is
+; issue-bound at the architectural ceiling of four MACs per cycle rather than
+; on decode or on the load unit.  Sixteen independent accumulators also put a
+; whole loop iteration between consecutive adds to the same one, which four
+; accumulators did not.
+;
+; NOTHING ABOUT THE ARITHMETIC MOVES.  Lane n of accumulator v(16+4j+q) is the
+; output at channel oc+j, position ox+4q+n, and it is only ever touched by its
+; own separate FMUL and FADD in the reference's input-channel-major, tap-minor
+; order, starting from the broadcast bias.  Lanes are never combined, there is
+; no horizontal reduction and there is no fused multiply-add, so each of the
+; sixty-four outputs sees exactly the sequence PmTensorConv1D performs for it.
+; Parallelism here is across independent outputs and nowhere else.
+;
+; The caller guarantees all four output channels are in one group, that the
+; stride is one, and that positions ox..ox+15 are all fully in range, so the
+; sixteen positions of any tap are one contiguous run of source samples and
+; the four output rows are one contiguous run each.
+Procedure PmTensorConv1DFp32FourBySixteen(*a.PmTensorConv1DFp32FourByFourArgs)
+  ASM
+    ldr x1, [x0, #0]                 ; source base
+    ldr x2, [x0, #8]                 ; weight base
+    ldr x4, [x0, #24]                ; input width
+    ldr x5, [x0, #32]                ; kernel
+    ldr x6, [x0, #40]                ; dilation
+    ldr x7, [x0, #48]                ; input channels per group
+    ldr x8, [x0, #56]                ; first input channel in group
+    ldr x9, [x0, #64]                ; batch
+    ldr x10, [x0, #72]               ; all input channels
+    mul x9, x9, x10
+    add x9, x9, x8
+    mul x9, x9, x4
+    ldr x10, [x0, #88]               ; first output position
+    add x9, x9, x10
+    ldr x10, [x0, #112]              ; left padding
+    sub x9, x9, x10
+    lsl x9, x9, #2
+    add x1, x1, x9                   ; source channel zero at output x, tap zero
+
+    ldr x11, [x0, #80]               ; first output channel
+    mul x12, x7, x5                  ; weights per output channel
+    mul x10, x11, x12
+    lsl x10, x10, #2
+    add x13, x2, x10                 ; four weight-row cursors
+    lsl x12, x12, #2
+    add x14, x13, x12
+    add x15, x14, x12
+    add x16, x15, x12
+
+    ; Every accumulator starts at its own output channel's bias, exactly as
+    ; the reference's sum does, so the bias is the first term of the sum and
+    ; not something folded in afterwards.
+    ldr s16, [x0, #120]
+    ldr s20, [x0, #124]
+    ldr s24, [x0, #128]
+    ldr s28, [x0, #132]
+    dup v17.4s, v16.s[0]
+    dup v18.4s, v16.s[0]
+    dup v19.4s, v16.s[0]
+    dup v16.4s, v16.s[0]
+    dup v21.4s, v20.s[0]
+    dup v22.4s, v20.s[0]
+    dup v23.4s, v20.s[0]
+    dup v20.4s, v20.s[0]
+    dup v25.4s, v24.s[0]
+    dup v26.4s, v24.s[0]
+    dup v27.4s, v24.s[0]
+    dup v24.4s, v24.s[0]
+    dup v29.4s, v28.s[0]
+    dup v30.4s, v28.s[0]
+    dup v31.4s, v28.s[0]
+    dup v28.4s, v28.s[0]
+    lsl x4, x4, #2                  ; bytes between source channels
+pmoNeonConvFp4x16Dilation:
+    lsl x6, x6, #2                  ; bytes between kernel taps
+    ; Both reduction loops below are do-while, so an empty group or an empty
+    ; kernel would run 2^64 times.  PmTensorConv1D leaves such an output at
+    ; its bias, and so does this: branch straight to the store, where the
+    ; accumulators still hold the broadcast bias.
+    cmp x7, #1
+    b.lt pmoNeonConvFp4x16Empty
+    cmp x5, #1
+    b.lt pmoNeonConvFp4x16Empty
+    mov x8, x7
+pmoNeonConvFp4x16Channel:
+    mov x10, x1
+    mov x9, x5
+pmoNeonConvFp4x16Kernel:
+pmoNeonConvFp4x16Source:
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x10], x6
+    ld1r {v4.4s}, [x13], #4
+    fmul v5.4s, v0.4s, v4.4s
+    fmul v6.4s, v1.4s, v4.4s
+    fmul v7.4s, v2.4s, v4.4s
+pmoNeonConvFp4x16Add0:
+    fadd v16.4s, v16.4s, v5.4s
+    fmul v5.4s, v3.4s, v4.4s
+    fadd v17.4s, v17.4s, v6.4s
+    fadd v18.4s, v18.4s, v7.4s
+    fadd v19.4s, v19.4s, v5.4s
+    ld1r {v4.4s}, [x14], #4
+    fmul v5.4s, v0.4s, v4.4s
+    fmul v6.4s, v1.4s, v4.4s
+    fmul v7.4s, v2.4s, v4.4s
+    fadd v20.4s, v20.4s, v5.4s
+    fmul v5.4s, v3.4s, v4.4s
+    fadd v21.4s, v21.4s, v6.4s
+    fadd v22.4s, v22.4s, v7.4s
+    fadd v23.4s, v23.4s, v5.4s
+    ld1r {v4.4s}, [x15], #4
+    fmul v5.4s, v0.4s, v4.4s
+    fmul v6.4s, v1.4s, v4.4s
+    fmul v7.4s, v2.4s, v4.4s
+    fadd v24.4s, v24.4s, v5.4s
+    fmul v5.4s, v3.4s, v4.4s
+    fadd v25.4s, v25.4s, v6.4s
+    fadd v26.4s, v26.4s, v7.4s
+    fadd v27.4s, v27.4s, v5.4s
+    ld1r {v4.4s}, [x16], #4
+    fmul v5.4s, v0.4s, v4.4s
+    fmul v6.4s, v1.4s, v4.4s
+    fmul v7.4s, v2.4s, v4.4s
+    fadd v28.4s, v28.4s, v5.4s
+    fmul v5.4s, v3.4s, v4.4s
+    fadd v29.4s, v29.4s, v6.4s
+    fadd v30.4s, v30.4s, v7.4s
+    fadd v31.4s, v31.4s, v5.4s
+    subs x9, x9, #1
+    b.ne pmoNeonConvFp4x16Kernel
+pmoNeonConvFp4x16Advance:
+    add x1, x1, x4
+    subs x8, x8, #1
+    b.ne pmoNeonConvFp4x16Channel
+
+pmoNeonConvFp4x16Empty:
+    ldr x3, [x0, #16]
+    ldr x9, [x0, #64]
+    ldr x10, [x0, #104]
+    mul x9, x9, x10
+    ldr x11, [x0, #80]
+    add x9, x9, x11
+    ldr x12, [x0, #96]
+    mul x9, x9, x12
+    ldr x11, [x0, #88]
+    add x9, x9, x11
+    lsl x9, x9, #2
+    add x3, x3, x9
+    lsl x12, x12, #2
+pmoNeonConvFp4x16Store0:
+    st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x3]
+    add x3, x3, x12
+    st1 {v20.4s, v21.4s, v22.4s, v23.4s}, [x3]
+    add x3, x3, x12
+    st1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x3]
+    add x3, x3, x12
+    st1 {v28.4s, v29.4s, v30.4s, v31.4s}, [x3]
+  EndASM
+EndProcedure
+
+; Four fully in-range output positions.  Reduction remains icg-major then
+; kx-major, and FMUL/FADD remain separate, so every lane follows the scalar
+; FP32 operation order.  Strided outputs use lane loads because A64 NEON has
+; no gather instruction.
+Procedure PmTensorConv1DFp32Four(*a.PmTensorConv1DFp32FourArgs)
+  ASM
+    ldr x1, [x0, #0]
+    ldr x2, [x0, #8]
+    ldr x3, [x0, #16]
+    ldr x4, [x0, #24]
+    ldr x5, [x0, #32]
+    ldr x6, [x0, #40]
+    ldr x7, [x0, #48]
+    ldr x8, [x0, #56]
+    ldr x9, [x0, #64]
+    ldr x10, [x0, #72]
+    ldr x11, [x0, #80]
+    mul x10, x10, x11
+    add x10, x10, x9
+    mul x10, x10, x4
+    ldr x11, [x0, #96]
+    mul x11, x11, x6
+    ldr x13, [x0, #120]
+    sub x11, x11, x13
+    add x10, x10, x11
+    lsl x10, x10, #2
+    add x1, x1, x10
+    ldr x10, [x0, #88]
+    mul x10, x10, x8
+    mul x10, x10, x5
+    lsl x10, x10, #2
+    add x2, x2, x10
+    ldr s16, [x0, #128]
+    dup v16.4s, v16.s[0]
+    lsl x6, x6, #2
+    lsl x7, x7, #2
+    lsl x4, x4, #2
+    ; Both loops below are do-while.  An empty group ran one spurious channel
+    ; and read weight word zero of a zero-length weight buffer; an empty kernel
+    ; iterated 2^64 times.  PmTensorConv1D leaves both at the bias, so branch
+    ; to the store, where v16 already holds the broadcast bias.
+    cmp x8, #1
+    b.lt pmoNeonConvFpFourStore
+    cmp x5, #1
+    b.lt pmoNeonConvFpFourStore
+    movz x9, #0
+pmoNeonConvFpFourChannel:
+    mov x10, x1
+    mov x11, x2
+    mov x12, x5
+pmoNeonConvFpFourKernel:
+    ldr s0, [x11]
+    dup v0.4s, v0.s[0]
+    ldr s1, [x10]
+    add x13, x10, x6
+    ld1 {v1.s}[1], [x13]
+    add x13, x13, x6
+    ld1 {v1.s}[2], [x13]
+    add x13, x13, x6
+    ld1 {v1.s}[3], [x13]
+    fmul v1.4s, v1.4s, v0.4s
+    fadd v16.4s, v16.4s, v1.4s
+    add x10, x10, x7
+    add x11, x11, #4
+    subs x12, x12, #1
+    b.ne pmoNeonConvFpFourKernel
+    add x1, x1, x4
+    lsl x10, x5, #2
+    add x2, x2, x10
+    add x9, x9, #1
+    cmp x9, x8
+    b.lt pmoNeonConvFpFourChannel
+pmoNeonConvFpFourStore:
+    ldr x10, [x0, #72]
+    ldr x11, [x0, #112]
+    mul x10, x10, x11
+    ldr x11, [x0, #88]
+    add x10, x10, x11
+    ldr x11, [x0, #104]
+    mul x10, x10, x11
+    ldr x11, [x0, #96]
+    add x10, x10, x11
+    lsl x10, x10, #2
+    add x3, x3, x10
+    st1 {v16.4s}, [x3]
+  EndASM
+EndProcedure
+
+; Four adjacent output channels at ONE partly padded position.  The four
+; channels share every source sample, so one broadcast feeds four independent
+; lane accumulators; lanes are never combined and there is no horizontal
+; reduction, so lane n performs exactly the adds PmTensorConv1D performs for
+; output channel oc+n.  The caller guarantees all four channels are in one
+; group and that Dilation >= 1.
+Procedure PmTensorConv1DFp32EdgeFour(*a.PmTensorConv1DFp32EdgeArgs)
+  ASM
+    ldr x4, [x0, #24]                ; input width
+    ldr x6, [x0, #48]                ; dilation
+    ldr x9, [x0, #96]                ; output position
+    ldr x10, [x0, #40]               ; stride
+    mul x9, x9, x10
+    ldr x10, [x0, #120]              ; left padding
+    sub x9, x9, x10                  ; input x of tap zero, unclamped
+    ; First kept tap: the smallest kx with ox*Stride-PadLeft+kx*Dilation >= 0.
+    ; Computed only when tap zero is left of the input, so the division always
+    ; has two positive operands.
+    movz x11, #0
+    cmp x9, #0
+    b.ge pmoNeonConvFpEdgeFourLow
+    sub x10, xzr, x9
+    add x10, x10, x6
+    sub x10, x10, #1
+    udiv x11, x10, x6
+pmoNeonConvFpEdgeFourLow:
+    ; One past the last kept tap, clamped to Kernel.  A negative numerator is
+    ; branched out rather than divided: this divide is unsigned.
+    ldr x8, [x0, #32]                ; kernel
+    mov x12, x8
+    sub x10, x4, #1
+    subs x10, x10, x9
+    b.lt pmoNeonConvFpEdgeFourNone
+    udiv x10, x10, x6
+    add x10, x10, #1
+    cmp x10, x12
+    b.ge pmoNeonConvFpEdgeFourHigh
+    mov x12, x10
+    b pmoNeonConvFpEdgeFourHigh
+pmoNeonConvFpEdgeFourNone:
+    movz x12, #0
+pmoNeonConvFpEdgeFourHigh:
+    ; A position whose whole kernel misses the input leaves the low bound above
+    ; the high one; it keeps no taps and stores the bias, as the reference does.
+    cmp x11, x12
+    b.lt pmoNeonConvFpEdgeFourCount
+    mov x11, x12
+pmoNeonConvFpEdgeFourCount:
+    sub x5, x12, x11                 ; taps kept at this position
+    mul x10, x11, x6
+    add x9, x9, x10                  ; input x of the first kept tap
+
+    ldr x10, [x0, #80]               ; all input channels
+    ldr x17, [x0, #72]               ; batch
+    mul x10, x10, x17
+    ldr x17, [x0, #64]               ; first input channel in group
+    add x10, x10, x17
+    mul x10, x10, x4
+    add x10, x10, x9
+    lsl x10, x10, #2
+    ldr x1, [x0, #0]
+    add x1, x1, x10                  ; source, channel zero, first kept tap
+
+    ldr x7, [x0, #56]                ; input channels per group
+    mul x17, x7, x8                  ; weights per output channel
+    ldr x10, [x0, #88]               ; first output channel
+    mul x10, x10, x17
+    add x10, x10, x11
+    lsl x10, x10, #2
+    ldr x2, [x0, #8]
+    add x13, x2, x10                 ; four weight cursors
+    lsl x17, x17, #2
+    add x14, x13, x17
+    add x15, x14, x17
+    add x16, x15, x17
+
+    sub x12, x8, x5                  ; taps skipped, per input channel
+    lsl x12, x12, #2
+    lsl x4, x4, #2                   ; bytes between source channels
+    lsl x6, x6, #2                   ; bytes between kept taps
+    add x17, x0, #128
+    ld1 { v16.4s }, [x17]            ; one accumulator lane per output channel
+    ; Both loops below are do-while, so an empty group or a position that keeps
+    ; no tap would run 2^64 times.  Branch to the store, where the accumulators
+    ; still hold the bias.
+    cmp x7, #1
+    b.lt pmoNeonConvFpEdgeFourStore
+    cmp x5, #1
+    b.lt pmoNeonConvFpEdgeFourStore
+    mov x8, x7
+pmoNeonConvFpEdgeFourChannel:
+    mov x10, x1
+    mov x9, x5
+pmoNeonConvFpEdgeFourKernel:
+pmoNeonConvFpEdgeFourSource:
+    ldr s1, [x10]
+    dup v1.4s, v1.s[0]
+    ld1 { v0.s }[0], [x13]
+    ld1 { v0.s }[1], [x14]
+    ld1 { v0.s }[2], [x15]
+    ld1 { v0.s }[3], [x16]
+    fmul v2.4s, v1.4s, v0.4s
+pmoNeonConvFpEdgeFourAdd:
+    fadd v16.4s, v16.4s, v2.4s
+    add x10, x10, x6
+    add x13, x13, #4
+    add x14, x14, #4
+    add x15, x15, #4
+    add x16, x16, #4
+    subs x9, x9, #1
+    b.ne pmoNeonConvFpEdgeFourKernel
+    add x1, x1, x4
+    add x13, x13, x12
+    add x14, x14, x12
+    add x15, x15, x12
+    add x16, x16, x12
+    subs x8, x8, #1
+    b.ne pmoNeonConvFpEdgeFourChannel
+pmoNeonConvFpEdgeFourStore:
+    ldr x3, [x0, #16]
+    ldr x9, [x0, #72]                ; batch
+    ldr x10, [x0, #112]              ; all output channels
+    mul x9, x9, x10
+    ldr x11, [x0, #88]
+    add x9, x9, x11
+    ldr x12, [x0, #104]              ; output width
+    mul x9, x9, x12
+    ldr x11, [x0, #96]
+    add x9, x9, x11
+    lsl x9, x9, #2
+    add x3, x3, x9
+    lsl x12, x12, #2
+pmoNeonConvFpEdgeFourStore0:
+    st1 { v16.s }[0], [x3]
+    add x3, x3, x12
+    st1 { v16.s }[1], [x3]
+    add x3, x3, x12
+    st1 { v16.s }[2], [x3]
+    add x3, x3, x12
+    st1 { v16.s }[3], [x3]
+  EndASM
+EndProcedure
+
+; One output channel at one partly padded position.  Same clamp, same order,
+; one scalar accumulator.  This is what a group with fewer than four remaining
+; output channels, and every strided convolution, use for their edges.
+Procedure PmTensorConv1DFp32EdgeOne(*a.PmTensorConv1DFp32EdgeArgs)
+  ASM
+    ldr x4, [x0, #24]                ; input width
+    ldr x6, [x0, #48]                ; dilation
+    ldr x9, [x0, #96]                ; output position
+    ldr x10, [x0, #40]               ; stride
+    mul x9, x9, x10
+    ldr x10, [x0, #120]              ; left padding
+    sub x9, x9, x10                  ; input x of tap zero, unclamped
+    movz x11, #0
+    cmp x9, #0
+    b.ge pmoNeonConvFpEdgeOneLow
+    sub x10, xzr, x9
+    add x10, x10, x6
+    sub x10, x10, #1
+    udiv x11, x10, x6
+pmoNeonConvFpEdgeOneLow:
+    ldr x8, [x0, #32]                ; kernel
+    mov x12, x8
+    sub x10, x4, #1
+    subs x10, x10, x9
+    b.lt pmoNeonConvFpEdgeOneNone
+    udiv x10, x10, x6
+    add x10, x10, #1
+    cmp x10, x12
+    b.ge pmoNeonConvFpEdgeOneHigh
+    mov x12, x10
+    b pmoNeonConvFpEdgeOneHigh
+pmoNeonConvFpEdgeOneNone:
+    movz x12, #0
+pmoNeonConvFpEdgeOneHigh:
+    cmp x11, x12
+    b.lt pmoNeonConvFpEdgeOneCount
+    mov x11, x12
+pmoNeonConvFpEdgeOneCount:
+    sub x5, x12, x11                 ; taps kept at this position
+    mul x10, x11, x6
+    add x9, x9, x10                  ; input x of the first kept tap
+
+    ldr x10, [x0, #80]               ; all input channels
+    ldr x17, [x0, #72]               ; batch
+    mul x10, x10, x17
+    ldr x17, [x0, #64]               ; first input channel in group
+    add x10, x10, x17
+    mul x10, x10, x4
+    add x10, x10, x9
+    lsl x10, x10, #2
+    ldr x1, [x0, #0]
+    add x1, x1, x10                  ; source, channel zero, first kept tap
+
+    ldr x7, [x0, #56]                ; input channels per group
+    mul x17, x7, x8                  ; weights per output channel
+    ldr x10, [x0, #88]               ; output channel
+    mul x10, x10, x17
+    add x10, x10, x11
+    lsl x10, x10, #2
+    ldr x2, [x0, #8]
+    add x13, x2, x10                 ; weight cursor
+
+    sub x12, x8, x5                  ; taps skipped, per input channel
+    lsl x12, x12, #2
+    lsl x4, x4, #2                   ; bytes between source channels
+    lsl x6, x6, #2                   ; bytes between kept taps
+    ldr s16, [x0, #128]              ; bias
+    cmp x7, #1
+    b.lt pmoNeonConvFpEdgeOneStore
+    cmp x5, #1
+    b.lt pmoNeonConvFpEdgeOneStore
+    mov x8, x7
+pmoNeonConvFpEdgeOneChannel:
+    mov x10, x1
+    mov x9, x5
+pmoNeonConvFpEdgeOneKernel:
+pmoNeonConvFpEdgeOneSource:
+    ldr s1, [x10]
+    ldr s0, [x13]
+    fmul s2, s1, s0
+pmoNeonConvFpEdgeOneAdd:
+    fadd s16, s16, s2
+    add x10, x10, x6
+    add x13, x13, #4
+    subs x9, x9, #1
+    b.ne pmoNeonConvFpEdgeOneKernel
+    add x1, x1, x4
+    add x13, x13, x12
+    subs x8, x8, #1
+    b.ne pmoNeonConvFpEdgeOneChannel
+pmoNeonConvFpEdgeOneStore:
+    ldr x3, [x0, #16]
+    ldr x9, [x0, #72]                ; batch
+    ldr x10, [x0, #112]              ; all output channels
+    mul x9, x9, x10
+    ldr x11, [x0, #88]
+    add x9, x9, x11
+    ldr x12, [x0, #104]              ; output width
+    mul x9, x9, x12
+    ldr x11, [x0, #96]
+    add x9, x9, x11
+    lsl x9, x9, #2
+    add x3, x3, x9
+pmoNeonConvFpEdgeOneStore0:
+    str s16, [x3]
+  EndASM
+EndProcedure
+
+; One padded or tail output through the scalar tensor accessors, testing every
+; tap the way the reference does.  The clamped edge bodies above need a
+; positive dilation to clamp with; this is what covers anything else.
+Procedure PmTensorConv1DFp32One(*g.PmTensorConv1DArgs, bn.i, oc.i, ox.i)
+  Protected icg.i
+  Protected kx.i
+  Protected ix.i
+  Protected group.i
+  Protected inPerGroup.i
+  Protected outPerGroup.i
+  Protected ic.i
+  Protected srcIndex.i
+  Protected weightIndex.i
+  Protected sum.f
+  inPerGroup=*g\InChannels / *g\Groups : outPerGroup=*g\OutChannels / *g\Groups
+  group=oc/outPerGroup : sum=0.0
+  If *g\Bias<>0 : sum=PmTensorGet(*g\Bias,oc) : EndIf
+  icg=0
+  While icg<inPerGroup
+    ic=group*inPerGroup+icg : kx=0
+    While kx<*g\Kernel
+      ix=ox* *g\Stride-*g\PadLeft+kx* *g\Dilation
+      If ix>=0 And ix<*g\InWidth
+        srcIndex=(bn* *g\InChannels+ic)* *g\InWidth+ix
+        weightIndex=(oc*inPerGroup+icg)* *g\Kernel+kx
+        sum=sum+PmTensorGet(*g\Src,srcIndex)*PmTensorGet(*g\Weight,weightIndex)
+      EndIf
+      kx+1
+    Wend
+    icg+1
+  Wend
+  PmTensorPut(*g\Dst,(bn* *g\OutChannels+oc)* *g\OutWidth+ox,sum)
+EndProcedure
+
+; ONE OUTPUT-CHANNEL RANGE OF THE CONVOLUTION, AND THAT IS THE WHOLE
+; CHANGE. The body below is what PmTensorConv1DFp32Neon always did; it now
+; takes the range it covers instead of assuming the whole tensor, so the
+; same code serves one core and four. It is the shape
+; PmTensorConv1DInt8Range already has.
+;
+; NOTHING ABOUT AN OUTPUT'S ARITHMETIC DEPENDS ON THE RANGE. Each output
+; is computed entirely inside one call, icg-major then kx-minor, with
+; separate FMUL and FADD and the same bias seeding, whichever of the
+; four-by-four, four-wide, edge or scalar bodies reaches it. So splitting
+; the channels between cores cannot change a single bit, and the boundary
+; alignment below is a speed choice rather than a correctness one.
+Procedure PmTensorConv1DFp32NeonRange(*g.PmTensorConv1DArgs, ocFirst.i, ocLast.i)
+  Protected bn.i
+  Protected oc.i
+  Protected ox.i
+  Protected group.i
+  Protected inPerGroup.i
+  Protected outPerGroup.i
+  Protected first.i
+  Protected last.i
+  Protected lastNumerator.i
+  Protected groupEnd.i
+  Protected lane.i
+  Protected useEdge.i
+  Protected four.PmTensorConv1DFp32FourArgs
+  Protected tile.PmTensorConv1DFp32FourByFourArgs
+  Protected edge.PmTensorConv1DFp32EdgeArgs
+  If *g=0 Or *g\Batches<=0 Or *g\OutChannels<=0 Or *g\OutWidth<=0
+    ProcedureReturn
+  EndIf
+  If ocFirst<0 : ocFirst=0 : EndIf
+  If ocLast>*g\OutChannels : ocLast=*g\OutChannels : EndIf
+  If ocFirst>=ocLast
+    ProcedureReturn
+  EndIf
+  ; The clamped-tap edge bodies divide by Dilation, so they need it positive;
+  ; ONNX requires that.  Anything else keeps PmTensorConv1DFp32One, which tests
+  ; every tap individually and therefore does not care what Dilation is.
+  useEdge=1
+  If *g\Dilation<1 : useEdge=0 : EndIf
+  inPerGroup=*g\InChannels / *g\Groups : outPerGroup=*g\OutChannels / *g\Groups
+  four\Src=*g\Src : four\Weight=*g\Weight : four\Dst=*g\Dst
+  four\InWidth=*g\InWidth : four\Kernel=*g\Kernel : four\Stride=*g\Stride
+  four\Dilation=*g\Dilation : four\InPerGroup=inPerGroup
+  four\InputChannels=*g\InChannels : four\OutputWidth=*g\OutWidth
+  four\OutChannels=*g\OutChannels : four\PadLeft=*g\PadLeft
+  tile\Src=*g\Src : tile\Weight=*g\Weight : tile\Dst=*g\Dst
+  tile\InWidth=*g\InWidth : tile\Kernel=*g\Kernel : tile\Dilation=*g\Dilation
+  tile\InPerGroup=inPerGroup : tile\InputChannels=*g\InChannels
+  tile\OutputWidth=*g\OutWidth : tile\OutChannels=*g\OutChannels : tile\PadLeft=*g\PadLeft
+  edge\Src=*g\Src : edge\Weight=*g\Weight : edge\Dst=*g\Dst
+  edge\InWidth=*g\InWidth : edge\Kernel=*g\Kernel : edge\Stride=*g\Stride
+  edge\Dilation=*g\Dilation : edge\InPerGroup=inPerGroup
+  edge\InputChannels=*g\InChannels : edge\OutputWidth=*g\OutWidth
+  edge\OutChannels=*g\OutChannels : edge\PadLeft=*g\PadLeft
+  first=(*g\PadLeft+*g\Stride-1)/ *g\Stride
+  If first<0 : first=0 : EndIf
+  lastNumerator=*g\InWidth-1+*g\PadLeft-(*g\Kernel-1)* *g\Dilation
+  If lastNumerator<0
+    last=-1
+  Else
+    last=lastNumerator/ *g\Stride
+  EndIf
+  If last>=*g\OutWidth : last=*g\OutWidth-1 : EndIf
+  bn=0
+  While bn<*g\Batches
+    four\Batch=bn : tile\Batch=bn : edge\Batch=bn : oc=ocFirst
+    While oc<ocLast
+      group=oc/outPerGroup : groupEnd=(group+1)*outPerGroup
+      edge\InputChannelBase=group*inPerGroup : edge\OutputChannel=oc
+      ; The four-wide tile must stay inside BOTH the conv group and this
+      ; partition. A partition boundary that is not a multiple of four is
+      ; correct and merely slower; the splitter aligns them anyway.
+      If *g\Stride=1 And oc+3<groupEnd And oc+3<ocLast
+        tile\InputChannelBase=group*inPerGroup : tile\OutputChannel=oc
+        tile\Bias0=0.0 : tile\Bias1=0.0 : tile\Bias2=0.0 : tile\Bias3=0.0
+        If *g\Bias<>0
+          tile\Bias0=PmTensorGet(*g\Bias,oc) : tile\Bias1=PmTensorGet(*g\Bias,oc+1)
+          tile\Bias2=PmTensorGet(*g\Bias,oc+2) : tile\Bias3=PmTensorGet(*g\Bias,oc+3)
+        EndIf
+        edge\Bias0=tile\Bias0 : edge\Bias1=tile\Bias1
+        edge\Bias2=tile\Bias2 : edge\Bias3=tile\Bias3
+        ox=0
+        While ox<first And ox<*g\OutWidth
+          If useEdge
+            edge\OutputX=ox : PmTensorConv1DFp32EdgeFour(@edge)
+          Else
+            lane=0 : While lane<4 : PmTensorConv1DFp32One(*g,bn,oc+lane,ox) : lane+1 : Wend
+          EndIf
+          ox+1
+        Wend
+        ; Sixteen positions at a time while a whole tile is in range, then
+        ; the four-wide tile for what is left, then the edge.  On every
+        ; Kokoro Conv the sixteen-wide tile takes all but the last fifteen
+        ; interior positions of a run thousands long.
+        ;
+        ; THIS IS A POSITION BLOCK AND PmParallelConvTile() IS A CHANNEL
+        ; BLOCK; they are different axes and the splitter is unaffected.
+        ; Both tiles are four output channels wide, so the blocking factor
+        ; the partitioner snaps to is still four.
+        While ox+15<=last
+          tile\OutputX=ox : PmTensorConv1DFp32FourBySixteen(@tile) : ox+16
+        Wend
+        While ox+3<=last
+          tile\OutputX=ox : PmTensorConv1DFp32FourByFour(@tile) : ox+4
+        Wend
+        While ox<*g\OutWidth
+          If useEdge
+            edge\OutputX=ox : PmTensorConv1DFp32EdgeFour(@edge)
+          Else
+            lane=0 : While lane<4 : PmTensorConv1DFp32One(*g,bn,oc+lane,ox) : lane+1 : Wend
+          EndIf
+          ox+1
+        Wend
+        oc+4
+      Else
+        four\InputChannelBase=group*inPerGroup
+        four\OutputChannel=oc : four\BiasValue=0.0
+        If *g\Bias<>0 : four\BiasValue=PmTensorGet(*g\Bias,oc) : EndIf
+        edge\Bias0=four\BiasValue
+        ox=0
+        While ox<first And ox<*g\OutWidth
+          If useEdge
+            edge\OutputX=ox : PmTensorConv1DFp32EdgeOne(@edge)
+          Else
+            PmTensorConv1DFp32One(*g,bn,oc,ox)
+          EndIf
+          ox+1
+        Wend
+        While ox+3<=last
+          four\OutputX=ox : PmTensorConv1DFp32Four(@four) : ox+4
+        Wend
+        While ox<*g\OutWidth
+          If useEdge
+            edge\OutputX=ox : PmTensorConv1DFp32EdgeOne(@edge)
+          Else
+            PmTensorConv1DFp32One(*g,bn,oc,ox)
+          EndIf
+          ox+1
+        Wend
+        oc+1
+      EndIf
+    Wend
+    bn+1
+  Wend
+EndProcedure
+
+Procedure PmTensorConv1DFp32Neon(*g.PmTensorConv1DArgs)
+  If *g=0
+    ProcedureReturn
+  EndIf
+  PmTensorConv1DFp32NeonRange(*g,0,*g\OutChannels)
+EndProcedure
+
+; ======================================================================
+;  THE FOUR-CORE CONVOLUTION - the payload half of Anvil's ABI 1.3
+;  parallel service.  Falls back to one core whenever it cannot be sure,
+;  and the fallback is the ordinary path above with nothing changed.
+; ----------------------------------------------------------------------
+;  WHY OUTPUT CHANNELS AND NOT POSITIONS. Every output element is
+;  computed entirely inside one call to the range body, in one order, so
+;  a channel split changes no arithmetic anywhere. A position split would
+;  too, but channels give contiguous, equal, cache-friendly pieces on the
+;  shapes that matter here - the decoder resblocks at [1,128,~2000] - and
+;  they do not interact with the padding edges the way a position split
+;  does.
+;
+;  THE OUTPUT TENSOR IS SHARED AND THAT IS FINE. Two partitions meet
+;  inside one 64-byte line at each channel boundary. On the monitor's
+;  Normal Write-Back Inner Shareable memory that is correct, because the
+;  coherency protocol resolves it; it is only a little slower. NOTHING
+;  HERE MAY CLEAN OR INVALIDATE THAT LINE - a clean would write one core's
+;  copy of it over the other's.
+;
+;  IT ALLOCATES NOTHING AND TOUCHES NO RUNTIME GLOBAL. The arena counters
+;  are the primary's and a partition worker may not reach them, so every
+;  buffer this convolution needs was taken before the call.
+; ======================================================================
+#PMP_PARALLEL_MAX_PARTS  = 4
+; args, ocFirst, ocLast, tile, activation-scale bits.
+;
+; THE FIFTH WORD EXISTS BECAUSE THE INT8 CONVOLUTION HAS A NUMBER THE FP32
+; ONE DOES NOT. Its activations are quantized against one scale computed
+; over the whole source, on the primary, before any partition starts; every
+; partition needs that same float and none of them may recompute it, since
+; a second pass over the source would be both slower and - if it ever saw
+; different bytes - a different answer. The FP32 splitter writes a zero
+; there and its worker never reads it.
+#PMP_PARALLEL_WORDS      = 5
+#PMP_PARALLEL_STRIDE     = 40         ; #PMP_PARALLEL_WORDS * 8
+
+; The partition blocks handed to the service, one per core. They are a
+; Global rather than a local because the service reads them from three
+; other cores while this procedure's frame is live, and a frame is the one
+; place a partition worker must not be pointed at.
+Global Dim PmParallelParts.i[#PMP_PARALLEL_MAX_PARTS * #PMP_PARALLEL_WORDS]
+
+; The kernel's output-channel blocking factor, in ONE place. Today it is
+; the four of PmTensorConv1DFp32FourByFour. A kernel with a different
+; block changes this and the splitter follows it; nothing downstream
+; carries a 4 of its own.
+Procedure.i PmParallelConvTile()
+  ProcedureReturn 4
+EndProcedure
+
+; One partition. Reads its range and its blocking factor out of the block
+; it was handed and touches nothing else. This is what runs on cores 1, 2
+; and 3 as well as on the primary.
+Procedure.i PmParallelConvWorker(*p.i)
+  Protected args.i
+  Protected first.i
+  Protected last.i
+  If *p=0
+    ProcedureReturn 1
+  EndIf
+  args=PeekI(*p)
+  first=PeekI(*p+8)
+  last=PeekI(*p+16)
+  If args=0
+    ProcedureReturn 2
+  EndIf
+  If first>=last
+    ProcedureReturn 0
+  EndIf
+  PmTensorConv1DFp32NeonRange(args,first,last)
+  ProcedureReturn 0
+EndProcedure
+
+; How many partitions are worth making: never more cores than the service
+; offers, never more than there are whole tiles, and never so few channels
+; per partition that the split costs more than it saves.
+; `tile` is the caller's kernel blocking factor - four for the FP32 tile,
+; one for the INT8 kernel, which blocks over positions and not channels -
+; because how coarse the split may be is a property of the body that will
+; run it, not of this procedure.
+Procedure.i pmParallelConvParts(*g.PmTensorConv1DArgs, tile.i)
+  Protected cores.i
+  Protected tiles.i
+  If PmAnvilServices=0
+    ProcedureReturn 1
+  EndIf
+  cores=pmSvcParCores()
+  If cores<2
+    ProcedureReturn 1
+  EndIf
+  If cores>#PMP_PARALLEL_MAX_PARTS
+    cores=#PMP_PARALLEL_MAX_PARTS
+  EndIf
+  If tile<1
+    tile=1
+  EndIf
+  tiles=*g\OutChannels/tile
+  ; A partition that is one tile wide spends more on dispatch than it
+  ; saves, and a conv this small is not where the run's time is.
+  While cores>1 And tiles<cores*2
+    cores-1
+  Wend
+  ProcedureReturn cores
+EndProcedure
+
+; Split [0, OutChannels) into `count` ranges, each a whole number of tiles
+; where the channel count allows it, and none straddling a conv group -
+; both for speed, since the arithmetic is the same either way.
+; `scaleBits` is the INT8 activation scale's FLOAT32 BIT PATTERN, or zero
+; for the FP32 bodies, which have no such number and whose worker never
+; reads the word. It is carried as bits rather than as a float so the block
+; stays a plain array of machine words and one procedure fills it for both
+; kernels.
+Procedure pmParallelConvSplit(*g.PmTensorConv1DArgs, count.i, tile.i, scaleBits.i)
+  Protected i.i
+  Protected first.i
+  Protected last.i
+  Protected outPerGroup.i
+  outPerGroup=*g\OutChannels / *g\Groups
+  For i=0 To #PMP_PARALLEL_MAX_PARTS-1
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+0]=0
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+1]=0
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+2]=0
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+3]=0
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+4]=0
+  Next
+  first=0
+  For i=0 To count-1
+    If i=count-1
+      last=*g\OutChannels
+    Else
+      last=*g\OutChannels*(i+1)/count
+      last=last/tile*tile
+      If outPerGroup>0 And last%outPerGroup<>0 And last/outPerGroup<>first/outPerGroup
+        last=last/outPerGroup*outPerGroup
+      EndIf
+      If last<first
+        last=first
+      EndIf
+      If last>*g\OutChannels
+        last=*g\OutChannels
+      EndIf
+    EndIf
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+0]=*g
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+1]=first
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+2]=last
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+3]=tile
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+4]=scaleBits
+    first=last
+  Next
+EndProcedure
+
+; The convolution, on as many cores as the monitor will give. Returns 1
+; when it ran - on one core or on four - so the caller has nothing to
+; decide. THE FALLBACK IS NOT AN ERROR PATH: an older monitor, a board
+; with one core, a refusal, a conv too small to split, all take the same
+; single-core code and produce the same bytes.
+Procedure.i PmParallelConv1D(*g.PmTensorConv1DArgs)
+  Protected count.i
+  Protected tile.i
+  Protected status.i
+  If *g=0
+    ProcedureReturn 0
+  EndIf
+  tile=PmParallelConvTile()
+  If tile<1
+    tile=1
+  EndIf
+  count=pmParallelConvParts(*g,tile)
+  If count<2
+    PmTensorConv1DFp32Neon(*g)
+    ProcedureReturn 1
+  EndIf
+  pmParallelConvSplit(*g,count,tile,0)
+  status=pmSvcParRun(@PmParallelConvWorker,@PmParallelParts[0],#PMP_PARALLEL_STRIDE,count)
+  If status=#PMP_SVC_OK
+    ProcedureReturn 1
+  EndIf
+  ; A REFUSAL IS NOT A REASON TO PRODUCE NOTHING. The monitor latches the
+  ; service failed and answers one core from here on, so this convolution
+  ; is simply done here instead - every output written again, by the
+  ; single-core path, over whatever a partial run left. The result is the
+  ; same bytes either way.
+  PmAnvilServices=0
+  PmTensorConv1DFp32Neon(*g)
+  ProcedureReturn 1
+EndProcedure
+CompilerEndIf
+
+CompilerIf #PMO_USE_CONVTRANSPOSE = 1
+; Fill one output row with the exact FLOAT32 bias bits (or +0).  Direct stores
+; avoid accessor overhead without changing the reference initialization.
+Procedure PmTensorConvTransposeFp32Fill(*dst.i,count.i,bits.i)
+  ASM
+    cbz x1, pmoNeonConvTransposeFillDone
+pmoNeonConvTransposeFillLoop:
+pmoNeonConvTransposeFillStore0:
+    str w2, [x0]
+    add x0, x0, #4
+    subs x1, x1, #1
+    b.ne pmoNeonConvTransposeFillLoop
+pmoNeonConvTransposeFillDone:
+  EndASM
+EndProcedure
+
+; Scatter one valid run of DILATED kernel taps into one output row.  Every tap
+; of a dilated run lands a whole Dilation apart, so there is no contiguous run
+; to put in a vector and this stays scalar; the contiguous case is
+; PmTensorConvTransposeFp32Taps below.  FMUL and FADD are kept separate and
+; taps advance in increasing kx order, matching the reference.
+Procedure PmTensorConvTransposeFp32Row(*weight.i,*dst.i,valueBits.i,count.i,dstStepBytes.i)
+  ASM
+    cbz x3, pmoNeonConvTransposeRowDone
+    fmov s0, w2
+pmoNeonConvTransposeRowLoop:
+    ldr s1, [x0]
+    add x0, x0, #4
+    ldr s2, [x1]
+    fmul s1, s0, s1
+pmoNeonConvTransposeRowAdd0:
+    fadd s2, s2, s1
+pmoNeonConvTransposeRowStore0:
+    str s2, [x1]
+    add x1, x1, x4
+    subs x3, x3, #1
+    b.ne pmoNeonConvTransposeRowLoop
+pmoNeonConvTransposeRowDone:
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+; The exact scatter, reordered so one output row is the working set.
+; ----------------------------------------------------------------------
+; PmTensorConvTranspose1D is the reference.  After the bias pass it runs
+;
+;     ic = 0 .. InChannels-1        (group = ic / inPerGroup)
+;       ix = 0 .. InWidth-1         (value = Src[bn][ic][ix])
+;         ocg = 0 .. outPerGroup-1  (oc = group*outPerGroup + ocg)
+;           kx = 0 .. Kernel-1
+;             ox = ix*Stride - PadLeft + kx*Dilation
+;             if 0 <= ox < OutWidth:
+;               Dst[bn][oc][ox] = Dst[bn][oc][ox] + value * W[(ic*outPerGroup+ocg)*Kernel+kx]
+;
+; THE ORDER, stated for one fixed output element (bn, oc, ox).  For a fixed
+; (ic, ix) at most ONE kx can reach that ox, because kx*Dilation is pinned to
+; ox + PadLeft - ix*Stride.  The contributions that element receives are
+; therefore indexed by (ic, ix) alone, and the reference delivers them in
+; ascending lexicographic (ic, ix) order, starting from the bias (or +0.0),
+; each one a separately rounded FMUL followed by a separately rounded FADD
+; into the stored FLOAT32.
+;
+; ocg only chooses WHICH element a contribution lands in; it never interleaves
+; two contributions to the SAME element.  So hoisting ocg outside ic and ix
+; leaves every element's sequence exactly as it was:
+;
+;     bn { bias pass over every (oc, ox) }            <- unchanged, still first
+;     bn { oc { ic in oc's group { ix { kx } } } }
+;
+; reaches element (bn, oc, ox) with the same ascending (ic, ix) sequence.  That
+; is the whole proof, and it is why this is a REORDERING rather than a new
+; numerical formulation: no term is added, dropped, split, fused or moved
+; relative to another term of the same sum.
+;
+; Why it is worth doing.  With ic outermost the old body walked all
+; outPerGroup destination rows for every single (ic, ix) - 128 rows 81.6 KB
+; apart on the model's node 2145 - and paid a procedure call per (ic, ix, ocg)
+; for twelve multiply-adds.  With oc outermost the destination row is ONE
+; 81.6 KB block that stays resident for the whole 256-channel sweep, and one
+; call covers a whole input channel.  Measured on the Pi at 6.3 ns/MAC against
+; the convolution tile's 0.95, that traffic is the cost, not the arithmetic.
+;
+; The bias pass still runs over EVERY (oc, ox) before any contribution, so a
+; caller that aliased Dst onto Src would see what the reference shows it.
+
+Structure PmTensorConvTransposeTapsArgs
+  Src.i                              ; &Src[bn][ic][first ix]
+  Weight.i                           ; &W[(ic*outPerGroup+ocg)*Kernel]
+  Dst.i                              ; &Dst[bn][oc][0]
+  Count.i                            ; how many ix positions
+  BaseOx.i                           ; ix*Stride - PadLeft at the first one
+  Stride.i
+  Kernel.i
+  OutWidth.i
+EndStructure
+
+; Every tap of one input channel into one output row, Dilation = 1, with the
+; kept tap range [kLo,kHi) clamped once per input position.  Four ADJACENT
+; output positions are one vector, and adjacent output positions are different
+; sums, so a lane is one element's accumulator being advanced by exactly one
+; term - never a slice of a reduction.  Both clamp branches avoid a division
+; entirely; there is nothing to divide when Dilation is one.
+Procedure PmTensorConvTransposeFp32Taps(*t.PmTensorConvTransposeTapsArgs)
+  ASM
+    ldr x1, [x0, #0]                 ; source cursor
+    ldr x2, [x0, #8]                 ; weight row
+    ldr x3, [x0, #16]                ; destination row
+    ldr x4, [x0, #24]                ; positions left
+    ldr x5, [x0, #32]                ; baseOx
+    ldr x6, [x0, #40]                ; stride
+    ldr x7, [x0, #48]                ; kernel
+    ldr x8, [x0, #56]                ; output width
+    cmp x4, #1
+    b.lt pmoConvTTapsDone
+pmoConvTTapsPosition:
+    ; kLo: the first tap that lands at or after output position zero.
+    movz x9, #0
+    cmp x5, #0
+    b.ge pmoConvTTapsLow
+    sub x9, xzr, x5
+pmoConvTTapsLow:
+    ; kHi: one past the last tap still inside the row, clamped to Kernel.
+    ; OutWidth-baseOx may be negative; the comparison below is signed and the
+    ; position is then skipped, so nothing negative reaches a shift.
+    sub x10, x8, x5
+    cmp x10, x7
+    b.lt pmoConvTTapsHigh
+    mov x10, x7
+pmoConvTTapsHigh:
+    cmp x9, x10
+    b.ge pmoConvTTapsNext
+    sub x11, x10, x9                 ; taps kept here
+    lsl x14, x9, #2
+    add x12, x2, x14                 ; first kept weight
+    add x13, x5, x9
+    lsl x13, x13, #2
+    add x13, x3, x13                 ; first touched output element
+pmoConvTTapsSource:
+    ldr s0, [x1]
+    dup v0.4s, v0.s[0]
+pmoConvTTapsFourCheck:
+    cmp x11, #4
+    b.lt pmoConvTTapsOneCheck
+    ld1 { v1.4s }, [x12], #16
+    ld1 { v2.4s }, [x13]
+    fmul v1.4s, v0.4s, v1.4s
+pmoConvTTapsAdd0:
+    fadd v2.4s, v2.4s, v1.4s
+pmoConvTTapsStore0:
+    st1 { v2.4s }, [x13], #16
+    sub x11, x11, #4
+    b pmoConvTTapsFourCheck
+pmoConvTTapsOneCheck:
+    cbz x11, pmoConvTTapsNext
+pmoConvTTapsOneLoop:
+    ldr s1, [x12]
+    add x12, x12, #4
+    ldr s2, [x13]
+    fmul s1, s0, s1
+pmoConvTTapsAdd1:
+    fadd s2, s2, s1
+    str s2, [x13]
+    add x13, x13, #4
+    subs x11, x11, #1
+    b.ne pmoConvTTapsOneLoop
+pmoConvTTapsNext:
+    add x1, x1, #4
+    add x5, x5, x6
+    subs x4, x4, #1
+    b.ne pmoConvTTapsPosition
+pmoConvTTapsDone:
+  EndASM
+EndProcedure
+
+Structure PmTensorConvTransposeWideArgs
+  Src.i                              ; &Src[bn][ic][first interior ix]
+  Weight.i                           ; &W[(ic*outPerGroup+ocg)*Kernel]
+  Dst.i                              ; &Dst[bn][oc][baseOx of that ix]
+  Count.i                            ; how many interior ix positions
+  StrideBytes.i                      ; Stride * 4
+  Vectors.i                          ; Kernel / 4, one to five
+EndStructure
+
+; The interior: every input position whose WHOLE kernel is inside the output
+; row, so there is no clamp left to compute and the weight row is loop
+; invariant.  The row is held in v16..v20 for the entire input channel, which
+; is the only reason this body exists - it turns twelve multiply-adds into
+; thirteen instructions instead of twenty-nine.  The arithmetic is the same
+; separate FMUL and FADD, on the same four-adjacent-positions lanes, in the
+; same ascending tap order, as PmTensorConvTransposeFp32Taps performs for the
+; head and tail positions on either side of it.
+Procedure PmTensorConvTransposeFp32Wide(*t.PmTensorConvTransposeWideArgs)
+  ASM
+    ldr x1, [x0, #0]
+    ldr x2, [x0, #8]
+    ldr x3, [x0, #16]
+    ldr x4, [x0, #24]
+    ldr x5, [x0, #32]
+    ldr x6, [x0, #40]
+    cmp x4, #1
+    b.lt pmoConvTWideDone
+    cmp x6, #1
+    b.eq pmoConvTWideOne
+    cmp x6, #2
+    b.eq pmoConvTWideTwo
+    cmp x6, #3
+    b.eq pmoConvTWideThree
+    cmp x6, #4
+    b.eq pmoConvTWideFour
+    cmp x6, #5
+    b.eq pmoConvTWideFive
+    b pmoConvTWideDone
+
+pmoConvTWideOne:
+    ld1 { v16.4s }, [x2]
+pmoConvTWideOneLoop:
+    ldr s0, [x1]
+    add x1, x1, #4
+    dup v0.4s, v0.s[0]
+    ld1 { v21.4s }, [x3]
+    fmul v26.4s, v0.4s, v16.4s
+pmoConvTWideOneAdd0:
+    fadd v21.4s, v21.4s, v26.4s
+pmoConvTWideOneStore0:
+    st1 { v21.4s }, [x3]
+    add x3, x3, x5
+    subs x4, x4, #1
+    b.ne pmoConvTWideOneLoop
+    b pmoConvTWideDone
+
+pmoConvTWideTwo:
+    ld1 { v16.4s-v17.4s }, [x2]
+pmoConvTWideTwoLoop:
+    ldr s0, [x1]
+    add x1, x1, #4
+    dup v0.4s, v0.s[0]
+    ld1 { v21.4s-v22.4s }, [x3]
+    fmul v26.4s, v0.4s, v16.4s
+pmoConvTWideTwoAdd0:
+    fadd v21.4s, v21.4s, v26.4s
+    fmul v27.4s, v0.4s, v17.4s
+    fadd v22.4s, v22.4s, v27.4s
+pmoConvTWideTwoStore0:
+    st1 { v21.4s-v22.4s }, [x3]
+    add x3, x3, x5
+    subs x4, x4, #1
+    b.ne pmoConvTWideTwoLoop
+    b pmoConvTWideDone
+
+pmoConvTWideThree:
+    ld1 { v16.4s-v18.4s }, [x2]
+pmoConvTWideThreeLoop:
+    ldr s0, [x1]
+    add x1, x1, #4
+    dup v0.4s, v0.s[0]
+    ld1 { v21.4s-v23.4s }, [x3]
+    fmul v26.4s, v0.4s, v16.4s
+pmoConvTWideThreeAdd0:
+    fadd v21.4s, v21.4s, v26.4s
+    fmul v27.4s, v0.4s, v17.4s
+    fadd v22.4s, v22.4s, v27.4s
+    fmul v28.4s, v0.4s, v18.4s
+    fadd v23.4s, v23.4s, v28.4s
+pmoConvTWideThreeStore0:
+    st1 { v21.4s-v23.4s }, [x3]
+    add x3, x3, x5
+    subs x4, x4, #1
+    b.ne pmoConvTWideThreeLoop
+    b pmoConvTWideDone
+
+pmoConvTWideFour:
+    ld1 { v16.4s-v19.4s }, [x2]
+pmoConvTWideFourLoop:
+    ldr s0, [x1]
+    add x1, x1, #4
+    dup v0.4s, v0.s[0]
+    ld1 { v21.4s-v24.4s }, [x3]
+    fmul v26.4s, v0.4s, v16.4s
+pmoConvTWideFourAdd0:
+    fadd v21.4s, v21.4s, v26.4s
+    fmul v27.4s, v0.4s, v17.4s
+    fadd v22.4s, v22.4s, v27.4s
+    fmul v28.4s, v0.4s, v18.4s
+    fadd v23.4s, v23.4s, v28.4s
+    fmul v29.4s, v0.4s, v19.4s
+    fadd v24.4s, v24.4s, v29.4s
+pmoConvTWideFourStore0:
+    st1 { v21.4s-v24.4s }, [x3]
+    add x3, x3, x5
+    subs x4, x4, #1
+    b.ne pmoConvTWideFourLoop
+    b pmoConvTWideDone
+
+pmoConvTWideFive:
+    add x7, x2, #64
+    ld1 { v16.4s-v19.4s }, [x2]
+    ld1 { v20.4s }, [x7]
+pmoConvTWideFiveLoop:
+    ldr s0, [x1]
+    add x1, x1, #4
+    dup v0.4s, v0.s[0]
+    add x7, x3, #64
+    ld1 { v21.4s-v24.4s }, [x3]
+    ld1 { v25.4s }, [x7]
+    fmul v26.4s, v0.4s, v16.4s
+pmoConvTWideFiveAdd0:
+    fadd v21.4s, v21.4s, v26.4s
+    fmul v27.4s, v0.4s, v17.4s
+    fadd v22.4s, v22.4s, v27.4s
+    fmul v28.4s, v0.4s, v18.4s
+    fadd v23.4s, v23.4s, v28.4s
+    fmul v29.4s, v0.4s, v19.4s
+    fadd v24.4s, v24.4s, v29.4s
+    fmul v30.4s, v0.4s, v20.4s
+    fadd v25.4s, v25.4s, v30.4s
+pmoConvTWideFiveStore0:
+    st1 { v21.4s-v24.4s }, [x3]
+    st1 { v25.4s }, [x7]
+    add x3, x3, x5
+    subs x4, x4, #1
+    b.ne pmoConvTWideFiveLoop
+pmoConvTWideDone:
+  EndASM
+EndProcedure
+
+Procedure PmTensorConvTranspose1DFp32Neon(*g.PmTensorConvTranspose1DArgs)
+  Protected bn.i
+  Protected ic.i
+  Protected ix.i
+  Protected ocg.i
+  Protected oc.i
+  Protected group.i
+  Protected inPerGroup.i
+  Protected outPerGroup.i
+  Protected baseOx.i
+  Protected firstK.i
+  Protected lastK.i
+  Protected limit.i
+  Protected srcIndex.i
+  Protected weightIndex.i
+  Protected dstIndex.i
+  Protected bits.i
+  Protected rowBase.i
+  Protected wideVectors.i
+  Protected headLast.i
+  Protected tailFirst.i
+  Protected weightRow.i
+  Protected nativeAllowed.i
+  Protected dilationBlock.i
+  Protected wideMaxVectors.i
+  Protected contiguous.i
+  Protected t.PmTensorConvTransposeTapsArgs
+  Protected w.PmTensorConvTransposeWideArgs
+  If *g=0 Or *g\Batches<=0 Or *g\Groups<=0 Or *g\InChannels<=0 Or *g\OutChannels<=0 Or *g\OutWidth<=0 Or *g\Kernel<=0 Or *g\Dilation<=0
+    ProcedureReturn
+  EndIf
+  ; The three widths are NAMED rather than written into the tests, so a control
+  ; build can retire one layer at a time and prove the layer beneath it still
+  ; returns the reference's bits on its own: nativeAllowed=0 retires all of
+  ; this and leaves PmTensorConvTranspose1D, dilationBlock=0 retires the
+  ; contiguous bodies and leaves the strided scatter row, and
+  ; wideMaxVectors=0 retires the register-resident interior and leaves the
+  ; clamped tap body.
+  nativeAllowed=1
+  dilationBlock=1
+  wideMaxVectors=5
+  inPerGroup=*g\InChannels / *g\Groups
+  outPerGroup=*g\OutChannels / *g\Groups
+  ; Every body below indexes a group by multiplying back out, so a channel
+  ; count the group count does not divide would silently address the wrong
+  ; weights.  Hand those to the portable reference, which IS the definition of
+  ; the answer, rather than guessing at what the shape meant.
+  If nativeAllowed=0 Or inPerGroup<=0 Or outPerGroup<=0 Or inPerGroup* *g\Groups<>*g\InChannels Or outPerGroup* *g\Groups<>*g\OutChannels
+    PmTensorConvTranspose1D(*g)
+    ProcedureReturn
+  EndIf
+  contiguous=0
+  If *g\Dilation=1 And dilationBlock>=1 : contiguous=1 : EndIf
+  ; The head/interior/tail split of the ix range.  It depends only on the
+  ; geometry, never on the channel, so it is computed once: headLast is the
+  ; first ix whose tap zero is at or after output position zero, and tailFirst
+  ; is the first ix whose last tap is past the end of the row.
+  wideVectors=0
+  headLast=0
+  tailFirst=0
+  If contiguous=1 And *g\Kernel%4=0 And *g\Kernel/4<=wideMaxVectors And wideMaxVectors>=1
+    wideVectors=*g\Kernel/4
+    headLast=(*g\PadLeft+*g\Stride-1)/ *g\Stride
+    If *g\PadLeft<=0 : headLast=0 : EndIf
+    If headLast>*g\InWidth : headLast=*g\InWidth : EndIf
+    limit=*g\OutWidth+*g\PadLeft-*g\Kernel
+    If limit<0
+      tailFirst=0
+    Else
+      tailFirst=limit/ *g\Stride+1
+    EndIf
+    If tailFirst>*g\InWidth : tailFirst=*g\InWidth : EndIf
+    If tailFirst<headLast : tailFirst=headLast : EndIf
+  EndIf
+  bn=0
+  While bn<*g\Batches
+    ; The bias pass covers every output element before any contribution, as
+    ; the reference's does.
+    oc=0
+    While oc<*g\OutChannels
+      bits=0
+      If *g\Bias<>0 : bits=PeekL(*g\Bias+oc*4) : EndIf
+      dstIndex=(bn* *g\OutChannels+oc)* *g\OutWidth
+      PmTensorConvTransposeFp32Fill(*g\Dst+dstIndex*4,*g\OutWidth,bits)
+      oc+1
+    Wend
+    oc=0
+    While oc<*g\OutChannels
+      group=oc/outPerGroup
+      ocg=oc-group*outPerGroup
+      rowBase=*g\Dst+(bn* *g\OutChannels+oc)* *g\OutWidth*4
+      ic=group*inPerGroup
+      While ic<group*inPerGroup+inPerGroup
+        srcIndex=(bn* *g\InChannels+ic)* *g\InWidth
+        weightRow=*g\Weight+(ic*outPerGroup+ocg)* *g\Kernel*4
+        If contiguous=1
+          ; Head, interior, tail - in ascending ix, so every element still sees
+          ; its contributions in ascending (ic, ix).
+          t\Weight=weightRow : t\Dst=rowBase
+          t\Stride=*g\Stride : t\Kernel=*g\Kernel : t\OutWidth=*g\OutWidth
+          If wideVectors>0
+            t\Src=*g\Src+srcIndex*4
+            t\Count=headLast
+            t\BaseOx=-*g\PadLeft
+            PmTensorConvTransposeFp32Taps(@t)
+            If tailFirst>headLast
+              w\Src=*g\Src+(srcIndex+headLast)*4
+              w\Weight=weightRow
+              w\Dst=rowBase+(headLast* *g\Stride-*g\PadLeft)*4
+              w\Count=tailFirst-headLast
+              w\StrideBytes=*g\Stride*4
+              w\Vectors=wideVectors
+              PmTensorConvTransposeFp32Wide(@w)
+            EndIf
+            t\Src=*g\Src+(srcIndex+tailFirst)*4
+            t\Count=*g\InWidth-tailFirst
+            t\BaseOx=tailFirst* *g\Stride-*g\PadLeft
+            PmTensorConvTransposeFp32Taps(@t)
+          Else
+            t\Src=*g\Src+srcIndex*4
+            t\Count=*g\InWidth
+            t\BaseOx=-*g\PadLeft
+            PmTensorConvTransposeFp32Taps(@t)
+          EndIf
+        Else
+          ix=0
+          While ix<*g\InWidth
+            bits=PeekL(*g\Src+(srcIndex+ix)*4)
+            baseOx=ix* *g\Stride-*g\PadLeft
+            firstK=0
+            If baseOx<0 : firstK=(-baseOx+*g\Dilation-1)/ *g\Dilation : EndIf
+            lastK=*g\Kernel
+            limit=*g\OutWidth-1-baseOx
+            If limit<0
+              lastK=0
+            ElseIf limit/ *g\Dilation+1<lastK
+              lastK=limit/ *g\Dilation+1
+            EndIf
+            If firstK<0 : firstK=0 : EndIf
+            If lastK>*g\Kernel : lastK=*g\Kernel : EndIf
+            If firstK<lastK
+              PmTensorConvTransposeFp32Row(weightRow+firstK*4,rowBase+(baseOx+firstK* *g\Dilation)*4,bits,lastK-firstK,*g\Dilation*4)
+            EndIf
+            ix+1
+          Wend
+        EndIf
+        ic+1
+      Wend
+      oc+1
+    Wend
+    bn+1
+  Wend
+EndProcedure
+CompilerEndIf
+
+CompilerIf #PMO_USE_INT8 = 1
+CompilerIf #PMO_USE_CONV = 1
+Structure PmTensorConv1DNeonEightArgs
+  Src.i
+  Weight.i
+  Dst.i
+  InChannels.i
+  InWidth.i
+  OutChannels.i
+  OutWidth.i
+  Kernel.i
+  PadLeft.i
+  Dilation.i
+  InPerGroup.i
+  InputChannelBase.i
+  Batch.i
+  OutputChannel.i
+  OutputX.i
+  Scale.f
+  BiasValue.f
+EndStructure
+
+Procedure PmTensorConv1DInt8One(*g.PmTensorConv1DArgs, bn.i, oc.i, ox.i, aScale.f)
+  Protected icg.i
+  Protected kx.i
+  Protected ix.i
+  Protected group.i
+  Protected inPerGroup.i
+  Protected outPerGroup.i
+  Protected ic.i
+  Protected srcIndex.i
+  Protected weightIndex.i
+  Protected accumulator.i
+  Protected converted.f
+  Protected sum.f
+  inPerGroup = *g\InChannels / *g\Groups
+  outPerGroup = *g\OutChannels / *g\Groups
+  group = oc / outPerGroup : sum = 0.0 : accumulator = 0
+  If *g\Bias <> 0 : sum = PmTensorGet(*g\Bias, oc) : EndIf
+  icg = 0
+  While icg < inPerGroup
+    ic = group * inPerGroup + icg : kx = 0
+    While kx < *g\Kernel
+      ix = ox - *g\PadLeft + kx * *g\Dilation
+      If ix >= 0 And ix < *g\InWidth
+        srcIndex = (bn * *g\InChannels + ic) * *g\InWidth + ix
+        weightIndex = (oc * inPerGroup + icg) * *g\Kernel + kx
+        accumulator = accumulator + PeekB(PmTensorInt8Scratch + srcIndex) * PeekB(*g\Weight + weightIndex)
+      EndIf
+      kx = kx + 1
+    Wend
+    icg = icg + 1
+  Wend
+  converted = accumulator
+  sum = sum + converted * aScale * PmTensorGet(*g\WeightScales, oc)
+  PmTensorPut(*g\Dst, (bn * *g\OutChannels + oc) * *g\OutWidth + ox, sum)
+EndProcedure
+
+; Eight adjacent output positions share each signed INT8 weight.  The kernel
+; widens products to signed 16-bit and accumulates in signed 32-bit lanes.
+; The caller admits only positions whose complete dilated kernel is in range.
+Procedure PmTensorConv1DInt8Eight(*g.PmTensorConv1DNeonEightArgs)
+  ASM
+    ; x0=args; structure offsets are eight-byte A64 integers through OutputX.
+    ldr  x1, [x0, #0]               ; quantized source
+    ldr  x2, [x0, #8]               ; signed INT8 weights
+    ldr  x3, [x0, #16]              ; FP32 destination
+    ldr  x4, [x0, #32]              ; input width
+    ldr  x5, [x0, #56]              ; kernel width
+    ldr  x6, [x0, #72]              ; dilation
+    ldr  x7, [x0, #80]              ; input channels per group
+
+    ldr  x8, [x0, #96]              ; batch
+    ldr  x9, [x0, #24]              ; all input channels
+    mul  x8, x8, x9
+    ldr  x9, [x0, #88]              ; first input channel for this group
+    add  x8, x8, x9
+    mul  x8, x8, x4
+    ldr  x9, [x0, #112]             ; output x
+    add  x8, x8, x9
+    ldr  x9, [x0, #64]              ; left pad
+    sub  x8, x8, x9
+    add  x1, x1, x8                 ; channel-zero source cursor
+
+    ldr  x8, [x0, #104]             ; output channel
+    mul  x8, x8, x7
+    mul  x8, x8, x5
+    add  x2, x2, x8                 ; channel-zero weight cursor
+
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movz x8, #0                     ; input-channel index
+pmoNeonConv1EightChannel:
+    mov  x9, x1
+    mov  x10, x2
+    mov  x11, x5
+pmoNeonConv1EightKernel:
+    ld1  { v1.8b }, [x9]
+    ld1  { v0.b }[0], [x10]
+    dup  v0.8b, v0.b[0]
+    smull v2.8h, v1.8b, v0.8b
+    sxtl v3.4s, v2.4h
+    sxtl2 v4.4s, v2.8h
+    add  v16.4s, v16.4s, v3.4s
+    add  v17.4s, v17.4s, v4.4s
+    add  x9, x9, x6
+    add  x10, x10, #1
+    subs x11, x11, #1
+    b.ne pmoNeonConv1EightKernel
+    add  x1, x1, x4
+    add  x2, x2, x5
+    add  x8, x8, #1
+    cmp  x8, x7
+    b.lt pmoNeonConv1EightChannel
+
+    scvtf v16.4s, v16.4s
+    scvtf v17.4s, v17.4s
+    ldr  s0, [x0, #120]
+    dup  v0.4s, v0.s[0]
+    fmul v16.4s, v16.4s, v0.4s
+    fmul v17.4s, v17.4s, v0.4s
+    ldr  s1, [x0, #124]
+    dup  v1.4s, v1.s[0]
+    fadd v16.4s, v16.4s, v1.4s
+    fadd v17.4s, v17.4s, v1.4s
+
+    ldr  x8, [x0, #96]
+    ldr  x9, [x0, #40]
+    mul  x8, x8, x9
+    ldr  x9, [x0, #104]
+    add  x8, x8, x9
+    ldr  x9, [x0, #48]
+    mul  x8, x8, x9
+    ldr  x9, [x0, #112]
+    add  x8, x8, x9
+    lsl  x8, x8, #2
+    add  x3, x3, x8
+    st1  { v16.4s }, [x3], #16
+    st1  { v17.4s }, [x3]
+  EndASM
+EndProcedure
+
+; ======================================================================
+;  THE INT8 CONVOLUTION OVER AN OUTPUT-CHANNEL RANGE.
+; ----------------------------------------------------------------------
+;  This is the body that used to be the whole of PmTensorConv1DNeon, with
+;  two things taken out of it and nothing else changed: the output-channel
+;  loop now starts and stops where it is told, and the activation scale
+;  arrives as an argument instead of being computed here.
+;
+;  BOTH REMOVALS ARE THE SAME REMOVAL. Quantizing the source is work over
+;  the WHOLE source and it must happen exactly once, on the primary,
+;  before any partition runs - it writes the shared INT8 scratch every
+;  partition then reads. A partition that quantized for itself would do
+;  the same work four times and would be reading a buffer three other
+;  cores were writing.
+;
+;  WHAT A PARTITION TOUCHES: its own frame, the argument structure the
+;  primary filled, the read-only quantized scratch, the weights, the
+;  scales, the bias, and the output elements of channels [ocFirst,
+;  ocLast). Nothing else, and no runtime global but the scratch POINTER,
+;  which was set before the dispatch and is not written again.
+; ======================================================================
+Procedure PmTensorConv1DNeonRange(*g.PmTensorConv1DArgs, ocFirst.i, ocLast.i, aScale.f)
+  Protected bn.i
+  Protected oc.i
+  Protected ox.i
+  Protected group.i
+  Protected inPerGroup.i
+  Protected outPerGroup.i
+  Protected eight.PmTensorConv1DNeonEightArgs
+  If *g = 0 Or *g\Batches <= 0 Or *g\OutChannels <= 0 Or *g\OutWidth <= 0
+    ProcedureReturn
+  EndIf
+  If ocFirst < 0 : ocFirst = 0 : EndIf
+  If ocLast > *g\OutChannels : ocLast = *g\OutChannels : EndIf
+  If ocFirst >= ocLast
+    ProcedureReturn
+  EndIf
+  inPerGroup = *g\InChannels / *g\Groups
+  outPerGroup = *g\OutChannels / *g\Groups
+  eight\Src = PmTensorInt8Scratch : eight\Weight = *g\Weight : eight\Dst = *g\Dst
+  eight\InChannels = *g\InChannels : eight\InWidth = *g\InWidth
+  eight\OutChannels = *g\OutChannels : eight\OutWidth = *g\OutWidth
+  eight\Kernel = *g\Kernel : eight\PadLeft = *g\PadLeft : eight\Dilation = *g\Dilation
+  eight\InPerGroup = inPerGroup
+  bn = 0
+  While bn < *g\Batches
+    eight\Batch = bn : oc = ocFirst
+    While oc < ocLast
+      group = oc / outPerGroup
+      eight\InputChannelBase = group * inPerGroup : eight\OutputChannel = oc
+      eight\Scale = aScale * PmTensorGet(*g\WeightScales, oc)
+      eight\BiasValue = 0.0 : If *g\Bias <> 0 : eight\BiasValue = PmTensorGet(*g\Bias, oc) : EndIf
+      ox = 0
+      While ox < *g\OutWidth And ox - *g\PadLeft < 0
+        PmTensorConv1DInt8One(*g, bn, oc, ox, aScale) : ox = ox + 1
+      Wend
+      While ox + 7 < *g\OutWidth And ox + 7 - *g\PadLeft + (*g\Kernel - 1) * *g\Dilation < *g\InWidth
+        eight\OutputX = ox : PmTensorConv1DInt8Eight(@eight) : ox = ox + 8
+      Wend
+      While ox < *g\OutWidth
+        PmTensorConv1DInt8One(*g, bn, oc, ox, aScale) : ox = ox + 1
+      Wend
+      oc = oc + 1
+    Wend
+    bn = bn + 1
+  Wend
+EndProcedure
+
+; The INT8 kernel's output-channel blocking factor, in ONE place, the way
+; PmParallelConvTile is the FP32 one. IT IS ONE, AND THAT IS NOT AN
+; OVERSIGHT: PmTensorConv1DInt8Eight blocks eight output POSITIONS of a
+; single channel, so consecutive channels share no register state and a
+; partition boundary may fall anywhere without costing a tile.
+Procedure.i PmParallelConvInt8Tile()
+  ProcedureReturn 1
+EndProcedure
+
+; One INT8 partition. Same shape as PmParallelConvWorker, plus the
+; activation scale out of word 4 of the block. The float is carried as its
+; bit pattern so the block stays machine words; it is put back into a
+; float here and nowhere else.
+Procedure.i PmParallelConvInt8Worker(*p.i)
+  Protected args.i
+  Protected first.i
+  Protected last.i
+  Protected aScale.f
+  If *p=0
+    ProcedureReturn 1
+  EndIf
+  args=PeekI(*p)
+  first=PeekI(*p+8)
+  last=PeekI(*p+16)
+  If args=0
+    ProcedureReturn 2
+  EndIf
+  If first>=last
+    ProcedureReturn 0
+  EndIf
+  PokeL(@aScale,PeekI(*p+32))
+  PmTensorConv1DNeonRange(args,first,last,aScale)
+  ProcedureReturn 0
+EndProcedure
+
+; The INT8 convolution on as many cores as the monitor will give, with the
+; same contract as PmParallelConv1D: it always runs, the fallback is the
+; ordinary single-core body, and the bytes are the same either way because
+; every output is computed entirely inside one call to the range body in
+; one order.
+;
+; THE SOURCE IS ALREADY QUANTIZED WHEN THIS IS CALLED. That is the
+; precondition and it is the caller's, because it is the one step that is
+; not per-channel.
+Procedure.i PmParallelConv1DInt8(*g.PmTensorConv1DArgs, aScale.f)
+  Protected count.i
+  Protected tile.i
+  Protected status.i
+  Protected bits.i
+  If *g=0
+    ProcedureReturn 0
+  EndIf
+  tile=PmParallelConvInt8Tile()
+  If tile<1
+    tile=1
+  EndIf
+  count=pmParallelConvParts(*g,tile)
+  If count<2
+    PmTensorConv1DNeonRange(*g,0,*g\OutChannels,aScale)
+    ProcedureReturn 1
+  EndIf
+  bits=PeekL(@aScale)
+  pmParallelConvSplit(*g,count,tile,bits)
+  status=pmSvcParRun(@PmParallelConvInt8Worker,@PmParallelParts[0],#PMP_PARALLEL_STRIDE,count)
+  If status=#PMP_SVC_OK
+    ProcedureReturn 1
+  EndIf
+  ; Same rule as the FP32 splitter: a refusal is not a reason to produce
+  ; nothing. Every output is written again by the single-core body, over
+  ; whatever a partial run left, and the result is the same bytes.
+  PmAnvilServices=0
+  PmTensorConv1DNeonRange(*g,0,*g\OutChannels,aScale)
+  ProcedureReturn 1
+EndProcedure
+
+; The entry the graph calls. Unchanged in what it decides; the difference
+; is that once the source is quantized the channels go to every core the
+; monitor will lend, exactly as the FP32 convolution's have since ABI 1.3.
+Procedure PmTensorConv1DNeon(*g.PmTensorConv1DArgs)
+  Protected aScale.f
+  If *g\WeightScales = 0
+    PmTensorConv1DFp32Neon(*g)
+    ProcedureReturn
+  EndIf
+  If *g\Stride <> 1
+    PmTensorConv1D(*g)
+    ProcedureReturn
+  EndIf
+  aScale = PmTensorDynamicScale(*g\Src, *g\Batches * *g\InChannels * *g\InWidth)
+  PmTensorQuantizeBuffer(*g\Src, PmTensorInt8Scratch, *g\Batches * *g\InChannels * *g\InWidth, aScale)
+  PmParallelConv1DInt8(*g, aScale)
+EndProcedure
+CompilerEndIf
+CompilerEndIf
+
+; The A64 Gemm is PmTensorGemmNeon, at the end of this file beside the exact
+; MatMul bodies it is built from.  The body that used to stand here contracted
+; the multiply and the add into fmla and finished with faddp, so it could never
+; return PmTensorGemm's bits; see the section header there.
+
+; ======================================================================
+; Exact FP32 MatMul.  Appended 2026-09-11.
+; ----------------------------------------------------------------------
+; PmTensorMatMul2 is the reference:
+;
+;     sum = 0.0
+;     inner = 0 .. k-1:  sum = sum + a[row][inner] * b[inner][col]
+;     dst[row][col] = sum
+;
+; a sequential left-to-right chain from +0.0 with the multiply and the add
+; ROUNDED SEPARATELY.  The bodies below reproduce that chain exactly, so this
+; kernel is bit-identical to the reference and not merely close to it.  Every
+; vector lane is a DIFFERENT OUTPUT COLUMN, never a slice of one column's
+; reduction, so no lane is ever combined with another and nothing is
+; reassociated.  fmla, fmadd and the horizontal reductions are therefore
+; absent by construction and the gate refuses them by name.
+;
+; The multiply keeps the reference's operand ORDER, a then b, because the two
+; orders differ when both operands are NaNs with different payloads.
+;
+; Why this exists (the retired fused kernel it replaced contracted the multiply
+; and the add into one fmla, which rounds once where the reference rounds
+; twice, and it walks B down a column, one strided 16-byte read per inner
+; index.  On the measured Kokoro request the n=2048 shapes cost 8.6 ns per
+; multiply-accumulate against 0.95 for the convolution tile; a stride of
+; n*4 = 8192 bytes puts every inner index on the same handful of L1 sets.
+; These bodies read B along its rows instead: one 64-byte line per inner index
+; feeds sixteen columns, and four output rows share it.
+; ----------------------------------------------------------------------
+Structure PmTensorMatMul2ExactArgs
+  A.i                                ; first row of A, at inner = 0
+  B.i                                ; column block of B, at inner = 0
+  Dst.i                              ; first output of the block
+  Count.i                            ; k, the length of the reduction
+  ARowBytes.i                        ; k * 4
+  BRowBytes.i                        ; n * 4
+  DstRowBytes.i                      ; n * 4
+EndStructure
+
+; Four output rows by sixteen adjacent output columns, the whole reduction in
+; registers.  v16..v31 are the sixteen accumulators, v0..v3 hold the sixteen B
+; values for this inner index, v4 the broadcast A value and v5 one product.
+; Only caller-saved vector registers are used.
+Procedure PmTensorMatMul2ExactFourBySixteen(*t.PmTensorMatMul2ExactArgs)
+  ASM
+    ldr  x1, [x0, #0]                ; A row 0 cursor
+    ldr  x2, [x0, #8]                ; B cursor
+    ldr  x4, [x0, #24]               ; k
+    ldr  x5, [x0, #32]               ; bytes between A rows
+    ldr  x6, [x0, #40]               ; bytes between B rows
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    movi v20.4s, #0
+    movi v21.4s, #0
+    movi v22.4s, #0
+    movi v23.4s, #0
+    movi v24.4s, #0
+    movi v25.4s, #0
+    movi v26.4s, #0
+    movi v27.4s, #0
+    movi v28.4s, #0
+    movi v29.4s, #0
+    movi v30.4s, #0
+    movi v31.4s, #0
+    add  x9, x1, x5                  ; A row 1
+    add  x10, x9, x5                 ; A row 2
+    add  x11, x10, x5                ; A row 3
+    ; An empty reduction leaves every output at +0.0, which is what the
+    ; reference stores, and must not enter a bottom-tested loop.
+    cmp  x4, #1
+    b.lt pmoMatMulExactFourStore
+pmoMatMulExactFourLoop:
+pmoMatMulExactFourSource:
+    ld1  {v0.4s-v3.4s}, [x2]
+    ldr  s4, [x1]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+pmoMatMulExactFourAdd0:
+    fadd v16.4s, v16.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v17.4s, v17.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v18.4s, v18.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v19.4s, v19.4s, v5.4s
+    ldr  s4, [x9]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v20.4s, v20.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v21.4s, v21.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v22.4s, v22.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v23.4s, v23.4s, v5.4s
+    ldr  s4, [x10]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v24.4s, v24.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v25.4s, v25.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v26.4s, v26.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v27.4s, v27.4s, v5.4s
+    ldr  s4, [x11]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v28.4s, v28.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v29.4s, v29.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v30.4s, v30.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v31.4s, v31.4s, v5.4s
+    add  x1, x1, #4
+    add  x9, x9, #4
+    add  x10, x10, #4
+    add  x11, x11, #4
+    add  x2, x2, x6
+    subs x4, x4, #1
+    b.ne pmoMatMulExactFourLoop
+pmoMatMulExactFourStore:
+    ldr  x3, [x0, #16]
+    ldr  x7, [x0, #48]
+pmoMatMulExactFourStore0:
+    st1  {v16.4s-v19.4s}, [x3]
+    add  x3, x3, x7
+    st1  {v20.4s-v23.4s}, [x3]
+    add  x3, x3, x7
+    st1  {v24.4s-v27.4s}, [x3]
+    add  x3, x3, x7
+    st1  {v28.4s-v31.4s}, [x3]
+  EndASM
+EndProcedure
+
+; One output row by sixteen adjacent output columns.  This is what a row block
+; with fewer than four rows left uses, so a leftover row keeps the same
+; row-wise B traffic instead of falling back to the scalar body.
+Procedure PmTensorMatMul2ExactOneBySixteen(*t.PmTensorMatMul2ExactArgs)
+  ASM
+    ldr  x1, [x0, #0]
+    ldr  x2, [x0, #8]
+    ldr  x4, [x0, #24]
+    ldr  x6, [x0, #40]
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    cmp  x4, #1
+    b.lt pmoMatMulExactRowStore
+pmoMatMulExactRowLoop:
+pmoMatMulExactRowSource:
+    ld1  {v0.4s-v3.4s}, [x2]
+    ldr  s4, [x1]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+pmoMatMulExactRowAdd0:
+    fadd v16.4s, v16.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v17.4s, v17.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v18.4s, v18.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v19.4s, v19.4s, v5.4s
+    add  x1, x1, #4
+    add  x2, x2, x6
+    subs x4, x4, #1
+    b.ne pmoMatMulExactRowLoop
+pmoMatMulExactRowStore:
+    ldr  x3, [x0, #16]
+pmoMatMulExactRowStore0:
+    st1  {v16.4s-v19.4s}, [x3]
+  EndASM
+EndProcedure
+
+; One output.  Fewer than sixteen columns remain, so there is nothing to put
+; in the other lanes; the chain is the reference's, one scalar at a time.
+Procedure PmTensorMatMul2ExactOneByOne(*t.PmTensorMatMul2ExactArgs)
+  ASM
+    ldr  x1, [x0, #0]
+    ldr  x2, [x0, #8]
+    ldr  x4, [x0, #24]
+    ldr  x6, [x0, #40]
+    fmov s16, wzr
+    cmp  x4, #1
+    b.lt pmoMatMulExactOneStore
+pmoMatMulExactOneLoop:
+pmoMatMulExactOneSource:
+    ldr  s4, [x1]
+    ldr  s0, [x2]
+    fmul s5, s4, s0
+pmoMatMulExactOneAdd0:
+    fadd s16, s16, s5
+    add  x1, x1, #4
+    add  x2, x2, x6
+    subs x4, x4, #1
+    b.ne pmoMatMulExactOneLoop
+pmoMatMulExactOneStore:
+    ldr  x3, [x0, #16]
+pmoMatMulExactOneStore0:
+    str  s16, [x3]
+  EndASM
+EndProcedure
+
+; The general dispatch.  Every output is produced by exactly one body, and
+; each body walks the same inner indices in the same order, so a result never
+; depends on which body its output landed in.  Rows are taken four at a time
+; while four remain and one at a time after that; columns sixteen at a time
+; while sixteen remain and one at a time after that.  Nothing here needs the
+; shape to be a multiple of anything, and an empty matrix writes nothing,
+; exactly as the reference does.
+Procedure PmTensorMatMul2ExactNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i)
+  Protected row.i
+  Protected col.i
+  Protected lane.i
+  Protected rowBlock.i
+  Protected colBlock.i
+  Protected t.PmTensorMatMul2ExactArgs
+  If *a=0 Or *b=0 Or *dst=0 Or m<1 Or n<1
+    ProcedureReturn
+  EndIf
+  ; The two block widths are named rather than written into the tests, so a
+  ; control build can narrow either one and prove the remaining bodies still
+  ; produce the reference's bits on their own.  Both tests are outside the
+  ; reduction, once per block, not once per inner index.
+  rowBlock=4
+  colBlock=16
+  t\Count=k
+  t\ARowBytes=k*4
+  t\BRowBytes=n*4
+  t\DstRowBytes=n*4
+  row=0
+  While row<m
+    If rowBlock>=4 And m-row>=4
+      col=0
+      While colBlock>=16 And n-col>=16
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactFourBySixteen(@t)
+        col+16
+      Wend
+      While col<n
+        lane=0
+        While lane<4
+          t\A=*a+(row+lane)*k*4 : t\B=*b+col*4 : t\Dst=*dst+((row+lane)*n+col)*4
+          PmTensorMatMul2ExactOneByOne(@t)
+          lane+1
+        Wend
+        col+1
+      Wend
+      row+4
+    Else
+      col=0
+      While colBlock>=16 And n-col>=16
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactOneBySixteen(@t)
+        col+16
+      Wend
+      While col<n
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactOneByOne(@t)
+        col+1
+      Wend
+      row+1
+    EndIf
+  Wend
+EndProcedure
+
+; ======================================================================
+; Zero fill - the arena's own primitive.
+; ----------------------------------------------------------------------
+; DAcquire's contract is that a freshly acquired arena block reads as zero
+; over its whole payload, and DAlloc clears its dimension scratch the same
+; way.  Both go through DZero in tensor_dynamic_portable.pmi, which
+; dispatches here under #PMD_NATIVE_BYTES=8 exactly as PmFastBinary and
+; PmFastGemm dispatch to their kernels; the byte loop in that file remains
+; the definition of the answer for every other target.
+;
+; THE ADDRESS IS ALIGNED BEFORE ANY WIDE STORE, and that is not tidiness.
+; With the MMU off every data access on this part is Device-nGnRnE, and an
+; unaligned 2/4/8/16-byte access to Device memory is an Alignment fault
+; whatever SCTLR.A says - with no vector installed it is a silent runaway,
+; not a message.  See the vault note "Unaligned access with the MMU off,
+; 2026-08-27".  The resident model runner turns the MMU on for part of its
+; run and leaves it off for the rest, so the fill has to be correct in both
+; regimes and cannot assume the caller's alignment.  DAcquire's payloads
+; happen to be 16-byte aligned already, so the prologue below costs three
+; instructions there and exists for every other caller.
+;
+; DC ZVA IS DELIBERATELY NOT USED.  It zeroes a block whose size is only
+; discoverable from DCZID_EL0, it is CONSTRAINED UNPREDICTABLE on Device
+; memory - which is what this arena is whenever the runner has not enabled
+; the MMU - and tools/a64/a64_interp.py does not model it at all, so the
+; owning gate could neither execute it nor mutate it.  A store the gate
+; cannot reach is a store nothing proves.
+;
+; Only caller-saved registers are touched: x0..x2 and v0..v3.
+Procedure PmTensorZeroFillNeon(*destination.i, bytes.i)
+  ASM
+    ; x0=destination x1=bytes
+    cmp  x1, #0
+    b.le pmoNeonZeroFillDone
+    movi v0.16b, #0
+    movi v1.16b, #0
+    movi v2.16b, #0
+    movi v3.16b, #0
+    ; Shifting the low four bits to the top is the mask: the result is
+    ; zero exactly when the address is already on a 16-byte boundary.
+    ; This assembler's `and` has no immediate form, and a shift says the
+    ; same thing in one instruction without a scratch constant.
+pmoNeonZeroFillAlign:
+    lsl  x2, x0, #60
+    cbz  x2, pmoNeonZeroFillBlock
+    strb wzr, [x0]
+    add  x0, x0, #1
+    subs x1, x1, #1
+    b.ne pmoNeonZeroFillAlign
+    b    pmoNeonZeroFillDone
+pmoNeonZeroFillBlock:
+    cmp  x1, #64
+    b.lt pmoNeonZeroFillSixteen
+    st1  { v0.16b, v1.16b, v2.16b, v3.16b }, [x0], #64
+    sub  x1, x1, #64
+    b    pmoNeonZeroFillBlock
+pmoNeonZeroFillSixteen:
+    cmp  x1, #16
+    b.lt pmoNeonZeroFillEight
+    st1  { v0.16b }, [x0], #16
+    sub  x1, x1, #16
+    b    pmoNeonZeroFillSixteen
+pmoNeonZeroFillEight:
+    cmp  x1, #8
+    b.lt pmoNeonZeroFillFour
+    str  xzr, [x0]
+    add  x0, x0, #8
+    sub  x1, x1, #8
+pmoNeonZeroFillFour:
+    cmp  x1, #4
+    b.lt pmoNeonZeroFillByte
+    str  wzr, [x0]
+    add  x0, x0, #4
+    sub  x1, x1, #4
+pmoNeonZeroFillByte:
+    cbz  x1, pmoNeonZeroFillDone
+    strb wzr, [x0]
+    add  x0, x0, #1
+    sub  x1, x1, #1
+    b    pmoNeonZeroFillByte
+pmoNeonZeroFillDone:
+  EndASM
+EndProcedure
+
+; ======================================================================
+; Exact FP32 Gemm.  Appended 2026-09-11.
+; ----------------------------------------------------------------------
+; PmTensorGemm is the reference:
+;
+;     sum = 0.0
+;     inner = 0 .. k-1:  sum = sum + A[ia] * B[ib]
+;     sum = sum * Alpha
+;     if C and CCount: sum = sum + Beta * C[ic]
+;     Dst[row*n+col] = sum
+;
+; with ia = row*k+inner (TransA=0) and ib = inner*n+col (TransB=0) or
+; col*k+inner (TransB=1).  So the reduction is exactly the MatMul chain: a
+; sequential left-to-right sum from +0.0 with the multiply and the add ROUNDED
+; SEPARATELY, and then a two-step epilogue that rounds the alpha scale and the
+; beta product separately again.
+;
+; The body that stood in the middle of this file until 2026-09-11 accumulated
+; four partial sums per output with fmla and finished them with two faddp, so
+; it rounded once where the reference rounds twice AND reassociated the sum
+; into a pairwise tree.  It could not return PmTensorGemm's bits on any input
+; where floating-point addition is not associative, which is nearly all of
+; them; it was never a Gemm kernel, only a fast approximation of one.  This
+; section replaces it with bodies that are bit-identical by construction.
+;
+; HOW.  The dots are produced by the exact MatMul kernel itself when B is not
+; transposed - the index arithmetic is literally the same - and by
+; PmTensorGemmExactFourColumns when it is, which puts four DIFFERENT OUTPUT
+; COLUMNS in the four lanes exactly as the MatMul tile does, so no lane is a
+; slice of a reduction and nothing is reassociated.  The multiply keeps the
+; reference's operand order, A then B, because the two orders differ when both
+; operands are NaNs with different payloads.
+;
+; The epilogue is then applied over the raw dots in the destination.  Writing
+; an FP32 value to FP32 storage and reading it back is exact, so an epilogue
+; that reads the dot back and performs the reference's own two lines gives the
+; reference's bits.  Those lines are copied verbatim from PmTensorGemm rather
+; than restated, so the rounding steps cannot drift apart.
+;
+; ANYTHING THIS DOES NOT COVER GOES TO PmTensorGemm ITSELF - a transposed A, or
+; an INT8 weight set, which has its own quantized reduction and its own
+; epilogue.  The fallback is the reference, so the fallback cannot disagree
+; with it.
+; ----------------------------------------------------------------------
+
+Structure PmTensorGemmExactArgs
+  A.i                                ; &A[row*k], at inner = 0
+  B.i                                ; &B[col*k], at inner = 0, TransB=1
+  Dst.i                              ; &Dst[row*n+col]
+  Count.i                            ; k
+  BColBytes.i                        ; k * 4, the distance between B's rows
+  ARowBytes.i                        ; k * 4, the distance between A's rows
+  DstRowBytes.i                      ; n * 4
+EndStructure
+
+; Four adjacent output columns of one row, transposed B, the whole reduction
+; in one accumulator vector.  Lane j is output column col+j and nothing else,
+; so lane j performs exactly the adds PmTensorGemm performs for that column.
+Procedure PmTensorGemmExactFourColumns(*t.PmTensorGemmExactArgs)
+  ASM
+    ldr  x1, [x0, #0]                ; A row cursor
+    ldr  x4, [x0, #24]               ; k
+    ldr  x6, [x0, #32]               ; bytes between B rows
+    ldr  x13, [x0, #8]               ; four B row cursors
+    add  x14, x13, x6
+    add  x15, x14, x6
+    add  x16, x15, x6
+    movi v16.4s, #0
+    ; An empty reduction leaves every output at +0.0, which is what the
+    ; reference has before its epilogue, and must not enter a bottom-tested
+    ; loop.
+    cmp  x4, #1
+    b.lt pmoGemmExactFourStore
+pmoGemmExactFourLoop:
+pmoGemmExactFourSource:
+    ldr  s4, [x1]
+    dup  v4.4s, v4.s[0]
+    ld1  { v0.s }[0], [x13]
+    ld1  { v0.s }[1], [x14]
+    ld1  { v0.s }[2], [x15]
+    ld1  { v0.s }[3], [x16]
+    fmul v5.4s, v4.4s, v0.4s
+pmoGemmExactFourAdd0:
+    fadd v16.4s, v16.4s, v5.4s
+    add  x1, x1, #4
+    add  x13, x13, #4
+    add  x14, x14, #4
+    add  x15, x15, #4
+    add  x16, x16, #4
+    subs x4, x4, #1
+    b.ne pmoGemmExactFourLoop
+pmoGemmExactFourStore:
+    ldr  x3, [x0, #16]
+pmoGemmExactFourStore0:
+    st1  { v16.4s }, [x3]
+  EndASM
+EndProcedure
+
+; Four output rows by four adjacent output columns, transposed B, the whole
+; reduction in registers.  v16..v19 are the four accumulators - one per output
+; row, four output columns per accumulator - v0 holds this inner index's four
+; B values, v4 the broadcast A value and v5 one product.  Sixteen different
+; outputs, sixteen separate lane accumulators; no lane is ever a slice of a
+; reduction.
+;
+; This is what makes the exact kernel affordable on the dominant contract.  A
+; four-column body alone reloads the same four B values once per output row;
+; this one fetches them once for four rows, which is the same trade the exact
+; MatMul tile makes.  It is still dearer than the superseded fmla body, and it
+; has to be: fmla did one rounding where the reference does two, so half the
+; instructions here exist precisely to keep the second rounding.
+Procedure PmTensorGemmExactFourByFour(*t.PmTensorGemmExactArgs)
+  ASM
+    ldr  x1, [x0, #0]                ; A row 0 cursor
+    ldr  x4, [x0, #24]               ; k
+    ldr  x5, [x0, #40]               ; bytes between A rows
+    ldr  x6, [x0, #32]               ; bytes between B rows
+    ldr  x13, [x0, #8]               ; four B row cursors
+    add  x14, x13, x6
+    add  x15, x14, x6
+    add  x16, x15, x6
+    add  x9, x1, x5                  ; A row 1
+    add  x10, x9, x5                 ; A row 2
+    add  x11, x10, x5                ; A row 3
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    ; An empty reduction leaves every output at +0.0, which is what the
+    ; reference has before its epilogue, and must not enter a bottom-tested
+    ; loop.
+    cmp  x4, #1
+    b.lt pmoGemmExactTileStore
+pmoGemmExactTileLoop:
+pmoGemmExactTileSource:
+    ld1  { v0.s }[0], [x13]
+    ld1  { v0.s }[1], [x14]
+    ld1  { v0.s }[2], [x15]
+    ld1  { v0.s }[3], [x16]
+    ldr  s4, [x1]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+pmoGemmExactTileAdd0:
+    fadd v16.4s, v16.4s, v5.4s
+    ldr  s4, [x9]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v17.4s, v17.4s, v5.4s
+    ldr  s4, [x10]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v18.4s, v18.4s, v5.4s
+    ldr  s4, [x11]
+    dup  v4.4s, v4.s[0]
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v19.4s, v19.4s, v5.4s
+    add  x1, x1, #4
+    add  x9, x9, #4
+    add  x10, x10, #4
+    add  x11, x11, #4
+    add  x13, x13, #4
+    add  x14, x14, #4
+    add  x15, x15, #4
+    add  x16, x16, #4
+    subs x4, x4, #1
+    b.ne pmoGemmExactTileLoop
+pmoGemmExactTileStore:
+    ldr  x3, [x0, #16]
+    ldr  x7, [x0, #48]               ; bytes between destination rows
+pmoGemmExactTileStore0:
+    st1  { v16.4s }, [x3]
+    add  x3, x3, x7
+    st1  { v17.4s }, [x3]
+    add  x3, x3, x7
+    st1  { v18.4s }, [x3]
+    add  x3, x3, x7
+    st1  { v19.4s }, [x3]
+  EndASM
+EndProcedure
+
+; Four output ROWS of one column, transposed B, the whole reduction in one
+; accumulator vector.  This is what a column remainder uses while four rows
+; remain, and it is the shape the model's duration projector has: k = 512
+; contracted into a SINGLE column, where a four-column body has nothing to put
+; in three of its lanes.  Lane j is output row row+j and nothing else.  The
+; superseded body reached four lanes on that shape by splitting ONE reduction
+; across them and folding it with faddp, which is the reassociation this
+; kernel exists to stop; four separate rows give the same width honestly.
+Procedure PmTensorGemmExactFourRows(*t.PmTensorGemmExactArgs)
+  ASM
+    ldr  x2, [x0, #8]                ; the one B row, shared by all four
+    ldr  x4, [x0, #24]               ; k
+    ldr  x6, [x0, #40]               ; bytes between A rows
+    ldr  x13, [x0, #0]               ; four A row cursors
+    add  x14, x13, x6
+    add  x15, x14, x6
+    add  x16, x15, x6
+    movi v16.4s, #0
+    ; An empty reduction leaves every output at +0.0, which is what the
+    ; reference has before its epilogue, and must not enter a bottom-tested
+    ; loop.
+    cmp  x4, #1
+    b.lt pmoGemmExactRowsStore
+pmoGemmExactRowsLoop:
+pmoGemmExactRowsSource:
+    ldr  s4, [x2]
+    dup  v4.4s, v4.s[0]
+    ld1  { v0.s }[0], [x13]
+    ld1  { v0.s }[1], [x14]
+    ld1  { v0.s }[2], [x15]
+    ld1  { v0.s }[3], [x16]
+    fmul v5.4s, v0.4s, v4.4s
+pmoGemmExactRowsAdd0:
+    fadd v16.4s, v16.4s, v5.4s
+    add  x2, x2, #4
+    add  x13, x13, #4
+    add  x14, x14, #4
+    add  x15, x15, #4
+    add  x16, x16, #4
+    subs x4, x4, #1
+    b.ne pmoGemmExactRowsLoop
+pmoGemmExactRowsStore:
+    ldr  x3, [x0, #16]
+    ldr  x7, [x0, #48]               ; bytes between destination rows
+pmoGemmExactRowsStore0:
+    st1  { v16.s }[0], [x3]
+    add  x3, x3, x7
+    st1  { v16.s }[1], [x3]
+    add  x3, x3, x7
+    st1  { v16.s }[2], [x3]
+    add  x3, x3, x7
+    st1  { v16.s }[3], [x3]
+  EndASM
+EndProcedure
+
+; The raw dots for a transposed B.  Columns are taken four at a time while four
+; remain and one at a time after that; the single-column body is the MatMul's
+; own, entered with four bytes between B's inner elements, which is what
+; transposing B means.
+Procedure PmTensorGemmExactTransposedB(*g.PmTensorGemmArgs)
+  Protected row.i
+  Protected col.i
+  Protected gemmRowBlock.i
+  Protected gemmColBlock.i
+  Protected t.PmTensorGemmExactArgs
+  Protected u.PmTensorMatMul2ExactArgs
+  ; The two block widths are named rather than written into the tests, so a
+  ; control build can narrow either one and prove the remaining bodies still
+  ; produce the reference's bits on their own.  Both tests are outside the
+  ; reduction, once per block, not once per inner index.
+  gemmRowBlock=4
+  gemmColBlock=4
+  t\Count=*g\K : t\BColBytes=*g\K*4
+  t\ARowBytes=*g\K*4 : t\DstRowBytes=*g\N*4
+  u\Count=*g\K : u\ARowBytes=*g\K*4 : u\BRowBytes=4 : u\DstRowBytes=*g\N*4
+  row=0
+  While row<*g\M
+    If gemmRowBlock>=4 And *g\M-row>=4
+      col=0
+      While gemmColBlock>=4 And *g\N-col>=4
+        t\A=*g\A+row* *g\K*4
+        t\B=*g\B+col* *g\K*4
+        t\Dst=*g\Dst+(row* *g\N+col)*4
+        PmTensorGemmExactFourByFour(@t)
+        col+4
+      Wend
+      While col<*g\N
+        t\A=*g\A+row* *g\K*4
+        t\B=*g\B+col* *g\K*4
+        t\Dst=*g\Dst+(row* *g\N+col)*4
+        PmTensorGemmExactFourRows(@t)
+        col+1
+      Wend
+      row+4
+    Else
+      col=0
+      While gemmColBlock>=4 And *g\N-col>=4
+        t\A=*g\A+row* *g\K*4
+        t\B=*g\B+col* *g\K*4
+        t\Dst=*g\Dst+(row* *g\N+col)*4
+        PmTensorGemmExactFourColumns(@t)
+        col+4
+      Wend
+      While col<*g\N
+        u\A=*g\A+row* *g\K*4
+        u\B=*g\B+col* *g\K*4
+        u\Dst=*g\Dst+(row* *g\N+col)*4
+        PmTensorMatMul2ExactOneByOne(@u)
+        col+1
+      Wend
+      row+1
+    EndIf
+  Wend
+EndProcedure
+
+Structure PmTensorGemmEpilogueArgs
+  Dst.i                              ; &Dst[row*n]
+  C.i                                ; the C value for column zero, or 0
+  Count.i                            ; n
+  AlphaBits.i                        ; alpha, as its FLOAT32 bits
+  BetaBits.i                         ; beta, as its FLOAT32 bits
+  CStepBytes.i                       ; 4 along a run of C, 0 for one scalar
+EndStructure
+
+; The alpha scale and the beta bias for one output row, over the raw dots
+; already in Dst.  This is PmTensorGemm's epilogue - sum*Alpha, then
+; sum + Beta*C[ic], with those two roundings kept apart and in that order and
+; with Beta*C multiplied beta-first - written with direct pointers instead of
+; through PmTensorGet and PmTensorPut.
+;
+; Why it is not left in the host language.  Measured under the interpreter,
+; the accessor-based epilogue was 2.57 million of the 3.61 million instructions
+; the whole kernel issued on the four staged shapes - seventy-one percent, for
+; two multiplies and one add per output.  That is the same static-storage cost
+; that made the scalar convolution edge body 98% of its kernel, and it is
+; fixed the same way.
+;
+; Four adjacent outputs of one row are one vector.  They are four different
+; outputs, so no lane is combined with another.  For a scalar C the product
+; Beta*C is formed once instead of once per output; the operands are identical
+; every time, so the bits are too.
+Procedure PmTensorGemmExactEpilogueRow(*e.PmTensorGemmEpilogueArgs)
+  ASM
+    ldr x1, [x0, #0]                 ; destination row
+    ldr x2, [x0, #8]                 ; C, or zero
+    ldr x3, [x0, #16]                ; outputs in this row
+    ldr w4, [x0, #24]                ; alpha bits
+    ldr w5, [x0, #32]                ; beta bits
+    ldr x6, [x0, #40]                ; bytes between C values
+    cmp x3, #1
+    b.lt pmoGemmEpilogueDone
+    fmov s1, w4
+    dup v1.4s, v1.s[0]
+    fmov s2, w5
+    dup v2.4s, v2.s[0]
+    cbz x2, pmoGemmEpilogueAlpha
+    cbz x6, pmoGemmEpilogueScalar
+
+    ; One C value per output column.
+pmoGemmEpilogueRunFour:
+    cmp x3, #4
+    b.lt pmoGemmEpilogueRunOneCheck
+pmoGemmEpilogueSource:
+    ld1 { v3.4s }, [x1]
+    fmul v3.4s, v3.4s, v1.4s
+    ld1 { v4.4s }, [x2], #16
+    fmul v4.4s, v2.4s, v4.4s
+pmoGemmEpilogueAdd0:
+    fadd v3.4s, v3.4s, v4.4s
+pmoGemmEpilogueStore0:
+    st1 { v3.4s }, [x1], #16
+    sub x3, x3, #4
+    b pmoGemmEpilogueRunFour
+pmoGemmEpilogueRunOneCheck:
+    cbz x3, pmoGemmEpilogueDone
+pmoGemmEpilogueRunOne:
+    ldr s3, [x1]
+    fmul s3, s3, s1
+    ldr s4, [x2]
+    add x2, x2, #4
+    fmul s4, s2, s4
+    fadd s3, s3, s4
+    str s3, [x1]
+    add x1, x1, #4
+    subs x3, x3, #1
+    b.ne pmoGemmEpilogueRunOne
+    b pmoGemmEpilogueDone
+
+    ; One scalar C for the whole matrix.
+pmoGemmEpilogueScalar:
+    ldr s4, [x2]
+    dup v4.4s, v4.s[0]
+    fmul v4.4s, v2.4s, v4.4s
+pmoGemmEpilogueScalarFour:
+    cmp x3, #4
+    b.lt pmoGemmEpilogueScalarOneCheck
+    ld1 { v3.4s }, [x1]
+    fmul v3.4s, v3.4s, v1.4s
+pmoGemmEpilogueScalarAdd0:
+    fadd v3.4s, v3.4s, v4.4s
+    st1 { v3.4s }, [x1], #16
+    sub x3, x3, #4
+    b pmoGemmEpilogueScalarFour
+pmoGemmEpilogueScalarOneCheck:
+    cbz x3, pmoGemmEpilogueDone
+pmoGemmEpilogueScalarOne:
+    ldr s3, [x1]
+    fmul s3, s3, s1
+    fadd s3, s3, s4
+    str s3, [x1]
+    add x1, x1, #4
+    subs x3, x3, #1
+    b.ne pmoGemmEpilogueScalarOne
+    b pmoGemmEpilogueDone
+
+    ; No C at all: the reference applies alpha and stops.
+pmoGemmEpilogueAlpha:
+pmoGemmEpilogueAlphaFour:
+    cmp x3, #4
+    b.lt pmoGemmEpilogueAlphaOneCheck
+    ld1 { v3.4s }, [x1]
+pmoGemmEpilogueAlphaMul0:
+    fmul v3.4s, v3.4s, v1.4s
+    st1 { v3.4s }, [x1], #16
+    sub x3, x3, #4
+    b pmoGemmEpilogueAlphaFour
+pmoGemmEpilogueAlphaOneCheck:
+    cbz x3, pmoGemmEpilogueDone
+pmoGemmEpilogueAlphaOne:
+    ldr s3, [x1]
+    fmul s3, s3, s1
+    str s3, [x1]
+    add x1, x1, #4
+    subs x3, x3, #1
+    b.ne pmoGemmEpilogueAlphaOne
+pmoGemmEpilogueDone:
+  EndASM
+EndProcedure
+
+; The epilogue over the whole matrix, one row at a time.  The three C shapes
+; the reference recognises - one scalar, one value per output column, and a
+; full M by N matrix - become a base pointer and a step, chosen once per row
+; rather than tested once per output.  The order of the tests is the
+; reference's: CCount = 1 is decided before CCount = N, which matters when N
+; is one and both would match.
+Procedure PmTensorGemmExactEpilogue(*g.PmTensorGemmArgs)
+  Protected row.i
+  Protected alpha.f
+  Protected beta.f
+  Protected e.PmTensorGemmEpilogueArgs
+  alpha=*g\Alpha
+  beta=*g\Beta
+  e\Count=*g\N
+  e\AlphaBits=PeekL(@alpha)
+  e\BetaBits=PeekL(@beta)
+  row=0
+  While row<*g\M
+    e\Dst=*g\Dst+row* *g\N*4
+    e\C=0
+    e\CStepBytes=0
+    If *g\C<>0 And *g\CCount>0
+      If *g\CCount=1
+        e\C=*g\C
+        e\CStepBytes=0
+      ElseIf *g\CCount=*g\N
+        e\C=*g\C
+        e\CStepBytes=4
+      Else
+        e\C=*g\C+row* *g\N*4
+        e\CStepBytes=4
+      EndIf
+    EndIf
+    PmTensorGemmExactEpilogueRow(@e)
+    row+1
+  Wend
+EndProcedure
+
+; The general dispatch.  Every legal Gemm is answered: the two forms this file
+; accelerates go through the exact bodies above, and everything else goes to
+; the reference itself.
+Procedure PmTensorGemmNeon(*g.PmTensorGemmArgs)
+  If *g=0
+    ProcedureReturn
+  EndIf
+  CompilerIf #PMO_USE_INT8 = 1
+  ; The quantized path has a different reduction and a different epilogue and
+  ; is not what the bodies above compute.
+  If *g\WeightScales<>0
+    PmTensorGemm(*g)
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+  If *g\TransA<>0
+    PmTensorGemm(*g)
+    ProcedureReturn
+  EndIf
+  ; No output at all: the reference's loops do not run and nothing is written.
+  If *g\M<1 Or *g\N<1
+    ProcedureReturn
+  EndIf
+  If *g\TransB=0
+    PmTensorMatMul2ExactNeon(*g\A,*g\B,*g\Dst,*g\M,*g\K,*g\N)
+  Else
+    PmTensorGemmExactTransposedB(*g)
+  EndIf
+  PmTensorGemmExactEpilogue(*g)
+EndProcedure
+
+; ======================================================================
+; Pow with a WHOLE-NUMBER exponent, four lanes at a time.  Appended
+; 2026-09-11.
+; ----------------------------------------------------------------------
+; NUMERICAL CONTRACT - this kernel IS bit-identical to the scalar Pow in
+; runtime/math/math_a64.pmi, and it is allowed to claim that because it
+; runs the SAME ALGORITHM, not an approximation of it.
+;
+; Pow(x, y) (math_a64.pmi:2184) chooses its path from y ALONE:
+;
+;     y = 0                        -> 1.0, for every x, NaN included
+;     x is NaN                     -> x, unchanged, payload and all
+;     x = 1.0                      -> 1.0
+;     y whole and -64 <= y <= 64   -> MathPowInt(x, Int(y)), which is
+;                                     repeated squaring in binary32:
+;                                       acc = 1.0 : base = x : e = |k|
+;                                       while e: if e&1: acc = acc*base
+;                                                base = base*base
+;                                                e = e >> 1
+;                                       k < 0 -> 1.0 / acc
+;                                     with x = +-0 answered first:
+;                                       k < 0 -> +Infinity, else +0.0
+;     anything else                -> Exp(y * Log(x)), which this kernel
+;                                     does NOT compute and never reaches.
+;
+; Every MathFMul in that loop is the correctly-rounded binary32 product
+; (math_a64.pmi's software core, which pi4FpGate.pi4 checks the FPU
+; against bit for bit), so `fmul Vd.4S` is the same single rounding per
+; lane, and `fdiv Vd.4S` is the same one for the k < 0 reciprocal.  The
+; loop's trip count and its acc-multiply decisions come from k, which is
+; ONE broadcast value for the whole call, so no lane ever takes a
+; different branch from its neighbours and there is nothing to mask but
+; the value specials.  Those are done with FCMEQ and BSL, not branches:
+;
+;     x == +-0   -> the k-dependent answer (+0.0 or +Infinity)
+;     x is NaN   -> x itself, so a signalling NaN stays signalling; an
+;                   FMUL would have quieted it
+;
+; The x = 1.0 early exit is deliberately NOT reproduced, because it
+; cannot be observed: squaring 1.0 gives 1.0 for every k and 1.0/1.0 is
+; 1.0.  The owning gate proves that rather than asserting it.
+;
+; WHAT THE CALLER MUST HAVE ESTABLISHED, because this kernel checks none
+; of it - DBinary does, through DPowWholeExponent, and routes everything
+; else to the scalar Pow:
+;   *a, *destination      FLOAT32, and *destination contiguous
+;   *b                    ONE FLOAT32 exponent, broadcast to every
+;                         element; it is a whole number and |y| <= 64
+;   aStride               1 for a contiguous base, 0 for one broadcast
+;                         element; nothing else
+;   destination           may be exactly *a when *a is contiguous; it may
+;                         not partially overlap either operand
+; count <= 0 writes nothing.  A trailing one, two or three elements run
+; the SAME instruction sequence with the upper three lanes loaded as
+; +0.0 by `ldr s0`, and only the low lane is stored - so the tail cannot
+; drift away from the body, because it IS the body.
+;
+; Int(y) below is the same conversion Pow uses one line above its call to
+; MathPowInt.  It is not a second opinion about whether y qualifies: the
+; caller has already decided that, and this reads the value it promised.
+;
+; Only caller-saved registers are touched: x0..x10 and v0..v7.
+Procedure PmTensorPowIntFp32NeonBody(*a.i, *destination.i, count.i, aStride.i, k.i, oneBits.i, zeroBits.i)
+  ASM
+    ; x0=a x1=destination x2=count x3=aStride x4=k x5=oneBits x6=zeroBits
+    cmp  x2, #0
+    b.le pmoNeonPowDone
+    dup  v3.4s, w5
+    dup  v4.4s, w6
+    movi v5.4s, #0
+    ; w7 = |k|, from -k: it is positive exactly when k is negative, which is
+    ; also the test, and it is written on -k rather than on k so that the
+    ; ONE other place the sign of k is read - the reciprocal below - is a
+    ; different instruction and can be mutated on its own.
+    sub  w7, wzr, w4
+    cmp  w7, #0
+    b.gt pmoNeonPowHaveE
+    mov  w7, w4
+pmoNeonPowHaveE:
+    cbnz w7, pmoNeonPowNext
+    ; k = 0. Pow returns 1.0 before it has looked at x at all, so this is
+    ; the one case the specials below must not touch.
+pmoNeonPowOnesFour:
+    cmp  x2, #4
+    b.lt pmoNeonPowOnesOne
+    st1  { v3.4s }, [x1]
+    add  x1, x1, #16
+    sub  x2, x2, #4
+    b    pmoNeonPowOnesFour
+pmoNeonPowOnesOne:
+    cbz  x2, pmoNeonPowDone
+    str  s3, [x1]
+    add  x1, x1, #4
+    sub  x2, x2, #1
+    b    pmoNeonPowOnesOne
+pmoNeonPowNext:
+    cbz  x2, pmoNeonPowDone
+    cmp  x2, #4
+    b.lt pmoNeonPowLoadOne
+    cbz  x3, pmoNeonPowLoadFourBroadcast
+    ld1  { v0.4s }, [x0]
+    add  x0, x0, #16
+    movz w9, #4
+    b    pmoNeonPowBody
+pmoNeonPowLoadFourBroadcast:
+    ld1r { v0.4s }, [x0]
+    movz w9, #4
+    b    pmoNeonPowBody
+pmoNeonPowLoadOne:
+    ldr  s0, [x0]
+    movz w9, #1
+pmoNeonPowBody:
+    mov  v1.16b, v0.16b
+    mov  v2.16b, v3.16b
+    mov  w8, w7
+pmoNeonPowSquare:
+    ; `e & 1`, written as a shift because this assembler's `and` has no
+    ; immediate form - the same reason PmTensorZeroFillNeon tests its
+    ; alignment that way.
+    lsl  w10, w8, #31
+    cbz  w10, pmoNeonPowSkipAcc
+    fmul v2.4s, v2.4s, v1.4s
+pmoNeonPowSkipAcc:
+    fmul v1.4s, v1.4s, v1.4s
+    lsr  w8, w8, #1
+    cbnz w8, pmoNeonPowSquare
+    cmp  w4, #0
+    b.ge pmoNeonPowSpecials
+    fdiv v2.4s, v3.4s, v2.4s
+pmoNeonPowSpecials:
+    fcmeq v6.4s, v0.4s, v5.4s
+    bsl  v6.16b, v4.16b, v2.16b
+    fcmeq v7.4s, v0.4s, v0.4s
+    bsl  v7.16b, v6.16b, v0.16b
+    cmp  w9, #4
+    b.lt pmoNeonPowStoreOne
+    st1  { v7.4s }, [x1]
+    add  x1, x1, #16
+    sub  x2, x2, #4
+    b    pmoNeonPowNext
+pmoNeonPowStoreOne:
+    str  s7, [x1]
+    add  x1, x1, #4
+    cbz  x3, pmoNeonPowStoreOneNext
+    add  x0, x0, #4
+pmoNeonPowStoreOneNext:
+    sub  x2, x2, #1
+    b    pmoNeonPowNext
+pmoNeonPowDone:
+  EndASM
+EndProcedure
+
+; The one float the body cannot build for itself: 1.0, and the answer for
+; a zero base, which is +Infinity for a negative exponent and +0.0
+; otherwise.  Both are constants in the host language rather than a
+; movi/fmov immediate, so the bit patterns are readable here and the body
+; has no encoded constants at all.
+Procedure PmTensorPowIntFp32Neon(*a.i, *b.i, *destination.i, count.i, aStride.i)
+  Protected k.i=0
+  Protected zeroBits.i=0
+  If count<=0
+    ProcedureReturn
+  EndIf
+  k=Int(PmTensorGet(*b,0))
+  If k<0
+    zeroBits=2139095040
+  EndIf
+  PmTensorPowIntFp32NeonBody(*a,*destination,count,aStride,k,1065353216,zeroBits)
+EndProcedure
+
+
+; ======================================================================
+; Sigmoid and Tanh, four lanes at a time.  Appended 2026-09-11.
+; ----------------------------------------------------------------------
+; NUMERICAL CONTRACT - these kernels are BIT-IDENTICAL to
+; PmTensorSigmoidValue and PmTensorTanhValue (tensor_fp32.pmi:303, :313),
+; and they may claim that because they run the SAME ARITHMETIC per lane,
+; in the same order, not an approximation of it.  There is no derived
+; bound here and none is needed; the vector Sin/Cos kernel took one
+; because its reduction had no lane-exact form, and this one does.
+;
+; Both scalar procedures are a handful of binary32 operations around one
+; call to Exp() in runtime/math/math_a64.pmi:
+;
+;     Sigmoid(x)  x >= 0 -> e = Exp(0.0 - x) ; 1.0 / (1.0 + e)
+;                 x <  0 -> e = Exp(x)       ; e   / (1.0 + e)
+;     Tanh(x)     x > 10 -> 1.0
+;                 x < -10 -> -1.0
+;                 else   -> e = Exp(x + x)   ; (e - 1.0) / (e + 1.0)
+;
+; Exp() itself dispatches: a finite, normal argument in -87..88 goes to
+; MathExpNativeA64, which is straight-line binary32 with a rounding point
+; after every source statement and no fused multiply-add, and everything
+; else goes to the integer soft-float MathExpSoftA64.  The native body is
+; the only part reproduced here, and every one of its steps has an exact
+; four-lane form:
+;
+;     t = x * log2e                     FMUL Vd.4S
+;     n = Int(t + 0.5) / Int(t - 0.5)   FCMGE + BSL, FADD, FCVTZS Vd.4S
+;     nf = n                            SCVTF Vd.4S
+;     r = x - nf*ln2hi ; r = r + nf*ln2lo   FMUL/FSUB, FMUL/FADD
+;     p = degree-5 Horner in r          five FMUL/FADD pairs
+;     z = r*r ; v = 1.0 + r ; v = v + p*z   FMUL, FADD, FMUL, FADD
+;     v * MathPow2i(n)                  SHL #23, ADD, FMUL
+;
+; FCVTZS rounds toward zero and saturates, which is what the scalar's
+; `fcvtzs x, s` followed by `sxtw` does for every argument this kernel
+; accepts.  MathPow2i's two rails - n > 127 and n < -126 - are not
+; reproduced because they CANNOT BE REACHED from the accepted interval:
+; t = x*log2e is at most 126.96 at x = 88 and at least -125.52 at
+; x = -87, so n stays inside -126..127 and MathPow2i is exactly
+; (n + 127) << 23.  That is written here as (n << 23) + (127 << 23),
+; which is the same 32-bit value for those n and lets the bias come from
+; the 1.0 already in a register rather than a second constant.  The
+; owning gate proves the bound over the whole accepted interval rather
+; than trusting this paragraph.
+;
+; A LANE THE NATIVE PATH DOES NOT OWN IS NOT APPROXIMATED HERE.  Each
+; block of four tests its own Exp argument, and the kernel STOPS at the
+; first block containing a NaN, an infinity, a subnormal, or a magnitude
+; outside the native interval; it reports how many elements it wrote and
+; the caller finishes that block one element at a time through the scalar
+; procedure itself.  So the answer for those values is not merely close
+; to the scalar's - it IS the scalar's, computed by the scalar.
+;
+; Tanh admits |x| > 10 whatever the Exp argument would be, because the
+; comparison decides the result and the exponential is discarded; the
+; lane still runs through the polynomial, harmlessly, since FPCR leaves
+; every exception untrapped and nothing reads FPSR.
+;
+; Only caller-saved registers are touched: x0..x10 and v0..v7, v16..v31.
+Procedure PmTensorSigmoidFp32NeonRun(*src.i, *dst.i, count.i, *done.i)
+  ASM
+    ; x0=src x1=dst x2=count x3=done
+    movz x8, #0
+    cmp  x2, #4
+    b.lt pmoSigmoidRunEnd
+
+    adrp x9, pmosigtanhabs
+    add  x9, x9, #:lo12:pmosigtanhabs
+    ld1  { v16.4s }, [x9]
+    adrp x9, pmosigtanhnormal
+    add  x9, x9, #:lo12:pmosigtanhnormal
+    ld1  { v17.4s }, [x9]
+    adrp x9, pmosigtanhlowrail
+    add  x9, x9, #:lo12:pmosigtanhlowrail
+    ld1  { v18.4s }, [x9]
+    adrp x9, pmosigtanhlog2e
+    add  x9, x9, #:lo12:pmosigtanhlog2e
+    ld1  { v20.4s }, [x9]
+    adrp x9, pmosigtanhhalf
+    add  x9, x9, #:lo12:pmosigtanhhalf
+    ld1  { v21.4s }, [x9]
+    adrp x9, pmosigtanhneghalf
+    add  x9, x9, #:lo12:pmosigtanhneghalf
+    ld1  { v22.4s }, [x9]
+    adrp x9, pmosigtanhln2hi
+    add  x9, x9, #:lo12:pmosigtanhln2hi
+    ld1  { v23.4s }, [x9]
+    adrp x9, pmosigtanhln2lo
+    add  x9, x9, #:lo12:pmosigtanhln2lo
+    ld1  { v24.4s }, [x9]
+    adrp x9, pmosigtanhc5
+    add  x9, x9, #:lo12:pmosigtanhc5
+    ld1  { v25.4s }, [x9]
+    adrp x9, pmosigtanhc4
+    add  x9, x9, #:lo12:pmosigtanhc4
+    ld1  { v26.4s }, [x9]
+    adrp x9, pmosigtanhc3
+    add  x9, x9, #:lo12:pmosigtanhc3
+    ld1  { v27.4s }, [x9]
+    adrp x9, pmosigtanhc2
+    add  x9, x9, #:lo12:pmosigtanhc2
+    ld1  { v28.4s }, [x9]
+    adrp x9, pmosigtanhc1
+    add  x9, x9, #:lo12:pmosigtanhc1
+    ld1  { v29.4s }, [x9]
+    adrp x9, pmosigtanhc0
+    add  x9, x9, #:lo12:pmosigtanhc0
+    ld1  { v30.4s }, [x9]
+    adrp x9, pmosigtanhone
+    add  x9, x9, #:lo12:pmosigtanhone
+    ld1  { v31.4s }, [x9]
+
+pmoSigmoidRunBlock:
+    ld1  { v0.4s }, [x0]
+    movi v3.4s, #0
+    fcmge v1.4s, v0.4s, v3.4s          ; the branch the scalar takes
+    fsub v4.4s, v3.4s, v0.4s           ; 0.0 - x, so -0.0 keeps its sign
+    mov  v2.16b, v1.16b
+    bsl  v2.16b, v4.16b, v0.16b        ; the argument Exp is handed
+
+    ; Admission.  The upper rail is not tested: the argument is at most
+    ; +0.0 in both branches, so only the lower one can be crossed.
+    and  v5.16b, v2.16b, v16.16b
+    cmeq v6.4s, v5.4s, v3.4s
+    cmhs v7.4s, v5.4s, v17.4s
+    orr  v6.16b, v6.16b, v7.16b        ; zero or normal
+    fcmge v7.4s, v2.4s, v18.4s         ; and at or above -87.0
+    and  v6.16b, v6.16b, v7.16b
+    uminv s6, v6.4s
+    fmov w10, s6
+    add  w10, w10, #1
+    cbnz w10, pmoSigmoidRunEnd
+
+    fmul v3.4s, v2.4s, v20.4s
+    movi v5.4s, #0
+    fcmge v4.4s, v3.4s, v5.4s
+    bsl  v4.16b, v21.16b, v22.16b
+    fadd v3.4s, v3.4s, v4.4s
+    fcvtzs v3.4s, v3.4s
+    scvtf v4.4s, v3.4s
+    fmul v5.4s, v4.4s, v23.4s
+    fsub v5.4s, v2.4s, v5.4s
+    fmul v6.4s, v4.4s, v24.4s
+    fadd v5.4s, v5.4s, v6.4s
+    mov  v6.16b, v25.16b
+    fmul v6.4s, v6.4s, v5.4s
+    fadd v6.4s, v6.4s, v26.4s
+    fmul v6.4s, v6.4s, v5.4s
+    fadd v6.4s, v6.4s, v27.4s
+    fmul v6.4s, v6.4s, v5.4s
+    fadd v6.4s, v6.4s, v28.4s
+    fmul v6.4s, v6.4s, v5.4s
+    fadd v6.4s, v6.4s, v29.4s
+    fmul v6.4s, v6.4s, v5.4s
+    fadd v6.4s, v6.4s, v30.4s
+    fmul v7.4s, v5.4s, v5.4s
+    fadd v4.4s, v31.4s, v5.4s
+    fmul v6.4s, v6.4s, v7.4s
+    fadd v4.4s, v4.4s, v6.4s
+    shl  v3.4s, v3.4s, #23
+    add  v3.4s, v3.4s, v31.4s
+    fmul v2.4s, v4.4s, v3.4s           ; e
+
+    fadd v3.4s, v31.4s, v2.4s          ; 1.0 + e, both branches
+    mov  v4.16b, v1.16b
+    bsl  v4.16b, v31.16b, v2.16b       ; 1.0 or e over it
+    fdiv v4.4s, v4.4s, v3.4s
+    st1  { v4.4s }, [x1]
+
+    add  x0, x0, #16
+    add  x1, x1, #16
+    add  x8, x8, #4
+    sub  x2, x2, #4
+    cmp  x2, #4
+    b.ge pmoSigmoidRunBlock
+pmoSigmoidRunEnd:
+    str  x8, [x3]
+  EndASM
+EndProcedure
+
+Procedure PmTensorTanhFp32NeonRun(*src.i, *dst.i, count.i, *done.i)
+  ASM
+    ; x0=src x1=dst x2=count x3=done
+    movz x8, #0
+    cmp  x2, #4
+    b.lt pmoTanhRunEnd
+
+    adrp x9, pmosigtanhabs
+    add  x9, x9, #:lo12:pmosigtanhabs
+    ld1  { v16.4s }, [x9]
+    adrp x9, pmosigtanhnormal
+    add  x9, x9, #:lo12:pmosigtanhnormal
+    ld1  { v17.4s }, [x9]
+    adrp x9, pmosigtanhten
+    add  x9, x9, #:lo12:pmosigtanhten
+    ld1  { v18.4s }, [x9]
+    adrp x9, pmosigtanhlog2e
+    add  x9, x9, #:lo12:pmosigtanhlog2e
+    ld1  { v20.4s }, [x9]
+    adrp x9, pmosigtanhhalf
+    add  x9, x9, #:lo12:pmosigtanhhalf
+    ld1  { v21.4s }, [x9]
+    adrp x9, pmosigtanhneghalf
+    add  x9, x9, #:lo12:pmosigtanhneghalf
+    ld1  { v22.4s }, [x9]
+    adrp x9, pmosigtanhln2hi
+    add  x9, x9, #:lo12:pmosigtanhln2hi
+    ld1  { v23.4s }, [x9]
+    adrp x9, pmosigtanhln2lo
+    add  x9, x9, #:lo12:pmosigtanhln2lo
+    ld1  { v24.4s }, [x9]
+    adrp x9, pmosigtanhc5
+    add  x9, x9, #:lo12:pmosigtanhc5
+    ld1  { v25.4s }, [x9]
+    adrp x9, pmosigtanhc4
+    add  x9, x9, #:lo12:pmosigtanhc4
+    ld1  { v26.4s }, [x9]
+    adrp x9, pmosigtanhc3
+    add  x9, x9, #:lo12:pmosigtanhc3
+    ld1  { v27.4s }, [x9]
+    adrp x9, pmosigtanhc2
+    add  x9, x9, #:lo12:pmosigtanhc2
+    ld1  { v28.4s }, [x9]
+    adrp x9, pmosigtanhc1
+    add  x9, x9, #:lo12:pmosigtanhc1
+    ld1  { v29.4s }, [x9]
+    adrp x9, pmosigtanhc0
+    add  x9, x9, #:lo12:pmosigtanhc0
+    ld1  { v30.4s }, [x9]
+    adrp x9, pmosigtanhone
+    add  x9, x9, #:lo12:pmosigtanhone
+    ld1  { v31.4s }, [x9]
+
+pmoTanhRunBlock:
+    ld1  { v0.4s }, [x0]
+    fcmgt v1.4s, v0.4s, v18.4s         ; x > 10.0
+    fneg v3.4s, v18.4s
+    fcmgt v19.4s, v3.4s, v0.4s         ; -10.0 > x
+    fadd v2.4s, v0.4s, v0.4s           ; the argument Exp is handed
+
+    ; Admission.  Neither rail of the native interval is tested: a lane
+    ; that reaches the exponential has |x| <= 10, so |x + x| <= 20.  What
+    ; is left is a subnormal argument, and a NaN, which no comparison
+    ; above has rejected.
+    ;
+    ; AND THERE IS NO "the comparison already decided it" TERM, because
+    ; the magnitude test already admits every such lane and a term that
+    ; cannot change an answer is a term no gate can reject.  |x| > 10
+    ; makes |x + x| at least twenty, so its magnitude is normal (or
+    ; infinite, which is also normal here); the only way to reach the
+    ; subnormal case is |x| < 2^-126, and there the comparison is false
+    ; anyway.
+    and  v5.16b, v2.16b, v16.16b
+    movi v3.4s, #0
+    cmeq v6.4s, v5.4s, v3.4s
+    cmhs v7.4s, v5.4s, v17.4s
+    orr  v6.16b, v6.16b, v7.16b        ; zero or normal
+    fcmeq v7.4s, v0.4s, v0.4s          ; and x is not a NaN
+    and  v6.16b, v6.16b, v7.16b
+    uminv s6, v6.4s
+    fmov w10, s6
+    add  w10, w10, #1
+    cbnz w10, pmoTanhRunEnd
+
+    fmul v3.4s, v2.4s, v20.4s
+    movi v5.4s, #0
+    fcmge v4.4s, v3.4s, v5.4s
+    bsl  v4.16b, v21.16b, v22.16b
+    fadd v3.4s, v3.4s, v4.4s
+    fcvtzs v3.4s, v3.4s
+    scvtf v4.4s, v3.4s
+    fmul v5.4s, v4.4s, v23.4s
+    fsub v5.4s, v2.4s, v5.4s
+    fmul v6.4s, v4.4s, v24.4s
+    fadd v5.4s, v5.4s, v6.4s
+    mov  v6.16b, v25.16b
+    fmul v6.4s, v6.4s, v5.4s
+    fadd v6.4s, v6.4s, v26.4s
+    fmul v6.4s, v6.4s, v5.4s
+    fadd v6.4s, v6.4s, v27.4s
+    fmul v6.4s, v6.4s, v5.4s
+    fadd v6.4s, v6.4s, v28.4s
+    fmul v6.4s, v6.4s, v5.4s
+    fadd v6.4s, v6.4s, v29.4s
+    fmul v6.4s, v6.4s, v5.4s
+    fadd v6.4s, v6.4s, v30.4s
+    fmul v7.4s, v5.4s, v5.4s
+    fadd v4.4s, v31.4s, v5.4s
+    fmul v6.4s, v6.4s, v7.4s
+    fadd v4.4s, v4.4s, v6.4s
+    shl  v3.4s, v3.4s, #23
+    add  v3.4s, v3.4s, v31.4s
+    fmul v2.4s, v4.4s, v3.4s           ; e
+
+    fsub v3.4s, v2.4s, v31.4s
+    fadd v4.4s, v2.4s, v31.4s
+    fdiv v3.4s, v3.4s, v4.4s
+    mov  v5.16b, v1.16b
+    bsl  v5.16b, v31.16b, v3.16b       ; +1.0 above ten
+    fneg v6.4s, v31.4s
+    mov  v7.16b, v19.16b
+    bsl  v7.16b, v6.16b, v5.16b        ; -1.0 below minus ten
+    st1  { v7.4s }, [x1]
+
+    add  x0, x0, #16
+    add  x1, x1, #16
+    add  x8, x8, #4
+    sub  x2, x2, #4
+    cmp  x2, #4
+    b.ge pmoTanhRunBlock
+pmoTanhRunEnd:
+    str  x8, [x3]
+  EndASM
+EndProcedure
+
+; The two entry points.  A block the kernel stopped on is finished by the
+; scalar procedure ITSELF, four elements of it, so the next kernel entry
+; is still on a four-element boundary and every vector access keeps the
+; alignment it started with.  The trailing one, two or three elements are
+; scalar for the same reason.
+Procedure PmTensorSigmoidFp32Neon(*src.i, *dst.i, count.i)
+  Protected i.i=0
+  Protected j.i=0
+  Protected done.i=0
+  While i+4<=count
+    done=0
+    PmTensorSigmoidFp32NeonRun(*src+i*4,*dst+i*4,count-i,@done)
+    i=i+done
+    If i+4<=count
+      j=0
+      While j<4
+        PmTensorPut(*dst,i+j,PmTensorSigmoidValue(PmTensorGet(*src,i+j)))
+        j=j+1
+      Wend
+      i=i+4
+    EndIf
+  Wend
+  While i<count
+    PmTensorPut(*dst,i,PmTensorSigmoidValue(PmTensorGet(*src,i)))
+    i=i+1
+  Wend
+EndProcedure
+
+Procedure PmTensorTanhFp32Neon(*src.i, *dst.i, count.i)
+  Protected i.i=0
+  Protected j.i=0
+  Protected done.i=0
+  While i+4<=count
+    done=0
+    PmTensorTanhFp32NeonRun(*src+i*4,*dst+i*4,count-i,@done)
+    i=i+done
+    If i+4<=count
+      j=0
+      While j<4
+        PmTensorPut(*dst,i+j,PmTensorTanhValue(PmTensorGet(*src,i+j)))
+        j=j+1
+      Wend
+      i=i+4
+    EndIf
+  Wend
+  While i<count
+    PmTensorPut(*dst,i,PmTensorTanhValue(PmTensorGet(*src,i)))
+    i=i+1
+  Wend
+EndProcedure
+
+; Every constant here is the binary32 value of the literal the scalar
+; carries, and the owning gate reads both out of the compiled image and
+; compares them rather than trusting this table.
+DataSection
+  pmoSigTanhAbs:
+  Data.l $7FFFFFFF,$7FFFFFFF,$7FFFFFFF,$7FFFFFFF
+  pmoSigTanhNormal:
+  Data.l $00800000,$00800000,$00800000,$00800000
+  pmoSigTanhLowRail:
+  Data.l $C2AE0000,$C2AE0000,$C2AE0000,$C2AE0000
+  pmoSigTanhTen:
+  Data.l $41200000,$41200000,$41200000,$41200000
+  pmoSigTanhLog2e:
+  Data.l $3FB8AA3B,$3FB8AA3B,$3FB8AA3B,$3FB8AA3B
+  pmoSigTanhHalf:
+  Data.l $3F000000,$3F000000,$3F000000,$3F000000
+  pmoSigTanhNegHalf:
+  Data.l $BF000000,$BF000000,$BF000000,$BF000000
+  pmoSigTanhLn2Hi:
+  Data.l $3F318000,$3F318000,$3F318000,$3F318000
+  pmoSigTanhLn2Lo:
+  Data.l $395E8083,$395E8083,$395E8083,$395E8083
+  pmoSigTanhC5:
+  Data.l $39506967,$39506967,$39506967,$39506967
+  pmoSigTanhC4:
+  Data.l $3AB743CE,$3AB743CE,$3AB743CE,$3AB743CE
+  pmoSigTanhC3:
+  Data.l $3C088908,$3C088908,$3C088908,$3C088908
+  pmoSigTanhC2:
+  Data.l $3D2AA9C1,$3D2AA9C1,$3D2AA9C1,$3D2AA9C1
+  pmoSigTanhC1:
+  Data.l $3E2AAAAA,$3E2AAAAA,$3E2AAAAA,$3E2AAAAA
+  pmoSigTanhC0:
+  Data.l $3F000000,$3F000000,$3F000000,$3F000000
+  pmoSigTanhOne:
+  Data.l $3F800000,$3F800000,$3F800000,$3F800000
+EndDataSection
+
+CompilerIf #PMO_USE_LSTM = 1
+; ======================================================================
+; LSTM: the transposed weight layout, and four or sixteen units per load.
+; Appended 2026-09-11.
+; ----------------------------------------------------------------------
+; PmTensorLstm (tensor_fp32.pmi:2030) computes, for one direction, one
+; timestep, one batch row and one unit, four dot products through
+; PmTensorLstmFloatFour: the FOUR GATES are the four lanes, and lane g
+; reads W[(dir*4*Hidden) + (g*Hidden + unit)][i].  Those four addresses are
+; Hidden*Count*4 bytes apart - 640 KB in Kokoro - and the three single-lane
+; `ld1 {v1.s}[n]` inserts that gather them, all serialised on one register,
+; are the cost: fifteen instructions and four open streams buy four
+; multiply-accumulates.
+;
+; THE FIX IS THE LAYOUT, NOT THE ARITHMETIC.  Four ADJACENT UNITS of one
+; gate are one 16-byte load if the weights are stored [gate][inner][unit]
+; instead of [gate][unit][inner].  DLstm makes that copy once per call into
+; the arena - it budgets the bytes there and refuses loudly when they will
+; not fit - and hands the two buffers here.
+;
+; NUMERICAL CONTRACT - bit-identical to PmTensorLstm, and it is the same
+; arithmetic that makes it so rather than a bound:
+;
+;   * Each LANE is a DIFFERENT UNIT's own dot product.  Nothing is ever
+;     split across lanes and folded, so no sum is reassociated: lane u
+;     accumulates sum = sum + A[i]*W[...][i] for i ascending from +0.0,
+;     with a separate FMUL and FADD, which is PmTensorLstmFloatFour's
+;     sequence for that unit, instruction for instruction.
+;   * The accumulators start at +0.0 (movi), as the reference's do, and a
+;     Count of zero stores +0.0 without entering the loop, as it does.
+;   * The gate order, the bias pairing, the two roundings of
+;     (bias + Wx) + Rh, the sigmoid and tanh, the newC expression and the
+;     deferred H copy-back are PmTensorLstm's own, reproduced below in the
+;     reference's order.  Since 2026-09-11 they are taken four UNITS at a
+;     time rather than one, which is a change of ORDER OF VISIT and not of
+;     arithmetic: the reference's unit loop has no cross-unit dependency,
+;     and the vector Sigmoid and Tanh below run Exp's own binary32
+;     algorithm per lane and hand any lane it does not own back to the
+;     scalar procedure itself.
+;   * ALL the recurrent dot products of one timestep read the SAME H,
+;     because the reference copies Y into YH only after every unit of that
+;     timestep is finished.  That is what lets the 4*Hidden dots be taken
+;     in one blocked pass before the unit loop instead of one unit at a
+;     time, and it is a fact about the reference, not an assumption.
+;
+; Anything this does not cover - an INT8 weight set, a missing transposed
+; buffer - stays with PmTensorLstm, which remains the definition of the
+; answer.
+;
+; THE ROW IS PADDED TO A MULTIPLE OF FOUR UNITS, AND THAT IS AN ALIGNMENT
+; DECISION, NOT A CONVENIENCE.  With the MMU off every access on this part
+; is Device memory, and the vault's 2026-08-27 note records that an
+; unaligned wide access there is a SILENT RUNAWAY rather than a message -
+; the same reason PmTensorZeroFillNeon aligns before its first wide store.
+; A Hidden of 5 would put the second gate's rows at 20-byte spacing and
+; every `ld1 {v.4s}` after the first at a 4-byte-aligned address.  Padding
+; the stride to (Hidden + 3) & -4 makes every vector address a multiple of
+; 16 by construction, for every Hidden, with no test to get wrong; the
+; padded columns are zero because DAcquire zero-fills, and nothing reads
+; the dots computed for them.  It also removes the scalar tail body
+; entirely: after the sixteen-unit blocks, the four-unit body finishes the
+; row exactly.
+;
+; The sixteen-unit body exists for the cache, not for the instruction
+; count: the transposed rows are Stride*4 bytes apart, so four units read
+; 16 of every 64-byte line and sixteen units read all of it.
+Structure PmTensorLstmDotsArgs
+  A.i
+  WT.i
+  Dst.i
+  Count.i
+  Stride.i
+EndStructure
+
+; All four gates of one direction: Dst[gate*Stride + unit] = sum over inner
+; of A[i] * WT[((gate*Count) + i)*Stride + unit], for every unit in the
+; padded row.  Stride is a multiple of four.
+; Only caller-saved registers are touched: x1..x15 and v0, v4..v7, v16..v19.
+Procedure PmTensorLstmDotsNeon(*t.PmTensorLstmDotsArgs)
+  ASM
+    ldr x1, [x0, #0]                 ; A, the input or hidden vector
+    ldr x2, [x0, #8]                 ; WT, gate 0 of this direction
+    ldr x3, [x0, #16]                ; Dst, gate 0 of this direction
+    ldr x4, [x0, #24]                ; Count, the inner length
+    ldr x5, [x0, #32]                ; Stride, units per row, a multiple of 4
+    lsl x6, x5, #2                   ; bytes from one inner row to the next
+    mul x7, x4, x6                   ; bytes from one gate plane to the next
+    movz x8, #0
+pmoLstmDotsGate:
+    cmp x8, #4
+    b.ge pmoLstmDotsDone
+    mul x9, x8, x7
+    add x9, x2, x9                   ; this gate's weight plane
+    mul x10, x8, x6
+    add x10, x3, x10                 ; this gate's output row
+    movz x11, #0
+pmoLstmDotsSixteen:
+    add x12, x11, #16
+    cmp x12, x5
+    b.gt pmoLstmDotsFour
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    lsl x13, x11, #2
+    add x13, x9, x13
+    mov x14, x1
+    mov x15, x4
+    cmp x15, #0
+    b.le pmoLstmDotsSixteenStore
+pmoLstmDotsSixteenLoop:
+    ld1r { v0.4s }, [x14]
+    add x14, x14, #4
+    ld1 { v4.16b, v5.16b, v6.16b, v7.16b }, [x13]
+    add x13, x13, x6
+    fmul v4.4s, v0.4s, v4.4s
+    fadd v16.4s, v16.4s, v4.4s
+    fmul v5.4s, v0.4s, v5.4s
+    fadd v17.4s, v17.4s, v5.4s
+    fmul v6.4s, v0.4s, v6.4s
+    fadd v18.4s, v18.4s, v6.4s
+    fmul v7.4s, v0.4s, v7.4s
+    fadd v19.4s, v19.4s, v7.4s
+    subs x15, x15, #1
+    b.ne pmoLstmDotsSixteenLoop
+pmoLstmDotsSixteenStore:
+    lsl x13, x11, #2
+    add x13, x10, x13
+    st1 { v16.16b, v17.16b, v18.16b, v19.16b }, [x13]
+    add x11, x11, #16
+    b   pmoLstmDotsSixteen
+pmoLstmDotsFour:
+    cmp x11, x5
+    b.ge pmoLstmDotsNextGate
+    movi v16.4s, #0
+    lsl x13, x11, #2
+    add x13, x9, x13
+    mov x14, x1
+    mov x15, x4
+    cmp x15, #0
+    b.le pmoLstmDotsFourStore
+pmoLstmDotsFourLoop:
+    ld1r { v0.4s }, [x14]
+    add x14, x14, #4
+    ld1 { v4.16b }, [x13]
+    add x13, x13, x6
+    fmul v4.4s, v0.4s, v4.4s
+    fadd v16.4s, v16.4s, v4.4s
+    subs x15, x15, #1
+    b.ne pmoLstmDotsFourLoop
+pmoLstmDotsFourStore:
+    lsl x13, x11, #2
+    add x13, x10, x13
+    st1 { v16.16b }, [x13]
+    add x11, x11, #4
+    b   pmoLstmDotsFour
+pmoLstmDotsNextGate:
+    add x8, x8, #1
+    b   pmoLstmDotsGate
+pmoLstmDotsDone:
+  EndASM
+EndProcedure
+
+; ONE ROW of the transpose: `units` words read srcStep bytes apart and
+; written contiguously.  Six instructions per word, against roughly thirty
+; for the same line in the host language, which carries two multiplies per
+; element.  This matters more than it looks: the transpose is a FIXED cost
+; per LSTM call, so it is the whole of the answer to "how many timesteps
+; does the new layout take to pay for itself".  Measured on the gate's
+; T2 shapes the host-language loop was most of the call.
+;
+; A word at a time and through general registers, not a vector gather:
+; there is no such instruction here, and building one out of single-lane
+; `ld1 {v.s}[n]` inserts is exactly the shape this whole change exists to
+; get rid of.
+Procedure PmTensorLstmGatherUnitsNeon(*src.i, *destination.i, units.i, srcStep.i)
+  ASM
+    ; x0=src x1=destination x2=units x3=srcStep
+    cmp  x2, #0
+    b.le pmoLstmGatherDone
+pmoLstmGatherLoop:
+    ldr  w9, [x0]
+    add  x0, x0, x3
+    str  w9, [x1]
+    add  x1, x1, #4
+    subs x2, x2, #1
+    b.ne pmoLstmGatherLoop
+pmoLstmGatherDone:
+  EndASM
+EndProcedure
+
+; [planes][units][inner] -> [planes][inner][stride], with stride >= units;
+; the padding columns are left as the arena handed them over, which is zero.
+; The DESTINATION is walked in order so the writes are sequential and only
+; the reads stride; a strided write costs a read-for-ownership of a line
+; that is about to be overwritten anyway.  The word move is an integer one,
+; so a NaN payload and a signed zero survive the copy unchanged - this is a
+; relabelling of the same weights, not an arithmetic pass over them.
+Procedure PmTensorLstmTransposeWeights(*src.i, *destination.i, planes.i, units.i, inner.i, stride.i)
+  Protected plane.i=0
+  Protected i.i=0
+  Protected source.i=0
+  Protected target.i=0
+  Protected innerBytes.i=0
+  innerBytes=inner*4
+  For plane=0 To planes-1
+    source=*src+plane*units*inner*4
+    target=*destination+plane*inner*stride*4
+    For i=0 To inner-1
+      PmTensorLstmGatherUnitsNeon(source+i*4,target+i*stride*4,units,innerBytes)
+    Next
+  Next
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+; The three arithmetic passes that surround the activations.  None of
+; them is an approximation: each runs the reference's own operations for
+; one unit, four units at a time, with the same operands in the same
+; order, and finishes any remainder one element at a time through the
+; SAME instruction sequence.
+;
+; WHY THE UNIT LOOP MAY BE TAKEN APART INTO PASSES AT ALL.  Inside one
+; (direction, timestep, batch row) the reference's unit loop has no
+; cross-unit dependency: unit u reads the bias, the two dot rows and
+; YC[...+u], and writes YC[...+u] and Y[...+u].  Nothing it writes is
+; read by another unit, and YH is copied only after the whole loop.  So
+; running each statement over every unit, in unit order, computes the
+; same values from the same inputs.  The owning gate proves that by
+; running both drivers on sixteen shapes and comparing Y, Y_h and Y_c
+; word for word, not by reading this paragraph.
+;
+; Only caller-saved registers are touched: x0..x10 and v0..v7.
+
+; dst[u] = ((b1[u] + b2[u]) + w[u]) + r[u], and with no bias tensor the
+; first term is +0.0 - which is a rounding step the reference takes too
+; (`iv = 0.0` then `iv = iv + ...`), not a shortcut past one.
+Procedure PmTensorLstmGateSumNeon(*b1.i, *b2.i, *w.i, *r.i, *dst.i, count.i)
+  ASM
+    ; x0=b1 x1=b2 x2=w x3=r x4=dst x5=count
+    cmp  x5, #0
+    b.le pmoLstmSumDone
+    movi v3.4s, #0
+pmoLstmSumFour:
+    cmp  x5, #4
+    b.lt pmoLstmSumOne
+    mov  v0.16b, v3.16b
+    cbz  x0, pmoLstmSumFourNoBias
+    ld1  { v1.4s }, [x0]
+    ld1  { v2.4s }, [x1]
+    fadd v0.4s, v1.4s, v2.4s
+    add  x0, x0, #16
+    add  x1, x1, #16
+pmoLstmSumFourNoBias:
+    ld1  { v1.4s }, [x2]
+    fadd v0.4s, v0.4s, v1.4s
+    ld1  { v2.4s }, [x3]
+    fadd v0.4s, v0.4s, v2.4s
+    st1  { v0.4s }, [x4]
+    add  x2, x2, #16
+    add  x3, x3, #16
+    add  x4, x4, #16
+    sub  x5, x5, #4
+    b    pmoLstmSumFour
+pmoLstmSumOne:
+    cbz  x5, pmoLstmSumDone
+    mov  v0.16b, v3.16b
+    cbz  x0, pmoLstmSumOneNoBias
+    ldr  s1, [x0]
+    ldr  s2, [x1]
+    fadd v0.4s, v1.4s, v2.4s
+    add  x0, x0, #4
+    add  x1, x1, #4
+pmoLstmSumOneNoBias:
+    ldr  s1, [x2]
+    fadd v0.4s, v0.4s, v1.4s
+    ldr  s2, [x3]
+    fadd v0.4s, v0.4s, v2.4s
+    str  s0, [x4]
+    add  x2, x2, #4
+    add  x3, x3, #4
+    add  x4, x4, #4
+    sub  x5, x5, #1
+    b    pmoLstmSumOne
+pmoLstmSumDone:
+  EndASM
+EndProcedure
+
+; c[u] = f[u] * c[u] + i[u] * g[u] - the reference's `newC = fv *
+; previousC + iv * cv`, two separate products and one sum, with the cell
+; read before it is written at the same index.
+Procedure PmTensorLstmCellNeon(*f.i, *i.i, *g.i, *c.i, count.i)
+  ASM
+    ; x0=f x1=i x2=g x3=c x4=count
+    cmp  x4, #0
+    b.le pmoLstmCellDone
+pmoLstmCellFour:
+    cmp  x4, #4
+    b.lt pmoLstmCellOne
+    ld1  { v0.4s }, [x0]
+    ld1  { v1.4s }, [x3]
+    fmul v0.4s, v0.4s, v1.4s
+    ld1  { v2.4s }, [x1]
+    ld1  { v3.4s }, [x2]
+    fmul v2.4s, v2.4s, v3.4s
+    fadd v0.4s, v0.4s, v2.4s
+    st1  { v0.4s }, [x3]
+    add  x0, x0, #16
+    add  x1, x1, #16
+    add  x2, x2, #16
+    add  x3, x3, #16
+    sub  x4, x4, #4
+    b    pmoLstmCellFour
+pmoLstmCellOne:
+    cbz  x4, pmoLstmCellDone
+    ldr  s0, [x0]
+    ldr  s1, [x3]
+    fmul v0.4s, v0.4s, v1.4s
+    ldr  s2, [x1]
+    ldr  s3, [x2]
+    fmul v2.4s, v2.4s, v3.4s
+    fadd v0.4s, v0.4s, v2.4s
+    str  s0, [x3]
+    add  x0, x0, #4
+    add  x1, x1, #4
+    add  x2, x2, #4
+    add  x3, x3, #4
+    sub  x4, x4, #1
+    b    pmoLstmCellOne
+pmoLstmCellDone:
+  EndASM
+EndProcedure
+
+; y[u] = o[u] * y[u], with y already holding Tanh(newC).
+Procedure PmTensorLstmOutNeon(*o.i, *y.i, count.i)
+  ASM
+    ; x0=o x1=y x2=count
+    cmp  x2, #0
+    b.le pmoLstmOutDone
+pmoLstmOutFour:
+    cmp  x2, #4
+    b.lt pmoLstmOutOne
+    ld1  { v0.4s }, [x0]
+    ld1  { v1.4s }, [x1]
+    fmul v0.4s, v0.4s, v1.4s
+    st1  { v0.4s }, [x1]
+    add  x0, x0, #16
+    add  x1, x1, #16
+    sub  x2, x2, #4
+    b    pmoLstmOutFour
+pmoLstmOutOne:
+    cbz  x2, pmoLstmOutDone
+    ldr  s0, [x0]
+    ldr  s1, [x1]
+    fmul v0.4s, v0.4s, v1.4s
+    str  s0, [x1]
+    add  x0, x0, #4
+    add  x1, x1, #4
+    sub  x2, x2, #1
+    b    pmoLstmOutOne
+pmoLstmOutDone:
+  EndASM
+EndProcedure
+
+; YH[u] = Y[u] for one timestep, the reference's deferred copy-back.  It
+; moves words, not values, so a NaN payload and a signed zero survive it.
+Procedure PmTensorLstmCarryNeon(*y.i, *yh.i, count.i)
+  ASM
+    ; x0=y x1=yh x2=count
+    cmp  x2, #0
+    b.le pmoLstmCarryDone
+pmoLstmCarryFour:
+    cmp  x2, #4
+    b.lt pmoLstmCarryOne
+    ld1  { v0.4s }, [x0]
+    st1  { v0.4s }, [x1]
+    add  x0, x0, #16
+    add  x1, x1, #16
+    sub  x2, x2, #4
+    b    pmoLstmCarryFour
+pmoLstmCarryOne:
+    cbz  x2, pmoLstmCarryDone
+    ldr  w9, [x0]
+    str  w9, [x1]
+    add  x0, x0, #4
+    add  x1, x1, #4
+    sub  x2, x2, #1
+    b    pmoLstmCarryOne
+pmoLstmCarryDone:
+  EndASM
+EndProcedure
+
+; PmTensorLstm's driver, with the four per-unit dot products replaced by two
+; blocked passes over the transposed weights, and the per-unit epilogue
+; replaced by seven passes over the unit axis.  Every line that is not
+; those passes is the reference's, in the reference's order, and every
+; pass computes the reference's own operations for one unit with the same
+; operands in the same order - so the driver stays BIT-IDENTICAL to
+; PmTensorLstm rather than close to it.
+;
+; The epilogue used to be three PmTensorSigmoidValue and two
+; PmTensorTanhValue per unit, each a software binary32 Exp, at about 2800
+; interpreter steps for the five of them.  Taking them four units at a
+; time is what this second LSTM lane is for; the passes around them - the
+; gate sums, the cell update, the output multiply and the carry - are
+; vectorised in the same shape because otherwise they become the new
+; floor.
+Procedure PmTensorLstmFp32Neon(*g.PmTensorLstmArgs, WT.i, RT.i, Dots.i, Stride.i)
+  Protected dir.i=0
+  Protected step.i=0
+  Protected t.i=0
+  Protected bn.i=0
+  Protected unit.i=0
+  Protected k.i=0
+  Protected stateIndex.i=0
+  Protected xIndex.i=0
+  Protected bBase.i=0
+  Protected yIndex.i=0
+  Protected valid.i=0
+  Protected wDots.i=0
+  Protected rDots.i=0
+  Protected gate.i=0
+  Protected j.i=0
+  Protected b1.i=0
+  Protected b2.i=0
+  Protected cPointer.i=0
+  Protected hPointer.i=0
+  Protected yPointer.i=0
+  Protected d.PmTensorLstmDotsArgs
+
+  wDots=Dots
+  rDots=Dots+4*Stride*4
+
+  ; Initial state becomes the mutable final-state buffers.
+  dir = 0
+  While dir < *g\Directions
+    bn = 0
+    While bn < *g\Batch
+      unit = 0
+      While unit < *g\Hidden
+        stateIndex = (dir * *g\Batch + bn) * *g\Hidden + unit
+        If *g\InitialH <> 0
+          PmTensorPut(*g\YH, stateIndex, PmTensorGet(*g\InitialH, stateIndex))
+        Else
+          PmTensorPut(*g\YH, stateIndex, 0.0)
+        EndIf
+        If *g\InitialC <> 0
+          PmTensorPut(*g\YC, stateIndex, PmTensorGet(*g\InitialC, stateIndex))
+        Else
+          PmTensorPut(*g\YC, stateIndex, 0.0)
+        EndIf
+        unit = unit + 1
+      Wend
+      bn = bn + 1
+    Wend
+    dir = dir + 1
+  Wend
+
+  dir = 0
+  While dir < *g\Directions
+    step = 0
+    While step < *g\Sequence
+      bn = 0
+      While bn < *g\Batch
+        valid = *g\Sequence
+        If *g\SeqLens <> 0 : valid = PmTensorGetI64(*g\SeqLens, bn) : EndIf
+        If dir = 0
+          t = step
+        Else
+          t = valid - 1 - step
+        EndIf
+        If step < valid
+          xIndex = (t * *g\Batch + bn) * *g\InputSize
+          stateIndex = (dir * *g\Batch + bn) * *g\Hidden
+          k = xIndex : k = k * 4
+          d\A = *g\X + k
+          k = dir : k = k * 4 : k = k * *g\InputSize : k = k * Stride : k = k * 4
+          d\WT = WT + k
+          d\Dst = wDots
+          d\Count = *g\InputSize
+          d\Stride = Stride
+          PmTensorLstmDotsNeon(@d)
+          k = stateIndex : k = k * 4
+          d\A = *g\YH + k
+          k = dir : k = k * 4 : k = k * *g\Hidden : k = k * Stride : k = k * 4
+          d\WT = RT + k
+          d\Dst = rDots
+          d\Count = *g\Hidden
+          d\Stride = Stride
+          PmTensorLstmDotsNeon(@d)
+          ; The gate pre-activations, one gate at a time, over the whole
+          ; unit axis and in place over the input dots.  With no bias
+          ; tensor the first term is +0.0, which is the reference's own
+          ; `iv = 0.0` followed by `iv = iv + ...`.
+          bBase = dir * 8 * *g\Hidden
+          gate = 0
+          While gate < 4
+            b1 = 0
+            b2 = 0
+            If *g\B <> 0
+              k = gate : k = k * *g\Hidden : k = k + bBase : k = k * 4
+              b1 = *g\B + k
+              k = gate : k = k + 4 : k = k * *g\Hidden : k = k + bBase : k = k * 4
+              b2 = *g\B + k
+            EndIf
+            k = gate : k = k * Stride : k = k * 4
+            PmTensorLstmGateSumNeon(b1, b2, wDots + k, rDots + k, wDots + k, *g\Hidden)
+            gate = gate + 1
+          Wend
+          ; The activations: i, o and f through the sigmoid, c through the
+          ; tanh, each four units at a time.
+          k = 0
+          PmTensorSigmoidFp32Neon(wDots + k, wDots + k, *g\Hidden)
+          k = Stride : k = k * 4
+          PmTensorSigmoidFp32Neon(wDots + k, wDots + k, *g\Hidden)
+          k = 2 : k = k * Stride : k = k * 4
+          PmTensorSigmoidFp32Neon(wDots + k, wDots + k, *g\Hidden)
+          k = 3 : k = k * Stride : k = k * 4
+          PmTensorTanhFp32Neon(wDots + k, wDots + k, *g\Hidden)
+          ; The cell, then the output.  Tanh(newC) is written straight into
+          ; Y and multiplied there by the output gate, so the timestep
+          ; needs no scratch of its own.
+          stateIndex = (dir * *g\Batch + bn) * *g\Hidden
+          yIndex = ((t * *g\Directions + dir) * *g\Batch + bn) * *g\Hidden
+          k = stateIndex : k = k * 4
+          cPointer = *g\YC + k
+          hPointer = *g\YH + k
+          k = yIndex : k = k * 4
+          yPointer = *g\Y + k
+          k = 2 : k = k * Stride : k = k * 4
+          j = 3 : j = j * Stride : j = j * 4
+          PmTensorLstmCellNeon(wDots + k, wDots, wDots + j, cPointer, *g\Hidden)
+          PmTensorTanhFp32Neon(cPointer, yPointer, *g\Hidden)
+          k = Stride : k = k * 4
+          PmTensorLstmOutNeon(wDots + k, yPointer, *g\Hidden)
+          ; Copy the completed timestep only after all recurrent reads used H(t-1).
+          PmTensorLstmCarryNeon(yPointer, hPointer, *g\Hidden)
+        EndIf
+        bn = bn + 1
+      Wend
+      step = step + 1
+    Wend
+    dir = dir + 1
+  Wend
+EndProcedure
+CompilerEndIf
+
+; ======================================================================
+; Square root and arctangent, four lanes at a time.  Appended 2026-09-15.
+; ----------------------------------------------------------------------
+; NUMERICAL CONTRACT - both kernels ARE bit-identical to the scalar
+; reference, and they are allowed to claim that because they run the
+; SAME ALGORITHM rather than a vector approximation of it.
+;
+; Neither Sqr() nor MathATan() in runtime/math/math_a64.pmi is a hardware
+; instruction.  Both are built out of MathFAddB, MathFMulB and MathFDivB -
+; the correctly-rounded binary32 core, evaluated in INTEGER arithmetic -
+; so one element of either costs thousands of instructions, and three of
+; those in Sqr() are software DIVISIONS.  That is why a square root over
+; a quarter of a million elements is a second and a half of a Kokoro
+; request, and an arctangent over the same elements is two seconds.
+;
+; A correctly-rounded binary32 operation is exactly what FADD, FMUL,
+; FSUB and FDIV compute per lane under FPCR = 0, which EnableFloatingPoint
+; establishes: nearest-even, gradual underflow, default-NaN DISABLED.  So
+; for every input these kernels ADMIT, each source statement of the scalar
+; has one vector instruction that produces its bits, and the whole
+; sequence is the scalar's sequence.  Nothing is reassociated, nothing is
+; contracted into an FMLA, and no polynomial is substituted.
+;
+; WHAT IS NOT ADMITTED, and why it is a REFUSAL rather than a select.
+; The two scalar bodies decide their specials with early returns that
+; carry bits a vector instruction does not: Sqr() answers a NaN with the
+; NaN ITSELF, payload and all, a negative with the canonical $7FC00000,
+; and -0.0 with -0.0; MathFAddB and MathFDivB canonicalise every NaN they
+; produce where FADD and FDIV propagate an operand's payload.  Rather
+; than rebuild those rails out of comparisons and risk one of them being
+; subtly the other function, each kernel admits only the case its
+; instructions are exactly right for - a POSITIVE NORMAL magnitude - and
+; STOPS at the first block of four that contains anything else, reporting
+; how many elements it wrote through an out pointer.  The entry point
+; then finishes that whole block of four through the reference kernel
+; ITSELF and re-enters on the next four-element boundary, so every vector
+; access keeps the alignment it started with and the answer for those
+; values is not close to the scalar's: it IS the scalar's.  This is the
+; pattern PmTensorSigmoidFp32Neon established above.
+;
+; The admission is ONE unsigned interval test on the bit pattern, which
+; is what makes it cheap enough to do per block:
+;
+;     $00800000 <= bits < $7F800000
+;
+; read UNSIGNED, that interval is exactly the positive normals - a
+; negative value has bit 31 set and compares ABOVE $7F800000, both zeros
+; and every subnormal compare below $00800000, and both infinities and
+; every NaN compare at or above $7F800000.  Sqrt tests the value itself,
+; because a negative one has its own answer; ATan tests the MAGNITUDE,
+; because MathATan folds the sign away first and its polynomial does not
+; care which side of zero the argument came from.
+; ----------------------------------------------------------------------
+; Sqr(x) - math_a64.pmi:1382.  For a positive normal x its body is
+;
+;     y = MathFromBits((MathBitsOf(x) >> 1) + 532487669)
+;     q = MathFDiv(x, y) : y = MathFMul(MathFAdd(y, q), 0.5)      x3
+;     ProcedureReturn MathFMul(y, 1.0)
+;
+; USHR by one and ADD carry the seed exactly - it is integer arithmetic on
+; a value below 2^31 - and the three Newton steps are FDIV, FADD, FMUL in
+; that order.  The trailing multiply by the scale is omitted: for a
+; positive normal x every intermediate is normal, because x >= 2^-126
+; makes its square root at least 2^-63, so y * 1.0 is y bit for bit.  The
+; subnormal rescale the scalar carries is unreachable here, because a
+; subnormal is not admitted.
+Procedure PmTensorSqrtFp32NeonRun(*src.i, *dst.i, count.i, *done.i)
+  ASM
+    ; x0=src x1=dst x2=count x3=done
+    movz x8, #0
+    cmp  x2, #4
+    b.lt pmoSqrtRunEnd
+
+    adrp x9, pmosqrtnormal
+    add  x9, x9, #:lo12:pmosqrtnormal
+    ld1  { v16.4s }, [x9]
+    adrp x9, pmosqrtinfinity
+    add  x9, x9, #:lo12:pmosqrtinfinity
+    ld1  { v17.4s }, [x9]
+    adrp x9, pmosqrtseed
+    add  x9, x9, #:lo12:pmosqrtseed
+    ld1  { v18.4s }, [x9]
+    adrp x9, pmosqrthalf
+    add  x9, x9, #:lo12:pmosqrthalf
+    ld1  { v19.4s }, [x9]
+
+pmoSqrtRunBlock:
+    ld1  { v0.4s }, [x0]
+pmoSqrtRunAdmitLow:
+    cmhs v1.4s, v0.4s, v16.4s
+pmoSqrtRunAdmitHigh:
+    cmhi v2.4s, v17.4s, v0.4s
+    and  v1.16b, v1.16b, v2.16b
+    uminv s1, v1.4s
+    fmov w10, s1
+    add  w10, w10, #1
+    cbnz w10, pmoSqrtRunEnd
+
+pmoSqrtRunSeedShift:
+    ushr v2.4s, v0.4s, #1
+pmoSqrtRunSeedAdd:
+    add  v2.4s, v2.4s, v18.4s
+
+pmoSqrtRunDivide1:
+    fdiv v3.4s, v0.4s, v2.4s
+    fadd v2.4s, v2.4s, v3.4s
+pmoSqrtRunHalve1:
+    fmul v2.4s, v2.4s, v19.4s
+pmoSqrtRunDivide2:
+    fdiv v3.4s, v0.4s, v2.4s
+    fadd v2.4s, v2.4s, v3.4s
+    fmul v2.4s, v2.4s, v19.4s
+pmoSqrtRunDivide3:
+    fdiv v3.4s, v0.4s, v2.4s
+pmoSqrtRunAdd3:
+    fadd v2.4s, v2.4s, v3.4s
+    fmul v2.4s, v2.4s, v19.4s
+pmoSqrtRunStore:
+    st1  { v2.4s }, [x1]
+
+    add  x0, x0, #16
+    add  x1, x1, #16
+    add  x8, x8, #4
+    sub  x2, x2, #4
+    cmp  x2, #4
+    b.ge pmoSqrtRunBlock
+pmoSqrtRunEnd:
+    str  x8, [x3]
+  EndASM
+EndProcedure
+
+; MathATan(t) - math_a64.pmi:1988.  For a normal t its body is
+;
+;     a = |t|                     MathFSub(0.0, a) on a normal is the sign
+;                                 bit cleared, so AND gives the same bits
+;     a > 2.4142135  -> z = -1.0 / a          y0 = pi/2
+;     a > 0.4142136  -> z = (a-1)/(a+1)       y0 = pi/4
+;     otherwise      -> z = a                 y0 = 0.0
+;     w = z*z
+;     p = c0 : p = p*w + c1 : p = p*w + c2 : p = p*w + c3
+;     v = y0 + (z + z*(p*w))
+;     t < 0          -> 0.0 - v
+;
+; Both folded forms are computed for every lane and the branch is a
+; SELECT, because a lane split costs more than a divide: for a positive
+; normal a, both -1.0/a and (a-1)/(a+1) are defined and finite - a+1
+; cannot overflow, and -1.0/a underflowing to a subnormal is correctly
+; rounded by FDIV exactly as MathFDivB rounds it - so the arm that is not
+; taken cannot produce anything the taken arm has to be protected from.
+;
+; The final negation is written as FSUB against a zero vector and not as
+; FNEG, for the reason the sigmoid's argument select gives: the scalar
+; takes the SUBTRACTION, and 0.0 - v and -v differ on a zero operand.
+Procedure PmTensorAtanFp32NeonRun(*src.i, *dst.i, count.i, *done.i)
+  ASM
+    ; x0=src x1=dst x2=count x3=done
+    movz x8, #0
+    cmp  x2, #4
+    b.lt pmoAtanRunEnd
+
+    adrp x9, pmoatanabs
+    add  x9, x9, #:lo12:pmoatanabs
+    ld1  { v16.4s }, [x9]
+    adrp x9, pmoatannormal
+    add  x9, x9, #:lo12:pmoatannormal
+    ld1  { v17.4s }, [x9]
+    adrp x9, pmoataninfinity
+    add  x9, x9, #:lo12:pmoataninfinity
+    ld1  { v18.4s }, [x9]
+    adrp x9, pmoatanhigh
+    add  x9, x9, #:lo12:pmoatanhigh
+    ld1  { v19.4s }, [x9]
+    adrp x9, pmoatanlow
+    add  x9, x9, #:lo12:pmoatanlow
+    ld1  { v20.4s }, [x9]
+    adrp x9, pmoatanone
+    add  x9, x9, #:lo12:pmoatanone
+    ld1  { v21.4s }, [x9]
+    adrp x9, pmoatanhalfpi
+    add  x9, x9, #:lo12:pmoatanhalfpi
+    ld1  { v22.4s }, [x9]
+    adrp x9, pmoatanquarterpi
+    add  x9, x9, #:lo12:pmoatanquarterpi
+    ld1  { v23.4s }, [x9]
+    adrp x9, pmoatanc0
+    add  x9, x9, #:lo12:pmoatanc0
+    ld1  { v24.4s }, [x9]
+    adrp x9, pmoatanc1
+    add  x9, x9, #:lo12:pmoatanc1
+    ld1  { v25.4s }, [x9]
+    adrp x9, pmoatanc2
+    add  x9, x9, #:lo12:pmoatanc2
+    ld1  { v26.4s }, [x9]
+    adrp x9, pmoatanc3
+    add  x9, x9, #:lo12:pmoatanc3
+    ld1  { v27.4s }, [x9]
+
+pmoAtanRunBlock:
+    ld1  { v0.4s }, [x0]
+pmoAtanRunFold:
+    and  v1.16b, v0.16b, v16.16b
+pmoAtanRunAdmitLow:
+    cmhs v2.4s, v1.4s, v17.4s
+pmoAtanRunAdmitHigh:
+    cmhi v3.4s, v18.4s, v1.4s
+    and  v2.16b, v2.16b, v3.16b
+    uminv s2, v2.4s
+    fmov w10, s2
+    add  w10, w10, #1
+    cbnz w10, pmoAtanRunEnd
+
+pmoAtanRunHighTest:
+    fcmgt v2.4s, v1.4s, v19.4s
+pmoAtanRunLowTest:
+    fcmgt v3.4s, v1.4s, v20.4s
+
+pmoAtanRunReciprocal:
+    fneg v4.4s, v21.4s
+    fdiv v4.4s, v4.4s, v1.4s
+pmoAtanRunRatioNumerator:
+    fsub v5.4s, v1.4s, v21.4s
+pmoAtanRunRatioDenominator:
+    fadd v6.4s, v1.4s, v21.4s
+pmoAtanRunRatio:
+    fdiv v5.4s, v5.4s, v6.4s
+
+pmoAtanRunSelectLow:
+    mov  v6.16b, v3.16b
+    bsl  v6.16b, v5.16b, v1.16b
+pmoAtanRunSelectHigh:
+    mov  v7.16b, v2.16b
+    bsl  v7.16b, v4.16b, v6.16b
+
+    movi v5.4s, #0
+pmoAtanRunOffsetLow:
+    mov  v6.16b, v3.16b
+    bsl  v6.16b, v23.16b, v5.16b
+pmoAtanRunOffsetHigh:
+    mov  v4.16b, v2.16b
+    bsl  v4.16b, v22.16b, v6.16b
+
+pmoAtanRunSquare:
+    fmul v5.4s, v7.4s, v7.4s
+    mov  v6.16b, v24.16b
+    fmul v6.4s, v6.4s, v5.4s
+pmoAtanRunPoly1:
+    fadd v6.4s, v6.4s, v25.4s
+    fmul v6.4s, v6.4s, v5.4s
+pmoAtanRunPoly2:
+    fadd v6.4s, v6.4s, v26.4s
+    fmul v6.4s, v6.4s, v5.4s
+pmoAtanRunPoly3:
+    fadd v6.4s, v6.4s, v27.4s
+pmoAtanRunTailProduct:
+    fmul v6.4s, v6.4s, v5.4s
+pmoAtanRunTailScale:
+    fmul v6.4s, v7.4s, v6.4s
+pmoAtanRunTailAdd:
+    fadd v6.4s, v7.4s, v6.4s
+pmoAtanRunOffsetAdd:
+    fadd v6.4s, v4.4s, v6.4s
+
+    movi v5.4s, #0
+pmoAtanRunNegate:
+    fsub v3.4s, v5.4s, v6.4s
+pmoAtanRunSignTest:
+    cmlt v2.4s, v0.4s, #0
+    bsl  v2.16b, v3.16b, v6.16b
+pmoAtanRunStore:
+    st1  { v2.4s }, [x1]
+
+    add  x0, x0, #16
+    add  x1, x1, #16
+    add  x8, x8, #4
+    sub  x2, x2, #4
+    cmp  x2, #4
+    b.ge pmoAtanRunBlock
+pmoAtanRunEnd:
+    str  x8, [x3]
+  EndASM
+EndProcedure
+
+; The two entry points.  A block the kernel stopped on is finished by the
+; REFERENCE KERNEL ITSELF over those four elements - PmTensorUnaryMath
+; with op 2 is the definition of this square root, and PmTensorTrig with
+; op 2 the definition of this arctangent - so the refused values are not
+; approximated by anything, and no second copy of either special-case
+; ladder exists to drift away from the first.  The next kernel entry is
+; still on a four-element boundary, and the trailing one, two or three
+; elements go the same way.
+Procedure PmTensorSqrtFp32Neon(*src.i, *dst.i, count.i)
+  Protected i.i=0
+  Protected done.i=0
+  While i+4<=count
+    done=0
+    PmTensorSqrtFp32NeonRun(*src+i*4,*dst+i*4,count-i,@done)
+    i=i+done
+    If i+4<=count
+      PmTensorUnaryMath(*src+i*4,*dst+i*4,4,2)
+      i=i+4
+    EndIf
+  Wend
+  If i<count
+    PmTensorUnaryMath(*src+i*4,*dst+i*4,count-i,2)
+  EndIf
+EndProcedure
+
+Procedure PmTensorAtanFp32Neon(*src.i, *dst.i, count.i)
+  Protected i.i=0
+  Protected done.i=0
+  While i+4<=count
+    done=0
+    PmTensorAtanFp32NeonRun(*src+i*4,*dst+i*4,count-i,@done)
+    i=i+done
+    If i+4<=count
+      PmTensorTrig(*src+i*4,*dst+i*4,4,2)
+      i=i+4
+    EndIf
+  Wend
+  If i<count
+    PmTensorTrig(*src+i*4,*dst+i*4,count-i,2)
+  EndIf
+EndProcedure
+
+; Every constant here is the binary32 value of the literal the scalar
+; carries, and the owning gate reads both out of the compiled image and
+; compares them rather than trusting this table.
+DataSection
+  pmoSqrtNormal:
+  Data.l $00800000,$00800000,$00800000,$00800000
+  pmoSqrtInfinity:
+  Data.l $7F800000,$7F800000,$7F800000,$7F800000
+  pmoSqrtSeed:
+  Data.l $1FBD1DF5,$1FBD1DF5,$1FBD1DF5,$1FBD1DF5
+  pmoSqrtHalf:
+  Data.l $3F000000,$3F000000,$3F000000,$3F000000
+  pmoAtanAbs:
+  Data.l $7FFFFFFF,$7FFFFFFF,$7FFFFFFF,$7FFFFFFF
+  pmoAtanNormal:
+  Data.l $00800000,$00800000,$00800000,$00800000
+  pmoAtanInfinity:
+  Data.l $7F800000,$7F800000,$7F800000,$7F800000
+  pmoAtanHigh:
+  Data.l $401A827A,$401A827A,$401A827A,$401A827A
+  pmoAtanLow:
+  Data.l $3ED413CD,$3ED413CD,$3ED413CD,$3ED413CD
+  pmoAtanOne:
+  Data.l $3F800000,$3F800000,$3F800000,$3F800000
+  pmoAtanHalfPi:
+  Data.l $3FC90FDB,$3FC90FDB,$3FC90FDB,$3FC90FDB
+  pmoAtanQuarterPi:
+  Data.l $3F490FDB,$3F490FDB,$3F490FDB,$3F490FDB
+  pmoAtanC0:
+  Data.l $3DA4F0D1,$3DA4F0D1,$3DA4F0D1,$3DA4F0D1
+  pmoAtanC1:
+  Data.l $BE0E1B85,$BE0E1B85,$BE0E1B85,$BE0E1B85
+  pmoAtanC2:
+  Data.l $3E4C925F,$3E4C925F,$3E4C925F,$3E4C925F
+  pmoAtanC3:
+  Data.l $BEAAAA2A,$BEAAAA2A,$BEAAAA2A,$BEAAAA2A
+EndDataSection
+
+; ======================================================================
+; The exact MatMul with its B column block PACKED.  Appended 2026-09-15.
+; ----------------------------------------------------------------------
+; NOTHING ABOUT THE ARITHMETIC MOVES.  PmTensorMatMul2ExactFourBySixteen
+; reads sixteen adjacent B values per inner index and adds them into
+; sixteen accumulators; this copies those same sixteen values into a
+; contiguous buffer FIRST and points the tile at the copy.  A copy of a
+; binary32 word is that word, the tile sees the same operands in the same
+; order, and every output keeps the reference's strictly increasing inner
+; index with separate FMUL and FADD from +0.0.  What changes is where the
+; bytes are read from, and nothing else.
+;
+; WHY, measured on the board rather than reasoned.  From the V5 node ticks
+; (request 2), the three hot MatMul shapes run at
+;
+;     m 69, k 768,  n 2048   12 nodes   3.252 s   2.50 ns/MAC
+;     m 69, k 2048, n 768    12 nodes   1.203 s   0.92 ns/MAC
+;     m 69, k 768,  n 768    48 nodes   1.454 s   0.74 ns/MAC
+;
+; The first two do exactly the same number of multiply-accumulates through
+; exactly the same body and the first is 2.7x slower, so the cost is not
+; arithmetic - it is the ROW STRIDE.  The tile walks B down the reduction
+; with a stride of n*4 bytes, and at n = 2048 that is 8192, a power of two
+; equal to half an L1 way on this part: every load in the reduction lands
+; in one of two sets and evicts the line the next row-block will want.  At
+; n = 768 the stride is 3072, which is not a power of two and spreads.
+;
+; With the block packed, the reduction reads 64 contiguous bytes per step
+; out of a k*64 byte buffer - 48 KB at the model's k, which stays in L1/L2
+; for the whole column block - and B itself is read exactly ONCE per node
+; instead of once per row block.  The loop order is inverted for the same
+; reason: the column block is outermost so one pack serves every row.
+;
+; The caller owns the buffer because this file must not touch the arena;
+; PmFastGemm takes it, exactly as PmFastLstm takes its transposed weights.
+; A caller with no buffer still has PmTensorMatMul2ExactNeon above, whose
+; answer is the same bits.
+Procedure PmTensorMatMul2ExactPackColumns(*b.i, *pack.i, count.i, bRowBytes.i)
+  ASM
+    ; x0=b x1=pack x2=count x3=bRowBytes
+    cmp  x2, #1
+    b.lt pmoMatMulPackEnd
+pmoMatMulPackLoop:
+pmoMatMulPackLoad:
+    ld1  {v0.4s-v3.4s}, [x0]
+pmoMatMulPackStore:
+    st1  {v0.4s-v3.4s}, [x1]
+    add  x1, x1, #64
+    add  x0, x0, x3
+    subs x2, x2, #1
+    b.ne pmoMatMulPackLoop
+pmoMatMulPackEnd:
+  EndASM
+EndProcedure
+
+Procedure PmTensorMatMul2ExactPackedNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i, *pack.i)
+  Protected row.i
+  Protected col.i
+  Protected packRowBlock.i
+  Protected packColBlock.i
+  Protected t.PmTensorMatMul2ExactArgs
+  If *a=0 Or *b=0 Or *dst=0 Or *pack=0 Or m<1 Or n<1
+    ProcedureReturn
+  EndIf
+  ; The two block widths are named here for the same reason the unpacked
+  ; driver names its own: a control build narrows either one and proves the
+  ; bodies that are left still produce the reference's bits on their own.
+  packRowBlock=4
+  packColBlock=16
+  t\Count=k
+  t\ARowBytes=k*4
+  t\DstRowBytes=n*4
+  col=0
+  While packColBlock>=16 And n-col>=16
+    PmTensorMatMul2ExactPackColumns(*b+col*4,*pack,k,n*4)
+    t\B=*pack
+    t\BRowBytes=64
+    row=0
+    While row<m
+      t\A=*a+row*k*4
+      t\Dst=*dst+(row*n+col)*4
+      If packRowBlock>=4 And m-row>=4
+        PmTensorMatMul2ExactFourBySixteen(@t)
+        row+4
+      Else
+        PmTensorMatMul2ExactOneBySixteen(@t)
+        row+1
+      EndIf
+    Wend
+    col+16
+  Wend
+  ; The last fewer-than-sixteen columns are not worth a pack of their own and
+  ; go through the same one-by-one body the unpacked driver uses for them.
+  t\BRowBytes=n*4
+  While col<n
+    row=0
+    While row<m
+      t\A=*a+row*k*4
+      t\B=*b+col*4
+      t\Dst=*dst+(row*n+col)*4
+      PmTensorMatMul2ExactOneByOne(@t)
+      row+1
+    Wend
+    col+1
+  Wend
+EndProcedure
+
+; ======================================================================
+; The STFT's radix-2 butterflies, four at a time.  Appended 2026-09-15.
+; ----------------------------------------------------------------------
+; NUMERICAL CONTRACT - bit-identical to PmTensorStftFft.  Every butterfly
+; below is the reference's own four expressions
+;
+;     firstR  = evenR + (rootR*oddR - rootI*oddI)
+;     firstI  = evenI + (rootR*oddI + rootI*oddR)
+;     secondR = evenR + (root2R*oddR - root2I*oddI)
+;     secondI = evenI + (root2R*oddI + root2I*oddR)
+;
+; with the same separate FMUL, FSUB and FADD in the same order, one lane
+; per butterfly.  Nothing is reassociated and nothing is fused.
+;
+; WHY THE LANES MAY BE INDEPENDENT.  Inside one stage the butterflies
+; PARTITION the array: for a fixed span, (k + j) and (k + j + midpoint)
+; over k in 0..midpoint-1 and j in multiples of span name every index
+; exactly once.  So no butterfly of a stage reads a value another
+; butterfly of the same stage writes, and the order the stage visits them
+; in cannot change an answer.  The gate proves that by running both
+; drivers rather than by reading this comment.
+;
+; WHAT IS VECTORISED IS THE k AXIS, for a fixed j.  Four consecutive k put
+; evenIndex = k+j and oddIndex = k+j+midpoint each in four adjacent words,
+; which is one 16-byte load apiece.  The two roots depend on k alone - the
+; reference recomputes PmTensorStftBitReverse(k) and
+; PmTensorStftBitReverse(midpoint+k) inside the k loop, for every stage of
+; every FFT of every frame - so the driver builds them ONCE per STFT call,
+; contiguous in k, and the kernel reads them straight.  A stage whose
+; midpoint is one or two has no four adjacent k and stays scalar in the
+; driver, at direct pointers rather than through the tensor accessors.
+;
+; ALIGNMENT: the entry is used only when midpoint is at least four, so j
+; is a multiple of span >= 8 and k of four; (k+j)*4 and midpoint*4 are
+; therefore multiples of sixteen by construction.  With the MMU off this
+; part's memory is Device and an unaligned wide access is a silent
+; runaway, so that is a correctness property and not a tuning one.
+CompilerIf #PMO_USE_STFT = 1
+Structure PmTensorStftButterflyArgs
+  EvenR.i                            ; dstR + j * 4
+  EvenI.i                            ; dstI + j * 4
+  OddBytes.i                         ; midpoint * 4
+  RootAR.i                           ; the first root's real part, at k = 0
+  RootAI.i
+  RootBR.i                           ; the second root's real part, at k = 0
+  RootBI.i
+  Blocks.i                           ; how many groups of four k
+EndStructure
+
+Procedure PmTensorStftButterflyNeon(*t.PmTensorStftButterflyArgs)
+  ASM
+    ldr  x1, [x0, #0]                ; evenR cursor
+    ldr  x2, [x0, #8]                ; evenI cursor
+    ldr  x3, [x0, #16]               ; bytes from even to odd
+    ldr  x4, [x0, #24]               ; first root, real
+    ldr  x5, [x0, #32]               ; first root, imaginary
+    ldr  x6, [x0, #40]               ; second root, real
+    ldr  x7, [x0, #48]               ; second root, imaginary
+    ldr  x8, [x0, #56]               ; blocks of four
+    cmp  x8, #1
+    b.lt pmoStftButterflyEnd
+pmoStftButterflyLoop:
+pmoStftButterflyLoadEven:
+    ld1  { v0.4s }, [x1]
+    ld1  { v1.4s }, [x2]
+    add  x9, x1, x3
+    add  x10, x2, x3
+pmoStftButterflyLoadOdd:
+    ld1  { v2.4s }, [x9]
+    ld1  { v3.4s }, [x10]
+pmoStftButterflyLoadRootA:
+    ld1  { v4.4s }, [x4]
+    ld1  { v5.4s }, [x5]
+pmoStftButterflyFirstRealProduct:
+    fmul v6.4s, v4.4s, v2.4s
+    fmul v7.4s, v5.4s, v3.4s
+pmoStftButterflyFirstRealSub:
+    fsub v6.4s, v6.4s, v7.4s
+pmoStftButterflyFirstRealAdd:
+    fadd v16.4s, v0.4s, v6.4s
+pmoStftButterflyFirstImagProduct:
+    fmul v6.4s, v4.4s, v3.4s
+    fmul v7.4s, v5.4s, v2.4s
+pmoStftButterflyFirstImagAdd:
+    fadd v6.4s, v6.4s, v7.4s
+    fadd v17.4s, v1.4s, v6.4s
+pmoStftButterflyLoadRootB:
+    ld1  { v4.4s }, [x6]
+    ld1  { v5.4s }, [x7]
+pmoStftButterflySecondRealProduct:
+    fmul v6.4s, v4.4s, v2.4s
+    fmul v7.4s, v5.4s, v3.4s
+pmoStftButterflySecondRealSub:
+    fsub v6.4s, v6.4s, v7.4s
+pmoStftButterflySecondRealAdd:
+    fadd v18.4s, v0.4s, v6.4s
+pmoStftButterflySecondImagProduct:
+    fmul v6.4s, v4.4s, v3.4s
+    fmul v7.4s, v5.4s, v2.4s
+pmoStftButterflySecondImagAdd:
+    fadd v6.4s, v6.4s, v7.4s
+    fadd v19.4s, v1.4s, v6.4s
+pmoStftButterflyStoreEven:
+    st1  { v16.4s }, [x1]
+    st1  { v17.4s }, [x2]
+pmoStftButterflyStoreOdd:
+    st1  { v18.4s }, [x9]
+    st1  { v19.4s }, [x10]
+    add  x1, x1, #16
+    add  x2, x2, #16
+    add  x4, x4, #16
+    add  x5, x5, #16
+    add  x6, x6, #16
+    add  x7, x7, #16
+    subs x8, x8, #1
+    b.ne pmoStftButterflyLoop
+pmoStftButterflyEnd:
+  EndASM
+EndProcedure
+
+; The per-stage root tables, built once per STFT call.  Stage s (span 2^s)
+; holds four arrays of `midpoint` floats - the first root's real and
+; imaginary parts at every k, then the second root's - and each array is
+; padded to a multiple of four floats so that every vector load in the
+; kernel above is sixteen-byte aligned whatever the stage.  The values are
+; exactly the ones the reference indexes:
+;
+;     rootAR[k] = rootsR[PmTensorStftBitReverse(k, stageBits)]
+;     rootBR[k] = rootsR[PmTensorStftBitReverse(midpoint + k, stageBits)]
+;
+; so this is a GATHER of the reference's own table and not a second way of
+; computing a root.  Words are moved as words, so a NaN or a signed zero in
+; the table arrives unchanged.
+Procedure.i PmTensorStftRootWords(count.i)
+  Protected span.i = 2
+  Protected total.i = 0
+  While span <= count
+    total = total + 4 * (((span >> 1) + 3) & -4)
+    span = span << 1
+  Wend
+  ProcedureReturn total
+EndProcedure
+
+Procedure PmTensorStftBuildRoots(*rootsR.i, *rootsI.i, *table.i, count.i)
+  Protected span.i = 2
+  Protected midpoint.i = 0
+  Protected stageBits.i = 0
+  Protected stride.i = 0
+  Protected k.i = 0
+  Protected cursor.i = *table
+  Protected first.i = 0
+  Protected second.i = 0
+  While span <= count
+    midpoint = span >> 1
+    stageBits = stageBits + 1
+    stride = (midpoint + 3) & -4
+    k = 0
+    While k < midpoint
+      first = PmTensorStftBitReverse(k, stageBits)
+      second = PmTensorStftBitReverse(midpoint + k, stageBits)
+      PokeL(cursor + k * 4, PeekL(*rootsR + first * 4))
+      PokeL(cursor + (stride + k) * 4, PeekL(*rootsI + first * 4))
+      PokeL(cursor + (2 * stride + k) * 4, PeekL(*rootsR + second * 4))
+      PokeL(cursor + (3 * stride + k) * 4, PeekL(*rootsI + second * 4))
+      k = k + 1
+    Wend
+    cursor = cursor + 4 * stride * 4
+    span = span << 1
+  Wend
+EndProcedure
+
+; PmTensorStftFft with the accessors taken out and the butterflies blocked.
+; The permutation, the stage walk and the inverse scaling are the
+; reference's own lines; only the way a float is reached changes, and a
+; float read through PmTensorGet is the same float read through a pointer.
+Procedure PmTensorStftFftNeon(*srcR.i, *srcI.i, *dstR.i, *dstI.i, count.i, inverse.i, *table.i)
+  Protected bits.i = 0
+  Protected span.i = 0
+  Protected midpoint.i = 0
+  Protected stride.i = 0
+  Protected i.i = 0
+  Protected k.i = 0
+  Protected j.i = 0
+  Protected reversed.i = 0
+  Protected evenIndex.i = 0
+  Protected oddIndex.i = 0
+  Protected cursor.i = *table
+  Protected evenR.f = 0.0
+  Protected evenI.f = 0.0
+  Protected oddR.f = 0.0
+  Protected oddI.f = 0.0
+  Protected rootR.f = 0.0
+  Protected rootI.f = 0.0
+  Protected firstR.f = 0.0
+  Protected firstI.f = 0.0
+  Protected secondR.f = 0.0
+  Protected secondI.f = 0.0
+  Protected scale.f = 0.0
+  Protected pa.i = 0
+  Protected pb.i = 0
+  Protected pc.i = 0
+  Protected pd.i = 0
+  Protected t.PmTensorStftButterflyArgs
+  i = count
+  While i > 1 : bits = bits + 1 : i = i >> 1 : Wend
+  i = 0
+  While i < count
+    reversed = PmTensorStftBitReverse(i, bits)
+    PokeL(*dstR + i * 4, PeekL(*srcR + reversed * 4))
+    PokeL(*dstI + i * 4, PeekL(*srcI + reversed * 4))
+    i = i + 1
+  Wend
+  span = 2
+  While span <= count
+    midpoint = span >> 1
+    stride = (midpoint + 3) & -4
+    If midpoint >= 4
+      t\OddBytes = midpoint * 4
+      t\RootAR = cursor
+      t\RootAI = cursor + stride * 4
+      t\RootBR = cursor + 2 * stride * 4
+      t\RootBI = cursor + 3 * stride * 4
+      t\Blocks = midpoint >> 2
+      j = 0
+      While j < count
+        t\EvenR = *dstR + j * 4
+        t\EvenI = *dstI + j * 4
+        PmTensorStftButterflyNeon(@t)
+        j = j + span
+      Wend
+    Else
+      k = 0
+      While k < midpoint
+        pa = cursor + k * 4
+        rootR = *pa.f
+        pa = cursor + (stride + k) * 4
+        rootI = *pa.f
+        pa = cursor + (2 * stride + k) * 4
+        secondR = *pa.f
+        pa = cursor + (3 * stride + k) * 4
+        secondI = *pa.f
+        j = 0
+        While j < count
+          evenIndex = k + j
+          oddIndex = evenIndex + midpoint
+          pa = *dstR + evenIndex * 4
+          pb = *dstI + evenIndex * 4
+          pc = *dstR + oddIndex * 4
+          pd = *dstI + oddIndex * 4
+          evenR = *pa.f
+          evenI = *pb.f
+          oddR = *pc.f
+          oddI = *pd.f
+          firstR = evenR + (rootR * oddR - rootI * oddI)
+          firstI = evenI + (rootR * oddI + rootI * oddR)
+          *pa.f = firstR
+          *pb.f = firstI
+          *pc.f = evenR + (secondR * oddR - secondI * oddI)
+          *pd.f = evenI + (secondR * oddI + secondI * oddR)
+          j = j + span
+        Wend
+        k = k + 1
+      Wend
+    EndIf
+    cursor = cursor + 4 * stride * 4
+    span = span << 1
+  Wend
+  If inverse
+    scale = count
+    i = 0
+    While i < count
+      pa = *dstR + i * 4
+      pb = *dstI + i * 4
+      *pa.f = *pa.f / scale
+      *pb.f = *pb.f / scale
+      i = i + 1
+    Wend
+  EndIf
+EndProcedure
+
+; PmTensorStft with the two per-frame transforms and the whole setup FFT
+; on the blocked path.  Everything else - the chirp, the mirror, the
+; windowing, the pointwise products and the bin extraction - is the
+; reference's own lines in the reference's order, so this driver and
+; PmTensorStft differ only in which FFT they call, and the gate runs both.
+;
+; THE CALLER MUST HAVE ADDED PmTensorStftRootWords(complexCount) WORDS to
+; the ten planes PmTensorStft uses, immediately after them.  DStft sizes
+; the block with that same function, so there is one definition of the
+; layout and not two; a kernel cannot check it, because the argument
+; structure carries a plane count and not a byte size, which is exactly
+; how ScratchComplex already works.
+Procedure.i PmTensorStftFp32Neon(*g.PmTensorStftArgs)
+  Protected bn.i
+  Protected frame.i
+  Protected bin.i
+  Protected sample.i
+  Protected signalIndex.i
+  Protected outputIndex.i
+  Protected complexCount.i
+  Protected bits.i=0
+  Protected reversed.i
+  Protected mirror.i
+  Protected *work1R.i
+  Protected *work1I.i
+  Protected *work2R.i
+  Protected *work2I.i
+  Protected *bR.i
+  Protected *bI.i
+  Protected *chirpR.i
+  Protected *chirpI.i
+  Protected *rootsR.i
+  Protected *rootsI.i
+  Protected *table.i
+  Protected value.f
+  Protected sourceR.f
+  Protected sourceI.f
+  Protected weightR.f
+  Protected weightI.f
+  Protected resultR.f
+  Protected resultI.f
+  Protected pi.f
+  Protected tau.f
+  Protected angular.f
+  Protected exponent.f
+  Protected angle.f
+  Protected complexFloat.f
+  Protected sampleFloat.f
+  Protected frameLengthFloat.f
+  If *g = 0 Or *g\Signal = 0 Or *g\Dst = 0 Or *g\Scratch = 0
+    ProcedureReturn 0
+  EndIf
+  If *g\Batches <= 0 Or *g\SignalLength < *g\FrameLength Or *g\FrameStep <= 0
+    ProcedureReturn 0
+  EndIf
+  If *g\FrameLength <= 0 Or *g\Frames <= 0 Or *g\Bins <> (*g\FrameLength >> 1) + 1
+    ProcedureReturn 0
+  EndIf
+  If *g\Frames > ((*g\SignalLength - *g\FrameLength) / *g\FrameStep) + 1
+    ProcedureReturn 0
+  EndIf
+  complexCount = 1
+  While complexCount < *g\FrameLength * 2 - 1 : complexCount = complexCount << 1 : Wend
+  If complexCount > *g\ScratchComplex : ProcedureReturn 0 : EndIf
+  *work1R = *g\Scratch
+  *work1I = *work1R + complexCount * 4
+  *work2R = *work1I + complexCount * 4
+  *work2I = *work2R + complexCount * 4
+  *bR = *work2I + complexCount * 4
+  *bI = *bR + complexCount * 4
+  *chirpR = *bI + complexCount * 4
+  *chirpI = *chirpR + complexCount * 4
+  *rootsR = *chirpI + complexCount * 4
+  *rootsI = *rootsR + complexCount * 4
+  *table = *rootsI + complexCount * 4
+
+  pi = 3.141592653589793
+  tau = 6.283185307179586
+  complexFloat = complexCount
+  frameLengthFloat = *g\FrameLength
+  angular = (tau * -1.0) / complexFloat
+  sample = complexCount
+  While sample > 1 : bits = bits + 1 : sample = sample >> 1 : Wend
+  sample = 0
+  While sample < complexCount
+    reversed = PmTensorStftBitReverse(sample, bits)
+    sampleFloat = sample
+    angle = sampleFloat * angular
+    PmTensorPut(*rootsR, reversed, Cos(angle))
+    PmTensorPut(*rootsI, reversed, Sin(angle))
+    sample = sample + 1
+  Wend
+  PmTensorStftBuildRoots(*rootsR, *rootsI, *table, complexCount)
+
+  PmTensorZero(*work1R, complexCount)
+  PmTensorZero(*work1I, complexCount)
+  PmTensorZero(*chirpR, complexCount)
+  PmTensorZero(*chirpI, complexCount)
+  sample = 0
+  While sample < *g\FrameLength
+    exponent = pi * -1.0
+    sampleFloat = sample
+    exponent = exponent * sampleFloat
+    exponent = exponent * sampleFloat
+    exponent = exponent / frameLengthFloat
+    weightR = Cos(exponent)
+    weightI = Sin(exponent)
+    PmTensorPut(*chirpR, sample, weightR)
+    PmTensorPut(*chirpI, sample, weightI)
+    PmTensorPut(*work1R, sample, weightR)
+    PmTensorPut(*work1I, sample, weightI * -1.0)
+    sample = sample + 1
+  Wend
+  sample = complexCount - *g\FrameLength + 1
+  While sample < complexCount
+    mirror = complexCount - sample
+    PmTensorPut(*work1R, sample, PmTensorGet(*work1R, mirror))
+    PmTensorPut(*work1I, sample, PmTensorGet(*work1I, mirror))
+    sample = sample + 1
+  Wend
+  PmTensorStftFftNeon(*work1R, *work1I, *bR, *bI, complexCount, 0, *table)
+
+  bn = 0
+  While bn < *g\Batches
+    frame = 0
+    While frame < *g\Frames
+      PmTensorZero(*work1R, complexCount)
+      PmTensorZero(*work1I, complexCount)
+      sample = 0
+      While sample < *g\FrameLength
+        signalIndex = bn * *g\SignalLength + frame * *g\FrameStep + sample
+        value = PmTensorGet(*g\Signal, signalIndex)
+        If *g\Window <> 0 : value = value * PmTensorGet(*g\Window, sample) : EndIf
+        weightR = PmTensorGet(*chirpR, sample)
+        weightI = PmTensorGet(*chirpI, sample)
+        PmTensorPut(*work1R, sample, value * weightR)
+        PmTensorPut(*work1I, sample, value * weightI)
+        sample = sample + 1
+      Wend
+      PmTensorStftFftNeon(*work1R, *work1I, *work2R, *work2I, complexCount, 0, *table)
+      sample = 0
+      While sample < complexCount
+        sourceR = PmTensorGet(*work2R, sample)
+        sourceI = PmTensorGet(*work2I, sample)
+        weightR = PmTensorGet(*bR, sample)
+        weightI = PmTensorGet(*bI, sample)
+        resultR = sourceR * weightR - sourceI * weightI
+        resultI = sourceR * weightI + sourceI * weightR
+        PmTensorPut(*work2R, sample, resultR)
+        PmTensorPut(*work2I, sample, resultI)
+        sample = sample + 1
+      Wend
+      PmTensorStftFftNeon(*work2R, *work2I, *work1R, *work1I, complexCount, 1, *table)
+      bin = 0
+      While bin < *g\Bins
+        mirror = bin
+        If mirror > 0 : mirror = complexCount - mirror : EndIf
+        sourceR = PmTensorGet(*work1R, mirror)
+        sourceI = PmTensorGet(*work1I, mirror)
+        weightR = PmTensorGet(*chirpR, bin)
+        weightI = PmTensorGet(*chirpI, bin)
+        resultR = sourceR * weightR - sourceI * weightI
+        resultI = sourceR * weightI + sourceI * weightR
+        outputIndex = ((bn * *g\Frames + frame) * *g\Bins + bin) * 2
+        PmTensorPut(*g\Dst, outputIndex, resultR)
+        PmTensorPut(*g\Dst, outputIndex + 1, resultI)
+        bin = bin + 1
+      Wend
+      frame = frame + 1
+    Wend
+    bn = bn + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+CompilerEndIf

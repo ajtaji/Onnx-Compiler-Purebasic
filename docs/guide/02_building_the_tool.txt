@@ -1,0 +1,173 @@
+@CHAPTER Building the tool from source
+@INTRO Two executables, one helper, and nothing to install first.
+
+@SECTION You may not need to build it
+
+The easiest way to get this compiler is the PureMetal Forge download from
+puremetalforge.ajtaji.com. It already includes the compiler, built and
+ready to run, in `PureMetalForge\tools\onnx\`:
+
+@FRAG
+PureMetalForge\tools\onnx\
+  PureMetalOnnxCompiler.exe       the window
+  PureMetalOnnxCompilerCLI.exe    the command line
+  NATIVE_COMPILER_GUIDE.txt       the user guide
+  README.md
+@ENDFRAG
+
+That is the same pair this chapter builds into `bin/`, and nothing else is
+needed to use it: no PureBasic. The two checks at the end of this chapter
+give the same output from the download's CLI. The same download is the
+PureMetal toolchain that builds the Pi 4, UNO Q, Pico and Pico 2 output.
+
+Building from source is for people changing the compiler, and for anyone
+who needs work committed to this repository after their download was
+built.
+
+@TRAP A download carries the compiler as it was when that release was
+built, and this repository moves faster than releases. The 2026-09-14
+release's executables were built on 2026-09-13. They run the chapter 3
+walkthrough, but they cannot build chapter 11's Kokoro sentence: that
+runner calls `PmOnnxAnvilEnter`, which the model source gained later, and
+the download's supplementary pronunciation pack is the older one. The
+2026-09-17 release's executables are commit `658566d`: they build the
+sentence and every asset, but its payload comes from later kernels than
+the one that ran. Chapter 11 shows exactly what differs.
+
+@SECTION What you need, and what you do not
+
+You need the host language's Windows **x64** compiler. That is the whole
+list. The tool has been built and verified with version 6.21 and its
+native assembly backend.
+
+You do not need Python, an ONNX package, an ONNX Runtime library, a model
+file, or a PureMetal Forge installation. None of those are required to
+build the generator, and none of them are required to run the arithmetic
+walkthrough in chapter 3. The complete build-source closure is in this
+checkout.
+
+@TRAP Build **x64**. The 32-bit compiler will produce an executable that
+looks fine and then behaves badly on real models, because the tool works
+in 64-bit offsets throughout. `Build.pb` refuses to compile at all under a
+32-bit compiler, and that refusal is deliberate - it is cheaper than the
+mystery.
+
+Linux and macOS hosts have not been validated. The window and the emitted
+Windows execution sources use Windows APIs directly. That is a statement
+of what has been tested, not a claim that the parser cares.
+
+@SECTION The helper
+
+Open `Build.pb` in the 64-bit IDE and run it. It finds the compiler that
+belongs to that installation, creates `bin/` if it is missing, and builds
+both entry points in order:
+
+@FRAG
+Building bin\PureMetalOnnxCompilerCLI.exe
+Building bin\PureMetalOnnxCompiler.exe
+Build complete. Open bin\PureMetalOnnxCompiler.exe.
+@ENDFRAG
+
+If either build fails, the helper prints the compiler's own output, says
+`BUILD FAILED`, names the source and the exit code, and stops. It does not
+go on to the second build and it does not leave you with one new
+executable and one stale one.
+
+@SECTION Or build the two entry points yourself
+
+The helper is a convenience, not a secret. It runs exactly these two
+commands, and so can you:
+
+@FRAG
+$pb = 'C:\Path\To\Compilers\pbcompiler.exe'
+New-Item -ItemType Directory -Force bin | Out-Null
+& $pb src/PureMetalOnnxCompiler.pb   /CONSOLE /THREAD /OPTIMIZER            /OUTPUT bin/PureMetalOnnxCompilerCLI.exe
+if ($LASTEXITCODE -ne 0) { throw 'CLI build failed' }
+& $pb src/PureMetalOnnxCompilerUI.pb          /THREAD /OPTIMIZER /DPIAWARE  /OUTPUT bin/PureMetalOnnxCompiler.exe
+if ($LASTEXITCODE -ne 0) { throw 'UI build failed' }
+@ENDFRAG
+
+In the IDE, the same thing: open each source, set the listed options, and
+use Create Executable with the matching output name.
+
+The options are not decorative. `/CONSOLE` is what makes the CLI a console
+program instead of one that opens a window. `/THREAD` is required because
+the window runs generation on a worker thread while staying responsive.
+`/OPTIMIZER` is what the verified builds use. `/DPIAWARE` keeps the window
+sharp on a scaled display.
+
+@SECTION What bin/ holds
+
+Two executables, and they are a pair.
+
+`PureMetalOnnxCompilerCLI.exe` is the engine. Everything the tool can do,
+it does here: inspecting, checking, generating, packing assets.
+
+`PureMetalOnnxCompiler.exe` is the window. You pick a model, an output
+prefix, a target and a precision, and press the button. It then launches
+the CLI sitting beside it and shows you what the CLI said.
+
+@TRAP Keep the two together. The window locates the CLI as its sibling in
+the same directory. Copy one of them somewhere on its own and the window
+will have nothing to run. It is not hiding a second copy of the compiler
+inside itself - there is only one implementation, and the window is a
+client of it.
+
+@NOTE `bin/` is not tracked by this repository, and neither is anything
+you generate into `output/`. The repository holds source and
+documentation. Your build is yours.
+
+@SECTION Check that it worked
+
+Two commands, and neither needs a model:
+
+@FRAG
+> .\bin\PureMetalOnnxCompilerCLI.exe --self-test
+PASS: bounded protobuf wire reader, native ONNX model inventory and PMG2P dictionary core
+
+> .\bin\PureMetalOnnxCompilerCLI.exe --list-targets
+windows Windows (native x64)
+pi4     Raspberry Pi 4 (PureMetal AArch64)
+unoq    Arduino UNO Q (PureMetal AArch64 UEFI)
+pico    Raspberry Pi Pico (RP2040 Cortex-M0+)
+pico2   Raspberry Pi Pico 2 (RP2350 Cortex-M33)
+@ENDFRAG
+
+`--self-test` exercises the bounded protobuf reader, the model inventory
+and the pronunciation-pack core against built-in cases. It is a sanity
+check on the build you just made, not a proof that every graph compiles.
+Chapter 8 is about what the real proofs are and where they live.
+
+`--help` prints the complete command list. It is the authority on flag
+spelling, and this book quotes it rather than paraphrasing it.
+
+@SECTION Why the runtime folder has to be there
+
+`runtime/` looks like it belongs to generated programs, and it does - but
+the generator needs it at ITS build time, not just at generation time.
+
+The emitters embed the runtime files into the tool with an
+include-the-file-as-bytes instruction, and the reduced-weight decoder and
+the shared speech sources are included as source outright. So a checkout
+missing `runtime/` does not produce a tool that generates broken models.
+It produces a tool that will not build.
+
+@TRAP Two consequences catch people, and they are the same fact twice.
+**Change a runtime file and you must rebuild the generator** before the
+change can reach anything. And **an already-generated application does not
+update itself**: its runtime was copied out beside it at generation time.
+To pick up a runtime change, regenerate the model's source closure and
+build the application again. Mixing an old generated runtime with a newly
+generated model source is how you get a mismatch nobody can see.
+
+@SECTION The private release hook, in one paragraph
+
+If you are maintaining a product that ships these executables, an ignored
+`build.local.ini` can name a PowerShell script, and `Build.pb` will hand
+the build to it with the source root and the compiler path. That script
+owns signing and installation into wherever the product keeps its
+binaries. Without that file - which is the normal case, and the one this
+book assumes - `Build.pb` just builds into `bin/` as above. The details
+are in the build reference page; the important part is that this is a
+developer hook for building THE TOOL, and it changes nothing about model
+generation.

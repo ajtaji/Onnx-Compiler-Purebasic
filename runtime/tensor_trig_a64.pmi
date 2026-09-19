@@ -1,0 +1,334 @@
+; AArch64 FP32 Sin/Cos tensor kernel.
+;
+; Four finite inputs at a time are reduced in binary64, then evaluated by
+; the same unfused binary32 Horner polynomials as MathSinCos.  A whole
+; remaining suffix falls back to PmTensorTrig if it contains an unsupported
+; operation, a value outside the accepted range, or a quotient landing within
+; 2^-28 of an exact half-integer.  The fallback therefore retains the full
+; finite-input Payne-Hanek range and the exact NaN, infinity, signed-zero and
+; tail behaviour of the portable path.
+;
+; The half-integer guard is NOT what makes the quadrant safe, and should not
+; be read that way.  Either choice of nearest integer is a correct reduction:
+; the one that loses is the one whose r leaves the polynomial's range, and at
+; a half-integer quotient |r| is pi/4, which is exactly in range.  What makes
+; the kernel safe is the magnitude bound below.  The guard is kept because it
+; costs one compare and removes the only place FRINTN's tie rule and
+; MathNearestInt's could be made to argue.
+;
+; ---------------------------------------------------------------------
+; NUMERICAL CONTRACT - what this kernel promises against Sin()/Cos() in
+; runtime/math/math_a64.pmi, which remain the definition of the answer.
+;
+; This is NOT a bit-identical kernel and does not claim to be.  Above
+; |x| = 12867 the scalar switches to MathTrigReduceLarge (264-bit
+; Payne-Hanek); this kernel instead reduces every accepted argument in
+; binary64 against a two-piece pi/2.  The two reductions land on
+; different representable r, so the two results differ in the last bits.
+;
+; The accepted range is bounded at |x| <= 2^20 for a provable reason, not
+; a measured one.  n*PiO2Hi is the only rounded product in the reduction,
+; so the absolute error of r is at most ulp(x)/2 in binary64, which is
+; 2^-33 = 1.164e-10 at |x| = 2^20 and smaller below it.  Sin's own
+; documented behaviour near a multiple of pi is an ABSOLUTE error of
+; about 1.4e-10 with the ULP count declared meaningless (math_a64.pmi,
+; the Sin() header).  2^-33 therefore keeps this kernel inside the
+; contract the scalar already publishes.  Anything larger goes to the
+; scalar, where Payne-Hanek keeps full relative precision.
+;
+; Measured against the compiled scalar on both captured Kokoro node-1532
+; corpora (615600 and 918000 values, 96-97% of them past the scalar's
+; Payne-Hanek boundary):
+;
+;   |result| >= 2^-10   at most 2 ULP from the scalar
+;   |result| <  2^-10   at most 1.164e-10 = 2^-33 absolute from the scalar
+;   versus float64 sin  at most 1.45 ULP  (the scalar itself is 2.46)
+;
+; So the vector path is closer to the true sine than the scalar path it
+; replaces; it simply is not the same last bit.  A caller that needs the
+; scalar's exact bits must call PmTensorTrig.
+; ---------------------------------------------------------------------
+;
+; EnableFloatingPoint establishes FPCR=0 before generated code runs: nearest
+; even, gradual underflow, and default-NaN disabled.  FRINTN nevertheless
+; names nearest-even explicitly.  Multiply/add pairs below remain separate;
+; replacing them with FMLA/FMLS would change established rounding points.
+;
+; Only caller-saved SIMD registers are touched - v0..v7 and v16..v31 - for
+; the reason tensor_fp32_neon.pmi gives: an ordinary A64 procedure prologue
+; here saves x30 and nothing else, so a kernel that wrote v8..v15 would
+; silently corrupt the low halves the moment Forge starts keeping language
+; float values in FP/SIMD registers across a call.
+
+Procedure PmTensorTrigA64(*src.i, *dst.i, count.i, op.i)
+  ASM
+    ; The generated receiver homes these four parameters before entering
+    ; the body and preserves x0-x3.  Consume the live entry ABI values: the
+    ; new automatic parameter slots deliberately have no absolute symbols.
+
+    ; The op is decided BEFORE the count.  Every op this kernel does not own
+    ; goes to PmTensorTrig, which owns the op set and refuses what is not in
+    ; it; leaving early on an empty request would skip that refusal and let a
+    ; wrongly generated program run on silently.
+    cmp x3, #1
+    b.hi pmoTrigA64Fallback
+    cmp x2, #0
+    b.le pmoTrigA64Done
+
+    adrp x9, pmotriga64invpio2
+    add x9, x9, #:lo12:pmotriga64invpio2
+    ld1 {v20.2d}, [x9]
+    adrp x9, pmotriga64pio2hi
+    add x9, x9, #:lo12:pmotriga64pio2hi
+    ld1 {v21.2d}, [x9]
+    adrp x9, pmotriga64pio2lo
+    add x9, x9, #:lo12:pmotriga64pio2lo
+    ld1 {v22.2d}, [x9]
+    adrp x9, pmotriga64ambiguity
+    add x9, x9, #:lo12:pmotriga64ambiguity
+    ld1 {v23.2d}, [x9]
+    adrp x9, pmotriga64cos10
+    add x9, x9, #:lo12:pmotriga64cos10
+    ld1 {v24.4s}, [x9]
+    adrp x9, pmotriga64cos8
+    add x9, x9, #:lo12:pmotriga64cos8
+    ld1 {v25.4s}, [x9]
+    adrp x9, pmotriga64cos6
+    add x9, x9, #:lo12:pmotriga64cos6
+    ld1 {v26.4s}, [x9]
+    adrp x9, pmotriga64cos4
+    add x9, x9, #:lo12:pmotriga64cos4
+    ld1 {v27.4s}, [x9]
+    adrp x9, pmotriga64cos2
+    add x9, x9, #:lo12:pmotriga64cos2
+    ld1 {v28.4s}, [x9]
+    adrp x9, pmotriga64one
+    add x9, x9, #:lo12:pmotriga64one
+    ld1 {v29.4s}, [x9]
+    adrp x9, pmotriga64sin9
+    add x9, x9, #:lo12:pmotriga64sin9
+    ld1 {v30.4s}, [x9]
+    adrp x9, pmotriga64sin7
+    add x9, x9, #:lo12:pmotriga64sin7
+    ld1 {v31.4s}, [x9]
+    adrp x9, pmotriga64sin5
+    add x9, x9, #:lo12:pmotriga64sin5
+    ld1 {v18.4s}, [x9]
+    adrp x9, pmotriga64sin3
+    add x9, x9, #:lo12:pmotriga64sin3
+    ld1 {v19.4s}, [x9]
+
+pmoTrigA64Loop:
+    cmp x2, #4
+    b.lt pmoTrigA64Fallback
+    ld1 {v17.4s}, [x0]
+
+    ; Positive finite encodings sort by magnitude.  $49800000 is 2^20, the
+    ; bound the header derives; NaN and both infinities exceed it and leave
+    ; through the same door.
+    movz w10, #0
+    movk w10, #18816, lsl #16
+    umov w9, v17.s[0]
+    lsl w9, w9, #1
+    lsr w9, w9, #1
+    cmp w9, w10
+    b.hi pmoTrigA64Fallback
+    umov w9, v17.s[1]
+    lsl w9, w9, #1
+    lsr w9, w9, #1
+    cmp w9, w10
+    b.hi pmoTrigA64Fallback
+    umov w9, v17.s[2]
+    lsl w9, w9, #1
+    lsr w9, w9, #1
+    cmp w9, w10
+    b.hi pmoTrigA64Fallback
+    umov w9, v17.s[3]
+    lsl w9, w9, #1
+    lsr w9, w9, #1
+    cmp w9, w10
+    b.hi pmoTrigA64Fallback
+
+    ; This assembler exposes scalar precision conversion but not FCVTL.  The
+    ; four reductions are therefore unrolled scalar binary64 operations; the
+    ; shared Horner work below remains four-lane binary32 SIMD.
+    ;
+    ; `add w9, w9, w3` IS the cosine.  MathSinCos spells it
+    ; `q = (q + wantCos) & 3` for the same reason: a cosine is a sine one
+    ; quadrant along, and op is already 0 or 1 here because anything above 1
+    ; left for the scalar at the top of the procedure.
+    umov w9, v17.s[0]
+    fmov s0, w9
+    fcvt d0, s0
+    fmul d1, d0, d20
+    frintn d2, d1
+    fsub d3, d1, d2
+    fabs d3, d3
+    fcmp d3, d23
+    b.ge pmoTrigA64Fallback
+    fmul d3, d2, d21
+    fsub d0, d0, d3
+    fmul d3, d2, d22
+    fsub d0, d0, d3
+    fcvt s4, d0
+    fmov w9, s4
+    ins v16.s[0], w9
+    fcvtzs x9, d2
+    add w9, w9, w3
+    ins v6.s[0], w9
+
+    umov w9, v17.s[1]
+    fmov s0, w9
+    fcvt d0, s0
+    fmul d1, d0, d20
+    frintn d2, d1
+    fsub d3, d1, d2
+    fabs d3, d3
+    fcmp d3, d23
+    b.ge pmoTrigA64Fallback
+    fmul d3, d2, d21
+    fsub d0, d0, d3
+    fmul d3, d2, d22
+    fsub d0, d0, d3
+    fcvt s4, d0
+    fmov w9, s4
+    ins v16.s[1], w9
+    fcvtzs x9, d2
+    add w9, w9, w3
+    ins v6.s[1], w9
+
+    umov w9, v17.s[2]
+    fmov s0, w9
+    fcvt d0, s0
+    fmul d1, d0, d20
+    frintn d2, d1
+    fsub d3, d1, d2
+    fabs d3, d3
+    fcmp d3, d23
+    b.ge pmoTrigA64Fallback
+    fmul d3, d2, d21
+    fsub d0, d0, d3
+    fmul d3, d2, d22
+    fsub d0, d0, d3
+    fcvt s4, d0
+    fmov w9, s4
+    ins v16.s[2], w9
+    fcvtzs x9, d2
+    add w9, w9, w3
+    ins v6.s[2], w9
+
+    umov w9, v17.s[3]
+    fmov s0, w9
+    fcvt d0, s0
+    fmul d1, d0, d20
+    frintn d2, d1
+    fsub d3, d1, d2
+    fabs d3, d3
+    fcmp d3, d23
+    b.ge pmoTrigA64Fallback
+    fmul d3, d2, d21
+    fsub d0, d0, d3
+    fmul d3, d2, d22
+    fsub d0, d0, d3
+    fcvt s4, d0
+    fmov w9, s4
+    ins v16.s[3], w9
+    fcvtzs x9, d2
+    add w9, w9, w3
+    ins v6.s[3], w9
+
+    mov v0.16b, v16.16b
+    mov v1.16b, v6.16b
+    movi v5.4s, #3
+    and v1.16b, v1.16b, v5.16b
+
+    ; Both existing binary32 polynomials are evaluated because quadrants can
+    ; differ within a vector.  No multiply-add instruction is used.
+    fmul v2.4s, v0.4s, v0.4s
+    mov v3.16b, v24.16b
+    fmul v3.4s, v3.4s, v2.4s
+    fadd v3.4s, v3.4s, v25.4s
+    fmul v3.4s, v3.4s, v2.4s
+    fadd v3.4s, v3.4s, v26.4s
+    fmul v3.4s, v3.4s, v2.4s
+    fadd v3.4s, v3.4s, v27.4s
+    fmul v3.4s, v3.4s, v2.4s
+    fadd v3.4s, v3.4s, v28.4s
+    fmul v4.4s, v3.4s, v2.4s
+    fadd v4.4s, v4.4s, v29.4s
+
+    mov v5.16b, v30.16b
+    fmul v5.4s, v5.4s, v2.4s
+    fadd v5.4s, v5.4s, v31.4s
+    fmul v5.4s, v5.4s, v2.4s
+    fadd v5.4s, v5.4s, v18.4s
+    fmul v5.4s, v5.4s, v2.4s
+    fadd v5.4s, v5.4s, v19.4s
+    fmul v6.4s, v5.4s, v2.4s
+    fmul v6.4s, v0.4s, v6.4s
+    fadd v6.4s, v0.4s, v6.4s
+
+    movi v5.4s, #1
+    and v7.16b, v1.16b, v5.16b
+    cmeq v7.4s, v7.4s, v5.4s
+    bsl v7.16b, v4.16b, v6.16b
+
+    movi v5.4s, #2
+    and v3.16b, v1.16b, v5.16b
+    cmeq v3.4s, v3.4s, v5.4s
+    movi v2.4s, #0
+    fsub v0.4s, v2.4s, v7.4s
+    bsl v3.16b, v0.16b, v7.16b
+
+    ; MathSinCos returns its input bit pattern for Sin(+/-0).  Cos(+/-0)
+    ; needs no repair: z is 0, so the cosine polynomial already lands on
+    ; exactly 1.0, which is what the scalar returns.
+    cbnz x3, pmoTrigA64Store
+    fcmeq v2.4s, v17.4s, #0.0
+    bsl v2.16b, v17.16b, v3.16b
+    mov v3.16b, v2.16b
+pmoTrigA64Store:
+    st1 {v3.4s}, [x1]
+    add x0, x0, #16
+    add x1, x1, #16
+    sub x2, x2, #4
+    b pmoTrigA64Loop
+
+pmoTrigA64Fallback:
+    ; x0/x1/x2/x3 always describe the untouched remaining suffix.  The
+    ; procedure prologue saved x30, so this call is safe from inside ASM.
+    bl pmtensortrig
+pmoTrigA64Done:
+  EndASM
+EndProcedure
+
+DataSection
+  pmoTrigA64InvPiO2:
+  Data.l $6DC9C883,$3FE45F30,$6DC9C883,$3FE45F30
+  pmoTrigA64PiO2Hi:
+  Data.l $54442D18,$3FF921FB,$54442D18,$3FF921FB
+  pmoTrigA64PiO2Lo:
+  Data.l $33145C07,$3C91A626,$33145C07,$3C91A626
+  pmoTrigA64Ambiguity:
+  Data.l $FC000000,$3FDFFFFF,$FC000000,$3FDFFFFF
+  pmoTrigA64Cos10:
+  Data.l $B493F27E,$B493F27E,$B493F27E,$B493F27E
+  pmoTrigA64Cos8:
+  Data.l $37D00D01,$37D00D01,$37D00D01,$37D00D01
+  pmoTrigA64Cos6:
+  Data.l $BAB60B61,$BAB60B61,$BAB60B61,$BAB60B61
+  pmoTrigA64Cos4:
+  Data.l $3D2AAAAB,$3D2AAAAB,$3D2AAAAB,$3D2AAAAB
+  pmoTrigA64Cos2:
+  Data.l $BF000000,$BF000000,$BF000000,$BF000000
+  pmoTrigA64One:
+  Data.l $3F800000,$3F800000,$3F800000,$3F800000
+  pmoTrigA64Sin9:
+  Data.l $3638EF1D,$3638EF1D,$3638EF1D,$3638EF1D
+  pmoTrigA64Sin7:
+  Data.l $B9500D01,$B9500D01,$B9500D01,$B9500D01
+  pmoTrigA64Sin5:
+  Data.l $3C088889,$3C088889,$3C088889,$3C088889
+  pmoTrigA64Sin3:
+  Data.l $BE2AAAAB,$BE2AAAAB,$BE2AAAAB,$BE2AAAAB
+EndDataSection

@@ -1,0 +1,1053 @@
+; ======================================================================
+; tensor_norm_small.pmi - portable kernels for InstanceNormalization, TopK,
+; ScatterElements, ReduceMax, ReduceProd, Not and Pad (constant, reflect,
+; edge, wrap).
+; ----------------------------------------------------------------------
+; Include tensor_fp32.pmi first. The Windows counterpart is
+; tensor_norm_small_windows.pbi; keep the two synchronized. Each kernel is
+; written from the ONNX operator specification,
+; https://onnx.ai/onnx/operators/, and names the section it implements.
+; Procedures take byte addresses and do no shape inference: the fixed-shape
+; emitter and the runtime-dimension wrappers have already checked shapes,
+; element types and attributes before any of these run.
+;
+; Element kinds are ONNX TensorProto codes: 1 FLOAT (4 bytes), 6 INT32
+; (4 bytes), 7 INT64 (8 bytes), 9 BOOL (1 byte). INT64 goes through
+; PmTensorGetI64/PmTensorPutI64, so a 32-bit target clears PmTensorInt64Ok
+; for a value or result outside its checked signed 32-bit range instead of
+; computing a different number.
+;
+; Word arrays (dims, begins, scratch) hold one native integer per entry:
+; four bytes on the 32-bit targets, eight on AArch64.
+; ======================================================================
+
+CompilerIf #PMO_INT64_SPLIT = 1
+Procedure.i PmNsWord(*base.i, index.i)
+  ProcedureReturn PeekL(*base + index * 4)
+EndProcedure
+
+Procedure PmNsSetWord(*base.i, index.i, value.i)
+  PokeL(*base + index * 4, value)
+EndProcedure
+CompilerElse
+Procedure.i PmNsWord(*base.i, index.i)
+  Protected p.i
+  p = *base + index * 8
+  ProcedureReturn *p.i
+EndProcedure
+
+Procedure PmNsSetWord(*base.i, index.i, value.i)
+  Protected p.i
+  p = *base + index * 8
+  *p.i = value
+EndProcedure
+CompilerEndIf
+
+Procedure PmNsCopyBytes(*src.i, *dst.i, bytes.i)
+  Protected i.i
+  i = 0
+  While i < bytes
+    PokeA(*dst + i, PeekA(*src + i))
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; InstanceNormalization-6 (the definition current through opset 20):
+;   y = scale * (x - mean) / sqrt(variance + epsilon) + B
+; with mean and variance computed per instance per channel over the
+; spatial elements D1..Dn of an (N x C x D1 ... Dn) input.
+;
+; THE REFERENCE ORDER OF EVALUATION, which the Advanced SIMD body below and
+; the SSE body in tensor_norm_small_windows.pbi reproduce bit for bit:
+;   * mean: four running sums, element k of the plane going to lane k mod 4
+;     in index order; sum = (lane0 + lane1) + (lane2 + lane3); mean = sum / n
+;   * variance: the same four lanes over d = x - mean, d = d * d; the same
+;     combination; variance = sum / n
+;   * den = Sqr(variance + epsilon)
+;   * per element, one binary32 operation per statement:
+;     t = x - mean, t = scale * t, t = t / den, y = t + B
+; Each statement is one IEEE binary32 operation with its operands in source
+; order, so a lane of four performs exactly the operations the scalar form
+; performs; signed zeros, infinities, subnormals and NaN operands give the
+; same bits either way.
+; ----------------------------------------------------------------------
+Structure PmTensorInstanceNormWork
+  Lane0.f
+  Lane1.f
+  Lane2.f
+  Lane3.f
+  Mean.f
+  Scale.f
+  Den.f
+  Bias.f
+  Count.f
+  Epsilon.f
+EndStructure
+
+Procedure PmTensorInstanceNormLanesScalar(*src.i, count.i, *work.PmTensorInstanceNormWork, squares.i)
+  Protected k.i
+  Protected x.f
+  Protected mean.f
+  Protected l0.f
+  Protected l1.f
+  Protected l2.f
+  Protected l3.f
+  mean = *work\Mean
+  l0 = 0.0
+  l1 = 0.0
+  l2 = 0.0
+  l3 = 0.0
+  k = 0
+  While k < count
+    x = PmTensorGet(*src, k)
+    If squares <> 0
+      x = x - mean
+      x = x * x
+    EndIf
+    Select k & 3
+      Case 0
+        l0 = l0 + x
+      Case 1
+        l1 = l1 + x
+      Case 2
+        l2 = l2 + x
+      Default
+        l3 = l3 + x
+    EndSelect
+    k = k + 1
+  Wend
+  *work\Lane0 = l0
+  *work\Lane1 = l1
+  *work\Lane2 = l2
+  *work\Lane3 = l3
+EndProcedure
+
+CompilerIf #PMO_INT8_BACKEND = 1
+; The correctly rounded binary32 square root of the float whose bits are in
+; w0, returned as bits. Sqr() in math_a64.pmi is three Newton steps that can
+; land one unit in the last place away from the true root; the reference
+; takes the IEEE answer, which is also what the SSE form computes.
+Procedure.i PmNsSqrtBits(bits.i)
+  ASM
+    fmov s0, w0
+    fsqrt s0, s0
+    fmov w0, s0
+  EndASM
+EndProcedure
+CompilerEndIf
+
+; Stage 0 stores the mean; stage 1 stores den = sqrt(variance + epsilon),
+; correctly rounded on AArch64 (the Cortex-M targets use Sqr()).
+Procedure PmTensorInstanceNormStats(*work.PmTensorInstanceNormWork, stage.i)
+  Protected a.f
+  Protected b.f
+  a = *work\Lane0 + *work\Lane1
+  b = *work\Lane2 + *work\Lane3
+  a = a + b
+  a = a / *work\Count
+  If stage = 0
+    *work\Mean = a
+  Else
+    a = a + *work\Epsilon
+    CompilerIf #PMO_INT8_BACKEND = 1
+    PokeL(@*work\Den, PmNsSqrtBits(PeekL(@a) & $FFFFFFFF))
+    CompilerElse
+    *work\Den = Sqr(a)
+    CompilerEndIf
+  EndIf
+EndProcedure
+
+Procedure PmTensorInstanceNormAffineScalar(*src.i, *dst.i, count.i, *work.PmTensorInstanceNormWork)
+  Protected k.i
+  Protected t.f
+  Protected mean.f
+  Protected scale.f
+  Protected den.f
+  Protected bias.f
+  mean = *work\Mean
+  scale = *work\Scale
+  den = *work\Den
+  bias = *work\Bias
+  k = 0
+  While k < count
+    t = PmTensorGet(*src, k)
+    t = t - mean
+    t = scale * t
+    t = t / den
+    t = t + bias
+    PmTensorPut(*dst, k, t)
+    k = k + 1
+  Wend
+EndProcedure
+
+CompilerIf #PMO_INT8_BACKEND = 1
+; The lane sums four elements per instruction. Lane j receives elements j,
+; j+4, j+8 ... in index order, exactly as the scalar form does; the one to
+; three trailing elements are added one at a time into lanes 0, 1 and 2 by
+; the same instructions in scalar form. Only caller-saved registers.
+Procedure PmTensorInstanceNormLanesNeon(*src.i, count.i, *work.i, squares.i)
+  ASM
+    ; x0=src x1=count x2=work x3=squares
+    movi v0.4s, #0
+    ldr  s2, [x2, #16]
+    dup  v3.4s, v2.s[0]
+    mov  x4, x1
+    cmp  x4, #0
+    b.gt pmoNsInLanesFour
+    movz x4, #0
+pmoNsInLanesFour:
+    cmp  x4, #4
+    b.lt pmoNsInLanesTail
+    ld1  {v1.4s}, [x0]
+    add  x0, x0, #16
+    cbz  x3, pmoNsInLanesPlain
+    fsub v1.4s, v1.4s, v3.4s
+    fmul v1.4s, v1.4s, v1.4s
+pmoNsInLanesPlain:
+    fadd v0.4s, v0.4s, v1.4s
+    sub  x4, x4, #4
+    b    pmoNsInLanesFour
+pmoNsInLanesTail:
+    st1  {v0.4s}, [x2]
+    mov  x5, x2
+pmoNsInLanesTailLoop:
+    cbz  x4, pmoNsInLanesDone
+    ldr  s1, [x0]
+    add  x0, x0, #4
+    cbz  x3, pmoNsInLanesTailPlain
+    fsub s1, s1, s2
+    fmul s1, s1, s1
+pmoNsInLanesTailPlain:
+    ldr  s4, [x5]
+    fadd s4, s4, s1
+    str  s4, [x5]
+    add  x5, x5, #4
+    sub  x4, x4, #1
+    b    pmoNsInLanesTailLoop
+pmoNsInLanesDone:
+  EndASM
+EndProcedure
+
+; The affine step four elements per instruction, operands in the scalar
+; form's order: t = x - mean, t = scale * t, t = t / den, y = t + B.
+Procedure PmTensorInstanceNormAffineNeon(*src.i, *dst.i, count.i, *work.i)
+  ASM
+    ; x0=src x1=dst x2=count x3=work
+    ldr  s2, [x3, #16]
+    ldr  s3, [x3, #20]
+    ldr  s4, [x3, #24]
+    ldr  s5, [x3, #28]
+    dup  v16.4s, v2.s[0]
+    dup  v17.4s, v3.s[0]
+    dup  v18.4s, v4.s[0]
+    dup  v19.4s, v5.s[0]
+    mov  x4, x2
+    cmp  x4, #0
+    b.gt pmoNsInAffineFour
+    movz x4, #0
+pmoNsInAffineFour:
+    cmp  x4, #4
+    b.lt pmoNsInAffineTail
+    ld1  {v0.4s}, [x0]
+    add  x0, x0, #16
+    fsub v0.4s, v0.4s, v16.4s
+    fmul v0.4s, v17.4s, v0.4s
+    fdiv v0.4s, v0.4s, v18.4s
+    fadd v0.4s, v0.4s, v19.4s
+    st1  {v0.4s}, [x1]
+    add  x1, x1, #16
+    sub  x4, x4, #4
+    b    pmoNsInAffineFour
+pmoNsInAffineTail:
+    cbz  x4, pmoNsInAffineDone
+    ldr  s0, [x0]
+    add  x0, x0, #4
+    fsub s0, s0, s2
+    fmul s0, s3, s0
+    fdiv s0, s0, s4
+    fadd s0, s0, s5
+    str  s0, [x1]
+    add  x1, x1, #4
+    sub  x4, x4, #1
+    b    pmoNsInAffineTail
+pmoNsInAffineDone:
+  EndASM
+EndProcedure
+CompilerEndIf
+
+Structure PmTensorInstanceNormArgs
+  Src.i
+  Scale.i
+  Bias.i
+  Dst.i
+  Batches.i
+  Channels.i
+  Spatial.i
+  Fast.i
+EndStructure
+
+; One work block for every plane; nested structure fields are not available
+; on every target this file serves.
+Global PmNsInstanceNormWork.PmTensorInstanceNormWork
+
+; fast=0 runs the scalar reference; fast=1 the Advanced SIMD bodies on
+; AArch64 (and the scalar reference elsewhere). The two write identical bits.
+Procedure PmTensorInstanceNormPlanes(*g.PmTensorInstanceNormArgs)
+  Protected n.i
+  Protected c.i
+  Protected plane.i
+  If *g\Spatial <= 0 Or *g\Batches <= 0 Or *g\Channels <= 0
+    ProcedureReturn
+  EndIf
+  PmNsInstanceNormWork\Count = *g\Spatial
+  n = 0
+  While n < *g\Batches
+    c = 0
+    While c < *g\Channels
+      plane = (n * *g\Channels + c) * *g\Spatial * 4
+      PokeL(@PmNsInstanceNormWork\Scale, PeekL(*g\Scale + c * 4))
+      PokeL(@PmNsInstanceNormWork\Bias, PeekL(*g\Bias + c * 4))
+      CompilerIf #PMO_INT8_BACKEND = 1
+      If *g\Fast <> 0
+        PmTensorInstanceNormLanesNeon(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 0)
+        PmTensorInstanceNormStats(@PmNsInstanceNormWork, 0)
+        PmTensorInstanceNormLanesNeon(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 1)
+        PmTensorInstanceNormStats(@PmNsInstanceNormWork, 1)
+        PmTensorInstanceNormAffineNeon(*g\Src + plane, *g\Dst + plane, *g\Spatial, @PmNsInstanceNormWork)
+      Else
+        PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 0)
+        PmTensorInstanceNormStats(@PmNsInstanceNormWork, 0)
+        PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 1)
+        PmTensorInstanceNormStats(@PmNsInstanceNormWork, 1)
+        PmTensorInstanceNormAffineScalar(*g\Src + plane, *g\Dst + plane, *g\Spatial, @PmNsInstanceNormWork)
+      EndIf
+      CompilerElse
+      PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 0)
+      PmTensorInstanceNormStats(@PmNsInstanceNormWork, 0)
+      PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 1)
+      PmTensorInstanceNormStats(@PmNsInstanceNormWork, 1)
+      PmTensorInstanceNormAffineScalar(*g\Src + plane, *g\Dst + plane, *g\Spatial, @PmNsInstanceNormWork)
+      CompilerEndIf
+      c = c + 1
+    Wend
+    n = n + 1
+  Wend
+EndProcedure
+
+Global PmNsInstanceNorm.PmTensorInstanceNormArgs
+
+Procedure PmTensorInstanceNormRun(*src.i, *scale.i, *bias.i, *dst.i, batches.i, channels.i, spatial.i, epsilon.f)
+  PmNsInstanceNorm\Src = *src
+  PmNsInstanceNorm\Scale = *scale
+  PmNsInstanceNorm\Bias = *bias
+  PmNsInstanceNorm\Dst = *dst
+  PmNsInstanceNorm\Batches = batches
+  PmNsInstanceNorm\Channels = channels
+  PmNsInstanceNorm\Spatial = spatial
+  PokeL(@PmNsInstanceNormWork\Epsilon, PeekL(@epsilon))
+  PmTensorInstanceNormPlanes(@PmNsInstanceNorm)
+EndProcedure
+
+; The operator on the fastest body this target has.
+Procedure PmTensorInstanceNorm(*src.i, *scale.i, *bias.i, *dst.i, batches.i, channels.i, spatial.i, epsilon.f)
+  PmNsInstanceNorm\Fast = 1
+  PmTensorInstanceNormRun(*src, *scale, *bias, *dst, batches, channels, spatial, epsilon)
+EndProcedure
+
+; The scalar reference, whatever the target.
+Procedure PmTensorInstanceNormScalar(*src.i, *scale.i, *bias.i, *dst.i, batches.i, channels.i, spatial.i, epsilon.f)
+  PmNsInstanceNorm\Fast = 0
+  PmTensorInstanceNormRun(*src, *scale, *bias, *dst, batches, channels, spatial, epsilon)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Element helpers shared by the selection kernels below.
+; ----------------------------------------------------------------------
+Procedure.i PmNsElementBytes(kind.i)
+  Select kind
+    Case 1
+      ProcedureReturn 4
+    Case 6
+      ProcedureReturn 4
+    Case 7
+      ProcedureReturn 8
+    Case 9
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PmNsIsNan(*value.i)
+  If (PeekL(*value) & $7FFFFFFF) > $7F800000
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PmNsReadInt(*base.i, index.i, kind.i)
+  Select kind
+    Case 7
+      ProcedureReturn PmTensorGetI64(*base, index)
+    Case 6
+      ProcedureReturn PeekL(*base + index * 4)
+    Case 9
+      ProcedureReturn PeekA(*base + index) & 255
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure PmNsWriteInt(*base.i, index.i, kind.i, value.i)
+  Select kind
+    Case 7
+      PmTensorPutI64(*base, index, value)
+    Case 6
+      PokeL(*base + index * 4, value)
+    Case 9
+      If value <> 0
+        PokeA(*base + index, 1)
+      Else
+        PokeA(*base + index, 0)
+      EndIf
+  EndSelect
+EndProcedure
+
+; Integer add (op 0) or multiply (op 1) of two INT32 or INT64 elements. INT32
+; keeps the low 32 bits of the result. INT64 wraps in 64 bits on AArch64; on a
+; 32-bit target a result outside the checked signed 32-bit range clears
+; PmTensorInt64Ok rather than wrapping to a different number.
+Procedure.i PmNsIntArith(a.i, b.i, op.i, kind.i)
+  CompilerIf #PMO_INT64_SPLIT = 1
+  If kind = 7
+    If op = 0
+      If (b > 0 And a > 2147483647 - b) Or (b < 0 And a < -2147483648 - b)
+        PmTensorInt64Ok = 0
+      EndIf
+    Else
+      If a <> 0 And b <> 0
+        If (a > 0 And b > 0 And a > 2147483647 / b) Or (a < 0 And b < 0 And a < 2147483647 / b) Or (a > 0 And b < 0 And b < -2147483648 / a) Or (a < 0 And b > 0 And a < -2147483648 / b)
+          PmTensorInt64Ok = 0
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+  CompilerEndIf
+  If op = 0
+    ProcedureReturn a + b
+  EndIf
+  ProcedureReturn a * b
+EndProcedure
+
+; 1 when element *a orders strictly above element *b. FLOAT: a NaN orders
+; above every number and equal to another NaN, the order numpy's sort uses;
+; the specification leaves NaN unordered.
+Procedure.i PmNsGreater(*a.i, *b.i, kind.i)
+  Protected an.i
+  Protected bn.i
+  Protected fa.f
+  Protected fb.f
+  If kind = 1
+    an = PmNsIsNan(*a)
+    bn = PmNsIsNan(*b)
+    If an <> 0 Or bn <> 0
+      If an <> 0 And bn = 0
+        ProcedureReturn 1
+      EndIf
+      ProcedureReturn 0
+    EndIf
+    fa = PmTensorGet(*a, 0)
+    fb = PmTensorGet(*b, 0)
+    If fa > fb
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If PmNsReadInt(*a, 0, kind) > PmNsReadInt(*b, 0, kind)
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; TopK-11 (current through opset 20). For every slice along the axis the
+; k largest (Largest=1) or smallest elements, in sorted order; "given two
+; equivalent values, ... the element with the lower index will appear
+; first". The slice is ordered by a stable bottom-up merge sort of its
+; indices, so equal elements keep index order, and the first k are written.
+; sorted=0 leaves the order unspecified; this kernel writes sorted order
+; for it too. Order must address 2 * Width words of scratch.
+; Kinds 1, 6 and 7; Indices are INT64.
+; ----------------------------------------------------------------------
+Structure PmTensorTopKArgs
+  Src.i
+  Values.i
+  Indices.i
+  Order.i
+  Outer.i
+  Width.i
+  Inner.i
+  K.i
+  Largest.i
+  Kind.i
+EndStructure
+
+Procedure PmTensorTopK(*g.PmTensorTopKArgs)
+  Protected o.i
+  Protected i.i
+  Protected j.i
+  Protected size.i
+  Protected base.i
+  Protected span.i
+  Protected lo.i
+  Protected mid.i
+  Protected hi.i
+  Protected a.i
+  Protected b.i
+  Protected out.i
+  Protected fromAt.i
+  Protected intoAt.i
+  Protected swapAt.i
+  Protected ia.i
+  Protected ib.i
+  Protected takeRight.i
+  size = PmNsElementBytes(*g\Kind)
+  If size = 0 Or *g\Width <= 0 Or *g\K <= 0
+    ProcedureReturn
+  EndIf
+  o = 0
+  While o < *g\Outer
+    i = 0
+    While i < *g\Inner
+      base = o * *g\Width * *g\Inner + i
+      fromAt = 0
+      intoAt = *g\Width
+      j = 0
+      While j < *g\Width
+        PmNsSetWord(*g\Order, j, j)
+        j = j + 1
+      Wend
+      span = 1
+      While span < *g\Width
+        lo = 0
+        While lo < *g\Width
+          mid = lo + span
+          If mid > *g\Width
+            mid = *g\Width
+          EndIf
+          hi = lo + 2 * span
+          If hi > *g\Width
+            hi = *g\Width
+          EndIf
+          a = lo
+          b = mid
+          out = lo
+          While a < mid Or b < hi
+            If a >= mid
+              takeRight = 1
+            ElseIf b >= hi
+              takeRight = 0
+            Else
+              ia = PmNsWord(*g\Order, fromAt + a)
+              ib = PmNsWord(*g\Order, fromAt + b)
+              ; The right element goes first only when it orders strictly
+              ; before the left one, which keeps equal elements in index order.
+              If *g\Largest <> 0
+                takeRight = PmNsGreater(*g\Src + (base + ib * *g\Inner) * size, *g\Src + (base + ia * *g\Inner) * size, *g\Kind)
+              Else
+                takeRight = PmNsGreater(*g\Src + (base + ia * *g\Inner) * size, *g\Src + (base + ib * *g\Inner) * size, *g\Kind)
+              EndIf
+            EndIf
+            If takeRight <> 0
+              PmNsSetWord(*g\Order, intoAt + out, PmNsWord(*g\Order, fromAt + b))
+              b = b + 1
+            Else
+              PmNsSetWord(*g\Order, intoAt + out, PmNsWord(*g\Order, fromAt + a))
+              a = a + 1
+            EndIf
+            out = out + 1
+          Wend
+          lo = hi
+        Wend
+        swapAt = fromAt
+        fromAt = intoAt
+        intoAt = swapAt
+        span = span * 2
+      Wend
+      j = 0
+      While j < *g\K
+        ia = PmNsWord(*g\Order, fromAt + j)
+        PmNsCopyBytes(*g\Src + (base + ia * *g\Inner) * size, *g\Values + ((o * *g\K + j) * *g\Inner + i) * size, size)
+        PmTensorPutI64(*g\Indices, (o * *g\K + j) * *g\Inner + i, ia)
+        j = j + 1
+      Wend
+      i = i + 1
+    Wend
+    o = o + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ScatterElements-18 (current through opset 20). Dst starts as a copy of
+; Data; every element of Indices, visited in row-major order, names the
+; target whose coordinate on Axis is that index value (negative counts from
+; the end) and whose other coordinates are the element's own; the matching
+; Updates element is stored (Reduction 0) or combined with the target by
+; 1 add, 2 mul, 3 max, 4 min. FLOAT max/min propagate a NaN from either
+; side, as numpy.maximum/minimum do. BOOL takes none, max (or) and min (and);
+; add and mul on BOOL are refused.
+; Returns 0, or 1 for an index outside [-s, s-1], or 2 for a refused
+; reduction.
+; ----------------------------------------------------------------------
+Structure PmTensorScatterElementsArgs
+  Data.i
+  Indices.i
+  Updates.i
+  Dst.i
+  Rank.i
+  Axis.i
+  Reduction.i
+  Kind.i
+  IndexKind.i
+  DataDims.i
+  IndexDims.i
+EndStructure
+
+Global Dim PmNsStride.i(8)
+
+Procedure.i PmTensorScatterElements(*g.PmTensorScatterElementsArgs)
+  Protected i.i
+  Protected d.i
+  Protected count.i
+  Protected dataCount.i
+  Protected size.i
+  Protected n.i
+  Protected coord.i
+  Protected target.i
+  Protected index.i
+  Protected extent.i
+  Protected cur.f
+  Protected upd.f
+  Protected ci.i
+  Protected ui.i
+  Protected t.i
+  Protected u.i
+  size = PmNsElementBytes(*g\Kind)
+  If size = 0
+    ProcedureReturn 2
+  EndIf
+  If *g\Kind = 9 And (*g\Reduction = 1 Or *g\Reduction = 2)
+    ProcedureReturn 2
+  EndIf
+  count = 1
+  dataCount = 1
+  d = *g\Rank - 1
+  While d >= 0
+    PmNsStride(d) = dataCount
+    dataCount = dataCount * PmNsWord(*g\DataDims, d)
+    count = count * PmNsWord(*g\IndexDims, d)
+    d = d - 1
+  Wend
+  If *g\Dst <> *g\Data
+    PmNsCopyBytes(*g\Data, *g\Dst, dataCount * size)
+  EndIf
+  extent = PmNsWord(*g\DataDims, *g\Axis)
+  i = 0
+  While i < count
+    n = i
+    target = 0
+    d = *g\Rank - 1
+    While d >= 0
+      coord = n % PmNsWord(*g\IndexDims, d)
+      n = n / PmNsWord(*g\IndexDims, d)
+      If d = *g\Axis
+        index = PmNsReadInt(*g\Indices, i, *g\IndexKind)
+        If index < 0
+          index = index + extent
+        EndIf
+        If index < 0 Or index >= extent
+          ProcedureReturn 1
+        EndIf
+        coord = index
+      EndIf
+      target = target + coord * PmNsStride(d)
+      d = d - 1
+    Wend
+    t = *g\Dst + target * size
+    u = *g\Updates + i * size
+    If *g\Reduction = 0
+      PmNsCopyBytes(u, t, size)
+    ElseIf *g\Kind = 1
+      Select *g\Reduction
+        Case 1
+          cur = PmTensorGet(t, 0)
+          upd = PmTensorGet(u, 0)
+          cur = cur + upd
+          PmTensorPut(t, 0, cur)
+        Case 2
+          cur = PmTensorGet(t, 0)
+          upd = PmTensorGet(u, 0)
+          cur = cur * upd
+          PmTensorPut(t, 0, cur)
+        Case 3
+          If PmNsIsNan(t) = 0
+            If PmNsIsNan(u) <> 0 Or PmNsGreater(u, t, 1) <> 0
+              PokeL(t, PeekL(u))
+            EndIf
+          EndIf
+        Default
+          If PmNsIsNan(t) = 0
+            If PmNsIsNan(u) <> 0 Or PmNsGreater(t, u, 1) <> 0
+              PokeL(t, PeekL(u))
+            EndIf
+          EndIf
+      EndSelect
+    Else
+      ci = PmNsReadInt(t, 0, *g\Kind)
+      ui = PmNsReadInt(u, 0, *g\Kind)
+      Select *g\Reduction
+        Case 1
+          ci = PmNsIntArith(ci, ui, 0, *g\Kind)
+        Case 2
+          ci = PmNsIntArith(ci, ui, 1, *g\Kind)
+        Case 3
+          If ui > ci
+            ci = ui
+          EndIf
+        Default
+          If ui < ci
+            ci = ui
+          EndIf
+      EndSelect
+      PmNsWriteInt(t, 0, *g\Kind, ci)
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ReduceMax-20 and ReduceProd-18 (and their earlier attribute forms, which
+; reduce the same way). Mask has bit d set for every reduced axis; the
+; output holds the product of the kept extents in row-major order whether
+; or not keepdims kept the reduced axes as ones. Every output starts at the
+; identity of the reduction over an empty set - ReduceMax: minus infinity
+; for FLOAT, the type's minimum for integers, False for BOOL; ReduceProd: 1
+; - and input elements are combined in row-major order. A FLOAT NaN wins
+; ReduceMax, as numpy.maximum.reduce does. Op 0 max, 1 prod.
+; ----------------------------------------------------------------------
+Structure PmTensorReduceArgs
+  Src.i
+  Dst.i
+  Rank.i
+  Dims.i
+  Mask.i
+  Op.i
+  Kind.i
+EndStructure
+
+Procedure PmTensorReduce(*g.PmTensorReduceArgs)
+  Protected i.i
+  Protected d.i
+  Protected n.i
+  Protected coord.i
+  Protected target.i
+  Protected size.i
+  Protected srcCount.i
+  Protected outCount.i
+  Protected extent.i
+  Protected cur.f
+  Protected value.f
+  Protected ci.i
+  Protected vi.i
+  Protected t.i
+  Protected s.i
+  size = PmNsElementBytes(*g\Kind)
+  If size = 0
+    ProcedureReturn
+  EndIf
+  srcCount = 1
+  outCount = 1
+  d = *g\Rank - 1
+  While d >= 0
+    extent = PmNsWord(*g\Dims, d)
+    srcCount = srcCount * extent
+    If ((*g\Mask >> d) & 1) <> 0
+      PmNsStride(d) = 0
+    Else
+      PmNsStride(d) = outCount
+      outCount = outCount * extent
+    EndIf
+    d = d - 1
+  Wend
+  i = 0
+  While i < outCount
+    t = *g\Dst + i * size
+    If *g\Op = 1
+      If *g\Kind = 1
+        PokeL(t, $3F800000)
+      Else
+        PmNsWriteInt(t, 0, *g\Kind, 1)
+      EndIf
+    Else
+      Select *g\Kind
+        Case 1
+          PokeL(t, $FF800000)
+        Case 6
+          PokeL(t, $80000000)
+        Case 7
+          CompilerIf #PMO_INT64_SPLIT = 1
+          PokeL(t, 0)
+          PokeL(t + 4, $80000000)
+          CompilerElse
+          PmTensorPutI64(t, 0, -9223372036854775807 - 1)
+          CompilerEndIf
+        Default
+          PokeA(t, 0)
+      EndSelect
+    EndIf
+    i = i + 1
+  Wend
+  i = 0
+  While i < srcCount
+    n = i
+    target = 0
+    d = *g\Rank - 1
+    While d >= 0
+      extent = PmNsWord(*g\Dims, d)
+      coord = n % extent
+      n = n / extent
+      target = target + coord * PmNsStride(d)
+      d = d - 1
+    Wend
+    t = *g\Dst + target * size
+    s = *g\Src + i * size
+    If *g\Kind = 1
+      If *g\Op = 1
+        cur = PmTensorGet(t, 0)
+        value = PmTensorGet(s, 0)
+        cur = cur * value
+        PmTensorPut(t, 0, cur)
+      ElseIf PmNsIsNan(t) = 0
+        If PmNsIsNan(s) <> 0 Or PmNsGreater(s, t, 1) <> 0
+          PokeL(t, PeekL(s))
+        EndIf
+      EndIf
+    ElseIf *g\Op = 1
+      ci = PmNsReadInt(t, 0, *g\Kind)
+      vi = PmNsReadInt(s, 0, *g\Kind)
+      PmNsWriteInt(t, 0, *g\Kind, PmNsIntArith(ci, vi, 1, *g\Kind))
+    Else
+      CompilerIf #PMO_INT64_SPLIT = 1
+      ; The INT64 identity -2^63 has no 32-bit form; the first element
+      ; replaces it outright.
+      If *g\Kind = 7 And PeekL(t) = 0 And PeekL(t + 4) = $80000000
+        PmNsWriteInt(t, 0, 7, PmNsReadInt(s, 0, 7))
+      ElseIf PmNsGreater(s, t, *g\Kind) <> 0
+        PmNsCopyBytes(s, t, size)
+      EndIf
+      CompilerElse
+      If PmNsGreater(s, t, *g\Kind) <> 0
+        PmNsCopyBytes(s, t, size)
+      EndIf
+      CompilerEndIf
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Pad-19 (current through opset 20; Pad-11 and Pad-18 are its constant,
+; reflect and edge subsets). Begins holds, per axis, the number of elements
+; added (or, when negative, removed) at the start; the end count follows
+; from the source and destination extents. Negative pads crop first, and the
+; three copying modes then work on the cropped data, as numpy.pad does on
+; the sliced array:
+;   constant  Value (one element, or zeros when Value is 0) outside the data
+;   reflect   mirrored on the first and last element, period 2(n-1); a
+;             single element reflects to itself
+;   edge      the nearest edge element
+;   wrap      the data repeated as a torus, period n
+; Map must address DstDims[Rank-1] words of scratch.
+; Returns 0, or 1 when a copying mode needs an element from an axis that
+; cropping left empty.
+; ----------------------------------------------------------------------
+Structure PmTensorPadArgs
+  Src.i
+  Dst.i
+  Rank.i
+  SrcDims.i
+  DstDims.i
+  Begins.i
+  Mode.i
+  Kind.i
+  Value.i
+  Map.i
+EndStructure
+
+; The source coordinate for destination coordinate c on one axis: -1 outside
+; the data in constant mode, -2 when a copying mode has no element to copy.
+Procedure.i PmNsPadCoordinate(c.i, before.i, srcExtent.i, dstExtent.i, mode.i)
+  Protected lo.i
+  Protected kept.i
+  Protected afterPad.i
+  Protected r.i
+  Protected period.i
+  afterPad = dstExtent - srcExtent - before
+  lo = 0
+  If before < 0
+    lo = 0 - before
+  EndIf
+  kept = srcExtent
+  If before < 0
+    kept = kept + before
+  EndIf
+  If afterPad < 0
+    kept = kept + afterPad
+  EndIf
+  r = c
+  If before > 0
+    r = r - before
+  EndIf
+  If r >= 0 And r < kept
+    ProcedureReturn lo + r
+  EndIf
+  If mode = 0
+    ProcedureReturn -1
+  EndIf
+  If kept <= 0
+    ProcedureReturn -2
+  EndIf
+  If mode = 1
+    If kept = 1
+      ProcedureReturn lo
+    EndIf
+    period = 2 * (kept - 1)
+    r = r % period
+    If r < 0
+      r = r + period
+    EndIf
+    If r >= kept
+      r = period - r
+    EndIf
+  ElseIf mode = 2
+    If r < 0
+      r = 0
+    Else
+      r = kept - 1
+    EndIf
+  Else
+    r = r % kept
+    If r < 0
+      r = r + kept
+    EndIf
+  EndIf
+  ProcedureReturn lo + r
+EndProcedure
+
+Procedure.i PmTensorPad(*g.PmTensorPadArgs)
+  Protected d.i
+  Protected n.i
+  Protected coord.i
+  Protected source.i
+  Protected outside.i
+  Protected size.i
+  Protected count.i
+  Protected width.i
+  Protected rows.i
+  Protected row.i
+  Protected last.i
+  Protected x.i
+  Protected k.i
+  Protected at.i
+  size = PmNsElementBytes(*g\Kind)
+  If size = 0
+    ProcedureReturn 1
+  EndIf
+  count = 1
+  n = 1
+  d = *g\Rank - 1
+  While d >= 0
+    PmNsStride(d) = n
+    n = n * PmNsWord(*g\SrcDims, d)
+    count = count * PmNsWord(*g\DstDims, d)
+    d = d - 1
+  Wend
+  If count = 0
+    ProcedureReturn 0
+  EndIf
+  If *g\Rank = 0
+    PmNsCopyBytes(*g\Src, *g\Dst, size)
+    ProcedureReturn 0
+  EndIf
+  last = *g\Rank - 1
+  width = PmNsWord(*g\DstDims, last)
+  rows = count / width
+  x = 0
+  While x < width
+    coord = PmNsPadCoordinate(x, PmNsWord(*g\Begins, last), PmNsWord(*g\SrcDims, last), width, *g\Mode)
+    If coord = -2
+      ProcedureReturn 1
+    EndIf
+    PmNsSetWord(*g\Map, x, coord)
+    x = x + 1
+  Wend
+  row = 0
+  While row < rows
+    n = row
+    source = 0
+    outside = 0
+    d = last - 1
+    While d >= 0
+      coord = n % PmNsWord(*g\DstDims, d)
+      n = n / PmNsWord(*g\DstDims, d)
+      coord = PmNsPadCoordinate(coord, PmNsWord(*g\Begins, d), PmNsWord(*g\SrcDims, d), PmNsWord(*g\DstDims, d), *g\Mode)
+      If coord = -2
+        ProcedureReturn 1
+      EndIf
+      If coord = -1
+        outside = 1
+      Else
+        source = source + coord * PmNsStride(d)
+      EndIf
+      d = d - 1
+    Wend
+    x = 0
+    While x < width
+      coord = PmNsWord(*g\Map, x)
+      at = *g\Dst + (row * width + x) * size
+      If outside <> 0 Or coord = -1
+        If *g\Value <> 0
+          PmNsCopyBytes(*g\Value, at, size)
+        Else
+          k = 0
+          While k < size
+            PokeA(at + k, 0)
+            k = k + 1
+          Wend
+        EndIf
+      Else
+        PmNsCopyBytes(*g\Src + (source + coord) * size, at, size)
+      EndIf
+      x = x + 1
+    Wend
+    row = row + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Not-1 (current through opset 20): the element-wise negation of a BOOL
+; tensor.
+; ----------------------------------------------------------------------
+Procedure PmTensorNot(*src.i, *dst.i, count.i)
+  Protected i.i
+  i = 0
+  While i < count
+    If (PeekA(*src + i) & 255) = 0
+      PokeA(*dst + i, 1)
+    Else
+      PokeA(*dst + i, 0)
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure

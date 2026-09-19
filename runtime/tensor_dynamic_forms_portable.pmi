@@ -1,0 +1,250 @@
+; Runtime-dimension entries for attribute forms whose effect needs a run-time
+; extent: Shape with start/end, Conv and ConvTranspose with auto_pad SAME, and
+; ScatterND with a reduction. Each computes what the attribute selects and
+; hands the rest to the kernel the default form already uses, so the default
+; forms emit and run exactly as before. The same answers as
+; tensor_dynamic_forms_windows.pbi, in the bare-metal dialect.
+; Specification: https://onnx.ai/onnx/operators/ - Shape-15, Conv-11,
+; ConvTranspose-11, ScatterND-18.
+
+; Shape-15: dimensions start..end-1 of the input's shape. A negative value
+; counts back from the rank; both are then clamped to 0..rank, and an end at or
+; before the start gives an empty shape.
+Procedure DShapeRange(Y.i,A.i,Start.i,Finish.i)
+  Protected i.i=0
+  Protected rank.i=Dt(A)\Rank
+  Protected first.i=Start
+  Protected last.i=Finish
+  If first<0
+    first=first+rank
+  EndIf
+  If last<0
+    last=last+rank
+  EndIf
+  If first<0
+    first=0
+  EndIf
+  If first>rank
+    first=rank
+  EndIf
+  If last<0
+    last=0
+  EndIf
+  If last>rank
+    last=rank
+  EndIf
+  If last<first
+    last=first
+  EndIf
+  If DShape(Y,7,1,last-first,0,0,0)=0
+    ProcedureReturn
+  EndIf
+  i=first
+  While i<last
+    DWriteI64(Dt(Y)\Data+(i-first)*8,DDims((A)*8+(i)))
+    i=i+1
+  Wend
+EndProcedure
+
+; Conv-11 auto_pad SAME_UPPER/SAME_LOWER: out = ceil(in / stride), total
+; padding max(0, (out-1)*stride + (kernel-1)*dilation + 1 - in), the odd unit
+; at the end for UPPER and at the start for LOWER.
+; DCall: 0 Y, 1 A, 2 W, 3 B, 4 Lower, 5 Stride, 6 Dilation, 7 Groups.
+Procedure DConvSame()
+  Protected A.i=DCall(1)
+  Protected W.i=DCall(2)
+  Protected Lower.i=DCall(4)
+  Protected Stride.i=DCall(5)
+  Protected Dilation.i=DCall(6)
+  Protected Groups.i=DCall(7)
+  Protected width.i=0
+  Protected kernel.i=0
+  Protected outWidth.i=0
+  Protected total.i=0
+  Protected begin.i=0
+  If Dt(A)\Rank<>3 Or Dt(W)\Rank<>3 Or Stride<=0 Or Dilation<=0
+    DFail("Invalid Conv1D shape or attributes.")
+    ProcedureReturn
+  EndIf
+  width=DDims((A)*8+(2))
+  kernel=DDims((W)*8+(2))
+  outWidth=(width+Stride-1)/Stride
+  total=(outWidth-1)*Stride+(kernel-1)*Dilation+1-width
+  If total<0
+    total=0
+  EndIf
+  If Lower<>0
+    begin=total-total/2
+  Else
+    begin=total/2
+  EndIf
+  DCall(4)=begin
+  DCall(5)=total-begin
+  DCall(6)=Stride
+  DCall(7)=Dilation
+  DCall(8)=Groups
+  DConv()
+EndProcedure
+
+; ConvTranspose-11 auto_pad SAME_UPPER/SAME_LOWER: out = in * stride, total
+; padding stride*(in-1) + output_padding + (kernel-1)*dilation + 1 - out;
+; SAME_UPPER puts total/2 at the start and the rest at the end, SAME_LOWER the
+; reverse.
+; DCall: 0 Y, 1 A, 2 W, 3 B, 4 Lower, 5 Stride, 6 Dilation, 7 Groups, 8 OutputPad.
+Procedure DConvTransposeSame()
+  Protected A.i=DCall(1)
+  Protected W.i=DCall(2)
+  Protected Lower.i=DCall(4)
+  Protected Stride.i=DCall(5)
+  Protected Dilation.i=DCall(6)
+  Protected Groups.i=DCall(7)
+  Protected OutputPad.i=DCall(8)
+  Protected width.i=0
+  Protected kernel.i=0
+  Protected total.i=0
+  Protected begin.i=0
+  If Dt(A)\Rank<>3 Or Dt(W)\Rank<>3 Or Stride<=0 Or Dilation<=0
+    DFail("Invalid transposed convolution.")
+    ProcedureReturn
+  EndIf
+  width=DDims((A)*8+(2))
+  kernel=DDims((W)*8+(2))
+  total=Stride*(width-1)+OutputPad+(kernel-1)*Dilation+1-width*Stride
+  If total<0
+    DFail("ConvTranspose auto_pad SAME needs a negative total padding for this input width, kernel and stride; the specification's output width in*stride cannot be reached.")
+    ProcedureReturn
+  EndIf
+  If Lower<>0
+    begin=total-total/2
+  Else
+    begin=total/2
+  EndIf
+  DCall(4)=begin
+  DCall(5)=total-begin
+  DCall(6)=Stride
+  DCall(7)=Dilation
+  DCall(8)=Groups
+  DCall(9)=OutputPad
+  DConvTranspose()
+EndProcedure
+
+; ScatterND-18 with reduction 1 add, 2 mul, 3 max, 4 min: each update is
+; combined with the element already at its destination, in index order, so a
+; repeated index accumulates. FLOAT, INT32 and INT64 data; integer add and mul
+; are checked against the native range the way the other integer kernels are.
+Procedure DScatterReduce(Y.i,A.i,Indices.i,Updates.i,Reduction.i)
+  Protected k.i=0
+  Protected i.i=0
+  Protected j.i=0
+  Protected e.i=0
+  Protected offset.i=0
+  Protected idx.i=0
+  Protected block.i=0
+  Protected tuples.i=0
+  Protected dst.i=0
+  Protected src.i=0
+  Protected f.f=0.0
+  Protected g.f=0.0
+  Protected q.i=0
+  Protected r.i=0
+  If Dt(A)\Kind<>1 And Dt(A)\Kind<>6 And Dt(A)\Kind<>7
+    DFail("ScatterND with a reduction requires FLOAT, INT32 or INT64 data.")
+    ProcedureReturn
+  EndIf
+  If Reduction<1 Or Reduction>4
+    DFail("ScatterND reduction code is outside 1 add, 2 mul, 3 max, 4 min.")
+    ProcedureReturn
+  EndIf
+  If Dt(Updates)\Kind<>Dt(A)\Kind
+    DFail("ScatterND updates must have the data's element type.")
+    ProcedureReturn
+  EndIf
+  If Dt(Indices)\Rank<1
+    DFail("ScatterND indices need a tuple axis.")
+    ProcedureReturn
+  EndIf
+  k=DDims((Indices)*8+(Dt(Indices)\Rank-1))
+  If k<=0 Or k>Dt(A)\Rank
+    DFail("Invalid ScatterND tuple width.")
+    ProcedureReturn
+  EndIf
+  block=DProduct(A,k,Dt(A)\Rank-1)
+  tuples=Dt(Indices)\Count/k
+  If Dt(Updates)\Count<>tuples*block
+    DFail("ScatterND update count mismatch.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y,A,0)=0
+    ProcedureReturn
+  EndIf
+  DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+  For i=0 To tuples-1
+    offset=0
+    For j=0 To k-1
+      idx=DInt(Indices,i*k+j)
+      If idx<0
+        idx=idx+DDims((A)*8+(j))
+      EndIf
+      If idx<0 Or idx>=DDims((A)*8+(j))
+        DFail("ScatterND index is out of bounds.")
+        ProcedureReturn
+      EndIf
+      offset=offset*DDims((A)*8+(j))+idx
+    Next
+    For e=0 To block-1
+      dst=offset*block+e
+      src=i*block+e
+      If Dt(A)\Kind=1
+        f=DReadF(Dt(Y)\Data+dst*4)
+        g=DReadF(Dt(Updates)\Data+src*4)
+        If Reduction=1
+          f=f+g
+        ElseIf Reduction=2
+          f=f*g
+        ElseIf Reduction=3
+          If g>f
+            f=g
+          EndIf
+        Else
+          If g<f
+            f=g
+          EndIf
+        EndIf
+        DWriteF(Dt(Y)\Data+dst*4,f)
+      Else
+        If Dt(A)\Kind=7
+          q=DReadI64(Dt(Y)\Data+dst*8)
+          r=DReadI64(Dt(Updates)\Data+src*8)
+        Else
+          q=PeekL(Dt(Y)\Data+dst*4)
+          r=PeekL(Dt(Updates)\Data+src*4)
+        EndIf
+        If Reduction=1
+          q=DIntegerOp(q,r,0)
+        ElseIf Reduction=2
+          q=DIntegerOp(q,r,2)
+        ElseIf Reduction=3
+          If r>q
+            q=r
+          EndIf
+        Else
+          If r<q
+            q=r
+          EndIf
+        EndIf
+        If DError<>0
+          ProcedureReturn
+        EndIf
+        If Dt(A)\Kind=7
+          DWriteI64(Dt(Y)\Data+dst*8,q)
+        Else
+          If q< -2147483648 Or q>2147483647
+            DFail("INT32 arithmetic overflow.")
+            ProcedureReturn
+          EndIf
+          PokeL(Dt(Y)\Data+dst*4,q)
+        EndIf
+      EndIf
+    Next
+  Next
+EndProcedure

@@ -1,0 +1,942 @@
+; Sequences and control-flow transfers for the runtime-dimension path in
+; caller-owned memory. Included after tensor_dynamic_portable.pmi, and only by
+; a model that uses If, Loop or a sequence operator.
+;
+; Reference semantics: the ONNX operator specification,
+; https://onnx.ai/onnx/operators/ - SequenceEmpty-11, SequenceConstruct-11,
+; SequenceInsert-11, SequenceAt-11, SequenceLength-11, SplitToSequence-11,
+; ConcatFromSequence-11, If-11..19 and Loop-11..19.
+;
+; A SEQUENCE IS ONE BLOCK taken from the bound arena through DAcquire, the
+; only allocator here. Dt(id)\Kind = #PMD_KIND_SEQUENCE, \Data is the block,
+; \Bytes its size, \Count the element count, \Owned = 1, so DRelease returns
+; the whole sequence to the arena and DLive accounts for it. A block that does
+; not fit is refused; nothing is truncated.
+;
+; Block layout, every field a 32-bit little-endian integer, identical to the
+; Windows runtime:
+;   +0 'PMSQ'  +4 element kind  +8 element count  +12 record capacity
+;   +16 data bytes used  +20 data capacity
+;   +24 records, 48 bytes each: rank, count, bytes, data offset, dims[8]
+;   +24+48*capacity: data area; element data at 8-byte aligned offsets
+#PMD_KIND_SEQUENCE=1024
+#PMD_SEQ_MAGIC=$51534D50
+#PMD_SEQ_HEADER=24
+#PMD_SEQ_RECORD=48
+
+Procedure.i DSeqAlign8(Value.i)
+  ProcedureReturn (Value+7) & -8
+EndProcedure
+
+Procedure.i DSeqNativeDim(Address.i,Index.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+    ProcedureReturn PeekN(Address+Index*8)
+  CompilerElse
+    ProcedureReturn PeekL(Address+Index*4)
+  CompilerEndIf
+EndProcedure
+
+Procedure DSeqMoveBytes(Source.i,Destination.i,Bytes.i)
+  Protected i.i=0
+  If Destination>Source
+    i=Bytes-1
+    While i>=0
+      PokeA(Destination+i,PeekA(Source+i))
+      i=i-1
+    Wend
+  Else
+    DCopy(Source,Destination,Bytes)
+  EndIf
+EndProcedure
+
+Procedure.i DSeqIs(Id.i)
+  If Id<=0 Or Id>#PMD_TENSOR_COUNT
+    ProcedureReturn 0
+  EndIf
+  If Dt(Id)\Kind<>#PMD_KIND_SEQUENCE Or Dt(Id)\Data=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DSeqRequire(Id.i)
+  If DSeqIs(Id)=0
+    ProcedureReturn DFail("A sequence operator was given a value that is not a sequence.")
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DSeqCount(Id.i)
+  If DSeqIs(Id)=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekL(Dt(Id)\Data+8)
+EndProcedure
+
+Procedure.i DSeqElementKind(Id.i)
+  If DSeqIs(Id)=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekL(Dt(Id)\Data+4)
+EndProcedure
+
+Procedure.i DSeqRecord(Id.i,Index.i)
+  ProcedureReturn Dt(Id)\Data+#PMD_SEQ_HEADER+Index*#PMD_SEQ_RECORD
+EndProcedure
+
+Procedure.i DSeqItemValid(Id.i,Index.i)
+  If DSeqIs(Id)=0
+    ProcedureReturn 0
+  EndIf
+  If Index<0 Or Index>=PeekL(Dt(Id)\Data+8)
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DSeqItemRank(Id.i,Index.i)
+  If DSeqItemValid(Id,Index)=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekL(DSeqRecord(Id,Index))
+EndProcedure
+
+Procedure.i DSeqItemCount(Id.i,Index.i)
+  If DSeqItemValid(Id,Index)=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekL(DSeqRecord(Id,Index)+4)
+EndProcedure
+
+Procedure.i DSeqItemBytes(Id.i,Index.i)
+  If DSeqItemValid(Id,Index)=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekL(DSeqRecord(Id,Index)+8)
+EndProcedure
+
+Procedure.i DSeqItemDim(Id.i,Index.i,Axis.i)
+  If DSeqItemValid(Id,Index)=0
+    ProcedureReturn 0
+  EndIf
+  If Axis<0 Or Axis>=PeekL(DSeqRecord(Id,Index))
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekL(DSeqRecord(Id,Index)+16+Axis*4)
+EndProcedure
+
+; The address is valid until the sequence next grows.
+Procedure.i DSeqItemData(Id.i,Index.i)
+  If DSeqItemValid(Id,Index)=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn Dt(Id)\Data+#PMD_SEQ_HEADER+PeekL(Dt(Id)\Data+12)*#PMD_SEQ_RECORD+PeekL(DSeqRecord(Id,Index)+12)
+EndProcedure
+
+Procedure.i DSeqBlockBytes(Capacity.i,DataBytes.i)
+  Protected records.i=0
+  If Capacity<0 Or DataBytes<0
+    ProcedureReturn -1
+  EndIf
+  If Capacity>(DLimit-#PMD_SEQ_HEADER)/#PMD_SEQ_RECORD
+    ProcedureReturn -1
+  EndIf
+  records=#PMD_SEQ_HEADER+Capacity*#PMD_SEQ_RECORD
+  If DataBytes>DLimit-records-8
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn DSeqAlign8(records+DataBytes)
+EndProcedure
+
+Procedure.i DSeqKindCarried(Kind.i)
+  If Kind=1 Or Kind=6 Or Kind=7 Or Kind=9
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure DSeqClearRecord(Id.i)
+  Protected i.i=0
+  Dt(Id)\Data=0
+  Dt(Id)\Kind=0
+  Dt(Id)\Rank=0
+  Dt(Id)\Count=0
+  Dt(Id)\Bytes=0
+  Dt(Id)\Owned=0
+  Dt(Id)\Scales=0
+  For i=0 To 7
+    DDims(Id*8+i)=0
+  Next
+EndProcedure
+
+Procedure.i DSeqMake(Id.i,ElementKind.i,Capacity.i,DataBytes.i)
+  Protected bytes.i=0
+  Protected block.i=0
+  If DError<>0 Or DCancel<>0
+    ProcedureReturn DFail("Request cancelled or an earlier operation failed.")
+  EndIf
+  If Id<=0 Or Id>#PMD_TENSOR_COUNT
+    ProcedureReturn DFail("Invalid sequence tensor ID.")
+  EndIf
+  If DSeqKindCarried(ElementKind)=0
+    ProcedureReturn DFail("A sequence carries FLOAT, INT32, INT64 or BOOL tensors only.")
+  EndIf
+  bytes=DSeqBlockBytes(Capacity,DataBytes)
+  DRelease(Id)
+  If bytes<0
+    ProcedureReturn DFail("A sequence exceeds the working-memory limit; nothing was truncated.")
+  EndIf
+  If bytes>DLimit-DLive
+    ProcedureReturn DFail("A sequence exceeds the working-memory limit; nothing was truncated.")
+  EndIf
+  block=DAcquire(bytes)
+  If block=0
+    ProcedureReturn 0
+  EndIf
+  PokeL(block,#PMD_SEQ_MAGIC)
+  PokeL(block+4,ElementKind)
+  PokeL(block+8,0)
+  PokeL(block+12,Capacity)
+  PokeL(block+16,0)
+  PokeL(block+20,bytes-#PMD_SEQ_HEADER-Capacity*#PMD_SEQ_RECORD)
+  Dt(Id)\Data=block
+  Dt(Id)\Kind=#PMD_KIND_SEQUENCE
+  Dt(Id)\Rank=0
+  Dt(Id)\Count=0
+  Dt(Id)\Bytes=bytes
+  Dt(Id)\Owned=1
+  Dt(Id)\Scales=0
+  DLive=DLive+bytes
+  DPeak=DMax(DPeak,DLive)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DSeqReserve(Id.i,MoreRecords.i,MoreBytes.i)
+  Protected old.i=0
+  Protected block.i=0
+  Protected count.i=0
+  Protected capacity.i=0
+  Protected used.i=0
+  Protected dataCapacity.i=0
+  Protected newCapacity.i=0
+  Protected newData.i=0
+  Protected bytes.i=0
+  Protected oldBytes.i=0
+  Protected need.i=0
+  If DSeqRequire(Id)=0
+    ProcedureReturn 0
+  EndIf
+  If MoreRecords<0 Or MoreBytes<0 Or MoreRecords>DLimit Or MoreBytes>DLimit
+    ProcedureReturn DFail("A sequence element exceeds the working-memory limit.")
+  EndIf
+  old=Dt(Id)\Data
+  count=PeekL(old+8)
+  capacity=PeekL(old+12)
+  used=PeekL(old+16)
+  dataCapacity=PeekL(old+20)
+  need=DSeqAlign8(used)+MoreBytes
+  If count+MoreRecords<=capacity And need<=dataCapacity
+    ProcedureReturn 1
+  EndIf
+  newCapacity=capacity
+  If count+MoreRecords>capacity
+    newCapacity=DMax(DMax(capacity*2,count+MoreRecords),4)
+  EndIf
+  newData=dataCapacity
+  If need>dataCapacity
+    newData=DMax(DMax(dataCapacity*2,need),64)
+  EndIf
+  bytes=DSeqBlockBytes(newCapacity,newData)
+  oldBytes=Dt(Id)\Bytes
+  If bytes<0
+    ProcedureReturn DFail("Sequence growth exceeds the working-memory limit; nothing was truncated.")
+  EndIf
+  If bytes-oldBytes>DLimit-DLive
+    ProcedureReturn DFail("Sequence growth exceeds the working-memory limit; nothing was truncated.")
+  EndIf
+  block=DAcquire(bytes)
+  If block=0
+    ProcedureReturn 0
+  EndIf
+  DCopy(old,block,#PMD_SEQ_HEADER)
+  If count>0
+    DCopy(old+#PMD_SEQ_HEADER,block+#PMD_SEQ_HEADER,count*#PMD_SEQ_RECORD)
+  EndIf
+  If used>0
+    DCopy(old+#PMD_SEQ_HEADER+capacity*#PMD_SEQ_RECORD,block+#PMD_SEQ_HEADER+newCapacity*#PMD_SEQ_RECORD,used)
+  EndIf
+  PokeL(block+12,newCapacity)
+  PokeL(block+20,bytes-#PMD_SEQ_HEADER-newCapacity*#PMD_SEQ_RECORD)
+  DFree(old)
+  Dt(Id)\Data=block
+  Dt(Id)\Bytes=bytes
+  DLive=DLive+bytes-oldBytes
+  DPeak=DMax(DPeak,DLive)
+  ProcedureReturn 1
+EndProcedure
+
+; Adds an element record at Position (0..count) and returns the address of its
+; zero-filled data, or zero after a refusal. DimsAddress holds Rank native
+; integers.
+Procedure.i DSeqPlace(Id.i,Position.i,Rank.i,DimsAddress.i,ElementCount.i,ElementBytes.i)
+  Protected block.i=0
+  Protected record.i=0
+  Protected count.i=0
+  Protected capacity.i=0
+  Protected offset.i=0
+  Protected i.i=0
+  Protected data.i=0
+  If Rank<0 Or Rank>8
+    ProcedureReturn DFail("A sequence element has a rank above eight.")
+  EndIf
+  If DSeqReserve(Id,1,ElementBytes)=0
+    ProcedureReturn 0
+  EndIf
+  block=Dt(Id)\Data
+  count=PeekL(block+8)
+  capacity=PeekL(block+12)
+  If Position<0 Or Position>count
+    ProcedureReturn DFail("A sequence insert position is outside the sequence.")
+  EndIf
+  If Position<count
+    DSeqMoveBytes(block+#PMD_SEQ_HEADER+Position*#PMD_SEQ_RECORD,block+#PMD_SEQ_HEADER+(Position+1)*#PMD_SEQ_RECORD,(count-Position)*#PMD_SEQ_RECORD)
+  EndIf
+  offset=DSeqAlign8(PeekL(block+16))
+  record=block+#PMD_SEQ_HEADER+Position*#PMD_SEQ_RECORD
+  DZero(record,#PMD_SEQ_RECORD)
+  PokeL(record,Rank)
+  PokeL(record+4,ElementCount)
+  PokeL(record+8,ElementBytes)
+  PokeL(record+12,offset)
+  For i=0 To Rank-1
+    PokeL(record+16+i*4,DSeqNativeDim(DimsAddress,i))
+  Next
+  PokeL(block+16,offset+ElementBytes)
+  PokeL(block+8,count+1)
+  Dt(Id)\Count=count+1
+  data=block+#PMD_SEQ_HEADER+capacity*#PMD_SEQ_RECORD+offset
+  If ElementBytes>0
+    DZero(data,ElementBytes)
+  EndIf
+  ProcedureReturn data
+EndProcedure
+
+Procedure.i DSeqTensorOk(T.i)
+  If T<=0 Or T>#PMD_TENSOR_COUNT
+    ProcedureReturn 0
+  EndIf
+  If Dt(T)\Kind=#PMD_KIND_SEQUENCE Or Dt(T)\Data=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn DSeqKindCarried(Dt(T)\Kind)
+EndProcedure
+
+Procedure.i DSeqPlaceTensor(Id.i,Position.i,T.i)
+  Protected data.i=0
+  If DSeqTensorOk(T)=0
+    ProcedureReturn DFail("A sequence element must be a FLOAT, INT32, INT64 or BOOL tensor.")
+  EndIf
+  If Dt(T)\Kind<>DSeqElementKind(Id)
+    ProcedureReturn DFail("A tensor's element type does not match the element type of the sequence it joins.")
+  EndIf
+  data=DSeqPlace(Id,Position,Dt(T)\Rank,@DDims((T)*8+(0)),Dt(T)\Count,Dt(T)\Bytes)
+  If data=0
+    ProcedureReturn 0
+  EndIf
+  If Dt(T)\Bytes>0
+    DCopy(Dt(T)\Data,data,Dt(T)\Bytes)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Hands Src's storage to Dst without copying; Src is left empty. The emitter
+; moves only a value nothing reads afterwards.
+Procedure DValueMove(Dst.i,Src.i)
+  Protected i.i=0
+  If Dst=Src
+    ProcedureReturn
+  EndIf
+  If Dst<=0 Or Dst>#PMD_TENSOR_COUNT Or Src<=0 Or Src>#PMD_TENSOR_COUNT
+    DFail("Invalid control-flow transfer ID.")
+    ProcedureReturn
+  EndIf
+  If Dt(Src)\Data=0
+    DFail("A control-flow value was read before anything produced it.")
+    ProcedureReturn
+  EndIf
+  DRelease(Dst)
+  Dt(Dst)\Data=Dt(Src)\Data
+  Dt(Dst)\Kind=Dt(Src)\Kind
+  Dt(Dst)\Rank=Dt(Src)\Rank
+  Dt(Dst)\Count=Dt(Src)\Count
+  Dt(Dst)\Bytes=Dt(Src)\Bytes
+  Dt(Dst)\Owned=Dt(Src)\Owned
+  Dt(Dst)\Scales=Dt(Src)\Scales
+  For i=0 To 7
+    DDims(Dst*8+i)=DDims(Src*8+i)
+  Next
+  DSeqClearRecord(Src)
+EndProcedure
+
+Procedure DValueCopy(Dst.i,Src.i)
+  Protected block.i=0
+  If Dst=Src
+    ProcedureReturn
+  EndIf
+  If Dst<=0 Or Dst>#PMD_TENSOR_COUNT Or Src<=0 Or Src>#PMD_TENSOR_COUNT
+    DFail("Invalid control-flow transfer ID.")
+    ProcedureReturn
+  EndIf
+  If Dt(Src)\Data=0
+    DFail("A control-flow value was read before anything produced it.")
+    ProcedureReturn
+  EndIf
+  If Dt(Src)\Kind=#PMD_KIND_SEQUENCE
+    If DError<>0 Or DCancel<>0
+      ProcedureReturn
+    EndIf
+    DRelease(Dst)
+    If Dt(Src)\Bytes>DLimit-DLive
+      DFail("Copying a sequence exceeds the working-memory limit; nothing was truncated.")
+      ProcedureReturn
+    EndIf
+    block=DAcquire(Dt(Src)\Bytes)
+    If block=0
+      ProcedureReturn
+    EndIf
+    DCopy(Dt(Src)\Data,block,Dt(Src)\Bytes)
+    Dt(Dst)\Data=block
+    Dt(Dst)\Kind=#PMD_KIND_SEQUENCE
+    Dt(Dst)\Rank=0
+    Dt(Dst)\Count=Dt(Src)\Count
+    Dt(Dst)\Bytes=Dt(Src)\Bytes
+    Dt(Dst)\Owned=1
+    Dt(Dst)\Scales=0
+    DLive=DLive+Dt(Dst)\Bytes
+    DPeak=DMax(DPeak,DLive)
+    ProcedureReturn
+  EndIf
+  If DAlloc(Dst,Dt(Src)\Kind,Dt(Src)\Rank,@DDims((Src)*8+(0)))
+    If Dt(Src)\Bytes>0
+      DCopy(Dt(Src)\Data,Dt(Dst)\Data,Dt(Src)\Bytes)
+    EndIf
+    Dt(Dst)\Scales=Dt(Src)\Scales
+  EndIf
+EndProcedure
+
+Procedure DValueTake(Dst.i,Src.i,Move.i)
+  If Move<>0
+    DValueMove(Dst,Src)
+  Else
+    DValueCopy(Dst,Src)
+  EndIf
+EndProcedure
+
+; If's cond and Loop's cond: a BOOL tensor holding exactly one element.
+Procedure.i DScalarTruth(Id.i)
+  If Id<=0 Or Id>#PMD_TENSOR_COUNT
+    DFail("A condition input is missing.")
+    ProcedureReturn 0
+  EndIf
+  If Dt(Id)\Data=0 Or Dt(Id)\Kind<>9 Or Dt(Id)\Count<>1
+    DFail("A condition must be a BOOL tensor holding exactly one element.")
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn Bool((PeekA(Dt(Id)\Data) & 255)<>0)
+EndProcedure
+
+; Loop's trip count M: an INT64 tensor holding exactly one element.
+Procedure.i DScalarCount(Id.i)
+  If Id<=0 Or Id>#PMD_TENSOR_COUNT
+    DFail("A Loop trip count is missing.")
+    ProcedureReturn 0
+  EndIf
+  If Dt(Id)\Data=0 Or Dt(Id)\Kind<>7 Or Dt(Id)\Count<>1
+    DFail("A Loop trip count must be an INT64 tensor holding exactly one element.")
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn DReadI64(Dt(Id)\Data)
+EndProcedure
+
+Procedure DScalarSet(Id.i,Kind.i,Value.i)
+  If DShape(Id,Kind,0,0,0,0,0)=0
+    ProcedureReturn
+  EndIf
+  If Kind=7
+    DWriteI64(Dt(Id)\Data,Value)
+  ElseIf Kind=6
+    PokeL(Dt(Id)\Data,Value)
+  ElseIf Kind=9
+    PokeA(Dt(Id)\Data,Bool(Value<>0))
+  Else
+    DFail("A loop counter or condition has an unsupported element type.")
+  EndIf
+EndProcedure
+
+Procedure DSeqEmpty(Y.i,Kind.i)
+  DSeqMake(Y,Kind,0,0)
+EndProcedure
+
+Procedure DSeqConstruct(Y.i,Inputs.i)
+  Protected count.i=DListCount(Inputs)
+  Protected i.i=0
+  Protected a.i=0
+  Protected kind.i=0
+  Protected total.i=0
+  a=DListValue(Inputs,1)
+  If DSeqTensorOk(a)=0
+    DFail("SequenceConstruct inputs must be FLOAT, INT32, INT64 or BOOL tensors.")
+    ProcedureReturn
+  EndIf
+  kind=Dt(a)\Kind
+  For i=1 To count
+    a=DListValue(Inputs,i)
+    If DSeqTensorOk(a)=0 Or Dt(a)\Kind<>kind
+      DFail("SequenceConstruct inputs must all be tensors of one element type.")
+      ProcedureReturn
+    EndIf
+    If Dt(a)\Bytes>DLimit-total
+      DFail("SequenceConstruct exceeds the working-memory limit; nothing was truncated.")
+      ProcedureReturn
+    EndIf
+    total=total+DSeqAlign8(Dt(a)\Bytes)
+  Next
+  If DSeqMake(Y,kind,count,total)=0
+    ProcedureReturn
+  EndIf
+  For i=1 To count
+    If DSeqPlaceTensor(Y,i-1,DListValue(Inputs,i))=0
+      ProcedureReturn
+    EndIf
+  Next
+EndProcedure
+
+Procedure.i DSeqPositionOk(Pos.i)
+  If Pos<=0 Or Pos>#PMD_TENSOR_COUNT
+    ProcedureReturn DFail("A sequence position must be an INT32 or INT64 tensor holding exactly one element.")
+  EndIf
+  If Dt(Pos)\Data=0 Or Dt(Pos)\Count<>1 Or (Dt(Pos)\Kind<>6 And Dt(Pos)\Kind<>7)
+    ProcedureReturn DFail("A sequence position must be an INT32 or INT64 tensor holding exactly one element.")
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; SequenceInsert: a new sequence with T at Pos (default: the end). Move=1
+; takes S's block over because the emitter proved nothing reads S again.
+Procedure DSeqInsert(Y.i,S.i,T.i,Pos.i,Move.i)
+  Protected n.i=0
+  Protected p.i=0
+  If DSeqRequire(S)=0
+    ProcedureReturn
+  EndIf
+  n=DSeqCount(S)
+  p=n
+  If Pos<>0
+    If DSeqPositionOk(Pos)=0
+      ProcedureReturn
+    EndIf
+    p=DInt(Pos,0)
+    If p<0
+      p=p+n
+    EndIf
+    If p<0 Or p>n
+      DFail("SequenceInsert position is outside [-n, n] for the sequence it inserts into.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  If DSeqTensorOk(T)=0
+    DFail("SequenceInsert tensor must be a FLOAT, INT32, INT64 or BOOL tensor.")
+    ProcedureReturn
+  EndIf
+  If Dt(T)\Kind<>DSeqElementKind(S)
+    DFail("SequenceInsert tensor element type does not match the sequence element type.")
+    ProcedureReturn
+  EndIf
+  DValueTake(Y,S,Move)
+  If DError<>0 Or DCancel<>0
+    ProcedureReturn
+  EndIf
+  DSeqPlaceTensor(Y,p,T)
+EndProcedure
+
+Procedure DSeqAt(Y.i,S.i,Pos.i)
+  Protected Dim dims.i(8)
+  Protected n.i=0
+  Protected p.i=0
+  Protected record.i=0
+  Protected i.i=0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If DSeqRequire(S)=0
+    ProcedureReturn
+  EndIf
+  If DSeqPositionOk(Pos)=0
+    ProcedureReturn
+  EndIf
+  n=DSeqCount(S)
+  p=DInt(Pos,0)
+  If p<0
+    p=p+n
+  EndIf
+  If p<0 Or p>=n
+    DFail("SequenceAt position is outside [-n, n-1] for the sequence it reads.")
+    ProcedureReturn
+  EndIf
+  record=DSeqRecord(S,p)
+  For i=0 To PeekL(record)-1
+    dims(i)=PeekL(record+16+i*4)
+  Next
+  If DAlloc(Y,DSeqElementKind(S),PeekL(record),@dims(0))=0
+    ProcedureReturn
+  EndIf
+  If Dt(Y)\Bytes>0
+    DCopy(DSeqItemData(S,p),Dt(Y)\Data,Dt(Y)\Bytes)
+  EndIf
+EndProcedure
+
+Procedure DSeqLength(Y.i,S.i)
+  If DSeqRequire(S)=0
+    ProcedureReturn
+  EndIf
+  If DShape(Y,7,0,0,0,0,0)
+    DWriteI64(Dt(Y)\Data,DSeqCount(S))
+  EndIf
+EndProcedure
+
+Procedure.i DSplitLength(Split.i,Mode.i,Chunk.i,Extent.i,Start.i,Index.i)
+  If Mode=0
+    ProcedureReturn 1
+  EndIf
+  If Mode=1
+    ProcedureReturn DMin(Chunk,Extent-Start)
+  EndIf
+  ProcedureReturn DInt(Split,Index)
+EndProcedure
+
+; SplitToSequence: no split gives chunks of one (keepdims decides whether the
+; axis stays); a scalar split gives equal chunks with a shorter last one; a
+; 1-D split gives explicit lengths that must sum to the axis extent.
+Procedure DSplitToSequence(Y.i,A.i,Split.i,Axis.i,KeepDims.i)
+  Protected Dim dims.i(8)
+  Protected rank.i=0
+  Protected extent.i=0
+  Protected outer.i=0
+  Protected inner.i=0
+  Protected size.i=0
+  Protected mode.i=0
+  Protected chunk.i=0
+  Protected chunks.i=0
+  Protected length.i=0
+  Protected sum.i=0
+  Protected total.i=0
+  Protected start.i=0
+  Protected c.i=0
+  Protected i.i=0
+  Protected o.i=0
+  Protected count.i=0
+  Protected bytes.i=0
+  Protected outRank.i=0
+  Protected data.i=0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If DSeqTensorOk(A)=0
+    DFail("SplitToSequence input must be a FLOAT, INT32, INT64 or BOOL tensor.")
+    ProcedureReturn
+  EndIf
+  rank=Dt(A)\Rank
+  If rank<1
+    DFail("SplitToSequence requires an input of rank one or more.")
+    ProcedureReturn
+  EndIf
+  If Axis<0
+    Axis=Axis+rank
+  EndIf
+  If Axis<0 Or Axis>=rank
+    DFail("SplitToSequence attribute axis is outside the input rank.")
+    ProcedureReturn
+  EndIf
+  extent=DDims((A)*8+(Axis))
+  outer=DProduct(A,0,Axis-1)
+  inner=DProduct(A,Axis+1,rank-1)
+  size=DSize(Dt(A)\Kind)
+  If Split<>0
+    If Dt(Split)\Data=0 Or (Dt(Split)\Kind<>6 And Dt(Split)\Kind<>7)
+      DFail("SplitToSequence split must be an INT32 or INT64 tensor.")
+      ProcedureReturn
+    EndIf
+    If Dt(Split)\Rank=0
+      mode=1
+      chunk=DInt(Split,0)
+      If chunk<=0
+        DFail("SplitToSequence scalar split must be positive.")
+        ProcedureReturn
+      EndIf
+      chunks=(extent+chunk-1)/chunk
+    ElseIf Dt(Split)\Rank=1
+      mode=2
+      chunks=Dt(Split)\Count
+      For c=0 To chunks-1
+        length=DInt(Split,c)
+        If length<0
+          DFail("SplitToSequence split lengths must not be negative.")
+          ProcedureReturn
+        EndIf
+        sum=sum+length
+      Next
+      If sum<>extent
+        DFail("SplitToSequence split lengths do not sum to the input extent along the axis.")
+        ProcedureReturn
+      EndIf
+    Else
+      DFail("SplitToSequence split must be a scalar or a 1-D tensor.")
+      ProcedureReturn
+    EndIf
+  Else
+    mode=0
+    chunks=extent
+  EndIf
+  start=0
+  For c=0 To chunks-1
+    length=DSplitLength(Split,mode,chunk,extent,start,c)
+    total=total+DSeqAlign8(outer*length*inner*size)
+    start=start+length
+  Next
+  If DSeqMake(Y,Dt(A)\Kind,chunks,total)=0
+    ProcedureReturn
+  EndIf
+  start=0
+  For c=0 To chunks-1
+    length=DSplitLength(Split,mode,chunk,extent,start,c)
+    For i=0 To rank-1
+      dims(i)=DDims((A)*8+(i))
+    Next
+    dims(Axis)=length
+    outRank=rank
+    If mode=0 And KeepDims=0
+      For i=Axis To rank-2
+        dims(i)=dims(i+1)
+      Next
+      outRank=rank-1
+    EndIf
+    count=outer*length*inner
+    bytes=count*size
+    data=DSeqPlace(Y,c,outRank,@dims(0),count,bytes)
+    If data=0
+      ProcedureReturn
+    EndIf
+    If bytes>0
+      For o=0 To outer-1
+        DCopy(Dt(A)\Data+(o*extent+start)*inner*size,data+o*length*inner*size,length*inner*size)
+      Next
+    EndIf
+    start=start+length
+  Next
+EndProcedure
+
+; ConcatFromSequence: new_axis=0 joins along an existing axis (numpy
+; concatenate); new_axis=1 stacks along a new one (numpy stack).
+Procedure DConcatFromSequence(Y.i,S.i,Axis.i,NewAxis.i)
+  Protected Dim dims.i(9)
+  Protected Dim first.i(8)
+  Protected n.i=0
+  Protected r.i=0
+  Protected outRank.i=0
+  Protected e.i=0
+  Protected i.i=0
+  Protected extent.i=0
+  Protected total.i=0
+  Protected outer.i=1
+  Protected inner.i=1
+  Protected size.i=0
+  Protected o.i=0
+  Protected span.i=0
+  Protected offset.i=0
+  DZero(@dims(0),9*#PMD_NATIVE_BYTES)
+  DZero(@first(0),8*#PMD_NATIVE_BYTES)
+  If DSeqRequire(S)=0
+    ProcedureReturn
+  EndIf
+  n=DSeqCount(S)
+  If n=0
+    DFail("ConcatFromSequence cannot join an empty sequence: the result would have no shape.")
+    ProcedureReturn
+  EndIf
+  r=DSeqItemRank(S,0)
+  For i=0 To r-1
+    first(i)=DSeqItemDim(S,0,i)
+  Next
+  If NewAxis<>0
+    outRank=r+1
+    If Axis<0-(r+1) Or Axis>r
+      DFail("ConcatFromSequence attribute axis is outside the element rank.")
+      ProcedureReturn
+    EndIf
+  Else
+    outRank=r
+    If r<1
+      DFail("ConcatFromSequence with new_axis=0 needs elements of rank one or more.")
+      ProcedureReturn
+    EndIf
+    If Axis<0-r Or Axis>r-1
+      DFail("ConcatFromSequence attribute axis is outside the element rank.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  If Axis<0
+    Axis=Axis+outRank
+  EndIf
+  If outRank>8
+    DFail("ConcatFromSequence result rank exceeds eight.")
+    ProcedureReturn
+  EndIf
+  For e=0 To n-1
+    If DSeqItemRank(S,e)<>r
+      DFail("ConcatFromSequence elements differ in rank.")
+      ProcedureReturn
+    EndIf
+    For i=0 To r-1
+      extent=DSeqItemDim(S,e,i)
+      If NewAxis<>0 Or i<>Axis
+        If extent<>first(i)
+          DFail("ConcatFromSequence elements differ in an extent other than the joined axis.")
+          ProcedureReturn
+        EndIf
+      EndIf
+    Next
+    If NewAxis<>0
+      total=total+1
+    Else
+      total=total+DSeqItemDim(S,e,Axis)
+    EndIf
+  Next
+  If NewAxis<>0
+    For i=0 To Axis-1
+      dims(i)=first(i)
+    Next
+    dims(Axis)=n
+    For i=Axis To r-1
+      dims(i+1)=first(i)
+    Next
+  Else
+    For i=0 To r-1
+      dims(i)=first(i)
+    Next
+    dims(Axis)=total
+  EndIf
+  If DAlloc(Y,DSeqElementKind(S),outRank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  size=DSize(DSeqElementKind(S))
+  For i=0 To Axis-1
+    outer=outer*first(i)
+  Next
+  If NewAxis<>0
+    For i=Axis To r-1
+      inner=inner*first(i)
+    Next
+  Else
+    For i=Axis+1 To r-1
+      inner=inner*first(i)
+    Next
+  EndIf
+  If Dt(Y)\Bytes=0
+    ProcedureReturn
+  EndIf
+  For o=0 To outer-1
+    For e=0 To n-1
+      If NewAxis<>0
+        span=inner*size
+      Else
+        span=DSeqItemDim(S,e,Axis)*inner*size
+      EndIf
+      If span>0
+        DCopy(DSeqItemData(S,e)+o*span,Dt(Y)\Data+offset,span)
+      EndIf
+      offset=offset+span
+    Next
+  Next
+EndProcedure
+
+; A Loop scan output: one copy per iteration, stacked when the loop ends.
+Procedure DSeqAppendTensor(Acc.i,T.i)
+  If DSeqTensorOk(T)=0
+    DFail("A Loop scan output must be a FLOAT, INT32, INT64 or BOOL tensor.")
+    ProcedureReturn
+  EndIf
+  If DSeqIs(Acc)=0
+    If DSeqMake(Acc,Dt(T)\Kind,4,DSeqAlign8(Dt(T)\Bytes))=0
+      ProcedureReturn
+    EndIf
+  EndIf
+  DSeqPlaceTensor(Acc,DSeqCount(Acc),T)
+EndProcedure
+
+; Stacks the accumulated scan values along a new first axis. After zero
+; iterations ONNX defines no shape for it; the result is [0] followed by the
+; body's declared extents only when all of them are declared, else refused.
+Procedure DSeqStack(Y.i,Acc.i,Kind.i,Rank.i,DimsText.i)
+  Protected Dim dims.i(9)
+  Protected i.i=0
+  DZero(@dims(0),9*#PMD_NATIVE_BYTES)
+  If DSeqIs(Acc)<>0
+    If DSeqCount(Acc)>0
+      DConcatFromSequence(Y,Acc,0,1)
+      ProcedureReturn
+    EndIf
+  EndIf
+  If DSeqKindCarried(Kind)=0
+    DFail("A Loop ran zero iterations and its scan output declares no FLOAT, INT32, INT64 or BOOL element type, so its empty result has no type.")
+    ProcedureReturn
+  EndIf
+  If Rank<0
+    DFail("A Loop ran zero iterations and its scan output does not declare every extent, so its empty result has no defined shape.")
+    ProcedureReturn
+  EndIf
+  If Rank+1>8
+    DFail("A Loop scan output rank exceeds eight.")
+    ProcedureReturn
+  EndIf
+  dims(0)=0
+  For i=1 To Rank
+    dims(i)=DListValue(DimsText,i)
+  Next
+  DAlloc(Y,Kind,Rank+1,@dims(0))
+EndProcedure
+
+; Host API for sequence graph inputs and outputs. DSeqReset makes an input id
+; an empty sequence of Kind; DSeqAppendShape appends one element of Rank
+; extents (DimsAddress: native integers) and returns the address to fill,
+; valid until the next append, or zero after a refusal.
+Procedure.i DSeqReset(Id.i,Kind.i)
+  ProcedureReturn DSeqMake(Id,Kind,0,0)
+EndProcedure
+
+Procedure.i DSeqAppendShape(Id.i,Kind.i,Rank.i,DimsAddress.i)
+  Protected i.i=0
+  Protected count.i=1
+  Protected extent.i=0
+  Protected size.i=DSize(Kind)
+  If DSeqRequire(Id)=0
+    ProcedureReturn 0
+  EndIf
+  If Kind<>DSeqElementKind(Id)
+    ProcedureReturn DFail("An appended element's type does not match the sequence element type.")
+  EndIf
+  If Rank<0 Or Rank>8
+    ProcedureReturn DFail("An appended element has a rank above eight.")
+  EndIf
+  For i=0 To Rank-1
+    extent=DSeqNativeDim(DimsAddress,i)
+    If extent<0 Or extent>DLimit
+      ProcedureReturn DFail("An appended element has an invalid extent.")
+    EndIf
+    If extent>0
+      If count>DLimit/extent
+        ProcedureReturn DFail("An appended element exceeds the working-memory limit.")
+      EndIf
+    EndIf
+    count=count*extent
+  Next
+  If count>DLimit/size
+    ProcedureReturn DFail("An appended element exceeds the working-memory limit.")
+  EndIf
+  ProcedureReturn DSeqPlace(Id,DSeqCount(Id),Rank,DimsAddress,count,count*size)
+EndProcedure

@@ -1,0 +1,291 @@
+@CHAPTER Speech, end to end
+@INTRO The largest thing this compiler has been pointed at: one pinned model, four checked assets, two adapters, and an honest account of how slow it still is.
+
+@SECTION Speech is an application of the compiler, not a second compiler
+
+Nothing in this chapter is a special path through the model compiler. The
+speech model is compiled exactly like the two-value `Add` in chapter 3: the
+same parser, the same validation, the same emitters, the same weight pack.
+It is a much bigger graph - 2,463 nodes, 3,032 tensors - and it needs a
+324,621,440-byte pack, but it goes through the same door.
+
+What is added on top is an **adapter**: the code that turns text into the
+token IDs the model wants, picks a voice, and hands back the audio samples
+that come out. That layer contains no graph semantics at all.
+
+@TRAP **This repository does not contain the model, the voices or the
+pronunciation data.** It contains the code that reads them, the code that
+builds the packed forms, and the code that checks them. You can build the
+compiler, run every arithmetic example, and generate speech source without
+any of those assets - but the speech demo will not speak until you supply
+compatible ones and keep their licences.
+
+@SECTION The model is pinned, and the pin is enforced
+
+One exact export. Not "a Kokoro model"; that one.
+
+@FRAG
+Full Kokoro-82M ONNX, full-precision v1.0 export
+325,532,232 bytes
+SHA-256 8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb
+@ENDFRAG
+
+Point the speech switches at anything else and they stop:
+
+@FRAG
+> ... --compile output\twice.onnx --output out\t --target pi4 --kokoro-text
+ONNX COMPILER ERROR: The speech adapter requires the documented full Kokoro-82M model. Check its SHA-256 identity.
+@ENDFRAG
+
+@NOTE Why pin at all, when the compiler handles a general subset? Because
+the adapter is not general. It knows this model's token vocabulary, its
+voice tensor dimensions, and the exact shape of its inputs. A different
+export with the same operator set would compile fine as a MODEL and be
+wrong as SPEECH, and that failure would arrive as bad audio rather than as
+an error.
+
+@SECTION The four assets, and their contracts
+
+@FRAG
+kokoro_us_english.pmg2p    12,613,954 B   base English pronunciation pack
+kokoro_us_extra.pmg2p       5,397,245 B   supplementary pronunciation pack
+<name>.pmvoice                522,368 B   one prepared voice
+the pinned model          325,532,232 B   as above
+@ENDFRAG
+
+The base pack is required. The supplementary pack is required by the
+Windows reader and optional-but-recommended in the portable adapter. Each
+voice is one file.
+
+@TRAP Size is not identity. The loaders validate the format, the header,
+the extents, the payload CRC-32 and the model identity recorded inside.
+You cannot rename an upstream raw voice `.bin` into `.pmvoice`, or a
+dictionary JSON into `.pmg2p`, and have it work - and the refusal you get
+will be a format refusal, not a hint that you were close.
+
+@SECTION Preparing a voice
+
+An upstream raw voice is exactly 510 rows of 256 little-endian FP32 values
+- 522,240 bytes. The packer turns that into the checked form:
+
+@FRAG
+> ...\PureMetalOnnxCompilerCLI.exe --kokoro-pack-voice C:\Models\af_heart.bin --output C:\Models\af_heart.pmvoice [--source-sha256 HEX]
+> ...\PureMetalOnnxCompilerCLI.exe --kokoro-verify-voice C:\Models\af_heart.pmvoice
+@ENDFRAG
+
+Packing rejects NaN and infinity in the data, validates the finished
+header, checksums and payload, records the pinned model's identity, and
+**refuses to overwrite an existing destination**. `--source-sha256` lets
+you assert the digest of the raw file you obtained from a trusted place,
+so a substituted download is caught before it is transformed.
+
+Verification is a separate command because a file at rest is a different
+question from a file being written:
+
+@FRAG
+> ...\PureMetalOnnxCompilerCLI.exe --kokoro-verify-voice missing.pmvoice
+VOICE PACK ERROR: PMVOICE file is missing or has the wrong length
+@ENDFRAG
+
+@NOTE Dimensions alone cannot prove a voice belongs to this model. 510 by
+256 is a shape, not an identity. The packer records what it was told and
+checks what it can; it does not claim more.
+
+@SECTION Preparing the pronunciation packs
+
+Two commands to build, two to verify, and every input is pinned by digest
+before a byte is parsed:
+
+@FRAG
+> ... --kokoro-pack-base-dictionary  us_gold.json --silver us_silver.json --output kokoro_us_english.pmg2p
+> ... --kokoro-pack-extra-dictionary cmudict.dict --base kokoro_us_english.pmg2p --output kokoro_us_extra.pmg2p
+> ... --kokoro-verify-base-dictionary  kokoro_us_english.pmg2p
+> ... --kokoro-verify-extra-dictionary kokoro_us_extra.pmg2p
+@ENDFRAG
+
+The supplementary pack is built **against the finished base pack**, which
+it consults so that it only adds words the base cannot already answer.
+That is why the order matters and why `--base` is not optional.
+
+Each pack is deterministic: the same pinned sources always produce the
+same bytes, down to the hash-slot probe order. Packing refuses a malformed
+lexicon line, a repeated word, a pronunciation outside the pinned
+vocabulary, a key longer than 63 bytes, and an existing destination - and
+every refusal names its numeric code and what to check. The completed
+header, the extents, the payload CRC-32, every hash slot and every
+pronunciation codepoint are validated before the output is published.
+
+@TRAP **The pinned digests include the line endings.** The two Misaki
+files are pinned with CRLF line endings, as a clone with
+`core.autocrlf=true` checks them out; downloaded raw they are LF and are
+refused. `cmudict.dict` is pinned as the LF file, so clone it with
+`core.autocrlf=false`. Chapter 11 gives the exact clone commands and the
+digests they produce.
+
+@TRAP A pack's exact size, entry count and payload CRC are **pinned in
+several places at once**: the board runtime's validator, the shipped
+verifier, and the loader used for checking. That is deliberate, and it has
+a consequence people meet the first time they want to add one word. A pack
+with one extra entry is refused by all of them. Adding a word is not a
+dictionary edit - it is a contract change that moves every pinned value
+and rebuilds the tools. The upside is that the pack cannot drift silently;
+the cost is that it cannot drift conveniently either.
+
+@NOTE A word that is not in either pack is not an error. The
+grapheme-to-phoneme layer falls back to spelling it out letter by letter.
+That is audible, correct, and occasionally comic: before the product's own
+name was added to the supplementary pack, the board said it as "K O K O R
+O", and the sentence went from 87 tokens to 100 because thirteen of them
+were the machine spelling.
+
+@SECTION Windows: the reading window
+
+@FRAG
+> New-Item -ItemType Directory -Force output | Out-Null
+> ... --compile 'C:\Models\kokoro.onnx' --output output\kokoro-reader --target windows --precision fp32 --speech-ui
+@ENDFRAG
+
+That emits a `.pb` you build yourself, as usual, thread-safe and optimized.
+Keep its `.pmw` and `.runtime/` with it. In the window you select a
+`.pmvoice` and the base `.pmg2p`, with `kokoro_us_extra.pmg2p` beside the
+base file. Voice discovery is local - it reads the directory you point at
+and does not fetch a catalogue from anywhere.
+
+The reader chunks text the way a book is read, queues audio through a
+bounded producer/consumer queue, and gives you Pause, Resume and Stop.
+
+`--speech-ui` is Windows only, and says so:
+
+@FRAG
+> ... --target pico2 --speech-ui
+ONNX COMPILER ERROR: The speech-window adapter requires Windows. Remove --speech-ui when generating a model library for another target.
+@ENDFRAG
+
+@SECTION Pi 4 and UNO Q: the resident text adapter
+
+@FRAG
+> ... --compile 'C:\Models\kokoro.onnx' --output output\kokoro-pi4 --target pi4 --precision fp32 --kokoro-text
+@ENDFRAG
+
+Use `--target unoq` for the UEFI profile. And the switch is refused
+anywhere it does not belong:
+
+@FRAG
+> ... --target windows --kokoro-text
+ONNX COMPILER ERROR: --kokoro-text requires pi4 or unoq; Windows uses --speech-ui. Full Kokoro cannot fit Pico RAM.
+@ENDFRAG
+
+The adapter deliberately contains no filesystem, no audio driver, no
+allocation service, no compiler invocation and no board addresses. It is
+text in, tensor IDs out, samples back. Everything else is the
+application's.
+
+@FRAG
+PmKokoroTextBind(*pack,packBytes, *extra,extraBytes, *voice,voiceBytes)
+PmKokoroTextSetVoice(*voice,voiceBytes)
+PmKokoroTextPrepare(*text,textBytes,speed)   ; -> token count, or 0
+PmKokoroTextRender(*text,textBytes,speed)    ; -> output tensor ID
+PmKokoroTextClose()
+@ENDFRAG
+
+@SECTION A resident runner, in outline
+
+The order is the whole design, so here it is as one shape. Every line is
+a place something can fail, and every one of them is checked in a real
+runner.
+
+@FRAG
+Main(x0):
+  PmOnnxAnvilEnter(x0)                  ; first statement - chapter 6
+  set up MMU and caches                 ; the application's job, not the model's
+  PmModelBindMemory(weights, 324621440, arena, arenaBytes)
+      ; validates the pack header, identity and CRC-32
+      ; runs constant preparation. Minutes of setup happen ONCE, here.
+  PmKokoroTextBind(basePack, baseBytes, extraPack, extraBytes, voice, voiceBytes)
+      ; assets stay CALLER-OWNED and immutable until close or rebind
+
+  for each sentence:
+      PmModelResetRequest()
+      id = PmKokoroTextRender(text, textBytes, 1.0)
+      if id = 0: read PmKokoroG2pError / PmKokoroG2pErrorAt / DError and stop
+      copy the samples somewhere of your own       ; they are BORROWED
+      ; ... play them, or write them, or hash them
+
+  PmKokoroTextClose()                   ; does NOT free your assets
+  PmModelClose()
+@ENDFRAG
+
+@TRAP The returned audio is **borrowed**. It is mono FP32 PCM at 24 kHz,
+valid until the next prepare, the next render, a model reset or the close.
+Copy it before you submit more text. Keeping the pointer and submitting
+the next sentence is the mistake, and it does not announce itself - the
+buffer is still readable, it just holds something else.
+
+Two more limits worth knowing before you design around it: one serialized
+request at a time, and a text request is capped at 4,096 UTF-8 bytes plus
+the supported phoneme sequence length. Book-sized scheduling is yours.
+
+@SECTION What performance to expect today
+
+Measured, on a Pi 4 at approximately 1.5 GHz, timed by the board's 54 MHz
+architected counter, FP32, resident model, single core unless stated.
+
+@FRAG
+"The sky is blue, and the sun is shining."
+    41 tokens, 68,400 samples, 2.85 s of audio
+    2026-09-10  433.6 s      about 152x slower than real time
+    2026-09-15   57.6 s
+
+"You are hearing a complete sentence produced on this small computer."
+    69 tokens, 102,000 samples, 4.25 s of audio
+    2026-09-10  639.3 s
+    2026-09-15   88.1 s
+@ENDFRAG
+
+@TRAP **This is not usable interactive speech, and the book will not
+pretend otherwise.** A 4.25-second sentence taking 88 seconds is roughly
+21 times slower than real time. It is a correctness checkpoint on the way
+somewhere, and the honest description of where it is today.
+
+Where the remaining time goes, from the board's own per-node tick rows for
+that 88.1-second request: convolution 70.5 s, everything else 10.8 s,
+matrix multiply 2.8 s, the LSTM 1.9 s, transposed convolution 1.8 s,
+general matrix multiply 0.4 s. Convolution is 80% of it, and the measured
+cost is 0.642 ns per multiply-accumulate over 109.67 GMAC on one core.
+
+@NOTE Every one of those speedups was required to leave the output
+unchanged, and did. The waveform digests for both sentences are
+bit-identical across the whole sequence of kernel changes. That is the
+contract chapter 9 describes, tested at model scale rather than in a
+fixture: a kernel that is four times faster and produces one different bit
+has not passed.
+
+The numbers above are the single-core FP32 ones. Two things have been
+measured since, each in its own chapter: running the convolutions on all
+four cores through the payload service of chapter 6 - chapter 11 has a
+295-token sentence rendered that way in 158.2 s, with the runner and the
+recipe that reproduce it - and INT8, which chapter 4 shows running this
+model at half the speed of FP32 on the same four cores.
+
+@SECTION Accuracy, stated the same way
+
+Against one frozen reference session of the pinned model, comparing every
+final sample with no alignment and no trimming:
+
+@FRAG
+limits:   max absolute error 0.1    RMSE 0.01    correlation 0.99
+
+sentence 1   0.0963 / 0.00429 / 0.99800     pass
+sentence 2   0.2119 / 0.00612 / 0.99638     FAILS on max absolute error
+@ENDFRAG
+
+That second row is recorded as a failure, because it is one. It is not
+widened, explained away, or re-described. What is known about it is in
+chapter 8.
+
+@SECTION Pico is not a destination for this
+
+The Pico profiles exist for small models. The full model's weights are 324
+MB and its text assets are tens of megabytes; no storage precision changes
+that by two orders of magnitude. The speech switches reject those target
+combinations outright rather than offering a demo that could never bind.

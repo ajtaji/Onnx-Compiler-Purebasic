@@ -1,0 +1,141 @@
+@CHAPTER Where everything is
+@INTRO The reference pages, what each one answers, and how this book is rendered and kept honest.
+
+@SECTION This book and the reference pages are different things
+
+The book is a path through the product: read it in order and you end up
+able to use the thing. The reference pages under `docs/` are lookups: go
+straight to the one that owns your question and read only that.
+
+Where they overlap, they are meant to agree. If they ever disagree, one of
+them is wrong and it is worth saying so rather than working around it.
+
+@SECTION The map
+
+@FRAG
+README.md              What the project is, in one screen, with the badges
+                       and the links. Start here if you arrived by
+                       accident.
+
+docs/QUICKSTART.md     The arithmetic walkthrough as a checklist: build,
+                       create the demo models, generate, run. Chapter 3 is
+                       the same ground with the reasoning attached.
+
+docs/BUILD.md          Building the two tools. Requirements, the helper,
+                       the manual commands, why runtime/ is needed at
+                       build time, and the optional private release hook.
+                       The authority for chapter 2.
+
+docs/SOURCE_MAP.md     EVERY published source file and what it is
+                       responsible for, plus a "which file should I
+                       change?" table. The authority for chapter 9's
+                       opening, and considerably more complete than it.
+
+docs/ARCHITECTURE.md   The pipeline as a diagram, the boundary where this
+                       tool stops, graph and memory planning, the two
+                       emission paths, why the source closure works the
+                       way it does.
+
+docs/TARGETS.md        Target-by-target integration: what you build each
+                       one with, what your application must supply, the
+                       two emitted APIs step by step, the precision
+                       table, Pico capacity, and the 64-bit Arm compiler
+                       compatibility requirements. The authority for
+                       chapters 5 and 6.
+
+docs/KOKORO.md         Speech: what is included, the four assets and their
+                       exact contracts, the pack and verify commands, the
+                       Windows reader, the portable adapter, and the
+                       measured Pi 4 status. The authority for chapter 7.
+
+docs/VALIDATION.md     What was checked, when, and what each check
+                       establishes - plus the explicit limitations, in a
+                       list. The authority for chapter 8.
+
+docs/ResidentProgress.md
+                       The progress-callback contract in full: the four
+                       phases, cancellation, the non-reentry rule, and
+                       what progress points do and do not bound.
+
+examples/pi4/          The Raspberry Pi 4 examples. kokoro-sentence/ is
+                       the runner, the two host tools and the recipe
+                       behind chapter 11, and its README is the
+                       authority for that recipe.
+
+tests/node_suite/      The node-test coverage harness, its generic driver,
+                       the targeted default-attribute and small-kernel
+                       cases, and the
+                       published scores in results/. Developer checks;
+                       chapter 8 says how to run them.
+
+THIRD_PARTY_NOTICES.md Everything obtained separately, what its
+                       relationship to this project is, and where to check
+                       its terms.
+
+LICENSE                MIT.
+@ENDFRAG
+
+@SECTION Two things that are deliberately not here
+
+**The gates.** `tests/` is ignored by this repository apart from the
+node-test harness in `tests/node_suite/`, and the internal diagnostics are
+not part of this export. Chapter 8 says where they live
+and why that is the rule rather than an omission.
+
+**The speech assets.** No model, no voices, no dictionary payloads.
+Chapter 7 and the speech reference page both say what the contracts are,
+so you can obtain or prepare compatible ones.
+
+@SECTION How this book is rendered
+
+The chapters are the `.txt` files beside this one, in filename order.
+Files beginning `00_` are documentation of the book and are never
+rendered; `00_OUTLINE.txt` explains the markup and the rules the chapters
+are written to.
+
+They are printed by the same renderer that prints the PureMetal Forge
+books, pointed at this folder, so this book looks like those books and
+cannot drift into its own private dialect of the markup:
+
+@FRAG
+python tools/build_help_pdf.py ^
+    --book <this checkout>\docs\guide ^
+    --out  <this checkout>\docs\guide\OnnxCompilerGuide.pdf ^
+    --title "The ONNX Compiler Guide" ^
+    --subtitle "Ahead-of-time ONNX compilation to readable BASIC source." ^
+    --section-nav
+@ENDFRAG
+
+It writes exactly one PDF exactly where you said, and nothing else. The
+`--section-nav` flag puts the section headings into the contents as well
+as the chapter titles, which on a reference book of this size is worth the
+extra page.
+
+@NOTE The renderer is part of the PureMetal Forge tooling, not of this
+repository, because it is one renderer serving several books. A second
+renderer maintained here would quietly drift from the first, and the two
+books would slowly stop looking like one product.
+
+@SECTION Keeping it true
+
+One rule governs this book, and it is worth stating where a contributor
+will meet it:
+
+**A commit that changes what a developer does updates the affected chapter
+and re-renders the PDF in the same commit.** A command, a flag, a file
+format, an emitted API, an install step, a capacity rule, a board
+procedure. Same commit, not a follow-up.
+
+The reason is the same reason chapter 4 is full of exact refusal text. A
+reader who copies a command from documentation and gets an error does not
+conclude that this one line is stale. They conclude that the documentation
+lies, and they stop trusting all of it - including the parts that would
+have saved them a day. A book that lags its repository is a defect, and it
+gets filed like one.
+
+Two habits keep it cheap. **Print only what you ran**: every command in
+this book was executed, or copied verbatim from `--help`, and every
+refusal quoted was produced by making that mistake on purpose. And **name
+pending work as pending, in the same sentence as the thing it will
+change**, so a reader can tell the product from the plan without having to
+guess which they are reading.

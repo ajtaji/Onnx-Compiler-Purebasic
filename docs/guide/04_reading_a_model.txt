@@ -1,0 +1,561 @@
+@CHAPTER Reading a model
+@INTRO What the compiler accepts, what it turns down, and exactly how the refusal reads.
+
+@SECTION Look before you compile
+
+`--inspect` parses the file and tells you what is in it, without emitting
+anything. It is the cheapest thing you can do to a model you did not write,
+and it answers most of the questions the rest of this chapter is about.
+
+@FRAG
+> .\bin\PureMetalOnnxCompilerCLI.exe --inspect output\dense.onnx
+Model:        output/dense.onnx
+Bytes:        138
+IR version:   8
+Graph:        dense
+Nodes:        1
+Initializers: 1 (raw=1, typed=0, external=0)
+Value infos:  0
+Inputs:
+  x type=1 [1,2]
+Outputs:
+  y type=1 [1,2]
+Operators:
+  MatMul 1
+@ENDFRAG
+
+The operator histogram at the bottom is the part to read first. Compare it
+against the list in the next section and you know in seconds whether this
+model has any chance at all.
+
+@NOTE `external=0` matters on a large model. An initializer stored
+externally is a reference to another file, not data. Check that number
+before you copy a model somewhere and wonder why it stopped working.
+
+@SECTION The operator subset, in full
+
+This is the complete list the fixed-shape validator implements; the
+runtime-dimension path adds Shape, ConstantOfShape and Constant, and
+the control-flow and sequence operators marked below. There is no long tail
+and no partial support hiding behind a flag - an operator is on this list
+or it is refused.
+
+@FRAG
+Arithmetic      Add  Sub  Mul  Div  Pow
+Activations     Relu  LeakyRelu  Sigmoid  Tanh  Clip
+Elementwise     Exp  Log  Sqrt  Abs  Neg  Sin  Cos  Atan  Floor  Round
+Linear algebra  MatMul  Gemm  Conv  ConvTranspose  LSTM
+Normalization   Softmax  LayerNormalization  BatchNormalization  InstanceNormalization
+Reductions      ReduceMean  ReduceSum  ReduceMax  ReduceProd  CumSum
+Signal          STFT  Resize
+Comparison      Equal  Greater  GreaterOrEqual  Less  LessOrEqual  And  Not  Where
+Indexing        Gather  Slice  Expand  Pad  NonZero  ScatterND  ScatterElements  TopK  Range
+Shape           Reshape  Flatten  Squeeze  Unsqueeze  Transpose  Concat
+Other           Cast  Identity
+Random          RandomNormal  RandomNormalLike  RandomUniform  RandomUniformLike
+Control flow    If  Loop                              (runtime dimensions)
+Sequences       SequenceEmpty  SequenceConstruct  SequenceInsert  SequenceAt
+                SequenceLength  SplitToSequence  ConcatFromSequence
+                                                      (runtime dimensions)
+@ENDFRAG
+
+Anything else is turned down by node number and by name:
+
+@FRAG
+ONNX COMPILER ERROR: node 0 uses unsupported operator Einsum
+@ENDFRAG
+
+@TRAP Being on the list is necessary, not sufficient. An operator is
+supported for the attribute combinations, ranks and element types that
+have actually been implemented and proved. A `Conv` with a grouping this
+runtime does not carry is still refused, and it is refused at validation
+rather than accepted and silently ignored. Read the error, not the list.
+
+@TRAP That is the rule. The official ONNX node tests (chapter 8) found
+eight forms that were accepted and computed the wrong answer; all eight
+are fixed, each recorded in its forum topic (848 and 850 to 856).
+
+Forms fixed since the node tests first ran, and the limits each keeps:
+- Clip reads a min or max that arrives while the program runs from its
+  tensor when the node runs; both bounds must be FLOAT scalars.
+- LayerNormalization normalises over any axis. Scale and B must have X's
+  extent on every normalised axis and 1 before it; one that broadcasts
+  inside the normalised block is refused.
+- Softmax normalises along any axis; below opset 13 it flattens every axis
+  from axis onward, as Softmax-11 specifies.
+- MatMul promotes a 1-D operand the way numpy.matmul does, on its own or
+  against a batched operand.
+- Pow reads each operand in its own element type. An INT64 base gives an
+  exact integer power; a FLOAT exponent that is not a whole number, a
+  negative exponent on a zero base, or an unsigned exponent above the signed
+  range stops the program at that node rather than rounding.
+- ScatterND computes its reductions add, mul, max and min, on FLOAT and
+  INT64 data (and INT32 on the runtime-dimension path).
+- BatchNormalization with training_mode 1 normalises with the batch's own
+  statistics and needs all three outputs; BatchNormalization-9's training
+  outputs and spatial 0 are refused.
+
+@SECTION Attributes: the value decides, not the presence
+
+Exporters write attributes out even when they hold the default, so a model
+full of `saturate = 1`, `auto_pad = NOTSET` and `stash_type = 1` is normal.
+None of those is a reason to refuse. An attribute is refused only when its
+value asks for something the kernel does not compute, and the refusal names
+the operator, the node, the attribute and the value, on either path:
+
+@FRAG
+ONNX COMPILER ERROR: Resize node up: nearest_mode is absent, so it takes the specification's default round_prefer_floor, which runtime-dimension emission does not implement for mode nearest; floor is.
+@ENDFRAG
+
+That one is worth reading twice. The attribute is not in the model at all,
+and the model is still refused, because absent means the specification's
+default and the default is a rounding this runtime does not implement.
+Presence was never the question; the value is.
+
+What each operator with attributes accepts, briefly - the validation page
+has the full table:
+
+@FRAG
+Cast        saturate with any value (it only affects float8 casts)
+Shape       start and end, negative and out-of-range values included
+LSTM        layout 0, input_forget 0, the default activations
+LayerNorm   stash_type 1
+Conv        auto_pad NOTSET, VALID, SAME_UPPER, SAME_LOWER
+ConvTransp. the same auto_pad values; not output_shape
+Resize      nearest (floor) or linear; half_pixel or asymmetric;
+            antialias 0, exclude_outside 0; attributes those modes ignore
+ScatterND   reduction none, add, mul, max, min
+ScatterEl.  reduction none, add, mul, max, min; negative indices
+TopK        axis, largest, sorted (sorted order is written either way)
+ReduceMax   keepdims, noop_with_empty_axes; axes input or attribute
+ReduceProd  the same as ReduceMax
+InstanceN.  epsilon
+Pad         mode constant, reflect, edge, wrap; the axes input
+ReduceSum   noop_with_empty_axes, when the axes are given
+@ENDFRAG
+
+@NOTE auto_pad SAME needs the input width, which a runtime-dimension model
+only knows while it runs, so that form is emitted as its own call -
+`DConvSame(...)` rather than `DConv(...)` - that computes the padding and
+then runs the same convolution. A model that uses only the default forms
+emits exactly the calls it always did.
+
+An opset import of another domain that no node uses, such as
+`ai.onnx.ml`, changes nothing and is accepted. A node that actually lives in
+another domain is refused, named, on either path:
+
+@FRAG
+ONNX COMPILER ERROR: node 0 uses unsupported domain com.microsoft
+ONNX COMPILER ERROR: FusedGelu node gelu: its domain com.microsoft is not implemented by runtime-dimension emission, which implements the ai.onnx domain only.
+@ENDFRAG
+
+The first is the fixed-shape path, the second the runtime-dimension path.
+
+@SECTION The opset range it will admit
+
+@FRAG
+> ... --compile dense25.onnx --output out\d --target windows
+ONNX COMPILER ERROR: ai.onnx opset 25 is outside the audited range 7..23
+
+> ... --compile dense5.onnx --output out\d --target windows
+ONNX COMPILER ERROR: ai.onnx opset 5 is outside the audited range 7..23
+@ENDFRAG
+
+Both ends are refusals. Too new is obvious; too old is the one that
+surprises people, and it is the same argument in reverse. Operator
+semantics changed across those early versions, and a compiler that assumes
+modern behaviour while reading an old graph produces plausible numbers
+that are wrong.
+
+"Audited" is the honest word. It means somebody checked what each operator
+means in that range, not that the range was chosen to look generous.
+
+@TRAP The runtime-dimension path is narrower, and it says so in its own
+words. A model with a symbolic extent goes down a second emitter that
+takes each node, subgraph nodes included, from its operator's floor - the
+oldest opset whose definition of it is the one implemented - through
+opset 20:
+
+@FRAG
+ONNX COMPILER ERROR: The model imports ai.onnx opset 21; runtime-dimension emission implements operator definitions through opset 20.
+ONNX COMPILER ERROR: Softmax node (unnamed): the model imports ai.onnx opset 11, whose definition of Softmax differs from the one runtime-dimension emission implements, which is current from opset 13 through 20.
+@ENDFRAG
+
+The second one is the reason for floors. Softmax at opset 11 flattens its
+input to two dimensions around the axis; from 13 it works along one axis.
+Same name, different operation, and a model that asks for the old one gets
+a sentence instead of the new one's numbers.
+
+Most operators on that path start at opset 11 or earlier; GreaterOrEqual
+starts at 12, Softmax at 13, LayerNormalization and STFT at 17, and an
+operator not yet checked across the versions still needs 20.
+InstanceNormalization, TopK, ScatterElements, ReduceMax, ReduceProd, Not,
+Identity and Pad have floors of their own - TopK from 10, ScatterElements
+and Pad from 11, InstanceNormalization from 6, the rest from 1 - and a form
+that belongs to another opset, such as Pad's wrap mode at opset 18, is
+refused by name. The fixed-shape path admits 7 through 23. The two paths
+are not equally broad, and the message tells you which one you are on.
+
+@SECTION Fixed shapes and runtime dimensions
+
+Every extent in an ONNX graph is either a number or a name. That single
+distinction decides which of the two emitters runs and which API you get.
+
+**All numbers** is a fixed-shape model. Every buffer size is known at
+generation time, lifetimes are known, and the arena is planned exactly.
+You get the `PmOnnx...` API, which never allocates: you hand it memory and
+it uses that memory.
+
+**Any name** is a runtime-dimension model. The extent is decided per
+request. You get the `PmModel...` API, which separates the model's
+persistent state from each request's temporary tensors.
+
+`twice.onnx` from chapter 3 is `[1,N]`, so it is the second kind, and that
+is what let one bind serve requests of 3, 6 and 9 values.
+
+@SECTION Pinning a dimension with --shape
+
+You can turn a symbolic extent into a number, and get the fixed-shape path
+for a model that did not ship that way:
+
+@FRAG
+--shape x=1,4
+@ENDFRAG
+
+It is checked, not trusted. Name an input that is not there, or an extent
+that is not a positive integer, and it stops:
+
+@FRAG
+ONNX COMPILER ERROR: --shape names no graph input: z
+ONNX COMPILER ERROR: --shape extents must be positive decimal integers for input x
+@ENDFRAG
+
+@TRAP Pinning the inputs does not always pin the graph, and this is the
+refusal that catches people out. On `twice.onnx`, `--shape x=1,4` produces:
+
+@FRAG
+ONNX COMPILER ERROR: tensor y still has a dynamic extent
+@ENDFRAG
+
+The input is fixed now, but the model's declared OUTPUT still carries the
+symbol `N`, so the graph as written is not fully determined. The compiler
+will not quietly decide that `N` must be 4 because the input happened to
+be. It names the tensor that is still open and stops. Fix the model's
+declared shapes, or use the runtime-dimension path as intended.
+
+@SECTION Control flow and sequences
+
+`If`, `Loop` and the sequence operators compile on the runtime-dimension
+path, for every target. A model that contains one of them takes that path
+even when every extent in it is a number: how many times a loop runs, and
+which branch an `If` takes, are decided while the program runs, and the
+fixed-shape planner has nowhere to put that.
+
+A branch or a loop body is its own small graph. It can read any value its
+enclosing graphs have already computed, by name, and the generated program
+gives each body its own procedure. A name a body defines that the model
+also defines somewhere else is renamed before anything is emitted, so the
+body always reads its own definition.
+
+Kitten TTS nano uses both. Its duration step is a `Loop` that turns token
+durations into frame indices one token at a time, building a sequence it
+joins at the end; its two `If` nodes squeeze an axis only when it has
+extent 1, so the branches return tensors of different rank. That is fine:
+every value on this path carries its shape at run time.
+
+An `Identity` whose input is a sequence (opset 14 and later) hands the
+sequence on, or copies it when something reads it again.
+
+A sequence is a value with its own storage: one block holding every
+element's shape and data. On the bare-metal targets that block comes out
+of the same arena you bind for the model, so a sequence that outgrows the
+arena is refused in a sentence rather than truncated. A loop that appends
+one element per iteration does not copy the sequence each time; the
+compiler hands the block from one iteration to the next when nothing else
+reads it.
+
+If a model takes or returns a sequence, you build or read it with its own
+calls, because a sequence has no single shape to give `DAlloc`:
+
+@FRAG
+id = PmModelInput(0)
+DSeqReset(id, 1)                            ; an empty sequence of FLOAT
+address = DSeqAppendShape(id, 1, 2, @dims(0)) ; one element; fill it
+...
+PmModelExecute()
+out = PmModelOutput(0)
+count = DSeqCount(out)                      ; then DSeqItemRank, DSeqItemDim,
+                                            ; DSeqItemBytes, DSeqItemData
+@ENDFRAG
+
+What is refused, in the tool's words:
+
+@FRAG
+ONNX COMPILER ERROR: Loop node (unnamed) has neither a trip count M nor a condition; the ONNX specification defines that form as a loop that never ends, so it is refused.
+ONNX COMPILER ERROR: Loop node (unnamed) scan output 0 is a sequence; Loop scan outputs are tensors stacked along a new first axis.
+ONNX COMPILER ERROR: SequenceEmpty node (unnamed) attribute dtype=10 is not FLOAT (1), INT32 (6), INT64 (7) or BOOL (9), the element types a sequence carries here.
+ONNX COMPILER ERROR: SplitToSequence node (unnamed) attribute keepdims=2 is not 0 or 1.
+ONNX COMPILER ERROR: ConcatFromSequence node (unnamed) has no axis attribute; the operator requires one.
+ONNX COMPILER ERROR: Graph input 'opt_seq' is an optional value; optional types (Optional, OptionalHasElement, OptionalGetElement) are not implemented.
+@ENDFRAG
+
+Some things can only be refused while a request runs, and they are, with
+the node number:
+
+@FRAG
+Node 1: SequenceAt position 3 is outside [-3, 2] for a sequence of 3 elements.
+Node 0: A Loop ran zero iterations and its scan output does not declare every extent, so its empty result has no defined shape.
+@ENDFRAG
+
+@NOTE The second one is not fussiness. ONNX does not say what shape a scan
+output has when the loop never ran, and two runtimes can answer differently.
+Declare the body output's shape in full and the answer is defined: `[0]`
+followed by those extents.
+
+@SECTION Random operators, and checking a model that has them
+
+`RandomNormal`, `RandomNormalLike`, `RandomUniform` and `RandomUniformLike`
+are compiled on both paths and for every target. They are the one family
+where the ONNX specification leaves something open that a compiler must not:
+it fixes the distribution, the element type and the shape, and says nothing
+about the generator. Two runtimes that both follow the specification can
+therefore disagree on every sample. This compiler specifies the generator
+(chapter 8 states the contract in full), so one seed, one request number and
+one shape give the same FLOAT values on Windows, the Pi 4, the UNO Q, the
+Pico and the Pico 2.
+
+What is claimed: FLOAT output (`dtype` 1, or no `dtype` on a Like node whose
+input is FLOAT); `mean` and `scale`, or `low` and `high`, with their
+specification defaults; the `seed` attribute; `shape` of up to eight axes; up
+to 4,294,967,295 elements per tensor. A random node is never folded and never
+scheduled with the bind-time constant work: every execution draws again.
+Every other form is refused with the node, the operator, the attribute and
+the value:
+
+@FRAG
+ONNX COMPILER ERROR: node 0 (RandomNormal) attribute dtype = 10 (FLOAT16) is not implemented: this compiler generates FLOAT (dtype 1) random tensors only. Re-export the node with dtype 1, or follow it with a Cast.
+ONNX COMPILER ERROR: node 0 (RandomUniformLike) has no dtype attribute, so its output takes its input's element type INT64 (7); this compiler generates FLOAT (1) random tensors only. Add dtype = 1 to the node.
+ONNX COMPILER ERROR: node 0 (RandomNormal) has attribute foo, which the ONNX specification does not define for RandomNormal; nothing was emitted.
+ONNX COMPILER ERROR: node 0 (RandomNormal) attribute shape extent 1 = -3 is negative.
+ONNX COMPILER ERROR: node 0 (RandomNormal) attribute mean = +Infinity is not a finite number; the generator needs a finite mean.
+@ENDFRAG
+
+On the runtime-dimension path a Like node's input type is sometimes only
+known when a request arrives. A dtype-less Like node fed a non-FLOAT tensor
+then fails that request, in the same words:
+
+@FRAG
+Node 1: RandomUniformLike has no dtype attribute, so its output would take the input's element type 7; only FLOAT (1) random tensors are generated. Add dtype=1 to the node.
+@ENDFRAG
+
+@TRAP A reference runtime does not reproduce its own noise, so a model with
+random nodes cannot be compared sample for sample against it as compiled.
+Its output is a different draw from the same distribution, and every error
+metric computed against the reference measures the noise, not the compiler.
+
+That is what `--random-inputs` is for. It compiles every random node as an
+extra model input that you fill, so you can feed the reference's own noise
+(add the random nodes' outputs to the reference model's graph outputs, run it
+once, and pass those tensors in) and get a sample-exact comparison:
+
+@FRAG
+--random-inputs makes every RandomNormal/RandomUniform(-Like) node an extra model input the caller fills.
+@ENDFRAG
+
+The window has the same switch, "Random nodes as model inputs (comparison)".
+The extra inputs follow the graph's own inputs in node order, and the
+manifest's `random.nodes[].input_index` says which is which. Each supplied
+tensor must be FLOAT with the shape the node would have produced, and a
+wrong shape fails the request with a sentence rather than flowing on. The
+option is refused for a model with no random node:
+
+@FRAG
+ONNX COMPILER ERROR: --random-inputs was given, but the model has no RandomNormal, RandomNormalLike, RandomUniform or RandomUniformLike node to turn into an input. Remove the option.
+@ENDFRAG
+
+@TRAP `--random-inputs` CHANGES THE MODEL'S INPUTS. A program built for the
+generated model will not drive the comparison build, and a comparison build
+generates nothing: leave it running with zeros in those inputs and the model
+runs noiseless. Use it to check the compiler against a reference, then
+compile again without it for anything you ship.
+
+@SECTION Errors are sentences
+
+Every refusal in this chapter is a complete statement of what was wrong.
+Nothing prints a bare code. Compare these two, which are the same class of
+mistake at two different layers:
+
+@FRAG
+ONNX COMPILER ERROR: ONNX model does not exist or is empty: output/nosuch.onnx
+ONNX COMPILER ERROR: length-delimited field exceeds its enclosing message
+@ENDFRAG
+
+The second is the bounded protobuf reader refusing a truncated file. It
+does not read past the end of a span and then discover the problem later;
+it checks the length against the message it is inside, and stops there.
+That check is the one thing standing between a malformed model and
+whatever the parser would otherwise have done with it.
+
+@NOTE Format checks are not a security audit. They stop a malformed file
+from confusing the parser. They do not make an untrusted model safe, and
+weights from an unknown source are still weights from an unknown source.
+
+@SECTION Precision: five choices, two mechanisms
+
+`--precision` takes `fp32`, `int8`, `fp16`, `bf16` or `int4`, and the
+default is `fp32`. Anything else is named right back at you:
+
+@FRAG
+ONNX COMPILER ERROR: --precision must be fp32, int8, fp16, bf16, or int4
+@ENDFRAG
+
+Underneath, there are only two different things happening.
+
+**FP32 is the baseline.** Weights and arithmetic are binary32 throughout.
+This is the one to establish correctness against. Every claim anyone makes
+about a reduced precision is a claim relative to this.
+
+**INT8 changes the arithmetic, selectively.** Eligible constant linear
+weights become per-output-channel signed INT8; activations are quantized
+dynamically; accumulation is INT32; the boundaries stay FP32. The tool
+tells you how much of your model that touched:
+
+@FRAG
+Quantized weights: 1 (per-output-channel signed INT8, dynamic activation scales, INT32 accumulation)
+@ENDFRAG
+
+If that count is zero, INT8 did nothing for this model, and no amount of
+re-running it will change that. Operators outside the eligible set keep
+their FP32 path in the same program.
+
+@SECTION What INT8 actually runs, and what it does not
+
+The count above says how many weights were quantized. It does not say
+which kernel each of them will reach, and on the 64-bit Arm targets that
+is a separate question with a real cost attached. Four things are worth
+knowing before you read a timing.
+
+**The eligible set is linear weights, and it is not everything.** Constant
+weights of convolution, the recurrent layer's two weight matrices, general
+matrix multiply and the general matrix-multiply-with-bias operator are
+eligible. Transposed convolution is not: its operator requires a float
+weight and refuses any other kind, so those weights stay FP32 in an INT8
+build by construction rather than by omission. Everything that is not a
+linear weight - element-wise arithmetic, the activations, normalisation,
+the transforms, the shape operators - is FP32 and untouched.
+
+**The tensors between operators stay FP32.** Only the stored weights are
+narrow. Each eligible operator quantizes its own activations at run time
+against one scale taken over the whole input tensor, accumulates in INT32,
+and converts back to FP32 before it returns. That is why the boundaries of
+an INT8 model look exactly like the boundaries of an FP32 one.
+
+**The vector convolution kernel requires unit stride.** A quantized
+convolution with any other stride falls back to the fully portable scalar
+body - correct, and much slower than the vector one. In one real speech
+model, three of eighty-eight convolutions are strided and take that path.
+Nothing warns you; the manifest counts the weight as quantized either way.
+If a profile shows a handful of convolutions costing far more than their
+multiply count suggests, check their strides first.
+
+**Quantizing the activations is not free, and it is per operator.** Before
+an eligible operator computes anything it walks its input three times: once
+to refuse a non-finite value, once for the maximum magnitude that sets the
+scale, and once to quantize, with a per-element step that is a short search
+rather than a single multiply and round. On large tensors that is a single-
+digit percentage; on small ones it can be most of the operator.
+
+@TRAP INT8 is not automatically faster. It moves a quarter of the bytes,
+which is the whole reason it can win, but on a processor without a
+dot-product instruction the arithmetic is not cheaper per multiply-
+accumulate than a well-blocked FP32 kernel - and the three activation
+passes above are pure addition. Whether it wins depends on whether the
+FP32 path was memory-bound. Measure your own model on your own target;
+do not reason from the weight-file size.
+
+@SECTION Measured: on the Pi 4, INT8 runs the speech model at HALF the speed
+
+This is the honest answer to the obvious question, and it is a measurement
+on the board rather than an opinion. The full speech model of chapter 7,
+the same graph, the same request, the same four cores, timed with the
+board's own 54 MHz counter:
+
+@FRAG
+request 2 ("You are hearing a complete sentence produced on this
+small computer.")            FP32 1 core   FP32 4 cores   INT8 4 cores
+  total                          88.079 s       34.614 s    72.782 s
+  Conv           (88 nodes)      70.450         17.149      51.500
+  MatMul        (102 nodes)       2.783          2.784       7.250
+  Gemm           (73 nodes)       0.378          0.378       0.015
+  ConvTranspose   (6 nodes)       1.804          1.804       1.750
+  everything else                     -              -   unchanged
+
+the longer sentence (295 tokens)               158.2 s     328.080 s
+@ENDFRAG
+
+INT8 is **2.10 times slower than FP32 on the same four cores**. The
+convolutions are three times slower and the matrix multiplies two and a
+half; the one family that gets faster is the general matrix-multiply-with-
+bias, twenty-five times faster - and it is four tenths of one per cent of
+the run, so it cannot pay for the rest. The families that keep their FP32
+kernels in both builds come back within three per cent, which is what says
+the clock and the attribution did not move and the difference really is
+the kernels.
+
+Two causes, and neither is a tuning problem. This processor has no
+integer dot-product instruction, so the kernel widens each 8x8 product to
+16 bits and accumulates in 32 - about 0.75 instructions per multiply-
+accumulate against 0.649 for the blocked FP32 kernel. And the three
+activation passes described above are work the FP32 path never does at
+all. The weight file is three and a half times smaller and that buys
+nothing, because this model on this processor is limited by arithmetic
+and not by memory bandwidth.
+
+@TRAP Do not choose INT8 for this speech model on this board. It is
+slower, and the audio was judged worse by ear: quantizing the duration
+predictor changes the predicted durations, so the output is not merely a
+noisier version of the FP32 waveform - it is a differently-timed one.
+Sample-by-sample error metrics against an FP32 reference therefore do not
+apply to it at all, and a person listening is the only acceptance test
+that means anything for a precision change.
+
+@NOTE None of this says INT8 is useless. It says it is the wrong choice
+for THIS model on THIS processor. A model that is memory-bound rather than
+arithmetic-bound, or a processor with an integer dot-product instruction,
+changes both of the causes above.
+
+INT8 output is **not** bit-identical to FP32 output and is not meant to be.
+It is also not bit-identical to the tool's own portable INT8 reference: the
+vector body scales a run of interior outputs by one product of the two
+scales where the scalar bodies multiply by each scale in turn, and those
+round differently. The two agree to a measured worst relative difference of
+3.5e-05 across the arithmetic gate's cases, against a 2.0e-03 limit. Bit
+identity is a contract the FP32 kernels carry (chapter 8) and INT8 does not.
+
+**FP16, BF16 and INT4 change storage only.** The weights are stored
+narrow and **decoded once, at bind time, into resident FP32 memory**. The
+arithmetic afterwards is the FP32 arithmetic. BF16 trades mantissa bits
+for FP32's exponent range, which matters for weights with a wide dynamic
+range; FP16 does the opposite; INT4 is the aggressive one and carries
+scales.
+
+@TRAP These three shrink the FILE. They do not shrink the RAM the model
+needs while it is running, because the decode target is full-width FP32
+and it is resident for the model's whole life. On a microcontroller, where
+flash and RAM are two different budgets, this is exactly the distinction
+that decides whether a model fits - and choosing INT4 does not make a
+large model fit a small part. The manifest reports the decoded reserve as
+its own number, and chapter 5 shows where.
+
+@SECTION What to do with your own model
+
+Start at FP32 with inputs whose answers you already know. Check the shapes
+and element types the tool reports against what you expected. Read the
+manifest's memory accounting and compare it with the memory the target
+actually has. Exercise your error paths - bind failures, allocation
+failures, a request larger than the arena - because a resident model that
+cannot fail cleanly will fail dirtily.
+
+Only then compare a reduced precision on representative data, and compare
+it yourself. A successful generation says the graph was understood. It
+does not say the answer is good enough for what you are doing.

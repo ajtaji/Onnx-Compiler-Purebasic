@@ -1,0 +1,166 @@
+@CHAPTER What this compiler is
+@INTRO It reads a model and writes source code. That sentence is the whole design, and most of the surprises come from taking it literally.
+
+@SECTION Ahead of time, and only once
+
+Most ways of running an ONNX model work like this: a library loads the
+file, walks the graph, and for every node it looks up what to do and does
+it. The graph is still there while your program runs. Something has to
+interpret it.
+
+This compiler does the work before your program exists. It reads the ONNX
+file, checks that every operator in it is one it understands, works out
+the shapes and the memory, and then writes out a source file containing
+the calls, in order, with nothing left to decide.
+
+@FRAG
+; from an emitted model, trimmed
+Procedure PmModelStage1_0()
+  DNode=0
+  DBinary(2,1,1,0)
+  If DError<>"" Or DCancel : ProcedureReturn : EndIf
+  DRelease(1)
+EndProcedure
+@ENDFRAG
+
+That is a whole one-node model. `DBinary(2,1,1,0)` is "write tensor 2 from
+tensors 1 and 1, operation 0, which is add". There is no table of operator
+names in the finished program, no dispatch, and no graph. The schedule was
+decided here and got flattened into code.
+
+@NOTE This is why the generated program cannot run a model it was not
+generated for. It is not a runner with a model loaded into it. It IS the
+model, expressed as a program.
+
+@SECTION What comes out is source. Not an executable.
+
+The tool finishes when the source file is written. It does not then call a
+compiler to turn that source into a program, and it will not do it if you
+ask.
+
+@FRAG
+PASS: reusable source emitted to ...\twice.pb
+Weights: ...\twice.pmw
+Model requires one downstream build; requests use runtime dimensions.
+@ENDFRAG
+
+"Requires one downstream build" is the tool telling you whose job the next
+step is. Yours. You open the emitted source in a compiler you already have
+and you build it, the same way you build anything else.
+
+Four things it deliberately does not do, and none of them is an oversight:
+
+- It does not invoke a downstream language compiler. There is no `--build`.
+- It does not install a toolchain, fetch a dependency, or download a model.
+- It does not upload firmware, open a serial port, or contact a board.
+- It does not link an inference engine into what it emits. The optional
+  reference bridge in chapter 8 is a checking instrument for the desk, and
+  nothing generated ever calls it.
+
+@TRAP The one exception is easy to misread. `Build.pb` in the repository
+root DOES run a compiler - the host language's own - but it builds THIS
+TOOL, not your model. It is developer infrastructure that happens to live
+in the same checkout. Chapter 2 uses it. Nothing in the model-generation
+path ever behaves that way, and if you are ever reading emitted code that
+seems to shell out to a compiler, something is wrong.
+
+@SECTION Why "source out" is the useful answer
+
+It sounds like a limitation until you look at where the source is going.
+
+A bare-metal program has no operating system underneath it. There is no
+loader, no file system unless you wrote one, no heap unless you provided
+one, and no agreement about where anything lives in memory except the one
+your application makes. A tool that tried to hand you a finished binary
+for that environment would have to guess your memory map, your startup
+code, and your build, and it would be wrong about all three.
+
+Source sidesteps every one of those questions. The emitted model asks for
+two pointers and their lengths, and the application - which knows where
+its memory actually is - supplies them.
+
+It also means you can read what you are about to run. The whole schedule
+is in one file in a language you can follow. When a number comes out wrong
+at node 1854, you can go and look at node 1854.
+
+@SECTION The four places the source can go
+
+One tool, five target profiles, four kinds of destination:
+
+@FRAG
+> PureMetalOnnxCompilerCLI.exe --list-targets
+windows Windows (native x64)
+pi4     Raspberry Pi 4 (PureMetal AArch64)
+unoq    Arduino UNO Q (PureMetal AArch64 UEFI)
+pico    Raspberry Pi Pico (RP2040 Cortex-M0+)
+pico2   Raspberry Pi Pico 2 (RP2350 Cortex-M33)
+@ENDFRAG
+
+**Windows** emits host-language source for a native x64 application. This
+is the one you can build with nothing but the compiler you already used to
+build this tool, so it is where the quick start goes and where you should
+establish what the right answer looks like.
+
+**Pi 4** and **UNO Q** emit PureMetal BASIC for 64-bit Arm, with hand
+written Advanced SIMD kernels underneath the ordinary tensor calls. These
+are the profiles the speech work in chapter 7 runs on. They are built with
+the PureMetal Forge toolchain, which is a separate product and is not in
+this repository.
+
+**Pico** and **Pico 2** emit PureMetal BASIC for the two microcontroller
+parts. They are for small models. Chapter 6 gives the numbers, and they
+are small numbers: the largest model a Pico will take has to leave room
+for your actual firmware.
+
+@NOTE The generator itself runs on Windows x64 in every case. The target
+you select changes what it writes, not what it runs on. Choosing `pico2`
+on a desktop machine is normal and expected; it does not mean a Pico 2 is
+attached, and nothing about generation touches one.
+
+@SECTION What it will refuse
+
+This is a compiler for a checked subset of ONNX, and the checking is the
+point. An operator it has not implemented is refused by name and by node:
+
+@FRAG
+> PureMetalOnnxCompilerCLI.exe --compile einsum.onnx --output out\e --target windows
+ONNX COMPILER ERROR: node 0 uses unsupported operator Einsum
+@ENDFRAG
+
+It also refuses opset versions outside the range it has actually audited,
+element types it does not carry, shapes it cannot justify, and model
+memory beyond a target's budget. Chapter 4 walks through the refusals with
+the exact text of each.
+
+@TRAP A refusal is the good outcome. The failure mode this whole project
+is built to avoid is a tool that accepts something it does not really
+support and emits code that runs, produces numbers, and is quietly wrong.
+That costs somebody a week. An error costs them ten minutes. If you find a
+graph that is accepted and produces the wrong answer, that is a defect
+worth more attention than any refusal.
+
+@SECTION Bind once, submit many
+
+The last piece of the design shows up in every chapter after this one.
+
+A generated model is not a function you call with a file and get an answer
+from. It is something you set up once and then feed. You give it memory
+and weights, it validates them and keeps them, and from then on you fill
+inputs, execute, read outputs, and go round again. The weights are checked
+and decoded exactly once, however many requests you make.
+
+For the speech model in chapter 7 that distinction is the difference
+between a usable design and an impossible one: binding 324 MB of weights
+is not something you want to do per sentence.
+
+@FRAG
+PmModelInitialize(weightPath)   ; once
+  PmModelResetRequest()         ; per request
+  ... fill inputs ...
+  PmModelExecute()
+  ... read outputs ...
+PmModelClose()                  ; once, at the end
+@ENDFRAG
+
+Chapter 5 describes both emitted APIs properly, including the fixed-shape
+one, which takes its memory from you rather than allocating any.

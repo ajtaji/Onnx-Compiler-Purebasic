@@ -1,0 +1,368 @@
+@CHAPTER Running a model on the Raspberry Pi 4: the Kokoro sentence
+@INTRO One sentence of speech from the full model, on a board with no operating system, on four cores - and every step from a clean checkout to the WAV.
+
+@SECTION What this chapter reproduces
+
+On 2026-09-16 a Raspberry Pi 4 running the Anvil monitor, with nothing
+underneath it, ran the full Kokoro-82M model of chapter 7 in FP32 on all
+four cores and spoke this sentence:
+
+@FRAG
+I am the kokoro speech AI model on the raspberry Pi 4. How do I sound,
+good? I am running on bare metal, with no operating system, under Anvil,
+a mini kernel and boot loader, on all four cores of the Raspberry Pi 4.
+Both Anvil and I were compiled by Pure Metal Forge.
+@ENDFRAG
+
+Everything that made it is published in `examples/pi4/kokoro-sentence/`:
+the runner that was entered on the board, two host tools, and a README
+that is the step-by-step recipe with every expected hash. This chapter is
+the same path with the reasoning attached. The README is the one to follow
+with a board in front of you.
+
+@FRAG
+examples/pi4/
+  README.md                    the Pi 4 examples, one line each
+  kokoro-sentence/
+    README.md                  the recipe
+    KokoroSentence.pi4         the runner - an Anvil payload
+    node_output_map.pbi        a table the runner's optional NaN scan reads
+    kokoro_readback.py         host tool: trace, result, dispatch count, waveform
+    f32_to_wav.py              host tool: raw samples to WAV
+@ENDFRAG
+
+@NOTE The two `.py` files are developer tools for talking to a board.
+Building this compiler, and generating or building a model with it, needs
+no Python. The tools use the Anvil repository's own host code by path -
+its console client in `tools/board_run.py` and its verified reader in
+`tools/anvil_readback.py` - rather than a copy of either.
+
+@SECTION What it measured
+
+@FRAG
+board                 Raspberry Pi 4 Model B, 4 GB, Anvil build 142
+tokens                295
+samples               453,000 FP32 at 24 kHz, mono: 18.875 s of audio
+time                  158.2 s from the start of the model bind to the end
+                      of the request (8,540,801,559 ticks at 54 MHz),
+                      about 8.4 times slower than real time
+four-core dispatches  84, read from the monitor's counter after the run on
+                      a monitor reset just before it
+payload status        0; trace stage 9 at node 2462
+raw samples           1,812,000 B  sha256 05c30419a882ad6a094a05fe0b7bbe4e
+                      96d549c20896a5522991c652d5296f6f, equal to the
+                      board's own sha256sum of the range
+WAV, 16-bit PCM       906,044 B  sha256 a764205813ee082c365ccd510cb24402
+                      f6357e452c3cfb584556295513207080, no sample clamped
+@ENDFRAG
+
+Against ONNX Runtime 1.29.0 on a PC, with the same text, the same two
+pronunciation packs and the same voice, every one of the 453,000 samples
+compared with no alignment and no trimming:
+
+@FRAG
+max absolute difference   0.259917
+RMSE                      0.006588
+correlation               0.996006
+@ENDFRAG
+
+@TRAP 0.26 is above the 0.1 maximum absolute difference set for the short
+test sentences, and it is recorded as a failure of that limit. The board's
+kernels are held bit-identical to the scalar reference, and the four-core
+split was proven to return the same bytes as one core on the shorter
+sentences, so the difference lies between the reference and ONNX Runtime.
+Chapter 8 traces the mechanism on a shorter sentence - a tiny divergence in
+the text encoder amplified into the phase of a sine with very large
+arguments. This sentence is 4.4 times longer and diverges further, which
+fits that mechanism; it has not been re-traced node by node.
+
+@SECTION What you need
+
+A Raspberry Pi 4 Model B with at least 4 GB: the runner's working memory
+ends at `$A0000000`. A FAT32 USB stick or SD card for Anvil; the run booted
+from a USB stick that also held the weight pack. An Ethernet cable straight
+to a Windows PC. On the PC: Git, PureBasic 6.21 x64 for this compiler,
+PureMetal Forge from puremetalforge.ajtaji.com for the payload, and Python
+3 for the host tools, with pyserial for Anvil's upload tool. The Forge
+download also includes a ready-built copy of this compiler. The 2026-09-14
+copy cannot build this example; the 2026-09-17 copy can, but not the exact
+payload that ran. The section after the two builds shows both.
+
+@SECTION The inputs, pinned
+
+The model and the voice come from the Kokoro-82M v1.0 ONNX repository at
+revision `1939ad2a...`; the dictionaries from Misaki at `fba12365...` and
+CMUdict at `74790861...`:
+
+@FRAG
+> $hf = 'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/1939ad2a8e416c0acfeecc08a694d14ef25f2231'
+> curl.exe -L -o downloads\model.onnx "$hf/onnx/model.onnx"
+> curl.exe -L -o downloads\af_heart.bin "$hf/voices/af_heart.bin"
+> git clone -c core.autocrlf=true https://github.com/hexgrad/misaki.git
+> git -C misaki checkout fba1236595f2d2bf21d414ba6e57d25256afada3
+> git clone -c core.autocrlf=false https://github.com/cmusphinx/cmudict.git
+> git -C cmudict checkout 74790861f652b15e4ac49015a90074ad62a27690
+
+model.onnx       325,532,232 B  8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb
+af_heart.bin         522,240 B  d583ccff3cdca2f7fae535cb998ac07e9fcb90f09737b9a41fa2734ec44a8f0b
+us_gold.json       3,093,057 B  a13911134e702c8fd1d79ea47cdc64f146aec1deabf4638a9a8cdd71da5b87a3
+us_silver.json     3,192,879 B  a7d8629ff02614cd37837f44c41f0085f55bed4f0eb2c169964f0077bb102d6b
+cmudict.dict       3,618,488 B  81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22
+@ENDFRAG
+
+@TRAP **The line endings are part of the pin.** The Misaki digests are of
+the files with CRLF line endings, which is what a clone with
+`core.autocrlf=true` produces; the same files downloaded raw have LF
+endings, a different size and a different digest, and the pack builder
+refuses them before parsing a byte. The CMUdict digest is the other way
+round, which is why its clone turns `core.autocrlf` off. Both clones were
+run and give the digests above.
+
+@NOTE The two files from the model repository were not downloaded again
+when this recipe was followed on the desk: copies already on disk with the
+same SHA-256 were used, and the two URLs were checked against the size and
+SHA-256 the server publishes for each file.
+
+@TRAP Keep the working folder's path short. The model's runtime files are
+written several folders deep inside it, and a path past the classic
+260-character Windows limit makes the compile fail with "Cannot create
+generated runtime source", a sentence that does not mention the length
+(forum topic 868, open). `$HOME\pi4-kokoro` is short enough.
+
+@SECTION Two builds of the compiler, and why
+
+The model source that ran was emitted by this compiler at commit
+`6b6b770`. Commits after it changed runtime kernels, so they emit a
+different payload - a payload built from `main` has not been run on a
+board. The supplementary pronunciation pack needs `main`, because until
+`b48cd05` the native packer could not build the pack its own verifier
+requires. So the recipe builds both, the older one under a second name:
+
+@FRAG
+> & $pb src\PureMetalOnnxCompiler.pb /CONSOLE /THREAD /OPTIMIZER /OUTPUT bin\PureMetalOnnxCompilerCLI.exe
+> git checkout 6b6b770
+> & $pb src\PureMetalOnnxCompiler.pb /CONSOLE /THREAD /OPTIMIZER /OUTPUT bin\OnnxCli-6b6b770.exe
+> git checkout main
+@ENDFRAG
+
+`bin\` is ignored by Git, so both executables survive the checkouts.
+
+@SECTION The compiler in the PureMetal Forge download
+
+The PureMetal Forge download includes this compiler ready to run, in
+`PureMetalForge\tools\onnx\`, and chapter 2 recommends it. Which release
+you have decides what it can do here.
+
+The 2026-09-14 release's copy cannot build this example. It was built on
+2026-09-13, before the model source gained `PmOnnxAnvilEnter`. On
+2026-09-16 the model and pack steps were run with it from fresh clones, in
+place of the two builds above:
+
+@FRAG
+> $onnx = "$root\PureMetalForge\tools\onnx\PureMetalOnnxCompilerCLI.exe"
+> & $onnx --compile "$root\downloads\model.onnx" --output "$ex\model\kokoro-pi4" --target pi4 --precision fp32 --kokoro-text
+
+kokoro-pi4.pmw          324,621,440 B  a4117721...   the same
+af_heart.pmvoice            522,368 B  79ef729c...   the same
+kokoro_us_english.pmg2p  12,613,954 B  0d791ecc...   the same
+kokoro_us_extra.pmg2p     5,397,230 B  e9eee914...   older: 66,304 entries
+kokoro-pi4.pi4              788,990 B  accb8c92...   older: no PmOnnxAnvilEnter
+@ENDFRAG
+
+The supplementary pack is the one from before forum topic 871, and a
+compiler built from `main` refuses it with `PMG2P-3020`. The model source
+has older kernels and no four-core entry, so the payload build stops:
+
+@FRAG
+SEMANTIC ERROR: 'PmOnnxAnvilEnter' at KokoroSentence.pi4 line 397, in procedure krbindservices() is not defined - there is no procedure and no intrinsic with that name.
+pmfc: BUILD FAILED - no output produced.
+@ENDFRAG
+
+The 2026-09-17 release's copy is commit `658566d`. Run the same way on
+2026-09-17, it gave the weight pack and all three packs byte-identical to
+the tables below, the 5,397,245-byte supplement included, and the runner
+built with it. The payload was different, because the model source comes
+from later runtime kernels (789,716 bytes, not 789,585):
+
+@FRAG
+build\kokoro-sentence.img.pmf   1,590,676 B  61668df99f5c7d7d34f42f3409b97872bd424662cd4964ac776ed9a250a7285f
+@ENDFRAG
+
+That payload has not been run on a board. To reproduce the exact payload
+that ran, build the compiler from source as this chapter does.
+
+@SECTION The model and the assets
+
+The model is emitted beside the runner, because the runner includes it by
+a relative path:
+
+@FRAG
+> .\bin\OnnxCli-6b6b770.exe --compile "$root\downloads\model.onnx" --output "$ex\model\kokoro-pi4" --target pi4 --precision fp32 --kokoro-text
+
+kokoro-pi4.pmw          324,621,440 B  a41177210505c80c08836acbb919283d140cb94ddfce89ed2dc732ed8c0d5413
+kokoro-pi4.pi4              789,585 B  1dc51126a2ef266a84a9694d47358c1f51509513c3efd6b32a9a9b58e5b5eafe
+kokoro-pi4.kokoro.pi4           243 B  b443f672ea10401e4bc35d87192f8ee6f4a1744b688d803e8e6025ebd2dbb397
+@ENDFRAG
+
+The weight pack is the file that ran. The source differs from the run's in
+exactly one way: the output name appears in five include lines, and the run
+used another name. The runtime folder's nine files match the run's once
+line endings are normalised, because a checkout gives them CRLF. Neither
+difference reaches the compiled payload.
+
+@FRAG
+> .\bin\PureMetalOnnxCompilerCLI.exe --kokoro-pack-voice "$root\downloads\af_heart.bin" --output "$root\assets\af_heart.pmvoice" --source-sha256 d583ccff3cdca2f7fae535cb998ac07e9fcb90f09737b9a41fa2734ec44a8f0b
+> .\bin\PureMetalOnnxCompilerCLI.exe --kokoro-pack-base-dictionary "$root\misaki\misaki\data\us_gold.json" --silver "$root\misaki\misaki\data\us_silver.json" --output "$root\assets\kokoro_us_english.pmg2p"
+> .\bin\PureMetalOnnxCompilerCLI.exe --kokoro-pack-extra-dictionary "$root\cmudict\cmudict.dict" --base "$root\assets\kokoro_us_english.pmg2p" --output "$root\assets\kokoro_us_extra.pmg2p"
+
+kokoro_us_english.pmg2p   12,613,954 B  0d791ecc12e11d77b5d961718128cf945a67ab53274816a94b9d8eecddbc0b88  -> $54000000
+kokoro_us_extra.pmg2p      5,397,245 B  73be678aa7d1e8cd1b8f87681f4ee1a14f26ac7298fad1063136813064ea8525  -> $55000000
+af_heart.pmvoice             522,368 B  79ef729cc9aa7ec47025ece5c3d6fa230404e0f4d061465d47a71afc4b3d06ce  -> $56000000
+@ENDFRAG
+
+All three are byte-identical to the assets the board bound.
+
+@SECTION The runner
+
+`KokoroSentence.pi4` is chapter 7's resident runner in outline, made real.
+Its comments walk through every step; the shape is:
+
+@FRAG
+Main():
+  KrCaptureX0()              keep x0, the service table - first statement
+  zero the tick rows and the KTRC trace
+  KrBindServices()           check the table's magic, version and slot count,
+                             take the deadman slot, and
+    PmOnnxAnvilEnter(table)  hand the table to the model: four cores
+  MmuBuildTables, MmuEnableCached    the payload's own page tables and caches
+  PmModelBindMemory($40000000, 324621440, $60000000, 1 GiB)
+  PmKokoroTextBind($54000000, ..., $55000000, ..., $56000000, ...)
+  KrRender(text, $57400000)  text -> tokens -> 453,000 samples; hash them,
+                             copy them out of the borrowed output tensor
+  KrFinish(0)                release everything, check nothing leaked,
+                             turn the MMU off, write trace stage 9, return
+@ENDFRAG
+
+Around that it keeps three records a host can read after the run: the
+KTRC trace at `$57E00000`, rewritten at every node, which says how far the
+run got even when the console has lost the return line; one row of
+per-node timer ticks per request from `$57D00000`; and a block of result
+globals whose addresses are in the `.sym` file the compiler writes beside
+the image. Its return value, `x0`, is a status: 0, or a code the file's
+`KrFinish` comment lists.
+
+@NOTE The file still carries the result fields of two earlier requests,
+their texts, and a per-node NaN scan that is switched off. They are
+compiled in, unused, so that this source builds the exact payload that
+ran; removing them is safe and changes the payload's hash.
+
+@SECTION The payload, byte for byte
+
+@FRAG
+> $build = Start-Process $pmf -ArgumentList '--compile KokoroSentence.pi4 -t pi4 --load-addr 0x500000 --bss-addr 0x1000000 --stack-addr 0x7F00000 --entry-returns --wants-services -o build\kokoro-sentence.img' -Wait -PassThru -NoNewWindow
+
+build\kokoro-sentence.img.pmf   1,578,488 B  58b402ea88f92c414a752df39f5ef4b006021a905018f3145df3fb4b02da63b3
+@ENDFRAG
+
+That is the container that was entered on the board on 2026-09-16. It was
+reproduced from fresh clones of this repository and Anvil with the
+PureMetal Forge download of 2026-09-14 (`PureMetalForge.exe` sha256
+`8f2e43d4...`). The 2026-09-17 release's `PureMetalForge.exe` (sha256
+`5898e744...`) builds the same bytes from the same `6b6b770`
+model source.
+
+@SECTION On the board
+
+Anvil's boot-volume skeleton, `Boards/RaspberryPi4/sdcard` in the Anvil
+repository, carries a `kernel8.img` and the rest of the card. The steps
+from there are uploads, one run and a readback, and one command does all of
+them from the manifest `examples/pi4/kokoro-sentence.run.json`:
+
+@FRAG
+> $tools = "$root\Anvil\tools"
+> python "$tools\board_model_run.py" "$ex\..\kokoro-sentence.run.json" --console-ip $board --no-lease
+@ENDFRAG
+
+Anvil's `board_model_run.py` asks the board for the `sha256sum` of each
+asset's range first and uploads only an asset whose digest differs, then
+uploads the payload, arms the 15-second deadman, enters it, and the moment
+it returns reads the 1,812,000 samples back, checks them against the board's
+own `sha256sum` and prints `WAV ready:` with the path of
+`run\<time>\kokoro-sentence.wav`. On a shared board, `--lease-file` and
+`--lane` replace `--no-lease` and it takes and releases the lease itself.
+
+@NOTE The tool was proven on a board on 2026-09-16 with the Kitten TTS
+manifest beside this one (`kitten-rosie.run.json`); this Kokoro manifest has
+not yet been run. The steps it replaces are below, as the run used them.
+
+These are the commands the run used, with this recipe's paths:
+
+@FRAG
+> python "$tools\pi4_upload.py" "$root\assets\kokoro_us_english.pmg2p" --console net --console-ip $board --board-ip $board --addr 0x54000000 --cache
+  VERIFIED: 12613954 bytes, sha256 equal, 1389 ms on the board (8868 KB/s).
+  (and the same for the supplement at 0x55000000 and the voice at 0x56000000)
+
+pmf> load MODEL.PMW 40000000
+Loaded 324621440 bytes into memory, filling 40000000 through 5359547F.
+
+> python "$tools\board_run.py" "$ex\build\kokoro-sentence.img.pmf" --console-ip $board --board-ip $board --addr 0x03000000 --deadman 15 --expect-x0 0 --timeout 700 --out "$ex\run" --name kokoro-sentence
+  stage   03000000
+  sent 1578488 bytes in 0.17 s
+  verified on the board: 1578488 bytes, digest matches
+  deadman 15 s
+  boot mem 3000000 shot
+
+pmf> sha256sum 57400000 1BA620
+sha256sum over 1812000 bytes, 57400000 .. 575BA61F ...
+The sha256sum is 05c30419a882ad6a094a05fe0b7bbe4e96d549c20896a5522991c652d5296f6f
+@ENDFRAG
+
+The weights did not go over the wire on the day: they had been uploaded
+and verified before and saved to the USB stick as `MODEL.PMW`, and after
+the reset before the run the board loaded them back. Uploading them with
+`pi4_upload.py` to `0x40000000` works the same way. Either way the payload
+checks the pack's header, identity and CRC-32 when it binds.
+
+@TRAP **`board_run.py` said the payload never returned, and it had
+finished.** The console lost the return line during a long silent run.
+Do not run it again: read the trace. That is what the trace is for, and
+what `kokoro_readback.py status` reads.
+
+@FRAG
+> python "$ex\kokoro_readback.py" cores --console-ip $board       before and after the run: the difference is the dispatch count
+> python "$ex\kokoro_readback.py" status --console-ip $board      trace, status, tokens, samples
+> python "$ex\kokoro_readback.py" wave --console-ip $board        board sha256sum, readback, sha256sum again
+> python "$ex\f32_to_wav.py"                                      run\kokoro-sentence.wav
+@ENDFRAG
+
+`wave` saves the samples only if the board's digest before the read, the
+board's digest after it and the host's digest of what arrived all agree,
+and the XOR of the samples equals the one the payload computed on the
+board before it copied them.
+
+@TRAP **Two parts of this section are not yet a board transcript.**
+`kokoro_readback.py` passes a self-test against a scripted console and has
+not been run against a board; on the day, the waveform came back through
+build 142's older `memory` dump path, which took 1,048 s. It uses the
+`readback` command of Anvil build 151, which the Anvil repository measured
+reading the same 1,812,000 bytes in 1.28 s. `f32_to_wav.py`, run on the
+day's samples afterwards on the desk, writes the published WAV byte for
+byte.
+
+@SECTION Speaking something else
+
+Change the bytes under `KrText3` - one `Data.a` value per UTF-8 byte - and
+`#KR_TEXT3_BYTES`. PowerShell produces both:
+
+@FRAG
+> [Text.Encoding]::UTF8.GetBytes('Hello from the Pi.') -join ','
+72,101,108,108,111,32,102,114,111,109,32,116,104,101,32,80,105,46
+> [Text.Encoding]::UTF8.GetByteCount('Hello from the Pi.')
+18
+@ENDFRAG
+
+Set `#KR_EXPECT_TOKENS3` to the sentence's token count if you know it. If
+it is wrong the samples are still rendered and copied, the payload returns
+320 instead of 0, and `status` prints the real count. The copy slot holds
+524,288 samples, 21.8 seconds; a longer sentence is refused with 313, not
+cut short. A changed runner is a different payload with a different hash.
