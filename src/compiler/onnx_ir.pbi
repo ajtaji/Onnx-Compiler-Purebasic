@@ -42,6 +42,7 @@ Structure PmoIrQuantWeight
   ScaleStride.q
   OriginalBytes.q
   QuantizedBytes.q
+  Wide.i
 EndStructure
 
 Structure PmoIrNodeRef

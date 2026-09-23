@@ -708,6 +708,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   PmdLine(file,"    ProcedureReturn")
   PmdLine(file,"  EndIf")
   PmdLine(file,"  For i=1 To #PMD_TENSOR_COUNT : DRelease(i) : Next")
+  If precision="int8" : PmdLine(file,"  PmTensorInt8Release()") : EndIf
   If PmdPortable
     PmdLine(file,"  DHeap=0 : DHeapBytes=0 : DHeapUsed=0")
   Else
@@ -898,7 +899,9 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   SetJSONString(AddJSONMember(object,"precision"),precision)
   SetJSONInteger(AddJSONMember(object,"quantized_weight_count"),ListSize(ir\QuantWeights()))
   If precision="int8"
-    SetJSONString(AddJSONMember(object,"computation"),"FP32 tensors; selected INT8 linear weights use dynamic INT8 activations and INT32 accumulation")
+    SetJSONString(AddJSONMember(object,"computation"),"FP32 tensors; selected INT8 linear weights use dynamic per-row INT8 activations and INT32 accumulation; wide weights (a precision plan) add a residual INT8 plane and 16-bit activations")
+    j=0 : ForEach ir\QuantWeights() : j+ir\QuantWeights()\Wide : Next
+    SetJSONInteger(AddJSONMember(object,"wide_weight_count"),j)
   Else
     SetJSONString(AddJSONMember(object,"computation"),"FP32 arithmetic; reduced storage weights are decoded once into resident FP32 working memory")
   EndIf

@@ -93,16 +93,11 @@ Procedure.i DSize(Kind.i)
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i DInt8Begin(*Input,Elements.i,Extra.i=0)
-  Protected i.i,bytes.i=Elements+Extra
-  If Elements<0 Or Extra<0 Or bytes<Elements Or bytes>DLimit-DLive : ProcedureReturn DFail("INT8 activation scratch exceeds available working memory.") : EndIf
-  For i=0 To Elements-1
-    If (PeekL(*Input+i*4) & $7F800000)=$7F800000 : ProcedureReturn DFail("INT8 activations contain NaN or infinity.") : EndIf
-  Next
-  PmTensorInt8Scratch=AllocateMemory(DMax(bytes,1))
-  If PmTensorInt8Scratch=0 : ProcedureReturn DFail("INT8 activation scratch allocation failed.") : EndIf
-  PmTensorInt8ScratchBytes=bytes : DLive+bytes : DPeak=DMax(DPeak,DLive)
-  ProcedureReturn 1
+; An INT8 operator scans its own activations for NaN and infinity while it
+; finds the row scales, and allocates its own working buffers; it reports
+; either failure through PmTensorInt8Fault (1 = not finite, 2 = no memory).
+Procedure DInt8Begin()
+  PmTensorInt8Fault=0
 EndProcedure
 
 Procedure.i DFiniteTensor(Id.i)
@@ -114,9 +109,12 @@ Procedure.i DFiniteTensor(Id.i)
   ProcedureReturn 1
 EndProcedure
 
-Procedure DInt8End()
-  If PmTensorInt8Scratch : FreeMemory(PmTensorInt8Scratch) : DLive-PmTensorInt8ScratchBytes : EndIf
-  PmTensorInt8Scratch=0 : PmTensorInt8ScratchBytes=0
+Procedure.i DInt8End()
+  Select PmTensorInt8Fault
+    Case 0 : ProcedureReturn 1
+    Case 1 : ProcedureReturn DFail("INT8 activations contain NaN or infinity; the operator refuses to quantize them. Check the node that produced this input.")
+  EndSelect
+  ProcedureReturn DFail("INT8 working memory could not be allocated for this operator.")
 EndProcedure
 
 Procedure DRelease(Id.i)
@@ -562,11 +560,12 @@ Procedure DMatMul(Y.i,A.i,B.i)
   Protected Dim dims.i(7)
   Protected rank.i=DMax(Dt(A)\Rank,Dt(B)\Rank),i.i,ai.i,bi.i,ad.i,bd.i
   Protected m.i,k.i,n.i,batches.i,batch.i,aoff.i,boff.i,idx.i,c.i,astride.i,bstride.i
-  If Dt(A)\Kind<>1 Or (Dt(B)\Kind<>1 And Dt(B)\Kind<>3) : DFail("MatMul requires FLOAT activations and FLOAT or INT8 weights.") : ProcedureReturn : EndIf
+  If Dt(A)\Kind<>1 Or (Dt(B)\Kind<>1 And Dt(B)\Kind<>3 And Dt(B)\Kind<>33) : DFail("MatMul requires FLOAT activations and FLOAT or INT8 weights.") : ProcedureReturn : EndIf
   If Dt(A)\Rank<2 Or Dt(B)\Rank<2 Or rank>8 : DFail("MatMul requires rank two or above.") : ProcedureReturn : EndIf
   m=Dt(A)\D[Dt(A)\Rank-2] : k=Dt(A)\D[Dt(A)\Rank-1] : n=Dt(B)\D[Dt(B)\Rank-1]
   If k<>Dt(B)\D[Dt(B)\Rank-2] : DFail("MatMul contraction mismatch.") : ProcedureReturn : EndIf
   If Dt(B)\Kind=3 And (Dt(B)\Scales=0 Or k>133144) : DFail("INT8 MatMul scales are missing or its reduction exceeds the INT32 bound.") : ProcedureReturn : EndIf
+  If Dt(B)\Kind=33 And Dt(B)\Scales=0 : DFail("Wide INT8 MatMul scales are missing.") : ProcedureReturn : EndIf
   batches=1
   For i=0 To rank-3
     ai=i-rank+Dt(A)\Rank : bi=i-rank+Dt(B)\Rank : ad=1 : bd=1
@@ -591,10 +590,10 @@ Procedure DMatMul(Y.i,A.i,B.i)
         bstride*Dt(B)\D[bi]
       EndIf
     Next
-    If Dt(B)\Kind=3
-      If DInt8Begin(Dt(A)\Data+aoff*4,m*k)=0 : ProcedureReturn : EndIf
-      PmTensorMatMul2Int8(Dt(A)\Data+aoff*4,Dt(B)\Data+boff,Dt(Y)\Data+batch*m*n*4,m,k,n,Dt(B)\Scales)
-      DInt8End()
+    If Dt(B)\Kind=3 Or Dt(B)\Kind=33
+      DInt8Begin()
+      If PmI8MatMul(Dt(A)\Data+aoff*4,Dt(B)\Data+boff,Dt(Y)\Data+batch*m*n*4,m,k,n,Dt(B)\Scales,Bool(Dt(B)\Kind=33),Dt(B)\Count)=0 And PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
+      If DInt8End()=0 : ProcedureReturn : EndIf
     Else
       PmFastGemm(Dt(A)\Data+aoff*4,Dt(B)\Data+boff*4,Dt(Y)\Data+batch*m*n*4,m,k,n)
     EndIf
@@ -603,20 +602,20 @@ EndProcedure
 
 Procedure DGemm(Y.i,A.i,B.i,C.i,TransA.i,TransB.i,Alpha.f,Beta.f)
   Protected g.PmTensorGemmArgs
-  If Dt(A)\Kind<>1 Or (Dt(B)\Kind<>1 And Dt(B)\Kind<>3) Or (C And Dt(C)\Kind<>1) Or TransA<0 Or TransA>1 Or TransB<0 Or TransB>1 : DFail("Gemm requires FLOAT activations, FLOAT/INT8 weights and valid transpose flags.") : ProcedureReturn : EndIf
+  If Dt(A)\Kind<>1 Or (Dt(B)\Kind<>1 And Dt(B)\Kind<>3 And Dt(B)\Kind<>33) Or (C And Dt(C)\Kind<>1) Or TransA<0 Or TransA>1 Or TransB<0 Or TransB>1 : DFail("Gemm requires FLOAT activations, FLOAT/INT8 weights and valid transpose flags.") : ProcedureReturn : EndIf
   If Dt(A)\Rank<>2 Or Dt(B)\Rank<>2 : DFail("Gemm requires matrices.") : ProcedureReturn : EndIf
   g\M=Dt(A)\D[TransA] : g\K=Dt(A)\D[1-TransA] : g\N=Dt(B)\D[1-TransB]
   If g\K<>Dt(B)\D[TransB] : DFail("Gemm contraction mismatch.") : ProcedureReturn : EndIf
   If DShape(Y,1,2,g\M,g\N)=0 : ProcedureReturn : EndIf
   g\A=Dt(A)\Data : g\B=Dt(B)\Data : g\C=Dt(C)\Data : g\Dst=Dt(Y)\Data
   g\CCount=Dt(C)\Count : g\TransA=TransA : g\TransB=TransB : g\Alpha=Alpha : g\Beta=Beta
-  If Dt(B)\Kind=3
-    If Dt(B)\Scales=0 Or g\K>133144 : DFail("INT8 Gemm scales are missing or its reduction exceeds the INT32 bound.") : ProcedureReturn : EndIf
-    If DInt8Begin(g\A,g\M*g\K)=0 : ProcedureReturn : EndIf
-    g\WeightScales=Dt(B)\Scales
+  If Dt(B)\Kind=3 Or Dt(B)\Kind=33
+    If Dt(B)\Scales=0 Or (Dt(B)\Kind=3 And g\K>133144) : DFail("INT8 Gemm scales are missing or its reduction exceeds the INT32 bound.") : ProcedureReturn : EndIf
+    DInt8Begin()
+    g\WeightScales=Dt(B)\Scales : g\Wide=Bool(Dt(B)\Kind=33)
   EndIf
   PmTensorGemm(@g)
-  If Dt(B)\Kind=3 : DInt8End() : EndIf
+  If Dt(B)\Kind=3 Or Dt(B)\Kind=33 : DInt8End() : EndIf
 EndProcedure
 
 Procedure DReduce(Y.i,A.i,Axes.i,Keep.i,Mean.i)
@@ -675,7 +674,7 @@ EndProcedure
 
 Procedure DConv(Y.i,A.i,W.i,B.i,PadLeft.i,PadRight.i,Stride.i,Dilation.i,Groups.i)
   Protected g.PmTensorConv1DArgs
-  If Dt(A)\Kind<>1 Or (Dt(W)\Kind<>1 And Dt(W)\Kind<>3) Or (B And Dt(B)\Kind<>1) : DFail("Conv requires FLOAT activations and FLOAT/INT8 weights.") : ProcedureReturn : EndIf
+  If Dt(A)\Kind<>1 Or (Dt(W)\Kind<>1 And Dt(W)\Kind<>3 And Dt(W)\Kind<>33) Or (B And Dt(B)\Kind<>1) : DFail("Conv requires FLOAT activations and FLOAT/INT8 weights.") : ProcedureReturn : EndIf
   If Dt(A)\Rank<>3 Or Dt(W)\Rank<>3 Or Stride<=0 Or Groups<=0 : DFail("Invalid Conv1D shape or attributes.") : ProcedureReturn : EndIf
   g\Batches=Dt(A)\D[0] : g\InChannels=Dt(A)\D[1] : g\InWidth=Dt(A)\D[2]
   g\OutChannels=Dt(W)\D[0] : g\Kernel=Dt(W)\D[2]
@@ -685,10 +684,10 @@ Procedure DConv(Y.i,A.i,W.i,B.i,PadLeft.i,PadRight.i,Stride.i,Dilation.i,Groups.
   If DShape(Y,1,3,g\Batches,g\OutChannels,g\OutWidth)=0 : ProcedureReturn : EndIf
   g\Src=Dt(A)\Data : g\Weight=Dt(W)\Data : g\Bias=Dt(B)\Data : g\Dst=Dt(Y)\Data
   g\PadLeft=PadLeft : g\Stride=Stride : g\Dilation=Dilation : g\Groups=Groups
-  If Dt(W)\Kind=3
-    If Dt(W)\Scales=0 Or g\InChannels/Groups*g\Kernel>133144 : DFail("INT8 Conv scales are missing or its reduction exceeds the INT32 bound.") : ProcedureReturn : EndIf
-    If DInt8Begin(g\Src,Dt(A)\Count)=0 : ProcedureReturn : EndIf
-    g\WeightScales=Dt(W)\Scales : PmTensorConv1D(@g) : DInt8End()
+  If Dt(W)\Kind=3 Or Dt(W)\Kind=33
+    If Dt(W)\Scales=0 Or (Dt(W)\Kind=3 And g\InChannels/Groups*g\Kernel>133144) : DFail("INT8 Conv scales are missing or its reduction exceeds the INT32 bound.") : ProcedureReturn : EndIf
+    DInt8Begin()
+    g\WeightScales=Dt(W)\Scales : g\Wide=Bool(Dt(W)\Kind=33) : PmTensorConv1D(@g) : DInt8End()
   Else
     If PmFastConv(@g,DLimit-DLive)=0 : DFail("Convolution scratch exceeds available working memory.") : EndIf
   EndIf
@@ -727,7 +726,7 @@ EndProcedure
 Procedure DLstm(Y.i,YH.i,YC.i,X.i,W.i,R.i,B.i,Seq.i,IH.i,IC.i,Hidden.i,Directions.i)
   Protected g.PmTensorLstmArgs
   Protected seq64.i,i.i,valid.i,seqBytes.i
-  If Dt(X)\Rank<>3 Or Dt(W)\Rank<>3 Or Dt(R)\Rank<>3 Or Dt(X)\Kind<>1 Or (Dt(W)\Kind<>1 And Dt(W)\Kind<>3) Or (Dt(R)\Kind<>1 And Dt(R)\Kind<>3) : DFail("LSTM requires FLOAT activations and rank-three FLOAT/INT8 weights.") : ProcedureReturn : EndIf
+  If Dt(X)\Rank<>3 Or Dt(W)\Rank<>3 Or Dt(R)\Rank<>3 Or Dt(X)\Kind<>1 Or (Dt(W)\Kind<>1 And Dt(W)\Kind<>3 And Dt(W)\Kind<>33) Or (Dt(R)\Kind<>1 And Dt(R)\Kind<>3 And Dt(R)\Kind<>33) : DFail("LSTM requires FLOAT activations and rank-three FLOAT/INT8 weights.") : ProcedureReturn : EndIf
   g\Sequence=Dt(X)\D[0] : g\Batch=Dt(X)\D[1] : g\InputSize=Dt(X)\D[2]
   g\Hidden=Hidden : g\Directions=Directions
   If Hidden<=0 Or Hidden>4096 Or Directions<1 Or Directions>2 : DFail("LSTM dimensions are invalid.") : ProcedureReturn : EndIf
@@ -742,9 +741,9 @@ Procedure DLstm(Y.i,YH.i,YC.i,X.i,W.i,R.i,B.i,Seq.i,IH.i,IC.i,Hidden.i,Direction
   g\X=Dt(X)\Data : g\W=Dt(W)\Data : g\R=Dt(R)\Data : g\B=Dt(B)\Data
   g\SeqLens=Dt(Seq)\Data : g\InitialH=Dt(IH)\Data : g\InitialC=Dt(IC)\Data
   g\Y=Dt(Y)\Data : g\YH=Dt(YH)\Data : g\YC=Dt(YC)\Data
-  If Dt(W)\Kind=3 Or Dt(R)\Kind=3
+  If Dt(W)\Kind=3 Or Dt(R)\Kind=3 Or Dt(W)\Kind=33 Or Dt(R)\Kind=33
     If DFiniteTensor(X)=0 Or DFiniteTensor(IH)=0 Or DFiniteTensor(IC)=0 : ProcedureReturn : EndIf
-    If (Dt(W)\Kind=3 And Dt(W)\Scales=0) Or (Dt(R)\Kind=3 And Dt(R)\Scales=0) Or g\InputSize>133144 : DFail("INT8 LSTM scales are missing or reduction is too large.") : ProcedureReturn : EndIf
+    If (Dt(W)\Kind<>1 And Dt(W)\Scales=0) Or (Dt(R)\Kind<>1 And Dt(R)\Scales=0) Or g\InputSize>133144 Or g\Hidden>133144 : DFail("INT8 LSTM scales are missing or reduction is too large.") : ProcedureReturn : EndIf
     If Seq
       seqBytes=g\Batch*8
       If seqBytes>DLimit-DLive : DFail("LSTM sequence metadata exceeds available memory.") : ProcedureReturn : EndIf
@@ -757,10 +756,15 @@ Procedure DLstm(Y.i,YH.i,YC.i,X.i,W.i,R.i,B.i,Seq.i,IH.i,IC.i,Hidden.i,Direction
       Next
       DLive+seqBytes : DPeak=DMax(DPeak,DLive) : g\SeqLens=seq64
     EndIf
-    If DInt8Begin(g\X,g\InputSize,g\Hidden)
-      g\WScales=Dt(W)\Scales : g\RScales=Dt(R)\Scales
-      PmTensorLstm(@g) : DInt8End()
+    DInt8Begin()
+    If Dt(W)\Kind<>1 : g\WScales=Dt(W)\Scales : g\WWide=Bool(Dt(W)\Kind=33) : EndIf
+    If Dt(R)\Kind<>1 : g\RScales=Dt(R)\Scales : g\RWide=Bool(Dt(R)\Kind=33) : EndIf
+    If g\WScales And g\RScales
+      PmI8Lstm(@g)
+    Else
+      PmTensorLstm(@g)
     EndIf
+    DInt8End()
     If seq64 : FreeMemory(seq64) : DLive-seqBytes : EndIf
   Else
     If PmFastLstm(@g,DLimit-DLive)=0 : DFail("LSTM scratch or sequence lengths exceed the model bounds.") : EndIf

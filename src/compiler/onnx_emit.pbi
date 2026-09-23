@@ -1650,6 +1650,7 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
   PmoEmitLine(File, "  PmOnnxRuntimeOk = 0 : PmOnnxRuntimeErrorNode = 0")
   If *Ir\Int8ScratchBytes > 0
     PmoEmitLine(File, "  PmTensorInt8Scratch = 0 : PmTensorInt8ScratchBytes = 0")
+    PmoEmitLine(File, "  PmTensorInt8Release()")
   EndIf
   PmoEmitLine(File, "EndProcedure")
   If *Profile\Launch = #PMO_LAUNCH_EMBEDDED_WEIGHTS

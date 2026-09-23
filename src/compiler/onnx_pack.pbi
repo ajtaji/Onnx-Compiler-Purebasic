@@ -133,7 +133,7 @@ Procedure.i PmoPackWeights(*Ir.PmoIrModel, Path.s)
   ForEach *Ir\Constants()
     If (Left(*Ir\Constants()\Name, 7) = "@trace/" Or Left(*Ir\Constants()\Name, 7) = "@quant/" Or
         FindMapElement(Used(), *Ir\Constants()\Name)) And
-       (*Ir\Constants()\ElementType = 1 Or *Ir\Constants()\ElementType = 3 Or *Ir\Constants()\ElementType = 6 Or *Ir\Constants()\ElementType = 7 Or
+       (*Ir\Constants()\ElementType = 1 Or *Ir\Constants()\ElementType = 3 Or *Ir\Constants()\ElementType = #PMO_ELEMENT_INT8_WIDE Or *Ir\Constants()\ElementType = 6 Or *Ir\Constants()\ElementType = 7 Or
         *Ir\Constants()\ElementType = 9)
       AddElement(Items())
       Items()\Name = *Ir\Constants()\Name

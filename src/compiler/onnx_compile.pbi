@@ -562,7 +562,7 @@ Procedure.i PmoCompileManifest(Path.s, *Ir.PmoIrModel, *Profile.PmoTargetProfile
   ForEach *Ir\QuantWeights() : OriginalBytes + *Ir\QuantWeights()\OriginalBytes : QuantizedBytes + *Ir\QuantWeights()\QuantizedBytes : Next
   WriteStringN(File, "  " + PmoCompileJson("quantization") + ": {", #PB_UTF8)
   WriteStringN(File, "    " + PmoCompileJson("mode") + ": " + PmoCompileJson(Precision) + ",", #PB_UTF8)
-  If Precision="int8" : Scheme="per-output-channel symmetric signed INT8 weights, dynamic per-tensor signed INT8 activations, INT32 accumulation, FP32 operator seams" : EndIf
+  If Precision="int8" : Scheme="per-output-channel symmetric signed INT8 weights, dynamic per-row signed INT8 activations, INT32 accumulation, FP32 operator seams" : EndIf
   If *Ir\ReducedWeightCount : Scheme=UCase(Precision)+" weight storage; decode once into resident FP32 memory; FP32 arithmetic and activations" : EndIf
   WriteStringN(File, "    " + PmoCompileJson("scheme") + ": " + PmoCompileJson(Scheme) + ",", #PB_UTF8)
   WriteStringN(File, "    " + PmoCompileJson("weight_count") + ": " + Str(ListSize(*Ir\QuantWeights())) + ",", #PB_UTF8)
@@ -765,7 +765,7 @@ Procedure.i PmoCompileCommand(ModelPath.s)
   PrintN("PASS: generated ONNX source for " + TargetId + " (" + Precision + ")")
   PrintN("Source: " + Source)
   PrintN("Weights: " + Weights + " (" + PmoCompileBytes(Ir\WeightBytes) + ")")
-  If Precision = "int8" : PrintN("Quantized weights: " + Str(ListSize(Ir\QuantWeights())) + " (per-output-channel signed INT8, dynamic activation scales, INT32 accumulation)") : EndIf
+  If Precision = "int8" : PrintN("Quantized weights: " + Str(ListSize(Ir\QuantWeights())) + " (per-output-channel signed INT8, dynamic per-row activation scales, INT32 accumulation)") : EndIf
   PrintN("Arena: " + PmoCompileBytes(Ir\ArenaBytes) + " including bounded inputs/outputs")
   PrintN("Manifest: " + Manifest)
   PrintN("Resident model: bind weights/arena once, fill inputs and execute repeatedly, then unbind when finished.")

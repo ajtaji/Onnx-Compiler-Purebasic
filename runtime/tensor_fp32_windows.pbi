@@ -467,16 +467,6 @@ Procedure PmTensorClip(*src, *dst, count.i, lo.f, hi.f)
   Wend
 EndProcedure
 
-Structure PmTensorInt8RowArgs
-  A.i
-  B.i
-  Dst.i
-  K.i
-  N.i
-  Scales.i
-  AScale.f
-EndStructure
-
 Structure PmTensorInt8DotArgs
   A.i
   B.i
@@ -493,281 +483,879 @@ Structure PmTensorDotInt8Args
   WeightScale.f
 EndStructure
 
+; ---------------------------------------------------------------------------
+; INT8 execution (forum 671). One scheme on every target:
+;
+;  * weights: symmetric INT8, one FP32 scale per output channel. A WIDE weight
+;    (the compiler's precision plan) carries a second INT8 plane after the
+;    first: w ~= scale * (Q1 + Q2 / 254);
+;  * activations: quantized at run time with ONE SCALE PER ROW of the
+;    reduction - per token (MatMul, Gemm), per time position (Conv), per step
+;    (LSTM). Narrow rows use +-127, wide rows +-32767. For a row with maximum
+;    magnitude m: m < 1e-30 gives scale 0 and an all-zero row; otherwise
+;    scale = m / qmax, and q = round-half-even(x * (qmax / m));
+;  * products are exact integers accumulated in INT32. A wide accumulator is
+;    converted to FP32 at least every 512 reduction elements (16-bit x 8-bit
+;    products; 512 of them stay inside INT32). For each output the FP32 sum
+;    F = sum over taps and chunks of float(acc) * rowScale, then
+;    y = bias + wScale * F, or bias + wScale * (F1 + F2 / 254) when wide.
+;
+; A NaN or an infinity in an INT8 operator's activations is refused by the
+; caller before any integer is formed.
+;
+; On this host the kernels hold activations as INT16 PAIRS along the
+; reduction (two neighbouring reduction elements in one 32-bit word) so a
+; single vpmaddwd forms two products. Weights are laid out the same way once,
+; on first use, and kept until PmTensorInt8Release (the model's close).
+; AVX2 is used when the processor has it; otherwise the same arithmetic runs
+; in plain code and gives the same integers and the same FP32 sums.
+; ---------------------------------------------------------------------------
 CompilerIf #PMO_USE_INT8 = 1
 Global PmTensorInt8Scratch.i
 Global PmTensorInt8ScratchBytes.i
+Global PmI8Avx2.i = IsProcessorFeaturePresent_(40)
+Global PmTensorInt8Fault.i
+Global NewMap PmI8Prepared.i()
+Global PmI8PrepareMutex.i = CreateMutex()
+#PMI8_FLUSH_PAIRS = 256
+#PMI8_WIDE_RESIDUAL = 254.0
+#PMI8_TINY = 1.0e-30
 
-; Reuse one activation for eight adjacent columns of row-major INT8 weights.
-Procedure PmTensorInt8Row8(*g.PmTensorInt8RowArgs)
-  Protected pa.i=*g\A, pb.i=*g\B, pd.i=*g\Dst, count.i=*g\K, stride.i=*g\N, scales.i=*g\Scales
-  Protected fa.f=*g\AScale
-  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
-    !mov rax,[p.v_pa]
-    !mov rdx,[p.v_pb]
-    !mov rcx,[p.v_count]
-    !mov r8,[p.v_stride]
-    !pxor xmm0,xmm0
-    !pxor xmm1,xmm1
-    !test rcx,rcx
-    !jz pmint8row_store
-    !pmint8row_inner:
-    !movq xmm2,[rdx]
-    !punpcklbw xmm2,xmm2
-    !psraw xmm2,8
-    !movzx r9d,byte [rax]
-    !movd xmm3,r9d
-    !punpcklbw xmm3,xmm3
-    !psraw xmm3,8
-    !pshuflw xmm3,xmm3,0
-    !pshufd xmm3,xmm3,0
-    !pmullw xmm2,xmm3
-    !movdqa xmm4,xmm2
-    !psraw xmm4,15
-    !movdqa xmm5,xmm2
-    !punpcklwd xmm2,xmm4
-    !punpckhwd xmm5,xmm4
-    !paddd xmm0,xmm2
-    !paddd xmm1,xmm5
-    !inc rax
-    !add rdx,r8
+Procedure PmTensorInt8Release()
+  LockMutex(PmI8PrepareMutex)
+  ForEach PmI8Prepared()
+    If PmI8Prepared() : FreeMemory(PmI8Prepared()) : EndIf
+  Next
+  ClearMap(PmI8Prepared())
+  UnlockMutex(PmI8PrepareMutex)
+EndProcedure
+
+; Largest |x| as its bit pattern (bits of a finite magnitude order like the
+; magnitude; any pattern >= $7F800000 is a NaN or an infinity).
+Procedure.i PmI8MaxBitsContig(*src, count.i)
+  Protected p.i=*src, n.i=count, best.i=0, v.i, blocks.i
+  If PmI8Avx2 And n>=8
+    blocks=n/8
+    !mov rax,[p.v_p]
+    !mov rcx,[p.v_blocks]
+    !vpcmpeqd ymm1,ymm1,ymm1
+    !vpsrld ymm1,ymm1,1
+    !vpxor ymm0,ymm0,ymm0
+    !pmi8mbc_loop:
+    !vpand ymm2,ymm1,[rax]
+    !vpmaxud ymm0,ymm0,ymm2
+    !add rax,32
     !dec rcx
-    !jnz pmint8row_inner
-    !pmint8row_store:
-    ; Match scalar host intermediates: rounded FP32 sum, then FP64 scale/bias.
-    !cvtdq2ps xmm0,xmm0
-    !cvtdq2ps xmm1,xmm1
-    !cvtss2sd xmm3,[p.v_fa]
-    !shufpd xmm3,xmm3,0
-    !mov rax,[p.v_pd]
-    !mov rdx,[p.v_scales]
-    !cvtps2pd xmm2,xmm0
-    !mulpd xmm2,xmm3
-    !cvtps2pd xmm4,[rdx+0]
-    !mulpd xmm2,xmm4
-    !cvtpd2ps xmm2,xmm2
-    !movq [rax+0],xmm2
-    !psrldq xmm0,8
-    !cvtps2pd xmm2,xmm0
-    !mulpd xmm2,xmm3
-    !cvtps2pd xmm4,[rdx+8]
-    !mulpd xmm2,xmm4
-    !cvtpd2ps xmm2,xmm2
-    !movq [rax+8],xmm2
-    !cvtps2pd xmm2,xmm1
-    !mulpd xmm2,xmm3
-    !cvtps2pd xmm4,[rdx+16]
-    !mulpd xmm2,xmm4
-    !cvtpd2ps xmm2,xmm2
-    !movq [rax+16],xmm2
-    !psrldq xmm1,8
-    !cvtps2pd xmm2,xmm1
-    !mulpd xmm2,xmm3
-    !cvtps2pd xmm4,[rdx+24]
-    !mulpd xmm2,xmm4
-    !cvtpd2ps xmm2,xmm2
-    !movq [rax+24],xmm2
-  CompilerEndIf
+    !jnz pmi8mbc_loop
+    !vextracti128 xmm2,ymm0,1
+    !vpmaxud xmm0,xmm0,xmm2
+    !vpshufd xmm2,xmm0,78
+    !vpmaxud xmm0,xmm0,xmm2
+    !vpshufd xmm2,xmm0,177
+    !vpmaxud xmm0,xmm0,xmm2
+    !vmovd eax,xmm0
+    !mov [p.v_best],rax
+    !vzeroupper
+    p+blocks*32 : n-blocks*8
+  EndIf
+  While n>0
+    v=PeekL(p) & $7FFFFFFF
+    If v>best : best=v : EndIf
+    p+4 : n-1
+  Wend
+  ProcedureReturn best
 EndProcedure
 
-; Exact signed-byte dot, with strides selected outside the reduction loop.
-Procedure.i PmTensorInt8Dot(*g.PmTensorInt8DotArgs)
-  Protected pa.i
-  Protected pb.i
-  Protected left.i
-  Protected sa.i
-  Protected sb.i
-  Protected total.i
-  pa = *g\A : pb = *g\B : left = *g\Count
-  sa = *g\StepA : sb = *g\StepB : total = 0
-  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
-    !mov rax,[p.v_pa]
-    !mov rdx,[p.v_pb]
-    !mov rcx,[p.v_left]
-    !mov r8,[p.v_sa]
-    !mov r9,[p.v_sb]
-    !xor r10d,r10d
-    !cmp r8,1
-    !jne pmint8dot_tail
-    !cmp r9,1
-    !jne pmint8dot_tail
-    !pxor xmm0,xmm0
-    !pmint8dot_vector:
-    !cmp rcx,8
-    !jl pmint8dot_reduce
-    !movq xmm1,[rax]
-    !movq xmm2,[rdx]
-    !punpcklbw xmm1,xmm1
-    !punpcklbw xmm2,xmm2
-    !psraw xmm1,8
-    !psraw xmm2,8
-    !pmaddwd xmm1,xmm2
-    !paddd xmm0,xmm1
-    !add rax,8
-    !add rdx,8
-    !sub rcx,8
-    !jmp pmint8dot_vector
-    !pmint8dot_reduce:
-    !pshufd xmm1,xmm0,78
-    !paddd xmm0,xmm1
-    !pshufd xmm1,xmm0,177
-    !paddd xmm0,xmm1
-    !movd r10d,xmm0
-    !pmint8dot_tail:
-    !test rcx,rcx
-    !jz pmint8dot_done
-    !pmint8dot_scalar:
-    !movsx r11d,byte [rax]
-    !movsx r8d,byte [rdx]
-    !imul r11d,r8d
-    !add r10d,r11d
-    !mov r8,[p.v_sa]
-    !add rax,r8
-    !add rdx,r9
+; out[c] = largest |src[r*rowbytes + c*4]| over rows, for c < cols.
+Procedure PmI8MaxBitsColumns(*src, rows.i, rowbytes.i, cols.i, *out)
+  Protected c.i=0, r.i, v.i, best.i, base.i, blocks.i=cols/8, ps.i=*src, po.i=*out
+  If PmI8Avx2 And blocks>0 And rows>0
+    !mov r8,[p.v_ps]
+    !mov r9,[p.v_po]
+    !mov r10,[p.v_blocks]
+    !mov r11,[p.v_rowbytes]
+    !mov rdx,[p.v_rows]
+    !vpcmpeqd ymm1,ymm1,ymm1
+    !vpsrld ymm1,ymm1,1
+    !pmi8mcol_block:
+    !vpxor ymm0,ymm0,ymm0
+    !mov rax,r8
+    !mov rcx,rdx
+    !pmi8mcol_row:
+    !vpand ymm2,ymm1,[rax]
+    !vpmaxud ymm0,ymm0,ymm2
+    !add rax,r11
     !dec rcx
-    !jnz pmint8dot_scalar
-    !pmint8dot_done:
-    !movsxd r10,r10d
-    !mov [p.v_total],r10
-    ProcedureReturn total
-  CompilerElse
-  While left >= 4
-    total = total + PeekB(pa) * PeekB(pb)
-    total = total + PeekB(pa + sa) * PeekB(pb + sb)
-    total = total + PeekB(pa + sa * 2) * PeekB(pb + sb * 2)
-    total = total + PeekB(pa + sa * 3) * PeekB(pb + sb * 3)
-    pa = pa + sa * 4 : pb = pb + sb * 4 : left = left - 4
+    !jnz pmi8mcol_row
+    !vmovdqu [r9],ymm0
+    !add r8,32
+    !add r9,32
+    !dec r10
+    !jnz pmi8mcol_block
+    !vzeroupper
+    c=blocks*8
+  EndIf
+  While c<cols
+    best=0 : base=*src+c*4
+    For r=0 To rows-1
+      v=PeekL(base+r*rowbytes) & $7FFFFFFF
+      If v>best : best=v : EndIf
+    Next
+    PokeL(*out+c*4,best) : c+1
   Wend
-  While left > 0
-    total = total + PeekB(pa) * PeekB(pb)
-    pa = pa + sa : pb = pb + sb : left = left - 1
-  Wend
-  ProcedureReturn total
-  CompilerEndIf
 EndProcedure
 
-Procedure.i PmTensorGetInt8(*base, index.i)
-  ProcedureReturn PeekB(*base + index)
-EndProcedure
-
-Procedure.f PmTensorDynamicScale(*base, count.i)
-  Protected i.i
-  Protected value.f
-  Protected magnitude.f
-  Protected maximum.f
-  i = 0 : maximum = 0.0
-  While i < count
-    value = PmTensorGet(*base, i)
-    magnitude = value
-    If magnitude < 0.0 : magnitude = 0.0 - magnitude : EndIf
-    If magnitude > maximum : maximum = magnitude : EndIf
-    i = i + 1
-  Wend
-  If maximum = 0.0 : ProcedureReturn 1.0 : EndIf
-  ProcedureReturn maximum / 127.0
-EndProcedure
-
-Procedure.i PmTensorQuantizeInt8(value.f, scale.f)
-  Protected quantized.i
-  Protected bit.i
-  Protected negative.i
-  Protected threshold.f
-  quantized = 0 : negative = 0
-  If value < 0.0 : negative = 1 : value = 0.0 - value : EndIf
-  bit = 64 : threshold = scale * 64.0
-  While bit > 0
-    If value >= threshold : quantized = quantized + bit : value = value - threshold : EndIf
-    threshold = threshold * 0.5 : bit = bit / 2
-  Wend
-  If value >= scale * 0.5 : quantized = quantized + 1 : EndIf
-  If quantized > 127 : quantized = 127 : EndIf
-  If negative <> 0 : quantized = 0 - quantized : EndIf
-  ProcedureReturn quantized
-EndProcedure
-
-Procedure PmTensorQuantizeBuffer(*src, *dst, count.i, scale.f)
-  Protected index.i
-  Protected pa.i=*src, pd.i=*dst, remaining.i=count
-  Protected threshold.f=scale*64.0, half.f=0.5
-  index = 0
-  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
-    ; Below normal range the scalar final half-scale comparison uses a
-    ; nonzero FP64 intermediate that a rounded FP32 threshold can lose.
-    If scale>=1.17549435e-38
-    ; Same seven rounded subtraction steps as the scalar quantizer, four lanes.
-    ; No reciprocal approximation or change to halfway rounding.
-    !mov rax,[p.v_pa]
-    !mov rdx,[p.v_pd]
-    !mov rcx,[p.v_remaining]
-    !pmint8quant_four:
-    !cmp rcx,4
-    !jl pmint8quant_done
-    !movups xmm1,[rax]
-    !movdqa xmm0,xmm1
-    !pxor xmm5,xmm5
-    !cmpltps xmm0,xmm5
-    !pcmpeqd xmm5,xmm5
-    !psrld xmm5,1
-    !andps xmm1,xmm5
-    !pxor xmm2,xmm2
-    !movss xmm3,[p.v_threshold]
-    !shufps xmm3,xmm3,0
-    !mov r9d,64
-    !movd xmm4,r9d
-    !pshufd xmm4,xmm4,0
-    !mov r8d,7
-    !pmint8quant_bit:
-    !movaps xmm5,xmm3
-    !cmpleps xmm5,xmm1
-    !pand xmm5,xmm4
-    !paddd xmm2,xmm5
-    !movaps xmm5,xmm3
-    !cmpleps xmm5,xmm1
-    !andps xmm5,xmm3
-    !subps xmm1,xmm5
-    !movss xmm5,[p.v_half]
-    !shufps xmm5,xmm5,0
-    !mulps xmm3,xmm5
-    !psrld xmm4,1
-    !dec r8d
-    !jnz pmint8quant_bit
-    !cmpleps xmm3,xmm1
-    !pcmpeqd xmm4,xmm4
-    !psrld xmm4,31
-    !pand xmm3,xmm4
-    !paddd xmm2,xmm3
-    !packssdw xmm2,xmm2
-    !packsswb xmm2,xmm2
-    !punpcklbw xmm2,xmm2
-    !psraw xmm2,8
-    !punpcklwd xmm2,xmm2
-    !psrad xmm2,16
-    !pxor xmm2,xmm0
-    !psubd xmm2,xmm0
-    !packssdw xmm2,xmm2
-    !packsswb xmm2,xmm2
-    !movd [rdx],xmm2
-    !add rax,16
-    !add rdx,4
-    !sub rcx,4
-    !jmp pmint8quant_four
-    !pmint8quant_done:
-    !mov [p.v_remaining],rcx
-    index=count-remaining
+; Scale and reciprocal for each row maximum. Returns 0 for a NaN or infinity.
+Procedure.i PmI8ScalesFromBits(*bits, count.i, qmax.f, *scale, *inv)
+  Protected i.i, b.i, m.f
+  For i=0 To count-1
+    b=PeekL(*bits+i*4)
+    If b>=$7F800000 Or b<0 : ProcedureReturn 0 : EndIf
+    m=PeekF(*bits+i*4)
+    If m<#PMI8_TINY
+      PokeF(*scale+i*4,0.0) : PokeF(*inv+i*4,0.0)
+    Else
+      PokeF(*scale+i*4,m/qmax) : PokeF(*inv+i*4,qmax/m)
     EndIf
-  CompilerEndIf
-  While index < count
-    PokeA(*dst + index, PmTensorQuantizeInt8(PmTensorGet(*src, index), scale) & 255)
-    index = index + 1
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; Round-half-even of one FP32 product (the MXCSR default), for the plain path.
+Procedure.i PmI8RoundProduct(x.f, inv.f)
+  Protected v.f=x*inv, q.i
+  !cvtss2si eax,[p.v_v]
+  !movsxd rax,eax
+  !mov [p.v_q],rax
+  ProcedureReturn q
+EndProcedure
+
+; Two neighbouring reduction rows (src1 = 0: a zero row) at `cols` positions,
+; each with its own reciprocal, into INT16 pairs.
+Procedure PmI8QuantColumnPair(*src0, *src1, cols.i, *inv, qmax.i, *dst)
+  Protected c.i=0, blocks.i=cols/8, a.i, b.i, p0.i=*src0, p1.i=*src1, pi.i=*inv, pd.i=*dst, lim.i=qmax
+  If PmI8Avx2 And blocks>0
+    !mov r8,[p.v_p0]
+    !mov r9,[p.v_p1]
+    !mov r10,[p.v_pi]
+    !mov r11,[p.v_pd]
+    !mov rcx,[p.v_blocks]
+    !vmovd xmm4,dword [p.v_lim]
+    !vpbroadcastd ymm4,xmm4
+    !vpxor ymm5,ymm5,ymm5
+    !vpsubd ymm5,ymm5,ymm4
+    !vpcmpeqd ymm3,ymm3,ymm3
+    !vpsrld ymm3,ymm3,16
+    !pmi8qcp_loop:
+    !vmovups ymm2,[r10]
+    !vmulps ymm0,ymm2,[r8]
+    !vcvtps2dq ymm0,ymm0
+    !vpminsd ymm0,ymm0,ymm4
+    !vpmaxsd ymm0,ymm0,ymm5
+    !vpand ymm0,ymm0,ymm3
+    !test r9,r9
+    !jz pmi8qcp_store
+    !vmulps ymm1,ymm2,[r9]
+    !vcvtps2dq ymm1,ymm1
+    !vpminsd ymm1,ymm1,ymm4
+    !vpmaxsd ymm1,ymm1,ymm5
+    !vpslld ymm1,ymm1,16
+    !vpor ymm0,ymm0,ymm1
+    !add r9,32
+    !pmi8qcp_store:
+    !vmovdqu [r11],ymm0
+    !add r8,32
+    !add r10,32
+    !add r11,32
+    !dec rcx
+    !jnz pmi8qcp_loop
+    !vzeroupper
+    c=blocks*8
+  EndIf
+  While c<cols
+    a=PmI8RoundProduct(PeekF(*src0+c*4),PeekF(*inv+c*4))
+    If a>qmax : a=qmax : ElseIf a<-qmax : a=-qmax : EndIf
+    b=0
+    If *src1
+      b=PmI8RoundProduct(PeekF(*src1+c*4),PeekF(*inv+c*4))
+      If b>qmax : b=qmax : ElseIf b<-qmax : b=-qmax : EndIf
+    EndIf
+    PokeW(*dst+c*4,a) : PokeW(*dst+c*4+2,b)
+    c+1
   Wend
 EndProcedure
 
-Procedure.f PmTensorDotInt8Scaled(*g.PmTensorDotInt8Args)
-  Protected dot.PmTensorInt8DotArgs
-  Protected converted.f
-  dot\A=*g\A : dot\B=*g\B : dot\Count=*g\Count : dot\StepA=1 : dot\StepB=1
-  converted=PmTensorInt8Dot(@dot)
-  ProcedureReturn converted * *g\AScale * *g\WeightScale
+; One row along the reduction: element k goes to half (k & 1) of the pair at
+; dst + (k >> 1) * dststride. An odd count leaves the last high half as is.
+Procedure PmI8QuantRowPairs(*src, count.i, inv.f, qmax.i, *dst, dststride.i)
+  Protected k.i=0, a.i, blocks.i=count/4, ps.i=*src, pd.i=*dst, fi.f=inv
+  If blocks>0
+    !mov r8,[p.v_ps]
+    !mov r9,[p.v_pd]
+    !mov r10,[p.v_dststride]
+    !mov rcx,[p.v_blocks]
+    !movss xmm3,[p.v_fi]
+    !shufps xmm3,xmm3,0
+    !pmi8qrp_loop:
+    !movups xmm0,[r8]
+    !mulps xmm0,xmm3
+    !cvtps2dq xmm0,xmm0
+    !packssdw xmm0,xmm0
+    !movd [r9],xmm0
+    !psrlq xmm0,32
+    !movd [r9+r10],xmm0
+    !add r8,16
+    !lea r9,[r9+r10*2]
+    !dec rcx
+    !jnz pmi8qrp_loop
+    k=blocks*4
+  EndIf
+  While k<count
+    a=PmI8RoundProduct(PeekF(*src+k*4),inv)
+    If a>qmax : a=qmax : ElseIf a<-qmax : a=-qmax : EndIf
+    PokeW(*dst+(k>>1)*dststride+(k & 1)*2,a)
+    k+1
+  Wend
 EndProcedure
+
+; Four prepared weight rows x sixteen positions, every tap: for each tap the
+; activation pairs start at X + XTap(tap) and the position scales at
+; S + STap(tap); the tap's pairs run in chunks of at most Flush steps, each
+; chunk's exact INT32 sums added into F[r][p] as float(acc) * S[p].
+Structure PmI8TileArgs
+  W.i
+  WStride.i
+  X.i
+  XStride.i
+  XTap.i
+  S.i
+  STap.i
+  Taps.i
+  Pairs.i
+  Flush.i
+  F.i
+EndStructure
+
+; The reference form of one chunk, and of the flush, for processors without
+; AVX2: the same integers, then the same single-precision convert, multiply
+; and add the vector flush performs.
+Procedure PmI8ChunkPlain(pw.i, ws.i, px.i, xs.i, n.i, psc.i, pf.i)
+  Protected r.i, p.i, i.i, acc.l, fv.f, sv.f, wv.i, xv.i
+  For r=0 To 3
+    For p=0 To 15
+      acc=0
+      For i=0 To n-1
+        wv=pw+r*ws+i*4 : xv=px+i*xs+p*4
+        acc+PeekW(wv)*PeekW(xv)+PeekW(wv+2)*PeekW(xv+2)
+      Next
+      sv=PeekF(psc+p*4) : fv=PeekF(pf+(r*16+p)*4)
+      !cvtsi2ss xmm0,dword [p.v_acc]
+      !mulss xmm0,[p.v_sv]
+      !addss xmm0,[p.v_fv]
+      !movss [p.v_fv],xmm0
+      PokeF(pf+(r*16+p)*4,fv)
+    Next
+  Next
+EndProcedure
+
+Procedure PmI8TileAll(*a.PmI8TileArgs)
+  Protected ap.i=*a, tap.i, pair.i, n.i, pw.i, px.i, psc.i
+  If *a\Taps<=0 Or *a\Pairs<=0 : ProcedureReturn : EndIf
+  If PmI8Avx2=0
+    pw=*a\W
+    For tap=0 To *a\Taps-1
+      px=*a\X+PeekI(*a\XTap+tap*8) : psc=*a\S+PeekI(*a\STap+tap*8) : pair=0
+      While pair<*a\Pairs
+        n=*a\Pairs-pair : If n>*a\Flush : n=*a\Flush : EndIf
+        PmI8ChunkPlain(pw,*a\WStride,px,*a\XStride,n,psc,*a\F)
+        pw+n*4 : px+n* *a\XStride : pair+n
+      Wend
+    Next
+    ProcedureReturn
+  EndIf
+  !mov rax,[p.v_ap]
+  !push rbx
+  !push rsi
+  !push rdi
+  !push r12
+  !push r13
+  !push r14
+  !push r15
+  !mov r15,rax
+  !sub rsp,96
+  !movdqu [rsp],xmm6
+  !movdqu [rsp+16],xmm7
+  !movdqu [rsp+32],xmm8
+  !movdqu [rsp+48],xmm9
+  !movdqu [rsp+64],xmm10
+  !movdqu [rsp+80],xmm11
+  !mov rcx,[r15]
+  !mov r10,[r15+8]
+  !lea r11,[r10+r10*2]
+  !add r11,rcx
+  !mov r8,[r15+24]
+  !mov r12,[r15+80]
+  !mov r13,[r15+56]
+  !xor rsi,rsi
+  !pmi8all_tap:
+  !mov rbx,[r15+32]
+  !mov rax,[rbx+rsi]
+  !add rax,[r15+16]
+  !mov rbx,[r15+48]
+  !mov r9,[rbx+rsi]
+  !add r9,[r15+40]
+  !mov r14,[r15+64]
+  !pmi8all_chunk:
+  !mov rdx,[r15+72]
+  !cmp r14,rdx
+  !cmovb rdx,r14
+  !sub r14,rdx
+  !vpxor ymm0,ymm0,ymm0
+  !vpxor ymm1,ymm1,ymm1
+  !vpxor ymm2,ymm2,ymm2
+  !vpxor ymm3,ymm3,ymm3
+  !vpxor ymm4,ymm4,ymm4
+  !vpxor ymm5,ymm5,ymm5
+  !vpxor ymm6,ymm6,ymm6
+  !vpxor ymm7,ymm7,ymm7
+  !test rdx,1
+  !jz pmi8all_pairs
+  !vmovdqu ymm8,[rax]
+  !vmovdqu ymm9,[rax+32]
+  !vpbroadcastd ymm10,[rcx]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm0,ymm0,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm1,ymm1,ymm11
+  !vpbroadcastd ymm10,[rcx+r10]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm2,ymm2,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm3,ymm3,ymm11
+  !vpbroadcastd ymm10,[rcx+r10*2]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm4,ymm4,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm5,ymm5,ymm11
+  !vpbroadcastd ymm10,[r11]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm6,ymm6,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm7,ymm7,ymm11
+  !add rax,r8
+  !add rcx,4
+  !add r11,4
+  !pmi8all_pairs:
+  !shr rdx,1
+  !jz pmi8all_flush
+  !pmi8all_loop:
+  !vmovdqu ymm8,[rax]
+  !vmovdqu ymm9,[rax+32]
+  !vpbroadcastd ymm10,[rcx]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm0,ymm0,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm1,ymm1,ymm11
+  !vpbroadcastd ymm10,[rcx+r10]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm2,ymm2,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm3,ymm3,ymm11
+  !vpbroadcastd ymm10,[rcx+r10*2]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm4,ymm4,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm5,ymm5,ymm11
+  !vpbroadcastd ymm10,[r11]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm6,ymm6,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm7,ymm7,ymm11
+  !vmovdqu ymm8,[rax+r8]
+  !vmovdqu ymm9,[rax+r8+32]
+  !vpbroadcastd ymm10,[rcx+4]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm0,ymm0,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm1,ymm1,ymm11
+  !vpbroadcastd ymm10,[rcx+r10+4]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm2,ymm2,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm3,ymm3,ymm11
+  !vpbroadcastd ymm10,[rcx+r10*2+4]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm4,ymm4,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm5,ymm5,ymm11
+  !vpbroadcastd ymm10,[r11+4]
+  !vpmaddwd ymm11,ymm10,ymm8
+  !vpaddd ymm6,ymm6,ymm11
+  !vpmaddwd ymm11,ymm10,ymm9
+  !vpaddd ymm7,ymm7,ymm11
+  !lea rax,[rax+r8*2]
+  !add rcx,8
+  !add r11,8
+  !dec rdx
+  !jnz pmi8all_loop
+  !pmi8all_flush:
+  !vmovups ymm8,[r9]
+  !vmovups ymm9,[r9+32]
+  !vcvtdq2ps ymm0,ymm0
+  !vmulps ymm0,ymm0,ymm8
+  !vaddps ymm0,ymm0,[r12]
+  !vmovups [r12],ymm0
+  !vcvtdq2ps ymm1,ymm1
+  !vmulps ymm1,ymm1,ymm9
+  !vaddps ymm1,ymm1,[r12+32]
+  !vmovups [r12+32],ymm1
+  !vcvtdq2ps ymm2,ymm2
+  !vmulps ymm2,ymm2,ymm8
+  !vaddps ymm2,ymm2,[r12+64]
+  !vmovups [r12+64],ymm2
+  !vcvtdq2ps ymm3,ymm3
+  !vmulps ymm3,ymm3,ymm9
+  !vaddps ymm3,ymm3,[r12+96]
+  !vmovups [r12+96],ymm3
+  !vcvtdq2ps ymm4,ymm4
+  !vmulps ymm4,ymm4,ymm8
+  !vaddps ymm4,ymm4,[r12+128]
+  !vmovups [r12+128],ymm4
+  !vcvtdq2ps ymm5,ymm5
+  !vmulps ymm5,ymm5,ymm9
+  !vaddps ymm5,ymm5,[r12+160]
+  !vmovups [r12+160],ymm5
+  !vcvtdq2ps ymm6,ymm6
+  !vmulps ymm6,ymm6,ymm8
+  !vaddps ymm6,ymm6,[r12+192]
+  !vmovups [r12+192],ymm6
+  !vcvtdq2ps ymm7,ymm7
+  !vmulps ymm7,ymm7,ymm9
+  !vaddps ymm7,ymm7,[r12+224]
+  !vmovups [r12+224],ymm7
+  !test r14,r14
+  !jnz pmi8all_chunk
+  !add rsi,8
+  !dec r13
+  !jnz pmi8all_tap
+  !vzeroupper
+  !movdqu xmm6,[rsp]
+  !movdqu xmm7,[rsp+16]
+  !movdqu xmm8,[rsp+32]
+  !movdqu xmm9,[rsp+48]
+  !movdqu xmm10,[rsp+64]
+  !movdqu xmm11,[rsp+80]
+  !add rsp,96
+  !pop r15
+  !pop r14
+  !pop r13
+  !pop r12
+  !pop rdi
+  !pop rsi
+  !pop rbx
+EndProcedure
+
+; E[c][p] = F[c][p] * wScale(c) (+ bias(c)); wide: (F[2c] + F[2c+1] / 254) * wScale(c).
+; `rows` output channels (4 narrow, 2 wide), sixteen positions each, in single
+; precision with the division by 254 done as a division, on both paths.
+Procedure PmI8Epilogue(*f, *e, rows.i, wide.i, *ws, *bias)
+  Protected c.i, p.i, v.f, v2.f, w.f, b.f, k.f=#PMI8_WIDE_RESIDUAL
+  Protected pf.i=*f, pe.i=*e, pw.i=*ws, pb.i=*bias, n.i=rows, wd.i=wide
+  If rows<=0 : ProcedureReturn : EndIf
+  If PmI8Avx2
+    !mov rax,[p.v_pf]
+    !mov rdx,[p.v_pe]
+    !mov r8,[p.v_pw]
+    !mov r9,[p.v_pb]
+    !mov rcx,[p.v_n]
+    !mov r10,[p.v_wd]
+    !vbroadcastss ymm5,[p.v_k]
+    !pmi8epi_row:
+    !vmovups ymm0,[rax]
+    !vmovups ymm1,[rax+32]
+    !test r10,r10
+    !jz pmi8epi_narrow
+    !vmovups ymm2,[rax+64]
+    !vmovups ymm3,[rax+96]
+    !vdivps ymm2,ymm2,ymm5
+    !vdivps ymm3,ymm3,ymm5
+    !vaddps ymm0,ymm0,ymm2
+    !vaddps ymm1,ymm1,ymm3
+    !add rax,64
+    !pmi8epi_narrow:
+    !vbroadcastss ymm4,[r8]
+    !vmulps ymm0,ymm0,ymm4
+    !vmulps ymm1,ymm1,ymm4
+    !test r9,r9
+    !jz pmi8epi_store
+    !vbroadcastss ymm4,[r9]
+    !vaddps ymm0,ymm4,ymm0
+    !vaddps ymm1,ymm4,ymm1
+    !add r9,4
+    !pmi8epi_store:
+    !vmovups [rdx],ymm0
+    !vmovups [rdx+32],ymm1
+    !add rax,64
+    !add rdx,64
+    !add r8,4
+    !dec rcx
+    !jnz pmi8epi_row
+    !vzeroupper
+    ProcedureReturn
+  EndIf
+  For c=0 To rows-1
+    w=PeekF(*ws+c*4) : b=0.0 : If *bias : b=PeekF(*bias+c*4) : EndIf
+    For p=0 To 15
+      If wide
+        v=PeekF(*f+(2*c*16+p)*4) : v2=PeekF(*f+((2*c+1)*16+p)*4)
+        !movss xmm1,[p.v_v2]
+        !divss xmm1,[p.v_k]
+        !movss xmm0,[p.v_v]
+        !addss xmm0,xmm1
+        !movss [p.v_v],xmm0
+      Else
+        v=PeekF(*f+(c*16+p)*4)
+      EndIf
+      !movss xmm0,[p.v_v]
+      !mulss xmm0,[p.v_w]
+      !movss [p.v_v],xmm0
+      If *bias
+        !movss xmm0,[p.v_b]
+        !addss xmm0,[p.v_v]
+        !movss [p.v_v],xmm0
+      EndIf
+      PokeF(*e+(c*16+p)*4,v)
+    Next
+  Next
+EndProcedure
+
+
+; Exact dot of `rows` INT8 weight rows (rowbytes apart) with one INT16 vector
+; of `count` elements (count <= 512 on the wide path), into INT32 out[].
+Procedure PmI8DotRows(*w, rowbytes.i, rows.i, *x, count.i, *out)
+  Protected r.i, k.i, blocks.i=count/16, pw.i=*w, px.i=*x, po.i=*out, tail.i=0, total.l
+  If PmI8Avx2 And blocks>0 And rows>0
+    !mov r8,[p.v_pw]
+    !mov r9,[p.v_po]
+    !mov r10,[p.v_rows]
+    !mov r11,[p.v_rowbytes]
+    !pmi8dot_row:
+    !mov rcx,r8
+    !mov rax,[p.v_px]
+    !mov rdx,[p.v_blocks]
+    !vpxor ymm0,ymm0,ymm0
+    !pmi8dot_loop:
+    !vpmovsxbw ymm1,[rcx]
+    !vpmaddwd ymm1,ymm1,[rax]
+    !vpaddd ymm0,ymm0,ymm1
+    !add rcx,16
+    !add rax,32
+    !dec rdx
+    !jnz pmi8dot_loop
+    !vextracti128 xmm1,ymm0,1
+    !vpaddd xmm0,xmm0,xmm1
+    !vpshufd xmm1,xmm0,78
+    !vpaddd xmm0,xmm0,xmm1
+    !vpshufd xmm1,xmm0,177
+    !vpaddd xmm0,xmm0,xmm1
+    !vmovd dword [r9],xmm0
+    !add r8,r11
+    !add r9,4
+    !dec r10
+    !jnz pmi8dot_row
+    !vzeroupper
+    tail=blocks*16
+  EndIf
+  For r=0 To rows-1
+    If tail=0 : total=0 : Else : total=PeekL(*out+r*4) : EndIf
+    pw=*w+r*rowbytes
+    For k=tail To count-1
+      total+PeekB(pw+k)*PeekW(px+k*2)
+    Next
+    PokeL(*out+r*4,total)
+  Next
+EndProcedure
+
+; ---- prepared weight layouts: INT16 pairs along the reduction ----------------
+; Row r of a prepared weight is 4 * taps * pairs bytes. Narrow: row = output
+; channel. Wide: row 2*o + plane, so a block of four rows is two channels with
+; both planes. Each group's rows start a new block of four (zero rows pad).
+Procedure.i PmI8GroupRows(outPerGroup.i, wide.i)
+  ProcedureReturn (outPerGroup*(1+wide)+3)&~3
+EndProcedure
+
+Procedure.i PmI8PrepareConv(*w, outCh.i, groups.i, chPerGroup.i, kernel.i, wide.i, elements.i)
+  Protected key.s=Hex(*w)+":c", pairs.i=(chPerGroup+1)/2, og.i=outCh/groups, rpg.i=PmI8GroupRows(og,wide)
+  Protected *p, o.i, plane.i, j.i, i.i, row.i, lo.i, hi.i, src.i, rowBytes.i=kernel*pairs*4
+  LockMutex(PmI8PrepareMutex)
+  If FindMapElement(PmI8Prepared(),key) : *p=PmI8Prepared() : UnlockMutex(PmI8PrepareMutex) : ProcedureReturn *p : EndIf
+  *p=AllocateMemory(groups*rpg*rowBytes)
+  If *p
+    For o=0 To outCh-1
+      For plane=0 To wide
+        row=(o/og)*rpg+(o % og)*(1+wide)+plane
+        src=*w+plane*elements+o*chPerGroup*kernel
+        For j=0 To kernel-1
+          For i=0 To pairs-1
+            lo=PeekB(src+(2*i)*kernel+j) : hi=0
+            If 2*i+1<chPerGroup : hi=PeekB(src+(2*i+1)*kernel+j) : EndIf
+            PokeW(*p+row*rowBytes+(j*pairs+i)*4,lo) : PokeW(*p+row*rowBytes+(j*pairs+i)*4+2,hi)
+          Next
+        Next
+      Next
+    Next
+    PmI8Prepared(key)=*p
+  EndIf
+  UnlockMutex(PmI8PrepareMutex)
+  ProcedureReturn *p
+EndProcedure
+
+; MatMul B is [K][N] (one batch slice), or [N][K] rows when bRows (an LSTM
+; input weight); prepared rows are the N output columns either way.
+Procedure.i PmI8PrepareMatMul(*w, k.i, n.i, wide.i, elements.i, bRows.i=0)
+  Protected key.s=Hex(*w)+":m"+Str(bRows), pairs.i=(k+1)/2, rows.i=n*(1+wide), padded.i=(rows+3)&~3
+  Protected *p, c.i, plane.i, i.i, row.i, lo.i, hi.i, src.i, rowBytes.i=pairs*4
+  LockMutex(PmI8PrepareMutex)
+  If FindMapElement(PmI8Prepared(),key) : *p=PmI8Prepared() : UnlockMutex(PmI8PrepareMutex) : ProcedureReturn *p : EndIf
+  *p=AllocateMemory(padded*rowBytes)
+  If *p
+    For c=0 To n-1
+      For plane=0 To wide
+        row=c : If wide : row=2*c+plane : EndIf
+        If bRows
+          src=*w+plane*elements+c*k
+          For i=0 To pairs-1
+            lo=PeekB(src+2*i) : hi=0
+            If 2*i+1<k : hi=PeekB(src+2*i+1) : EndIf
+            PokeW(*p+row*rowBytes+i*4,lo) : PokeW(*p+row*rowBytes+i*4+2,hi)
+          Next
+          Continue
+        EndIf
+        src=*w+plane*elements+c
+        For i=0 To pairs-1
+          lo=PeekB(src+(2*i)*n) : hi=0
+          If 2*i+1<k : hi=PeekB(src+(2*i+1)*n) : EndIf
+          PokeW(*p+row*rowBytes+i*4,lo) : PokeW(*p+row*rowBytes+i*4+2,hi)
+        Next
+      Next
+    Next
+    PmI8Prepared(key)=*p
+  EndIf
+  UnlockMutex(PmI8PrepareMutex)
+  ProcedureReturn *p
+EndProcedure
+
+; Gemm B with transB=0 is [K][N]; the dot path wants rows of K, so keep a
+; transposed INT8 copy (both planes).
+Procedure.i PmI8PrepareRows(*w, k.i, n.i, wide.i, elements.i)
+  Protected key.s=Hex(*w)+":t", *p, c.i, i.i, plane.i
+  LockMutex(PmI8PrepareMutex)
+  If FindMapElement(PmI8Prepared(),key) : *p=PmI8Prepared() : UnlockMutex(PmI8PrepareMutex) : ProcedureReturn *p : EndIf
+  *p=AllocateMemory(k*n*(1+wide))
+  If *p
+    For plane=0 To wide
+      For c=0 To n-1
+        For i=0 To k-1
+          PokeB(*p+plane*k*n+c*k+i,PeekB(*w+plane*elements+i*n+c))
+        Next
+      Next
+    Next
+    PmI8Prepared(key)=*p
+  EndIf
+  UnlockMutex(PmI8PrepareMutex)
+  ProcedureReturn *p
+EndProcedure
+
+; ---- the tiled integer product ---------------------------------------------
+; One job computes prepared rows [RowFirst, RowLast) (multiples of four) at
+; position tiles [TileFirst, TileLast) of sixteen. Tap j reads activation
+; pairs at X + XTap(j) and position scales at S + STap(j).
+Structure PmI8TileJob
+  W.i
+  WRowBytes.i
+  Pairs.i
+  Taps.i
+  X.i
+  XStride.i
+  XTap.i
+  S.i
+  STap.i
+  Flush.i
+  RowFirst.i
+  RowLast.i
+  TileCount.i
+  ByTiles.i
+  Counter.i
+  Mode.i
+  Wide.i
+  Dst.i
+  Scales.i
+  Bias.i
+  Rows.i
+  RowBase.i
+  ChannelBase.i
+  Positions.i
+  DstRowStride.i
+EndStructure
+
+#PMI8_MODE_CONV = 0
+#PMI8_MODE_MATMUL = 1
+
+; The next task number of a shared counter (lock xadd).
+Procedure.i PmI8Claim(*counter)
+  Protected pc.i=*counter, v.i
+  !mov rcx,[p.v_pc]
+  !mov rax,1
+  !lock xadd [rcx],rax
+  !mov [p.v_v],rax
+  ProcedureReturn v
+EndProcedure
+
+; Workers claim tasks from one counter - a position tile (every row block) or
+; a row block (every tile) - so a slower core simply takes fewer of them.
+Procedure PmI8TileWorker(*j.PmI8TileJob)
+  Dim f.f(63)
+  Dim e.f(63)
+  Protected a.PmI8TileArgs
+  Protected task.i, t.i, t0.i, t1.i, rb.i, r0.i, r1.i, c.i, p.i, ch0.i, local.i, valid.i, channels.i, n.i
+  a\WStride=*j\WRowBytes : a\XStride=*j\XStride : a\XTap=*j\XTap : a\STap=*j\STap
+  a\Taps=*j\Taps : a\Pairs=*j\Pairs : a\Flush=*j\Flush : a\F=@f(0)
+  Repeat
+    task=PmI8Claim(*j\Counter)
+    If *j\ByTiles
+      If task>=*j\TileCount : Break : EndIf
+      t0=task : t1=task+1 : r0=*j\RowFirst : r1=*j\RowLast
+    Else
+      If task>=(*j\RowLast-*j\RowFirst)/4 : Break : EndIf
+      t0=0 : t1=*j\TileCount : r0=*j\RowFirst+task*4 : r1=r0+4
+    EndIf
+    For t=t0 To t1-1
+      valid=*j\Positions-t*16 : If valid>16 : valid=16 : EndIf
+      rb=r0
+      While rb<r1
+        local=(rb-*j\RowBase) >> *j\Wide
+        channels=*j\Rows-local : If channels>(4 >> *j\Wide) : channels=4 >> *j\Wide : EndIf
+        If channels>0
+          FillMemory(@f(0),256,0)
+          a\W=*j\W+rb* *j\WRowBytes : a\X=*j\X+t*64 : a\S=*j\S+t*64
+          PmI8TileAll(@a)
+          ch0=*j\ChannelBase+local
+          If *j\Bias : n=*j\Bias+ch0*4 : Else : n=0 : EndIf
+          PmI8Epilogue(@f(0),@e(0),channels,*j\Wide,*j\Scales+ch0*4,n)
+          If *j\Mode=#PMI8_MODE_CONV
+            For c=0 To channels-1
+              CopyMemory(@e(c*16),*j\Dst+((ch0+c)* *j\DstRowStride+t*16)*4,valid*4)
+            Next
+          Else
+            For c=0 To channels-1
+              For p=0 To valid-1
+                PokeF(*j\Dst+((t*16+p)* *j\DstRowStride+ch0+c)*4,e(c*16+p))
+              Next
+            Next
+          EndIf
+        EndIf
+        rb+4
+      Wend
+    Next
+  ForEver
+EndProcedure
+
+Procedure PmI8RunTiles(*proto.PmI8TileJob, rowBase.i, rowsPadded.i, tiles.i)
+  Protected workers.i=CountCPUs(#PB_System_ProcessCPUs), i.i, counter.i=0
+  Protected macs.q=rowsPadded
+  Protected Dim jobs.PmI8TileJob(7), Dim threads.i(7)
+  macs*tiles*16 : macs* *proto\Pairs* *proto\Taps*2
+  If workers>8 : workers=8 : EndIf
+  If macs<2000000 : workers=1 : EndIf
+  If workers<1 : workers=1 : EndIf
+  For i=0 To workers-1
+    CopyStructure(*proto,@jobs(i),PmI8TileJob)
+    jobs(i)\RowFirst=rowBase : jobs(i)\RowLast=rowBase+rowsPadded
+    jobs(i)\TileCount=tiles : jobs(i)\Counter=@counter
+    jobs(i)\ByTiles=Bool(tiles>=workers*4 Or tiles>=rowsPadded/4)
+  Next
+  For i=0 To workers-1
+    If i=workers-1
+      PmI8TileWorker(@jobs(i))
+    Else
+      threads(i)=CreateThread(@PmI8TileWorker(),@jobs(i))
+      If threads(i)=0 : PmI8TileWorker(@jobs(i)) : EndIf
+    EndIf
+  Next
+  For i=0 To workers-1 : If threads(i) : WaitThread(threads(i)) : EndIf : Next
+EndProcedure
+
+; ---- operators ------------------------------------------------------------
+; MatMul: A is [m][k] (one batch slice), B is INT8 [k][n], dst [m][n].
+; Returns 0 for a NaN or an infinity in A, or when memory runs out.
+Procedure.i PmI8MatMul(*a, *b, *dst, m.i, k.i, n.i, *weightScales, wide.i, elements.i, bRows.i=0)
+  Protected pairs.i=(k+1)/2, tiles.i=(m+15)/16, positions.i=tiles*16, row.i, qmax.i=127
+  Protected *x, *s, *inv, *bits, *wp, ok.i=0, inv.f
+  Protected job.PmI8TileJob
+  Protected zero.i=0
+  If m<=0 Or n<=0 : ProcedureReturn 1 : EndIf
+  If wide : qmax=32767 : EndIf
+  *wp=PmI8PrepareMatMul(*b,k,n,wide,elements,bRows)
+  *x=AllocateMemory(pairs*positions*4+64) : *s=AllocateMemory(positions*4+64)
+  *inv=AllocateMemory(positions*4+64) : *bits=AllocateMemory(positions*4+64)
+  If *wp And *x And *s And *inv And *bits
+    For row=0 To m-1 : PokeL(*bits+row*4,PmI8MaxBitsContig(*a+row*k*4,k)) : Next
+    If PmI8ScalesFromBits(*bits,m,qmax,*s,*inv)=0
+      PmTensorInt8Fault=1
+    Else
+      For row=0 To m-1
+        inv=PeekF(*inv+row*4)
+        PmI8QuantRowPairs(*a+row*k*4,k,inv,qmax,*x+row*4,positions*4)
+      Next
+      job\W=*wp : job\WRowBytes=pairs*4 : job\Pairs=pairs : job\Taps=1
+      job\X=*x : job\XStride=positions*4 : job\XTap=@zero : job\S=*s : job\STap=@zero
+      job\Flush=pairs : If wide : job\Flush=#PMI8_FLUSH_PAIRS : EndIf
+      job\Mode=#PMI8_MODE_MATMUL : job\Wide=wide : job\Dst=*dst : job\Scales=*weightScales
+      job\Rows=n : job\RowBase=0 : job\ChannelBase=0 : job\Positions=m : job\DstRowStride=n
+      PmI8RunTiles(@job,0,PmI8GroupRows(n,wide),tiles)
+      ok=1
+    EndIf
+  EndIf
+  If *x : FreeMemory(*x) : EndIf
+  If *s : FreeMemory(*s) : EndIf
+  If *inv : FreeMemory(*inv) : EndIf
+  If *bits : FreeMemory(*bits) : EndIf
+  ProcedureReturn ok
+EndProcedure
+
+; ---- the row-dot path: Gemm and LSTM -----------------------------------------
+; Quantize one contiguous row of `count` floats to INT16 (dst) with its scale.
+; Returns 0 for a NaN or an infinity.
+Procedure.i PmI8QuantizeVector(*src, count.i, qmax.i, *dst, *scale)
+  Protected bits.i=PmI8MaxBitsContig(*src,count), m.f, inv.f
+  If bits>=$7F800000 : ProcedureReturn 0 : EndIf
+  PokeL(@m,bits)
+  If m<#PMI8_TINY
+    FillMemory(*dst,count*2,0) : PokeF(*scale,0.0) : ProcedureReturn 1
+  EndIf
+  PokeF(*scale,m/qmax) : inv=qmax/m
+  PmI8QuantRowPairs(*src,count,inv,qmax,*dst,4)
+  ProcedureReturn 1
+EndProcedure
+
+; F[r] = sum over chunks of float(dot(row r, x)) * xScale, for `rows` INT8
+; rows `rowbytes` apart; chunks of 512 elements when wide, else one chunk.
+Procedure PmI8DotRowsScaled(*w, rowbytes.i, rows.i, *x, count.i, xScale.f, wide.i, *acc, *f)
+  Protected k.i=0, chunk.i, r.i, v.f
+  FillMemory(*f,rows*4,0)
+  While k<count
+    chunk=count-k
+    If wide And chunk>512 : chunk=512 : EndIf
+    PmI8DotRows(*w+k,rowbytes,rows,*x+k*2,chunk,*acc)
+    For r=0 To rows-1
+      v=PeekL(*acc+r*4) : v=v*xScale : v=PeekF(*f+r*4)+v
+      PokeF(*f+r*4,v)
+    Next
+    k+chunk
+  Wend
+EndProcedure
+
+
 CompilerEndIf
 
 ; A is MxK, B is KxN and dst is MxN, all row-major.
@@ -802,35 +1390,9 @@ Procedure PmTensorMatMul2(*a, *b, *dst, m.i, k.i, n.i)
 EndProcedure
 
 CompilerIf #PMO_USE_INT8 = 1
+; The fixed-shape entry: narrow weights, one scale per row of A.
 Procedure PmTensorMatMul2Int8(*a, *b, *dst, m.i, k.i, n.i, *weightScales)
-  Protected row.i
-  Protected col.i
-  Protected aScale.f
-  Protected converted.f
-  Protected dot.PmTensorInt8DotArgs
-  aScale = PmTensorDynamicScale(*a, m * k)
-  Protected eight.PmTensorInt8RowArgs
-  PmTensorQuantizeBuffer(*a, PmTensorInt8Scratch, m * k, aScale)
-  dot\Count=k : dot\StepA=1 : dot\StepB=n
-  row=0
-  While row<m
-    dot\A=PmTensorInt8Scratch+row*k : col=0
-    CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
-    eight\A=dot\A : eight\K=k : eight\N=n : eight\AScale=aScale
-    While col+7<n
-      eight\B=*b+col : eight\Dst=*dst+(row*n+col)*4 : eight\Scales=*weightScales+col*4
-      PmTensorInt8Row8(@eight)
-      col=col+8
-    Wend
-    CompilerEndIf
-    While col<n
-      dot\B=*b+col
-      converted=PmTensorInt8Dot(@dot)
-      PmTensorPut(*dst,row*n+col,converted*aScale*PmTensorGet(*weightScales,col))
-      col=col+1
-    Wend
-    row=row+1
-  Wend
+  If PmI8MatMul(*a,*b,*dst,m,k,n,*weightScales,0,k*n)=0 And PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
 EndProcedure
 CompilerEndIf
 
@@ -848,7 +1410,52 @@ Structure PmTensorGemmArgs
   Beta.f
   CCount.i
   WeightScales.i
+  Wide.i
 EndStructure
+
+CompilerIf #PMO_USE_INT8 = 1
+
+; ONNX Gemm with an INT8 B: one scale per row of A' (per token).
+Procedure.i PmI8Gemm(*g.PmTensorGemmArgs)
+  Protected wide.i=*g\Wide, qmax.i=127, row.i, col.i, i.i, ic.i, *rows, *xq, *acc, *f1, *f2, *arow, ok.i=0
+  Protected xs.f, v.f, elements.i=*g\K * *g\N, rowbytes.i=*g\K
+  If wide : qmax=32767 : EndIf
+  If *g\TransB : *rows=*g\B : Else : *rows=PmI8PrepareRows(*g\B,*g\K,*g\N,wide,elements) : EndIf
+  *xq=AllocateMemory(*g\K*2+64) : *acc=AllocateMemory(*g\N*4+64)
+  *f1=AllocateMemory(*g\N*4+64) : *f2=AllocateMemory(*g\N*4+64) : *arow=AllocateMemory(*g\K*4+64)
+  If *rows And *xq And *acc And *f1 And *f2 And *arow
+    ok=1
+    For row=0 To *g\M-1
+      If *g\TransA
+        For i=0 To *g\K-1 : PokeL(*arow+i*4,PeekL(*g\A+(i* *g\M+row)*4)) : Next
+      Else
+        CopyMemory(*g\A+row* *g\K*4,*arow,*g\K*4)
+      EndIf
+      If PmI8QuantizeVector(*arow,*g\K,qmax,*xq,@xs)=0 : PmTensorInt8Fault=1 : ok=0 : Break : EndIf
+      PmI8DotRowsScaled(*rows,rowbytes,*g\N,*xq,*g\K,xs,wide,*acc,*f1)
+      If wide : PmI8DotRowsScaled(*rows+elements,rowbytes,*g\N,*xq,*g\K,xs,wide,*acc,*f2) : EndIf
+      For col=0 To *g\N-1
+        v=PeekF(*f1+col*4)
+        If wide : v=v+PeekF(*f2+col*4)/#PMI8_WIDE_RESIDUAL : EndIf
+        v=v*PeekF(*g\WeightScales+col*4)
+        v=v* *g\Alpha
+        If *g\C<>0 And *g\CCount>0
+          ic=row* *g\N+col
+          If *g\CCount=1 : ic=0 : ElseIf *g\CCount=*g\N : ic=col : EndIf
+          v=v+*g\Beta*PeekF(*g\C+ic*4)
+        EndIf
+        PokeF(*g\Dst+(row* *g\N+col)*4,v)
+      Next
+    Next
+  EndIf
+  If *xq : FreeMemory(*xq) : EndIf
+  If *acc : FreeMemory(*acc) : EndIf
+  If *f1 : FreeMemory(*f1) : EndIf
+  If *f2 : FreeMemory(*f2) : EndIf
+  If *arow : FreeMemory(*arow) : EndIf
+  ProcedureReturn ok
+EndProcedure
+CompilerEndIf
 
 ; ONNX Gemm: Y = alpha * A' * B' + beta * C. C may be absent (0), a
 ; scalar (cCount=1), one value per column (cCount=n), or a full MxN matrix.
@@ -868,31 +1475,7 @@ Procedure PmTensorGemm(*g.PmTensorGemmArgs)
   Protected sum.f
   CompilerIf #PMO_USE_INT8 = 1
   If *g\WeightScales <> 0
-    aScale = PmTensorDynamicScale(*g\A, *g\M * *g\K)
-    PmTensorQuantizeBuffer(*g\A, PmTensorInt8Scratch, *g\M * *g\K, aScale)
-    dot\Count=*g\K : dot\StepA=1 : dot\StepB=*g\N
-    If *g\TransA : dot\StepA=*g\M : EndIf
-    If *g\TransB : dot\StepB=1 : EndIf
-    row=0
-    While row<*g\M
-      ia=row* *g\K : If *g\TransA : ia=row : EndIf
-      dot\A=PmTensorInt8Scratch+ia : col=0
-      While col<*g\N
-        ib=col : If *g\TransB : ib=col* *g\K : EndIf
-        dot\B=*g\B+ib
-        converted=PmTensorInt8Dot(@dot)
-        sum=converted*aScale*PmTensorGet(*g\WeightScales,col)
-        sum=sum* *g\Alpha
-        If *g\C<>0 And *g\CCount>0
-          ic=row* *g\N+col
-          If *g\CCount=1 : ic=0 : ElseIf *g\CCount=*g\N : ic=col : EndIf
-          sum=sum+*g\Beta*PmTensorGet(*g\C,ic)
-        EndIf
-        PmTensorPut(*g\Dst,row* *g\N+col,sum)
-        col=col+1
-      Wend
-      row=row+1
-    Wend
+    If PmI8Gemm(*g)=0 And PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
     ProcedureReturn
   EndIf
   CompilerEndIf
@@ -1669,149 +2252,150 @@ Structure PmTensorConv1DArgs
   Dilation.i
   Groups.i
   WeightScales.i
+  Wide.i
 EndStructure
 
 CompilerIf #PMO_USE_CONV = 1
 CompilerIf #PMO_USE_INT8 = 1
-; Eight neighboring outputs, exact signed products, no additional scratch.
-Procedure PmTensorConv1DInt8Eight(src.i, weights.i, dst.i, channels.i, width.i, kernel.i, dilation.i, aScale.f, wScale.f, bias.f)
-  Protected fa.f=aScale, fw.f=wScale, fb.f=bias
-  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
-    !mov r8,[p.v_src]
-    !mov rdx,[p.v_weights]
-    !mov r9,[p.v_width]
-    !mov r10,[p.v_dilation]
-    !pxor xmm0,xmm0
-    !pxor xmm1,xmm1
-    !pmint8conv_channel:
-    !mov rax,r8
-    !mov rcx,[p.v_kernel]
-    !pmint8conv_kernel:
-    !movq xmm2,[rax]
-    !punpcklbw xmm2,xmm2
-    !psraw xmm2,8
-    !movzx r11d,byte [rdx]
-    !movd xmm3,r11d
-    !punpcklbw xmm3,xmm3
-    !psraw xmm3,8
-    !pshuflw xmm3,xmm3,0
-    !pshufd xmm3,xmm3,0
-    !pmullw xmm2,xmm3
-    !movdqa xmm4,xmm2
-    !psraw xmm4,15
-    !movdqa xmm5,xmm2
-    !punpcklwd xmm2,xmm4
-    !punpckhwd xmm5,xmm4
-    !paddd xmm0,xmm2
-    !paddd xmm1,xmm5
-    !add rax,r10
-    !inc rdx
-    !dec rcx
-    !jnz pmint8conv_kernel
-    !add r8,r9
-    !dec qword [p.v_channels]
-    !jnz pmint8conv_channel
-    ; Match scalar host intermediates: rounded FP32 sum, then FP64 scale/bias.
-    !cvtdq2ps xmm0,xmm0
-    !cvtdq2ps xmm1,xmm1
-    !cvtss2sd xmm3,[p.v_fa]
-    !shufpd xmm3,xmm3,0
-    !mov rax,[p.v_dst]
-    !cvtss2sd xmm4,[p.v_fw]
-    !shufpd xmm4,xmm4,0
-    !cvtss2sd xmm5,[p.v_fb]
-    !shufpd xmm5,xmm5,0
-    !cvtps2pd xmm2,xmm0
-    !mulpd xmm2,xmm3
-    !mulpd xmm2,xmm4
-    !addpd xmm2,xmm5
-    !cvtpd2ps xmm2,xmm2
-    !movq [rax+0],xmm2
-    !psrldq xmm0,8
-    !cvtps2pd xmm2,xmm0
-    !mulpd xmm2,xmm3
-    !mulpd xmm2,xmm4
-    !addpd xmm2,xmm5
-    !cvtpd2ps xmm2,xmm2
-    !movq [rax+8],xmm2
-    !cvtps2pd xmm2,xmm1
-    !mulpd xmm2,xmm3
-    !mulpd xmm2,xmm4
-    !addpd xmm2,xmm5
-    !cvtpd2ps xmm2,xmm2
-    !movq [rax+16],xmm2
-    !psrldq xmm1,8
-    !cvtps2pd xmm2,xmm1
-    !mulpd xmm2,xmm3
-    !mulpd xmm2,xmm4
-    !addpd xmm2,xmm5
-    !cvtpd2ps xmm2,xmm2
-    !movq [rax+24],xmm2
-  CompilerEndIf
+; Quantizing a convolution input is split by position ranges over the same
+; threads as the product: each position's scale needs every channel, and
+; positions are independent.
+Structure PmI8QuantJob
+  Src.i
+  Channels.i
+  Width.i
+  First.i
+  Last.i
+  PadLeft.i
+  QMax.i
+  Bits.i
+  Scales.i
+  Inv.i
+  Xs.i
+  Qp.i
+  Groups.i
+  PerGroup.i
+  Pairs.i
+  Fault.i
+EndStructure
+
+Procedure PmI8QuantWorker(*q.PmI8QuantJob)
+  Protected n.i=*q\Last-*q\First, grp.i, i.i, c.i, at.i=*q\PadLeft+*q\First, src1.i
+  If n<=0 : ProcedureReturn : EndIf
+  PmI8MaxBitsColumns(*q\Src+*q\First*4,*q\Channels,*q\Width*4,n,*q\Bits+at*4)
+  If PmI8ScalesFromBits(*q\Bits+at*4,n,*q\QMax,*q\Scales+at*4,*q\Inv+at*4)=0 : *q\Fault=1 : ProcedureReturn : EndIf
+  For grp=0 To *q\Groups-1
+    For i=0 To *q\Pairs-1
+      c=grp* *q\PerGroup+2*i
+      src1=0 : If 2*i+1<*q\PerGroup : src1=*q\Src+((c+1)* *q\Width+*q\First)*4 : EndIf
+      PmI8QuantColumnPair(*q\Src+(c* *q\Width+*q\First)*4,src1,n,*q\Inv+at*4,*q\QMax,*q\Xs+((grp* *q\Pairs+i)* *q\Qp+at)*4)
+    Next
+  Next
 EndProcedure
 
-; Padding is clipped once per output, not checked for every multiply.
-Procedure PmTensorConv1DInt8Range(*g.PmTensorConv1DArgs, first.i, last.i, aScale.f)
-  Protected work.i
-  Protected bn.i
-  Protected oc.i
-  Protected ox.i
-  Protected start.i
-  Protected beginK.i
-  Protected endK.i
-  Protected ic.i
-  Protected channels.i
-  Protected groupBase.i
-  Protected srcBase.i
-  Protected weightBase.i
-  Protected total.i
-  Protected value.f
-  Protected bias.f
-  Protected wScale.f
-  Protected dot.PmTensorInt8DotArgs
-  channels=*g\InChannels / *g\Groups
-  dot\StepA=*g\Dilation : dot\StepB=1
-  work=first
-  While work<last
-    bn=work / *g\OutChannels : oc=work % *g\OutChannels
-    groupBase=(oc / (*g\OutChannels / *g\Groups))*channels
-    srcBase=PmTensorInt8Scratch+(bn* *g\InChannels+groupBase)* *g\InWidth
-    weightBase=*g\Weight+oc*channels* *g\Kernel
-    bias=0.0 : If *g\Bias : bias=PmTensorGet(*g\Bias,oc) : EndIf
-    wScale=PmTensorGet(*g\WeightScales,oc)
-    ox=0
-    While ox<*g\OutWidth
-      start=ox* *g\Stride-*g\PadLeft
-      CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
-      If *g\Stride=1 And start>=0 And ox+7<*g\OutWidth And start+7+(*g\Kernel-1)* *g\Dilation<*g\InWidth
-        PmTensorConv1DInt8Eight(srcBase+start,weightBase,*g\Dst+(work* *g\OutWidth+ox)*4,channels,*g\InWidth,*g\Kernel,*g\Dilation,aScale,wScale,bias)
-        ox=ox+8
-        Continue
-      EndIf
-      CompilerEndIf
-      beginK=0
-      If start<0 : beginK=(0-start+*g\Dilation-1) / *g\Dilation : EndIf
-      endK=*g\Kernel
-      If start+(*g\Kernel-1)* *g\Dilation>=*g\InWidth
-        endK=(*g\InWidth-1-start) / *g\Dilation+1
-        If start>=*g\InWidth : endK=0 : EndIf
-      EndIf
-      dot\Count=endK-beginK : total=0 : ic=0
-      If dot\Count>0
-        dot\A=srcBase+start+beginK* *g\Dilation
-        dot\B=weightBase+beginK
-        While ic<channels
-          total=total+PmTensorInt8Dot(@dot)
-          dot\A=dot\A+*g\InWidth : dot\B=dot\B+*g\Kernel
-          ic=ic+1
-        Wend
-      EndIf
-      value=total : value=bias+value*aScale*wScale
-      PmTensorPut(*g\Dst,work* *g\OutWidth+ox,value)
-      ox=ox+1
-    Wend
-    work=work+1
+Procedure.i PmI8QuantConvInput(*proto.PmI8QuantJob)
+  Protected workers.i=CountCPUs(#PB_System_ProcessCPUs), i.i, chunk.i, fault.i
+  Protected Dim jobs.PmI8QuantJob(7), Dim threads.i(7)
+  If workers>8 : workers=8 : EndIf
+  If *proto\Width* *proto\Channels<65536 : workers=1 : EndIf
+  If workers<1 : workers=1 : EndIf
+  chunk=((*proto\Width+workers-1)/workers+7)&~7
+  For i=0 To workers-1
+    CopyStructure(*proto,@jobs(i),PmI8QuantJob)
+    jobs(i)\First=i*chunk : jobs(i)\Last=(i+1)*chunk
+    If jobs(i)\Last>*proto\Width : jobs(i)\Last=*proto\Width : EndIf
+    If jobs(i)\First>*proto\Width : jobs(i)\First=*proto\Width : EndIf
+    If i=workers-1
+      PmI8QuantWorker(@jobs(i))
+    Else
+      threads(i)=CreateThread(@PmI8QuantWorker(),@jobs(i))
+      If threads(i)=0 : PmI8QuantWorker(@jobs(i)) : EndIf
+    EndIf
+  Next
+  For i=0 To workers-1
+    If threads(i) : WaitThread(threads(i)) : EndIf
+    If jobs(i)\Fault : fault=1 : EndIf
+  Next
+  ProcedureReturn 1-fault
+EndProcedure
+
+; 1-D convolution, NCW, W [out][in/groups][kernel] INT8 (both planes if wide).
+; Activations are quantized once for the whole input: one scale per input
+; position over every channel. Stride 1 reads the shared padded layout at an
+; offset per tap; any other stride gathers each tap's positions first.
+Procedure.i PmI8Conv1D(*g.PmTensorConv1DArgs, wide.i, elements.i)
+  Protected cg.i=*g\InChannels / *g\Groups, og.i=*g\OutChannels / *g\Groups, pairs.i=(cg+1)/2
+  Protected tiles.i=(*g\OutWidth+15)/16, owr.i=tiles*16, span.i=(*g\Kernel-1)* *g\Dilation
+  Protected qp.i, padR.i, bn.i, grp.i, c.i, j.i, i.i, t.i, qmax.i=127, ok.i=1, rowsPadded.i
+  Protected *xs, *ss, *inv, *bits, *xg, *sg, *wp, *src, *xtap, *stap, xbase.i, sbase.i
+  Protected job.PmI8TileJob, qj.PmI8QuantJob
+  If wide : qmax=32767 : EndIf
+  ; padded positions: q = ix + PadLeft, enough that every tile of every tap stays inside
+  qp=*g\PadLeft+*g\InWidth
+  If *g\Stride=1
+    If owr+span>qp : qp=owr+span : EndIf
+  Else
+    If (owr-1)* *g\Stride+span+1>qp : qp=(owr-1)* *g\Stride+span+1 : EndIf
+  EndIf
+  qp=(qp+15)&~15
+  *xs=AllocateMemory(*g\Groups*pairs*qp*4+64) : *ss=AllocateMemory(qp*4+64)
+  *inv=AllocateMemory(qp*4+64) : *bits=AllocateMemory(qp*4+64)
+  *xtap=AllocateMemory(*g\Kernel*8) : *stap=AllocateMemory(*g\Kernel*8)
+  If *g\Stride<>1
+    *xg=AllocateMemory(*g\Kernel* *g\Groups*pairs*owr*4+64) : *sg=AllocateMemory(*g\Kernel*owr*4+64)
+  EndIf
+  *wp=PmI8PrepareConv(*g\Weight,*g\OutChannels,*g\Groups,cg,*g\Kernel,wide,elements)
+  If *xs=0 Or *ss=0 Or *inv=0 Or *bits=0 Or *xtap=0 Or *stap=0 Or *wp=0 Or (*g\Stride<>1 And (*xg=0 Or *sg=0))
+    ok=0
+  EndIf
+  bn=0
+  While ok And bn<*g\Batches
+    FillMemory(*xs,*g\Groups*pairs*qp*4,0)
+    *src=*g\Src+bn* *g\InChannels* *g\InWidth*4
+    qj\Src=*src : qj\Channels=*g\InChannels : qj\Width=*g\InWidth : qj\PadLeft=*g\PadLeft
+    qj\QMax=qmax : qj\Bits=*bits : qj\Scales=*ss : qj\Inv=*inv : qj\Xs=*xs : qj\Qp=qp
+    qj\Groups=*g\Groups : qj\PerGroup=cg : qj\Pairs=pairs : qj\Fault=0
+    If PmI8QuantConvInput(@qj)=0 : PmTensorInt8Fault=1 : ok=0 : Break : EndIf
+    If *g\Stride=1
+      For j=0 To *g\Kernel-1 : PokeI(*xtap+j*8,j* *g\Dilation*4) : PokeI(*stap+j*8,j* *g\Dilation*4) : Next
+      xbase=*xs : sbase=*ss : job\XStride=qp*4
+    Else
+      For j=0 To *g\Kernel-1
+        For t=0 To owr-1
+          PokeF(*sg+(j*owr+t)*4,PeekF(*ss+(t* *g\Stride+j* *g\Dilation)*4))
+        Next
+        For i=0 To *g\Groups*pairs-1
+          For t=0 To owr-1
+            PokeL(*xg+((j* *g\Groups*pairs+i)*owr+t)*4,PeekL(*xs+(i*qp+t* *g\Stride+j* *g\Dilation)*4))
+          Next
+        Next
+        PokeI(*xtap+j*8,j* *g\Groups*pairs*owr*4) : PokeI(*stap+j*8,j*owr*4)
+      Next
+      xbase=*xg : sbase=*sg : job\XStride=owr*4
+    EndIf
+    rowsPadded=PmI8GroupRows(og,wide)
+    For grp=0 To *g\Groups-1
+      job\W=*wp : job\WRowBytes=*g\Kernel*pairs*4 : job\Pairs=pairs : job\Taps=*g\Kernel
+      job\X=xbase+grp*pairs*job\XStride : job\XTap=*xtap : job\S=sbase : job\STap=*stap
+      job\Flush=pairs : If wide : job\Flush=#PMI8_FLUSH_PAIRS : EndIf
+      job\Mode=#PMI8_MODE_CONV : job\Wide=wide
+      job\Scales=*g\WeightScales : job\Bias=*g\Bias
+      job\Dst=*g\Dst+bn* *g\OutChannels* *g\OutWidth*4
+      job\Rows=og : job\RowBase=grp*rowsPadded : job\ChannelBase=grp*og
+      job\Positions=*g\OutWidth : job\DstRowStride=*g\OutWidth
+      PmI8RunTiles(@job,grp*rowsPadded,rowsPadded,tiles)
+    Next
+    bn+1
   Wend
+  If *xs : FreeMemory(*xs) : EndIf
+  If *ss : FreeMemory(*ss) : EndIf
+  If *inv : FreeMemory(*inv) : EndIf
+  If *bits : FreeMemory(*bits) : EndIf
+  If *xtap : FreeMemory(*xtap) : EndIf
+  If *stap : FreeMemory(*stap) : EndIf
+  If *xg : FreeMemory(*xg) : EndIf
+  If *sg : FreeMemory(*sg) : EndIf
+  ProcedureReturn ok
 EndProcedure
 CompilerEndIf
 Structure PmTensorConv1DWorker
@@ -1842,12 +2426,6 @@ Procedure PmTensorConv1DWorker(*worker.PmTensorConv1DWorker)
   inPerGroup = *g\InChannels / *g\Groups
   outPerGroup = *g\OutChannels / *g\Groups
   work = *worker\WorkStart
-  CompilerIf #PMO_USE_INT8 = 1
-  If *g\WeightScales
-    PmTensorConv1DInt8Range(*g,*worker\WorkStart,*worker\WorkEnd,*worker\AScale)
-    ProcedureReturn
-  EndIf
-  CompilerEndIf
   While work < *worker\WorkEnd
     bn = work / *g\OutChannels
     oc = work % *g\OutChannels
@@ -1888,8 +2466,8 @@ Procedure PmTensorConv1D(*g.PmTensorConv1DArgs)
   Protected aScale.f
   CompilerIf #PMO_USE_INT8 = 1
   If *g\WeightScales <> 0
-    aScale = PmTensorDynamicScale(*g\Src, *g\Batches * *g\InChannels * *g\InWidth)
-    PmTensorQuantizeBuffer(*g\Src, PmTensorInt8Scratch, *g\Batches * *g\InChannels * *g\InWidth, aScale)
+    If PmI8Conv1D(*g,*g\Wide,*g\OutChannels*(*g\InChannels / *g\Groups)* *g\Kernel)=0 And PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
+    ProcedureReturn
   EndIf
   CompilerEndIf
   totalMacs = workCount : totalMacs * *g\OutWidth : totalMacs * (*g\InChannels / *g\Groups) : totalMacs * *g\Kernel
@@ -1943,81 +2521,59 @@ EndStructure
 
 CompilerIf #PMO_USE_CONV = 1
 CompilerIf #PMO_USE_INT8 = 1
-Procedure PmTensorConv2DInt8(*g.PmTensorConv2DArgs, aScale.f)
-  Protected bn.i
-  Protected oc.i
-  Protected oy.i
-  Protected ox.i
-  Protected ic.i
-  Protected ky.i
-  Protected sx.i
-  Protected sy.i
-  Protected bx.i
-  Protected ex.i
-  Protected by.i
-  Protected ey.i
-  Protected channels.i
-  Protected srcBase.i
-  Protected weightBase.i
-  Protected sourceRow.i
-  Protected weightRow.i
-  Protected total.i
-  Protected value.f
-  Protected bias.f
-  Protected wScale.f
-  Protected dot.PmTensorInt8DotArgs
-  channels=*g\InChannels / *g\Groups
-  dot\StepA=*g\DilationW : dot\StepB=1
+; 2-D convolution with INT8 weights (the fixed-shape path; narrow only): one
+; scale per input position (y, x) over every channel, one FP32 partial per tap.
+Procedure.i PmI8Conv2D(*g.PmTensorConv2DArgs)
+  Protected positions.i=*g\InH* *g\InW, cg.i=*g\InChannels / *g\Groups, og.i=*g\OutChannels / *g\Groups
+  Protected bn.i, oc.i, oy.i, ox.i, ky.i, kx.i, iy.i, ix.i, c.i, grp.i, pos.i, q.i, acc.l, ok.i=1
+  Protected *bits, *s, *inv, *q, src.i, w.i, f.f, v.f, bias.f
+  *bits=AllocateMemory(positions*4+64) : *s=AllocateMemory(positions*4+64)
+  *inv=AllocateMemory(positions*4+64) : *q=AllocateMemory(*g\InChannels*positions+64)
+  If *bits=0 Or *s=0 Or *inv=0 Or *q=0 : ok=0 : EndIf
   bn=0
-  While bn<*g\Batches
-    oc=0
-    While oc<*g\OutChannels
-      srcBase=PmTensorInt8Scratch+(bn* *g\InChannels+(oc / (*g\OutChannels / *g\Groups))*channels)* *g\InH* *g\InW
-      weightBase=*g\Weight+oc*channels* *g\KernelH* *g\KernelW
-      bias=0.0 : If *g\Bias : bias=PmTensorGet(*g\Bias,oc) : EndIf
-      wScale=PmTensorGet(*g\WeightScales,oc)
-      oy=0
-      While oy<*g\OutH
-        sy=oy* *g\StrideH-*g\PadTop : by=0 : ey=*g\KernelH
-        If sy<0 : by=(0-sy+*g\DilationH-1) / *g\DilationH : EndIf
-        If sy+(*g\KernelH-1)* *g\DilationH>=*g\InH
-          ey=(*g\InH-1-sy) / *g\DilationH+1
-          If sy>=*g\InH : ey=0 : EndIf
-        EndIf
-        ox=0
-        While ox<*g\OutW
-          sx=ox* *g\StrideW-*g\PadLeft : bx=0 : ex=*g\KernelW
-          If sx<0 : bx=(0-sx+*g\DilationW-1) / *g\DilationW : EndIf
-          If sx+(*g\KernelW-1)* *g\DilationW>=*g\InW
-            ex=(*g\InW-1-sx) / *g\DilationW+1
-            If sx>=*g\InW : ex=0 : EndIf
-          EndIf
-          dot\Count=ex-bx : total=0 : ic=0
-          If dot\Count>0 And ey>by
-            sourceRow=srcBase+(sy+by* *g\DilationH)* *g\InW+sx+bx* *g\DilationW
-            weightRow=weightBase+by* *g\KernelW+bx
-            While ic<channels
-              dot\A=sourceRow : dot\B=weightRow : ky=by
-              While ky<ey
-                total=total+PmTensorInt8Dot(@dot)
-                dot\A=dot\A+*g\DilationH* *g\InW : dot\B=dot\B+*g\KernelW
-                ky=ky+1
-              Wend
-              sourceRow=sourceRow+*g\InH* *g\InW
-              weightRow=weightRow+*g\KernelH* *g\KernelW
-              ic=ic+1
-            Wend
-          EndIf
-          value=total : value=bias+value*aScale*wScale
-          PmTensorPut(*g\Dst,((bn* *g\OutChannels+oc)* *g\OutH+oy)* *g\OutW+ox,value)
-          ox=ox+1
-        Wend
-        oy=oy+1
-      Wend
-      oc=oc+1
-    Wend
-    bn=bn+1
+  While ok And bn<*g\Batches
+    src=*g\Src+bn* *g\InChannels*positions*4
+    PmI8MaxBitsColumns(src,*g\InChannels,positions*4,positions,*bits)
+    If PmI8ScalesFromBits(*bits,positions,127,*s,*inv)=0 : PmTensorInt8Fault=1 : ok=0 : Break : EndIf
+    For c=0 To *g\InChannels-1
+      For pos=0 To positions-1
+        q=PmI8RoundProduct(PeekF(src+(c*positions+pos)*4),PeekF(*inv+pos*4))
+        If q>127 : q=127 : ElseIf q<-127 : q=-127 : EndIf
+        PokeB(*q+c*positions+pos,q)
+      Next
+    Next
+    For oc=0 To *g\OutChannels-1
+      grp=oc/og
+      bias=0.0 : If *g\Bias : bias=PeekF(*g\Bias+oc*4) : EndIf
+      For oy=0 To *g\OutH-1
+        For ox=0 To *g\OutW-1
+          f=0.0
+          For ky=0 To *g\KernelH-1
+            iy=oy* *g\StrideH-*g\PadTop+ky* *g\DilationH
+            If iy<0 Or iy>=*g\InH : Continue : EndIf
+            For kx=0 To *g\KernelW-1
+              ix=ox* *g\StrideW-*g\PadLeft+kx* *g\DilationW
+              If ix<0 Or ix>=*g\InW : Continue : EndIf
+              pos=iy* *g\InW+ix : acc=0
+              For c=0 To cg-1
+                w=*g\Weight+((oc*cg+c)* *g\KernelH+ky)* *g\KernelW+kx
+                acc+PeekB(w)*PeekB(*q+(grp*cg+c)*positions+pos)
+              Next
+              v=acc : v=v*PeekF(*s+pos*4) : f=f+v
+            Next
+          Next
+          v=f*PeekF(*g\WeightScales+oc*4) : v=bias+v
+          PokeF(*g\Dst+(((bn* *g\OutChannels+oc)* *g\OutH+oy)* *g\OutW+ox)*4,v)
+        Next
+      Next
+    Next
+    bn+1
   Wend
+  If *bits : FreeMemory(*bits) : EndIf
+  If *s : FreeMemory(*s) : EndIf
+  If *inv : FreeMemory(*inv) : EndIf
+  If *q : FreeMemory(*q) : EndIf
+  ProcedureReturn ok
 EndProcedure
 CompilerEndIf
 
@@ -2046,9 +2602,7 @@ Procedure PmTensorConv2D(*g.PmTensorConv2DArgs)
   outPerGroup = *g\OutChannels / *g\Groups
   CompilerIf #PMO_USE_INT8 = 1
   If *g\WeightScales <> 0
-    aScale = PmTensorDynamicScale(*g\Src, *g\Batches * *g\InChannels * *g\InH * *g\InW)
-    PmTensorQuantizeBuffer(*g\Src, PmTensorInt8Scratch, *g\Batches * *g\InChannels * *g\InH * *g\InW, aScale)
-    PmTensorConv2DInt8(*g,aScale)
+    If PmI8Conv2D(*g)=0 And PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
     ProcedureReturn
   EndIf
   CompilerEndIf
@@ -2118,6 +2672,8 @@ Structure PmTensorLstmArgs
   Directions.i
   WScales.i
   RScales.i
+  WWide.i
+  RWide.i
 EndStructure
 
 CompilerIf #PMO_USE_LSTM = 1
@@ -2161,6 +2717,15 @@ Procedure PmTensorLstmFloatFour(*g.PmTensorLstmFloatFourArgs)
   Wend
 EndProcedure
 
+CompilerIf #PMO_USE_INT8 = 1
+; One gate's pre-activation from the scaled row sums: wScale * (F1 + F2 / 254).
+Procedure.f PmI8GateValue(*f1, *f2, row.i, wide.i, *scales, scaleBase.i)
+  Protected v.f=PeekF(*f1+row*4)
+  If wide : v=v+PeekF(*f2+row*4)/#PMI8_WIDE_RESIDUAL : EndIf
+  ProcedureReturn v*PeekF(*scales+(scaleBase+row)*4)
+EndProcedure
+CompilerEndIf
+
 Procedure PmTensorLstm(*g.PmTensorLstmArgs)
   Protected dir.i
   Protected timeStep.i
@@ -2188,6 +2753,20 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
   Protected dotValue.f
   Protected dot.PmTensorDotInt8Args
   Protected floatFour.PmTensorLstmFloatFourArgs
+  CompilerIf #PMO_USE_INT8 = 1
+  Protected rows4.i=4 * *g\Hidden, *xq, *hq, *acc, *gw1, *gw2, *gr1, *gr2, qx.i=127, qh.i=127
+  Protected wElements.i=*g\Directions*rows4* *g\InputSize, rElements.i=*g\Directions*rows4* *g\Hidden
+  If *g\WScales <> 0 Or *g\RScales <> 0
+    If *g\WWide : qx=32767 : EndIf
+    If *g\RWide : qh=32767 : EndIf
+    *xq=AllocateMemory(*g\InputSize*2+64) : *hq=AllocateMemory(*g\Hidden*2+64) : *acc=AllocateMemory(rows4*4+64)
+    *gw1=AllocateMemory(rows4*4+64) : *gw2=AllocateMemory(rows4*4+64)
+    *gr1=AllocateMemory(rows4*4+64) : *gr2=AllocateMemory(rows4*4+64)
+    If *xq=0 Or *hq=0 Or *acc=0 Or *gw1=0 Or *gw2=0 Or *gr1=0 Or *gr2=0
+      PmTensorInt8Fault=2 : Goto PmTensorLstmInt8Done
+    EndIf
+  EndIf
+  CompilerEndIf
 
   ; Initial state becomes the mutable final-state buffers.
   dir = 0
@@ -2231,15 +2810,20 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
           xIndex = (t * *g\Batch + bn) * *g\InputSize
           stateIndex = (dir * *g\Batch + bn) * *g\Hidden
           CompilerIf #PMO_USE_INT8 = 1
+          ; One scale for x(t), one for h(t-1); every gate row at once.
           If *g\WScales <> 0
             leftPointer = *g\X : leftPointer = leftPointer + xIndex * 4
-            xScale = PmTensorDynamicScale(leftPointer, *g\InputSize)
-            PmTensorQuantizeBuffer(leftPointer, PmTensorInt8Scratch, *g\InputSize, xScale)
+            If PmI8QuantizeVector(leftPointer, *g\InputSize, qx, *xq, @xScale)=0 : PmTensorInt8Fault=1 : Goto PmTensorLstmInt8Done : EndIf
+            rightPointer = *g\W + dir * rows4 * *g\InputSize
+            PmI8DotRowsScaled(rightPointer, *g\InputSize, rows4, *xq, *g\InputSize, xScale, *g\WWide, *acc, *gw1)
+            If *g\WWide : PmI8DotRowsScaled(rightPointer + wElements, *g\InputSize, rows4, *xq, *g\InputSize, xScale, 1, *acc, *gw2) : EndIf
           EndIf
           If *g\RScales <> 0
             leftPointer = *g\YH : leftPointer = leftPointer + stateIndex * 4
-            hScale = PmTensorDynamicScale(leftPointer, *g\Hidden)
-            PmTensorQuantizeBuffer(leftPointer, PmTensorInt8Scratch + *g\InputSize, *g\Hidden, hScale)
+            If PmI8QuantizeVector(leftPointer, *g\Hidden, qh, *hq, @hScale)=0 : PmTensorInt8Fault=1 : Goto PmTensorLstmInt8Done : EndIf
+            rightPointer = *g\R + dir * rows4 * *g\Hidden
+            PmI8DotRowsScaled(rightPointer, *g\Hidden, rows4, *hq, *g\Hidden, hScale, *g\RWide, *acc, *gr1)
+            If *g\RWide : PmI8DotRowsScaled(rightPointer + rElements, *g\Hidden, rows4, *hq, *g\Hidden, hScale, 1, *acc, *gr2) : EndIf
           EndIf
           CompilerEndIf
           unit = 0
@@ -2255,19 +2839,10 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
             wBase = (dir * 4 * *g\Hidden) * *g\InputSize
             CompilerIf #PMO_USE_INT8 = 1
             If *g\WScales <> 0
-              dot\A = PmTensorInt8Scratch : dot\Count = *g\InputSize : dot\AScale = xScale
-              rightPointer = *g\W : rightPointer = rightPointer + wBase + unit * *g\InputSize
-              dot\WeightScale = PmTensorGet(*g\WScales, dir * 4 * *g\Hidden + unit)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : iv = iv + dotValue
-              rightPointer = *g\W : rightPointer = rightPointer + wBase + (*g\Hidden + unit) * *g\InputSize
-              dot\WeightScale = PmTensorGet(*g\WScales, dir * 4 * *g\Hidden + *g\Hidden + unit)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : ov = ov + dotValue
-              rightPointer = *g\W : rightPointer = rightPointer + wBase + (2 * *g\Hidden + unit) * *g\InputSize
-              dot\WeightScale = PmTensorGet(*g\WScales, dir * 4 * *g\Hidden + 2 * *g\Hidden + unit)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : fv = fv + dotValue
-              rightPointer = *g\W : rightPointer = rightPointer + wBase + (3 * *g\Hidden + unit) * *g\InputSize
-              dot\WeightScale = PmTensorGet(*g\WScales, dir * 4 * *g\Hidden + 3 * *g\Hidden + unit)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : cv = cv + dotValue
+              iv = iv + PmI8GateValue(*gw1, *gw2, unit, *g\WWide, *g\WScales, dir * rows4)
+              ov = ov + PmI8GateValue(*gw1, *gw2, *g\Hidden + unit, *g\WWide, *g\WScales, dir * rows4)
+              fv = fv + PmI8GateValue(*gw1, *gw2, 2 * *g\Hidden + unit, *g\WWide, *g\WScales, dir * rows4)
+              cv = cv + PmI8GateValue(*gw1, *gw2, 3 * *g\Hidden + unit, *g\WWide, *g\WScales, dir * rows4)
             Else
               leftPointer = *g\X : k = xIndex : k = k * 4 : leftPointer = leftPointer + k
               rightPointer = *g\W : k = wBase : k = k * 4 : rightPointer = rightPointer + k
@@ -2290,19 +2865,10 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
             rBase = (dir * 4 * *g\Hidden) * *g\Hidden
             CompilerIf #PMO_USE_INT8 = 1
             If *g\RScales <> 0
-              dot\A = PmTensorInt8Scratch + *g\InputSize : dot\Count = *g\Hidden : dot\AScale = hScale
-              rightPointer = *g\R : rightPointer = rightPointer + rBase + unit * *g\Hidden
-              dot\WeightScale = PmTensorGet(*g\RScales, dir * 4 * *g\Hidden + unit)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : iv = iv + dotValue
-              rightPointer = *g\R : rightPointer = rightPointer + rBase + (*g\Hidden + unit) * *g\Hidden
-              dot\WeightScale = PmTensorGet(*g\RScales, dir * 4 * *g\Hidden + *g\Hidden + unit)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : ov = ov + dotValue
-              rightPointer = *g\R : rightPointer = rightPointer + rBase + (2 * *g\Hidden + unit) * *g\Hidden
-              dot\WeightScale = PmTensorGet(*g\RScales, dir * 4 * *g\Hidden + 2 * *g\Hidden + unit)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : fv = fv + dotValue
-              rightPointer = *g\R : rightPointer = rightPointer + rBase + (3 * *g\Hidden + unit) * *g\Hidden
-              dot\WeightScale = PmTensorGet(*g\RScales, dir * 4 * *g\Hidden + 3 * *g\Hidden + unit)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : cv = cv + dotValue
+              iv = iv + PmI8GateValue(*gr1, *gr2, unit, *g\RWide, *g\RScales, dir * rows4)
+              ov = ov + PmI8GateValue(*gr1, *gr2, *g\Hidden + unit, *g\RWide, *g\RScales, dir * rows4)
+              fv = fv + PmI8GateValue(*gr1, *gr2, 2 * *g\Hidden + unit, *g\RWide, *g\RScales, dir * rows4)
+              cv = cv + PmI8GateValue(*gr1, *gr2, 3 * *g\Hidden + unit, *g\RWide, *g\RScales, dir * rows4)
             Else
               leftPointer = *g\YH : k = stateIndex : k = k * 4 : leftPointer = leftPointer + k
               rightPointer = *g\R : k = rBase : k = k * 4 : rightPointer = rightPointer + k
@@ -2348,5 +2914,87 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
     Wend
     dir = dir + 1
   Wend
+  CompilerIf #PMO_USE_INT8 = 1
+  PmTensorLstmInt8Done:
+  If *xq : FreeMemory(*xq) : EndIf
+  If *hq : FreeMemory(*hq) : EndIf
+  If *acc : FreeMemory(*acc) : EndIf
+  If *gw1 : FreeMemory(*gw1) : EndIf
+  If *gw2 : FreeMemory(*gw2) : EndIf
+  If *gr1 : FreeMemory(*gr1) : EndIf
+  If *gr2 : FreeMemory(*gr2) : EndIf
+  CompilerEndIf
 EndProcedure
+
+CompilerIf #PMO_USE_INT8 = 1
+; INT8 LSTM with both weights quantized, in the host's fast shape: every x(t)
+; projected at once by the INT8 product (one scale per step, as the scheme
+; says), then per step one scale for h(t-1) and every recurrent row at once.
+; Returns 0 on a fault (PmTensorInt8Fault says which).
+Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
+  Protected width.i=4* *g\Hidden, dir.i, i.i, t.i, bn.i, unit.i, stepIndex.i, valid.i, state.i, inputRow.i, outRow.i, bbase.i
+  Protected wElements.i=*g\Directions*width* *g\InputSize, rElements.i=*g\Directions*width* *g\Hidden, qh.i=127
+  Protected *xproj, *hq, *acc, *r1, *r2, hs.f, iv.f, ov.f, fv.f, cv.f, previous.f, ok.i=1
+  If *g\RWide : qh=32767 : EndIf
+  *xproj=AllocateMemory(width* *g\Sequence* *g\Batch*4+64) : *hq=AllocateMemory(*g\Hidden*2+64)
+  *acc=AllocateMemory(width*4+64) : *r1=AllocateMemory(width*4+64) : *r2=AllocateMemory(width*4+64)
+  If *xproj=0 Or *hq=0 Or *acc=0 Or *r1=0 Or *r2=0 : PmTensorInt8Fault=2 : ok=0 : EndIf
+  If ok
+    For i=0 To *g\Directions* *g\Batch* *g\Hidden-1
+      iv=0 : cv=0
+      If *g\InitialH : iv=PeekF(*g\InitialH+i*4) : EndIf
+      If *g\InitialC : cv=PeekF(*g\InitialC+i*4) : EndIf
+      PokeF(*g\YH+i*4,iv) : PokeF(*g\YC+i*4,cv)
+    Next
+  EndIf
+  dir=0
+  While ok And dir<*g\Directions
+    If PmI8MatMul(*g\X,*g\W+dir*width* *g\InputSize,*xproj,*g\Sequence* *g\Batch,*g\InputSize,width,*g\WScales+dir*width*4,*g\WWide,wElements,1)=0
+      If PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
+      ok=0 : Break
+    EndIf
+    For stepIndex=0 To *g\Sequence-1
+      For bn=0 To *g\Batch-1
+        valid=*g\Sequence
+        If *g\SeqLens : valid=PeekQ(*g\SeqLens+bn*8) : EndIf
+        If stepIndex>=valid : Continue : EndIf
+        t=stepIndex : If dir=1 : t=valid-1-stepIndex : EndIf
+        inputRow=(t* *g\Batch+bn)*width
+        state=(dir* *g\Batch+bn)* *g\Hidden
+        outRow=((t* *g\Directions+dir)* *g\Batch+bn)* *g\Hidden
+        bbase=dir*8* *g\Hidden
+        If PmI8QuantizeVector(*g\YH+state*4,*g\Hidden,qh,*hq,@hs)=0 : PmTensorInt8Fault=1 : ok=0 : Break 2 : EndIf
+        PmI8DotRowsScaled(*g\R+dir*width* *g\Hidden,*g\Hidden,width,*hq,*g\Hidden,hs,*g\RWide,*acc,*r1)
+        If *g\RWide : PmI8DotRowsScaled(*g\R+rElements+dir*width* *g\Hidden,*g\Hidden,width,*hq,*g\Hidden,hs,1,*acc,*r2) : EndIf
+        For unit=0 To *g\Hidden-1
+          iv=0 : ov=0 : fv=0 : cv=0
+          If *g\B
+            iv=PeekF(*g\B+(bbase+unit)*4)+PeekF(*g\B+(bbase+4* *g\Hidden+unit)*4)
+            ov=PeekF(*g\B+(bbase+ *g\Hidden+unit)*4)+PeekF(*g\B+(bbase+5* *g\Hidden+unit)*4)
+            fv=PeekF(*g\B+(bbase+2* *g\Hidden+unit)*4)+PeekF(*g\B+(bbase+6* *g\Hidden+unit)*4)
+            cv=PeekF(*g\B+(bbase+3* *g\Hidden+unit)*4)+PeekF(*g\B+(bbase+7* *g\Hidden+unit)*4)
+          EndIf
+          iv+PeekF(*xproj+(inputRow+unit)*4) : iv+PmI8GateValue(*r1,*r2,unit,*g\RWide,*g\RScales,dir*width)
+          ov+PeekF(*xproj+(inputRow+ *g\Hidden+unit)*4) : ov+PmI8GateValue(*r1,*r2,*g\Hidden+unit,*g\RWide,*g\RScales,dir*width)
+          fv+PeekF(*xproj+(inputRow+2* *g\Hidden+unit)*4) : fv+PmI8GateValue(*r1,*r2,2* *g\Hidden+unit,*g\RWide,*g\RScales,dir*width)
+          cv+PeekF(*xproj+(inputRow+3* *g\Hidden+unit)*4) : cv+PmI8GateValue(*r1,*r2,3* *g\Hidden+unit,*g\RWide,*g\RScales,dir*width)
+          previous=PeekF(*g\YC+(state+unit)*4)
+          cv=PmTensorSigmoidValue(fv)*previous+PmTensorSigmoidValue(iv)*PmTensorTanhValue(cv)
+          ov=PmTensorSigmoidValue(ov)*PmTensorTanhValue(cv)
+          PokeF(*g\YC+(state+unit)*4,cv) : PokeF(*g\Y+(outRow+unit)*4,ov)
+        Next
+        CopyMemory(*g\Y+outRow*4,*g\YH+state*4,*g\Hidden*4)
+      Next
+    Next
+    dir+1
+  Wend
+  If *xproj : FreeMemory(*xproj) : EndIf
+  If *hq : FreeMemory(*hq) : EndIf
+  If *acc : FreeMemory(*acc) : EndIf
+  If *r1 : FreeMemory(*r1) : EndIf
+  If *r2 : FreeMemory(*r2) : EndIf
+  ProcedureReturn ok
+EndProcedure
+CompilerEndIf
+
 CompilerEndIf
