@@ -3141,3 +3141,194 @@ Procedure DOpTensorScatter(Y.i, P.i, U.i, W.i, Axis.i, Circular.i)
     DFail("A TensorScatter write index places the update past the cache (mode linear).")
   EndIf
 EndProcedure
+
+; ----------------------------------------------------------------------
+; Attention-23/24: Q, K, V 3-D ([B, S, H*D], with Hq and Hkv) or 4-D
+; ([B, H, S, D]); optional mask M (FLOAT or BOOL, broadcastable to
+; [B, Hq, Sq, <= T]), past caches, nonpad lengths NP (INT64 [B]).
+; Outputs Y, present key PK, present value PV, qk output QK (0 when
+; absent). scale and softcap in PmOpF(0), PmOpF(1) (HasScale, HasCap).
+; ----------------------------------------------------------------------
+Procedure.i DOpDataOrZero(T.i)
+  If T = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn Dt(T)\Data
+EndProcedure
+
+Procedure DOpAttention(Y.i, PK.i, PV.i, QK.i, Q.i, K.i, V.i, M.i, PastK.i, PastV.i, NP.i, Hq.i, Hkv.i, Causal.i, Mode.i, HasScale.i, HasCap.i)
+  Protected Dim dims.i(8)
+  Protected bn.i
+  Protected sq.i
+  Protected skv.i
+  Protected pl.i
+  Protected dn.i
+  Protected dv.i
+  Protected three.i
+  Protected tt.i
+  Protected r.i
+  Protected k4.i
+  Protected scratch.i
+  Protected yA.i
+  Protected pkA.i
+  Protected pvA.i
+  Protected qkA.i
+  If Q = 0 Or K = 0 Or V = 0
+    DFail("Attention requires Q, K and V.")
+    ProcedureReturn
+  EndIf
+  If Dt(Q)\Kind <> 1 Or Dt(K)\Kind <> 1 Or Dt(V)\Kind <> 1
+    DFail("Attention takes FLOAT Q, K and V.")
+    ProcedureReturn
+  EndIf
+  r = Dt(Q)\Rank
+  If Dt(K)\Rank <> r Or Dt(V)\Rank <> r Or (r <> 3 And r <> 4)
+    DFail("Attention takes Q, K and V of rank 3 or all of rank 4.")
+    ProcedureReturn
+  EndIf
+  bn = DOpDim(Q, 0)
+  If r = 3
+    three = 1
+    If Hq < 1 Or Hkv < 1 Or DOpDim(Q, 2) % Hq <> 0 Or DOpDim(K, 2) % Hkv <> 0 Or DOpDim(V, 2) % Hkv <> 0
+      DFail("Attention with 3-D inputs needs q_num_heads and kv_num_heads dividing the hidden sizes.")
+      ProcedureReturn
+    EndIf
+    sq = DOpDim(Q, 1)
+    skv = DOpDim(K, 1)
+    dn = DOpDim(Q, 2) / Hq
+    dv = DOpDim(V, 2) / Hkv
+    If DOpDim(K, 2) / Hkv <> dn Or DOpDim(V, 1) <> skv
+      DFail("Attention's K must have Q's head size and V K's sequence length.")
+      ProcedureReturn
+    EndIf
+  Else
+    three = 0
+    Hq = DOpDim(Q, 1)
+    Hkv = DOpDim(K, 1)
+    sq = DOpDim(Q, 2)
+    skv = DOpDim(K, 2)
+    dn = DOpDim(Q, 3)
+    dv = DOpDim(V, 3)
+    If DOpDim(K, 3) <> dn Or DOpDim(V, 1) <> Hkv Or DOpDim(V, 2) <> skv
+      DFail("Attention's K must have Q's head size, and V K's heads and sequence length.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  If DOpDim(K, 0) <> bn Or DOpDim(V, 0) <> bn Or Hq % Hkv <> 0
+    DFail("Attention's batch sizes must agree, and q_num_heads must be a multiple of kv_num_heads.")
+    ProcedureReturn
+  EndIf
+  pl = 0
+  If PastK <> 0 Or PastV <> 0
+    If PastK = 0 Or PastV = 0 Or NP <> 0
+      DFail("Attention takes past_key and past_value together, and not with nonpad_kv_seqlen.")
+      ProcedureReturn
+    EndIf
+    If Dt(PastK)\Kind <> 1 Or Dt(PastV)\Kind <> 1 Or Dt(PastK)\Rank <> 4 Or Dt(PastV)\Rank <> 4
+      DFail("Attention's past caches are FLOAT [B, kv_num_heads, past, head_size].")
+      ProcedureReturn
+    EndIf
+    pl = DOpDim(PastK, 2)
+    If DOpDim(PastK, 0) <> bn Or DOpDim(PastK, 1) <> Hkv Or DOpDim(PastK, 3) <> dn Or DOpDim(PastV, 0) <> bn Or DOpDim(PastV, 1) <> Hkv Or DOpDim(PastV, 2) <> pl Or DOpDim(PastV, 3) <> dv
+      DFail("Attention's past caches have the wrong extents.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  tt = pl + skv
+  PmOpI(10) = 0
+  If M <> 0
+    If (Dt(M)\Kind <> 1 And Dt(M)\Kind <> 9) Or Dt(M)\Rank < 1 Or Dt(M)\Rank > 4
+      DFail("Attention's attn_mask is FLOAT or BOOL of rank 1 to 4.")
+      ProcedureReturn
+    EndIf
+    PmOpI(10) = Dt(M)\Kind
+    PmOpI(11) = 1
+    PmOpI(12) = 1
+    PmOpI(13) = 1
+    k4 = 0
+    While k4 < Dt(M)\Rank
+      PmOpI(15 - Dt(M)\Rank + k4) = DOpDim(M, k4)
+      k4 = k4 + 1
+    Wend
+    If (PmOpI(11) <> 1 And PmOpI(11) <> bn) Or (PmOpI(12) <> 1 And PmOpI(12) <> Hq) Or (PmOpI(13) <> 1 And PmOpI(13) <> sq) Or PmOpI(14) > tt
+      DFail("Attention's attn_mask does not broadcast to [batch, q_num_heads, q_sequence, total_sequence].")
+      ProcedureReturn
+    EndIf
+  EndIf
+  PmOpI(15) = 0
+  If NP <> 0
+    If Dt(NP)\Kind <> 7 Or Dt(NP)\Count <> bn
+      DFail("Attention's nonpad_kv_seqlen is INT64, one length per batch sample.")
+      ProcedureReturn
+    EndIf
+    PmOpI(15) = 1
+  EndIf
+  PmOpI(0) = bn
+  PmOpI(1) = Hq
+  PmOpI(2) = Hkv
+  PmOpI(3) = sq
+  PmOpI(4) = skv
+  PmOpI(5) = pl
+  PmOpI(6) = dn
+  PmOpI(7) = dv
+  PmOpI(8) = three
+  PmOpI(9) = Causal
+  PmOpI(16) = -1
+  If QK <> 0
+    PmOpI(16) = Mode
+  EndIf
+  PmOpI(17) = HasScale
+  PmOpI(18) = HasCap
+  dims(0) = bn
+  If three <> 0
+    dims(1) = sq
+    dims(2) = Hq * dv
+    If DAlloc(Y, 1, 3, @dims(0)) = 0
+      ProcedureReturn
+    EndIf
+  Else
+    dims(1) = Hq
+    dims(2) = sq
+    dims(3) = dv
+    If DAlloc(Y, 1, 4, @dims(0)) = 0
+      ProcedureReturn
+    EndIf
+  EndIf
+  yA = Dt(Y)\Data
+  pkA = 0
+  If PK <> 0
+    dims(1) = Hkv
+    dims(2) = tt
+    dims(3) = dn
+    If DAlloc(PK, 1, 4, @dims(0)) = 0
+      ProcedureReturn
+    EndIf
+    pkA = Dt(PK)\Data
+  EndIf
+  pvA = 0
+  If PV <> 0
+    dims(1) = Hkv
+    dims(2) = tt
+    dims(3) = dv
+    If DAlloc(PV, 1, 4, @dims(0)) = 0
+      ProcedureReturn
+    EndIf
+    pvA = Dt(PV)\Data
+  EndIf
+  qkA = 0
+  If QK <> 0
+    dims(1) = Hq
+    dims(2) = sq
+    dims(3) = tt
+    If DAlloc(QK, 1, 4, @dims(0)) = 0
+      ProcedureReturn
+    EndIf
+    qkA = Dt(QK)\Data
+  EndIf
+  scratch = DNsScratch(tt * 4 + 4)
+  If scratch = 0
+    ProcedureReturn
+  EndIf
+  PmOpAttention(Dt(Q)\Data, Dt(K)\Data, Dt(V)\Data, DOpDataOrZero(M), DOpDataOrZero(PastK), DOpDataOrZero(PastV), DOpDataOrZero(NP), yA, pkA, pvA, qkA, scratch)
+  DNsScratchFree(scratch, tt * 4 + 4)
+EndProcedure

@@ -6775,3 +6775,252 @@ Procedure.i PmOpTensorScatter(past.i, upd.i, wi.i, y.i, outer.i, batchInner.i, m
   Wend
   ProcedureReturn 0
 EndProcedure
+
+; ----------------------------------------------------------------------
+; Attention-23/24. Dimensions in PmOpI: 0 B, 1 Hq, 2 Hkv, 3 Sq, 4 Skv,
+; 5 P (past length), 6 D, 7 Dv, 8 1 when Q, K, V and Y are 3-D
+; ([B, S, H*D]) rather than 4-D ([B, H, S, D]), 9 is_causal, 10 the mask's
+; kind (0 none, 1 FLOAT added, 9 BOOL where false masks), 11..14 the mask's
+; extents right-aligned to (B, Hq, Sq, Tm), 1 where it has fewer axes, Tm
+; its last extent (at most T = P + Skv; the rest counts as masked),
+; 15 nonpad lengths given, 16 qk_matmul_output_mode (-1 when that output
+; is absent), 17 a scale attribute given, 18 softcap given (> 0).
+; PmOpF: 0 scale, 1 softcap. The past caches are 4-D; present caches and
+; qk output 4-D. Scratch holds T FLOATs. Each head of Q uses KV head
+; h / (Hq / Hkv) (grouped query attention). Every step is one binary32
+; operation: sqrt(scale) on Q and K, the dot product summed in order,
+; tanh softcap, the bias, the softmax as max, exp(s - max), sum in order,
+; divide, and the weighted sum of V in order.
+; ----------------------------------------------------------------------
+Procedure.i PmOpAttnQ(b.i, h.i, i.i, d.i, hn.i, sn.i, dn.i, three.i)
+  If three <> 0
+    ProcedureReturn ((b * sn + i) * hn + h) * dn + d
+  EndIf
+  ProcedureReturn ((b * hn + h) * sn + i) * dn + d
+EndProcedure
+
+; Element d of key (or value) row j of batch b, KV head g: from the past
+; cache below P, from K (or V) above it.
+Procedure.f PmOpAttnKV(past.i, cur.i, b.i, g.i, j.i, d.i, dn.i)
+  Protected v.f
+  If j < PmOpI(5)
+    v = PmTensorGet(past, ((b * PmOpI(2) + g) * PmOpI(5) + j) * dn + d)
+  Else
+    v = PmTensorGet(cur, PmOpAttnQ(b, g, j - PmOpI(5), d, PmOpI(2), PmOpI(4), dn, PmOpI(8)))
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+; The mask's bias for (b, h, i, j): 0, the FLOAT value, or -inf.
+Procedure.f PmOpAttnMask(mask.i, b.i, h.i, i.i, j.i)
+  Protected at.i
+  Protected v.f
+  If PmOpI(10) = 0
+    ProcedureReturn 0.0
+  EndIf
+  If j >= PmOpI(14)
+    ProcedureReturn PmOpNeg(PmOpInfinity)
+  EndIf
+  at = b % PmOpI(11)
+  at = at * PmOpI(12) + h % PmOpI(12)
+  at = at * PmOpI(13) + i % PmOpI(13)
+  at = at * PmOpI(14) + j
+  If PmOpI(10) = 9
+    If PeekA(mask + at) = 0
+      ProcedureReturn PmOpNeg(PmOpInfinity)
+    EndIf
+    ProcedureReturn 0.0
+  EndIf
+  v = PmTensorGet(mask, at)
+  ProcedureReturn v
+EndProcedure
+
+Procedure PmOpAttention(q.i, k.i, v.i, mask.i, pastK.i, pastV.i, nonpad.i, y.i, presK.i, presV.i, qkOut.i, scratch.i)
+  Protected bn.i
+  Protected hq.i
+  Protected hkv.i
+  Protected sq.i
+  Protected skv.i
+  Protected pl.i
+  Protected dn.i
+  Protected dv.i
+  Protected three.i
+  Protected tt.i
+  Protected reps.i
+  Protected b.i
+  Protected h.i
+  Protected g.i
+  Protected i.i
+  Protected j.i
+  Protected d.i
+  Protected limit.i
+  Protected sc.f
+  Protected rs.f
+  Protected acc.f
+  Protected x.f
+  Protected w.f
+  Protected mx.f
+  Protected sum.f
+  PmOpInit()
+  bn = PmOpI(0)
+  hq = PmOpI(1)
+  hkv = PmOpI(2)
+  sq = PmOpI(3)
+  skv = PmOpI(4)
+  pl = PmOpI(5)
+  dn = PmOpI(6)
+  dv = PmOpI(7)
+  three = PmOpI(8)
+  tt = pl + skv
+  reps = hq / hkv
+  If PmOpI(17) <> 0
+    sc = PmOpF(0)
+  Else
+    sc = PmOpIntToF(dn)
+    sc = PmOpSqrt(sc)
+    sc = PmOpOne / sc
+  EndIf
+  rs = PmOpSqrt(sc)
+  ; the present caches: the past followed by the new rows
+  If presK <> 0
+    b = 0
+    While b < bn
+      g = 0
+      While g < hkv
+        j = 0
+        While j < tt
+          d = 0
+          While d < dn
+            x = PmOpAttnKV(pastK, k, b, g, j, d, dn)
+            PokeL(presK + (((b * hkv + g) * tt + j) * dn + d) * 4, PmOpBits(x))
+            d = d + 1
+          Wend
+          j = j + 1
+        Wend
+        g = g + 1
+      Wend
+      b = b + 1
+    Wend
+  EndIf
+  If presV <> 0
+    b = 0
+    While b < bn
+      g = 0
+      While g < hkv
+        j = 0
+        While j < tt
+          d = 0
+          While d < dv
+            x = PmOpAttnKV(pastV, v, b, g, j, d, dv)
+            PokeL(presV + (((b * hkv + g) * tt + j) * dv + d) * 4, PmOpBits(x))
+            d = d + 1
+          Wend
+          j = j + 1
+        Wend
+        g = g + 1
+      Wend
+      b = b + 1
+    Wend
+  EndIf
+  b = 0
+  While b < bn
+    limit = tt
+    If PmOpI(15) <> 0
+      limit = PmTensorGetI64(nonpad, b)
+    EndIf
+    h = 0
+    While h < hq
+      g = h / reps
+      i = 0
+      While i < sq
+        ; scores
+        j = 0
+        While j < tt
+          acc = 0.0
+          d = 0
+          While d < dn
+            x = PmTensorGet(q, PmOpAttnQ(b, h, i, d, hq, sq, dn, three))
+            x = x * rs
+            w = PmOpAttnKV(pastK, k, b, g, j, d, dn)
+            w = w * rs
+            x = x * w
+            acc = acc + x
+            d = d + 1
+          Wend
+          If PmOpI(16) = 0
+            PmOpStoreF(qkOut, ((b * hq + h) * sq + i) * tt + j, acc)
+          EndIf
+          If PmOpI(18) <> 0
+            acc = acc / PmOpF(1)
+            acc = PmOpTanh(acc)
+            acc = acc * PmOpF(1)
+          EndIf
+          If PmOpI(16) = 1
+            PmOpStoreF(qkOut, ((b * hq + h) * sq + i) * tt + j, acc)
+          EndIf
+          x = PmOpAttnMask(mask, b, h, i, j)
+          If PmOpI(9) <> 0 And j > pl + i
+            x = PmOpNeg(PmOpInfinity)
+          EndIf
+          If j >= limit
+            x = PmOpNeg(PmOpInfinity)
+          EndIf
+          acc = acc + x
+          If PmOpI(16) = 2
+            PmOpStoreF(qkOut, ((b * hq + h) * sq + i) * tt + j, acc)
+          EndIf
+          PmTensorPut(scratch, j, acc)
+          j = j + 1
+        Wend
+        ; softmax
+        mx = PmTensorGet(scratch, 0)
+        j = 1
+        While j < tt
+          x = PmTensorGet(scratch, j)
+          If x > mx
+            mx = x
+          EndIf
+          j = j + 1
+        Wend
+        sum = 0.0
+        j = 0
+        While j < tt
+          x = PmTensorGet(scratch, j)
+          x = x - mx
+          x = PmOpExp(x)
+          PmTensorPut(scratch, j, x)
+          sum = sum + x
+          j = j + 1
+        Wend
+        j = 0
+        While j < tt
+          x = PmTensorGet(scratch, j)
+          x = x / sum
+          PmTensorPut(scratch, j, x)
+          If PmOpI(16) = 3
+            PmOpStoreF(qkOut, ((b * hq + h) * sq + i) * tt + j, x)
+          EndIf
+          j = j + 1
+        Wend
+        ; the weighted sum of V
+        d = 0
+        While d < dv
+          acc = 0.0
+          j = 0
+          While j < tt
+            x = PmTensorGet(scratch, j)
+            w = PmOpAttnKV(pastV, v, b, g, j, d, dv)
+            x = x * w
+            acc = acc + x
+            j = j + 1
+          Wend
+          PmOpStoreF(y, PmOpAttnQ(b, h, i, d, hq, sq, dv, three), acc)
+          d = d + 1
+        Wend
+        i = i + 1
+      Wend
+      h = h + 1
+    Wend
+    b = b + 1
+  Wend
+EndProcedure

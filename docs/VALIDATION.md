@@ -918,6 +918,38 @@ both paths for every target.
 | Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `628ee1c` (the multicore Windows runtime) | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
 | Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
 
+## Above opset 20, third batch: Attention — September 24, 2026
+
+Attention (opsets 23 and 24) compiles on both paths for every target: Q, K
+and V all 3-D (`[B, S, heads x size]` with `q_num_heads` and
+`kv_num_heads`) or all 4-D; grouped-query and multi-query heads; a FLOAT
+mask (added) or BOOL mask (false masks), broadcast from rank 1 to 4 and
+shorter than the total sequence (the rest masked); `is_causal`, aligned
+upper-left and after the past; past and present key and value caches;
+`nonpad_kv_seqlen`; `scale` (default `1/sqrt(head size)`); `softcap`; the
+four `qk_matmul_output_mode`s. `softmax_precision` other than FLOAT is
+refused. Its kernel joins `runtime/tensor_ops.pmi`: `sqrt(scale)` on Q and
+K, the dot product summed in order, the tanh softcap, the bias, the softmax
+as max, `exp(s - max)`, a sum in order and a division, and the weighted
+sum of V in order, each one binary32 step. A row whose every position is
+masked gives NaN, as the reference's softmax does.
+
+**One disagreement with the onnx 1.22.0 reference.** `qk_matmul_output_mode`
+0 is, in the operator's text, the output of the QK product, before the
+softcap. The reference's implementation hands out the softcapped value
+there when `softcap` is set. This compiler follows the text. No official
+case combines mode 0 with a softcap, and the targeted case for mode 0 runs
+without one.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 580 cases - the 575 before; Attention in five forms: grouped heads, 3-D with a causal float mask and a scale, past caches with a BOOL mask and a softcap, nonpad lengths with a short mask, multi-head causal; every output (Y, present key and value, the qk output in all four modes) | Windows, Pi 4, Pico and Pico 2: 580 of 580 bit-identical to the definition; `--mutants` 65 of 65 caught (three new: the grouped head's KV head, causal alignment after the past, the softcap's place before the mask) |
+| `tests/node_suite/targeted_ops.py`: 909 cases - the 889 before; nine Attention forms on both paths and softmax_precision DOUBLE refused | 909 of 909 as expected |
+| `ops_targets_gate.py`: the new builds on the Pi 4, Pico and Pico 2 in unicorn | 18 builds, 54 runs: 54 of 54 bit-identical to the Windows program |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 866 of 1,750 before, 928 after (and one PASS_SHAPE in both): the 62 Attention cases whose inputs are FLOAT, every one of them attempted; no case that passed fails. The float16 cases are refused by type and the function-expanded ones stay refused (their folded batch size has no graph value) |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `14b8423` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
+| Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

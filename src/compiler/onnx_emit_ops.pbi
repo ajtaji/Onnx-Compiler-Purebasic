@@ -25,7 +25,7 @@ Procedure.i PmoOpsOwns(Operation.s)
                                   "RNN|GRU|NonMaxSuppression|RoiAlign|GridSample|QuantizeLinear|DequantizeLinear|" +
                                   "DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|HannWindow|HammingWindow|" +
                                   "BlackmanWindow|DFT|MelWeightMatrix|NegativeLogLikelihoodLoss|SoftmaxCrossEntropyLoss|Col2Im|" +
-                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|Unique|Swish|RMSNormalization|CumProd|BitCast|RotaryEmbedding|TensorScatter|", "|" + Operation + "|"))
+                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|Unique|Swish|RMSNormalization|CumProd|BitCast|RotaryEmbedding|TensorScatter|Attention|", "|" + Operation + "|"))
 EndProcedure
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
@@ -61,6 +61,7 @@ Procedure.i PmoOpsFloor(Operation.s)
     Case "Swish" : ProcedureReturn 24
     Case "CumProd" : ProcedureReturn 26
     Case "RotaryEmbedding" : ProcedureReturn 23
+    Case "Attention" : ProcedureReturn 23
     Case "TensorScatter" : ProcedureReturn 24
     Case "BitCast" : ProcedureReturn 26
     Case "QuantizeLinear", "DequantizeLinear", "MatMulInteger", "QLinearMatMul", "ConvInteger", "QLinearConv" : ProcedureReturn 10
@@ -375,6 +376,18 @@ Procedure.s PmoOpsMelSentence()
   ProcedureReturn "MelWeightMatrix is implemented for five initializer inputs, from which the compiler computes the matrix in binary64 as the reference does; a band edge computed in binary32 at run time can fall in another bin."
 EndProcedure
 
+; Attention-23/24 (see PmOpAttention for the parameter block).
+Procedure.q PmoOpsAttentionTotal(*Ir.PmoIrModel, *Node.PmoOnnxNode)
+  Protected *K.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *P.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 4))
+  Protected T.q
+  If *K = 0 : ProcedureReturn 0 : EndIf
+  If PmoEmitRank(*K) = 4 : T = PmoEmitDim(*K, 2) : Else : T = PmoEmitDim(*K, 1) : EndIf
+  If PmoEmitInput(*Node, 4) <> "" And *P And PmoEmitRank(*P) = 4 : T + PmoEmitDim(*P, 2) : EndIf
+  ProcedureReturn T
+EndProcedure
+
+
 Procedure.q PmoOpsNodeScratch(*Ir.PmoIrModel, *Node.PmoOnnxNode)
   Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
   Protected *W.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
@@ -384,6 +397,8 @@ Procedure.q PmoOpsNodeScratch(*Ir.PmoIrModel, *Node.PmoOnnxNode)
     Case "Det"
       N = PmoEmitDim(*X, PmoEmitRank(*X) - 1)
       ProcedureReturn N * N * 4
+    Case "Attention"
+      ProcedureReturn (PmoOpsAttentionTotal(*Ir, *Node) + 1) * 4
     Case "SoftmaxCrossEntropyLoss"
       If PmoEmitOutput(*Node, 1) = "" : ProcedureReturn *X\Elements * 4 : EndIf
     Case "RNN", "GRU"
@@ -1454,6 +1469,84 @@ Procedure.i PmoEmitOpsTensorScatter(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, P
   ProcedureReturn #True
 EndProcedure
 
+; Attention-23/24 (see PmOpAttention for the parameter block).
+Procedure.i PmoEmitOpsAttention(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *Q.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *K.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *V.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+  Protected *M.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 3))
+  Protected *PK.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 4))
+  Protected *PV.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 5))
+  Protected *NP.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 6))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Rank.i, Bn.q, Hq.q, Hkv.q, Sq.q, Skv.q, Pl.q, Dn.q, Dv.q, T.q, Mode.i, k.i, Soft.f
+  Protected Dim MaskDims.q(3)
+  If PmoEmitNsAttributesAllowed(*Node, "|is_causal|kv_num_heads|q_num_heads|qk_matmul_output_mode|scale|softcap|softmax_precision|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitNsAttributePresent(*Node, "softmax_precision") And PmoEmitAttrI(*Node, "softmax_precision", 1) <> 1
+    ProcedureReturn PmoEmitNsFail(*Node, "softmax_precision = " + Str(PmoEmitAttrI(*Node, "softmax_precision", 1)) + "; the softmax is FLOAT (1).")
+  EndIf
+  Mode = PmoEmitAttrI(*Node, "qk_matmul_output_mode", 0)
+  If Mode < 0 Or Mode > 3 : ProcedureReturn PmoEmitNsFail(*Node, "qk_matmul_output_mode = " + Str(Mode) + "; 0 to 3 are defined.") : EndIf
+  If PmoOpsTypeOk(*Node, *Q, "Q", 1) = 0 Or PmoOpsTypeOk(*Node, *K, "K", 1) = 0 Or PmoOpsTypeOk(*Node, *V, "V", 1) = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*Q)
+  If PmoEmitRank(*K) <> Rank Or PmoEmitRank(*V) <> Rank Or (Rank <> 3 And Rank <> 4) : ProcedureReturn PmoEmitNsFail(*Node, "Q, K and V must all be rank 3 or all rank 4.") : EndIf
+  Bn = PmoEmitDim(*Q, 0)
+  If Rank = 3
+    Hq = PmoEmitAttrI(*Node, "q_num_heads", 0) : Hkv = PmoEmitAttrI(*Node, "kv_num_heads", 0)
+    If Hq < 1 Or Hkv < 1 Or PmoEmitDim(*Q, 2) % Hq <> 0 Or PmoEmitDim(*K, 2) % Hkv <> 0 Or PmoEmitDim(*V, 2) % Hkv <> 0
+      ProcedureReturn PmoEmitNsFail(*Node, "3-D inputs need q_num_heads and kv_num_heads dividing the hidden sizes.")
+    EndIf
+    Sq = PmoEmitDim(*Q, 1) : Skv = PmoEmitDim(*K, 1) : Dn = PmoEmitDim(*Q, 2) / Hq : Dv = PmoEmitDim(*V, 2) / Hkv
+    If PmoEmitDim(*K, 2) / Hkv <> Dn Or PmoEmitDim(*V, 1) <> Skv : ProcedureReturn PmoEmitNsFail(*Node, "K must have Q's head size, and V K's sequence length.") : EndIf
+  Else
+    Hq = PmoEmitDim(*Q, 1) : Hkv = PmoEmitDim(*K, 1) : Sq = PmoEmitDim(*Q, 2) : Skv = PmoEmitDim(*K, 2) : Dn = PmoEmitDim(*Q, 3) : Dv = PmoEmitDim(*V, 3)
+    If PmoEmitDim(*K, 3) <> Dn Or PmoEmitDim(*V, 1) <> Hkv Or PmoEmitDim(*V, 2) <> Skv : ProcedureReturn PmoEmitNsFail(*Node, "K must have Q's head size, and V K's heads and sequence length.") : EndIf
+  EndIf
+  If PmoEmitDim(*K, 0) <> Bn Or PmoEmitDim(*V, 0) <> Bn Or Hq % Hkv <> 0 : ProcedureReturn PmoEmitNsFail(*Node, "the batch sizes must agree, and q_num_heads must be a multiple of kv_num_heads.") : EndIf
+  If Bool(PmoEmitInput(*Node, 4) <> "") <> Bool(PmoEmitInput(*Node, 5) <> "") : ProcedureReturn PmoEmitNsFail(*Node, "past_key and past_value go together.") : EndIf
+  If PmoEmitInput(*Node, 4) <> ""
+    If PmoEmitInput(*Node, 6) <> "" : ProcedureReturn PmoEmitNsFail(*Node, "nonpad_kv_seqlen does not go with past_key and past_value.") : EndIf
+    If PmoOpsTypeOk(*Node, *PK, "past_key", 1) = 0 Or PmoOpsTypeOk(*Node, *PV, "past_value", 1) = 0 : ProcedureReturn #False : EndIf
+    If PmoEmitRank(*PK) <> 4 Or PmoEmitRank(*PV) <> 4 Or PmoEmitDim(*PK, 0) <> Bn Or PmoEmitDim(*PK, 1) <> Hkv Or PmoEmitDim(*PK, 3) <> Dn Or
+       PmoEmitDim(*PV, 0) <> Bn Or PmoEmitDim(*PV, 1) <> Hkv Or PmoEmitDim(*PV, 2) <> PmoEmitDim(*PK, 2) Or PmoEmitDim(*PV, 3) <> Dv
+      ProcedureReturn PmoEmitNsFail(*Node, "past_key and past_value must be [batch, kv_num_heads, past, head_size].")
+    EndIf
+    Pl = PmoEmitDim(*PK, 2)
+  EndIf
+  T = Pl + Skv
+  For k = 0 To 3 : MaskDims(k) = 1 : Next
+  If PmoEmitInput(*Node, 3) <> ""
+    If *M = 0 Or (*M\ElementType <> 1 And *M\ElementType <> 9) Or PmoEmitRank(*M) < 1 Or PmoEmitRank(*M) > 4
+      ProcedureReturn PmoEmitNsFail(*Node, "attn_mask must be FLOAT or BOOL of rank 1 to 4.")
+    EndIf
+    For k = 0 To PmoEmitRank(*M) - 1 : MaskDims(4 - PmoEmitRank(*M) + k) = PmoEmitDim(*M, k) : Next
+    If (MaskDims(0) <> 1 And MaskDims(0) <> Bn) Or (MaskDims(1) <> 1 And MaskDims(1) <> Hq) Or (MaskDims(2) <> 1 And MaskDims(2) <> Sq) Or MaskDims(3) > T
+      ProcedureReturn PmoEmitNsFail(*Node, "attn_mask must broadcast to [batch, q_num_heads, q_sequence, total_sequence].")
+    EndIf
+  EndIf
+  If PmoEmitInput(*Node, 6) <> ""
+    If PmoOpsTypeOk(*Node, *NP, "nonpad_kv_seqlen", 4) = 0 : ProcedureReturn #False : EndIf
+    If *NP\Elements <> Bn : ProcedureReturn PmoEmitNsFail(*Node, "nonpad_kv_seqlen must hold one length per batch sample.") : EndIf
+  EndIf
+  If *Y = 0 Or *Y\ElementType <> 1 : ProcedureReturn PmoEmitNsFail(*Node, "the output Y needs a concrete FLOAT shape.") : EndIf
+  If (Rank = 3 And (PmoEmitRank(*Y) <> 3 Or PmoEmitDim(*Y, 2) <> Hq * Dv)) Or (Rank = 4 And (PmoEmitRank(*Y) <> 4 Or PmoEmitDim(*Y, 3) <> Dv))
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared output Y has the wrong shape.")
+  EndIf
+  Soft = PmoEmitAttrF(*Node, "softcap", 0.0)
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(Bn) + " : PmOpI(1) = " + Str(Hq) + " : PmOpI(2) = " + Str(Hkv) + " : PmOpI(3) = " + Str(Sq) + " : PmOpI(4) = " + Str(Skv))
+  PmoEmitLine(File, "  PmOpI(5) = " + Str(Pl) + " : PmOpI(6) = " + Str(Dn) + " : PmOpI(7) = " + Str(Dv) + " : PmOpI(8) = " + Str(Bool(Rank = 3)) + " : PmOpI(9) = " + Str(Bool(PmoEmitAttrI(*Node, "is_causal", 0) <> 0)))
+  If PmoEmitInput(*Node, 3) <> "" : k = *M\ElementType : Else : k = 0 : EndIf
+  PmoEmitLine(File, "  PmOpI(10) = " + Str(k) + " : PmOpI(11) = " + Str(MaskDims(0)) + " : PmOpI(12) = " + Str(MaskDims(1)) + " : PmOpI(13) = " + Str(MaskDims(2)) + " : PmOpI(14) = " + Str(MaskDims(3)))
+  If PmoEmitOutput(*Node, 3) <> "" : k = Mode : Else : k = -1 : EndIf
+  PmoEmitLine(File, "  PmOpI(15) = " + Str(Bool(PmoEmitInput(*Node, 6) <> "")) + " : PmOpI(16) = " + Str(k) + " : PmOpI(17) = " + Str(PmoEmitNsAttributePresent(*Node, "scale")) + " : PmOpI(18) = " + Str(Bool(Soft > 0.0)))
+  PmoEmitLine(File, "  PmOpSetBits(@PmOpF(0), " + PmoOpsBits(PmoEmitAttrF(*Node, "scale", 1.0)) + ") : PmOpSetBits(@PmOpF(1), " + PmoOpsBits(Soft) + ")")
+  PmoEmitLine(File, "  PmOpAttention(*i0, *i1, *i2, " + PmoOpsIn(*Node, 3) + ", " + PmoOpsIn(*Node, 4) + ", " + PmoOpsIn(*Node, 5) + ", " + PmoOpsIn(*Node, 6) + ", *o0, " +
+                    PmoOpsOut(*Node, 1) + ", " + PmoOpsOut(*Node, 2) + ", " + PmoOpsOut(*Node, 3) + ", PmOnnxArenaBase + " + Str(*Ir\OpsScratchOffset) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
 Procedure.i PmoEmitOpsEyeLike(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
   Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
   Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
@@ -2487,6 +2580,7 @@ Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
     Case "RMSNormalization" : Done = PmoEmitOpsRmsNorm(File, *Ir, *Node, ProcName, Opset)
     Case "CumProd" : Done = PmoEmitOpsCumProd(File, *Ir, *Node, ProcName, Opset)
     Case "BitCast" : Done = PmoEmitOpsBitCast(File, *Ir, *Node, ProcName, Opset)
+    Case "Attention" : Done = PmoEmitOpsAttention(File, *Ir, *Node, ProcName, Opset)
     Case "RotaryEmbedding" : Done = PmoEmitOpsRotary(File, *Ir, *Node, ProcName, Opset)
     Case "TensorScatter" : Done = PmoEmitOpsTensorScatter(File, *Ir, *Node, ProcName, Opset)
     Case "Erf", "Reciprocal", "Ceil", "Sign", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish", "Gelu", "Swish",

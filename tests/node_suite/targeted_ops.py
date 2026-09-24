@@ -1028,6 +1028,38 @@ def cases() -> list[Case]:
     c.append(Case("refuse_tensorscatter_mode", [N("TensorScatter", ["p", "u"], ["y"], mode="wrap")],
                   [("p", F, [2, 5, 3]), ("u", F, [2, 2, 3])], [("y", F, [2, 5, 3])], {"p": f32(2, 5, 3), "u": f32(2, 2, 3)}, opset=24,
                   refuse="linear and circular"))
+    # Attention-23/24: 4-D and 3-D, grouped query heads, masks, causal, past
+    # caches with present outputs, nonpad lengths, scale, softcap, qk output
+    aq, ak, av = f32(2, 4, 3, 8), f32(2, 2, 5, 8), f32(2, 2, 5, 6)
+    c.append(Case("attention_gqa_4d", [N("Attention", ["q", "k", "v"], ["y"])],
+                  [("q", F, [2, 4, 3, 8]), ("k", F, [2, 2, 5, 8]), ("v", F, [2, 2, 5, 6])], [("y", F, [2, 4, 3, 6])],
+                  {"q": aq, "k": ak, "v": av}, opset=23))
+    c.append(Case("attention_3d_causal_float_mask", [N("Attention", ["q", "k", "v", "m"], ["y"], q_num_heads=2, kv_num_heads=2, is_causal=1)],
+                  [("q", F, [1, 4, 8]), ("k", F, [1, 4, 8]), ("v", F, [1, 4, 6]), ("m", F, [4, 4])], [("y", F, [1, 4, 6])],
+                  {"q": f32(1, 4, 8), "k": f32(1, 4, 8), "v": f32(1, 4, 6), "m": f32(4, 4)}, opset=23))
+    bm = np.ones((1, 2, 3, 4), np.bool_)
+    bm[0, 1, :, 2] = False
+    c.append(Case("attention_bool_mask", [N("Attention", ["q", "k", "v", "m"], ["y"])],
+                  [("q", F, [1, 2, 3, 4]), ("k", F, [1, 2, 4, 4]), ("v", F, [1, 2, 4, 4]), ("m", B, [1, 2, 3, 4])], [("y", F, [1, 2, 3, 4])],
+                  {"q": f32(1, 2, 3, 4), "k": f32(1, 2, 4, 4), "v": f32(1, 2, 4, 4), "m": bm}, opset=23))
+    c.append(Case("attention_past_present_float_mask_scale", [N("Attention", ["q", "k", "v", "m", "pk", "pv"], ["y", "prk", "prv"], scale=0.3)],
+                  [("q", F, [2, 2, 2, 4]), ("k", F, [2, 2, 3, 4]), ("v", F, [2, 2, 3, 5]), ("m", F, [2, 1, 2, 5]), ("pk", F, [2, 2, 2, 4]), ("pv", F, [2, 2, 2, 5])],
+                  [("y", F, [2, 2, 2, 5]), ("prk", F, [2, 2, 5, 4]), ("prv", F, [2, 2, 5, 5])],
+                  {"q": f32(2, 2, 2, 4), "k": f32(2, 2, 3, 4), "v": f32(2, 2, 3, 5), "m": f32(2, 1, 2, 5), "pk": f32(2, 2, 2, 4), "pv": f32(2, 2, 2, 5)},
+                  opset=23))
+    for mode in (0, 1, 2, 3):
+        # mode 0 is the product before the softcap; the onnx 1.22.0 reference hands out
+        # the softcapped value there, so that form is tested without a softcap
+        cap = {} if mode == 0 else {"softcap": 2.0}
+        c.append(Case("attention_softcap_qk_mode%d" % mode, [N("Attention", ["q", "k", "v"], ["y", "", "", "qk"], qk_matmul_output_mode=mode, **cap)],
+                      [("q", F, [1, 2, 3, 4]), ("k", F, [1, 2, 4, 4]), ("v", F, [1, 2, 4, 4])], [("y", F, [1, 2, 3, 4]), ("qk", F, [1, 2, 3, 4])],
+                      {"q": f32(1, 2, 3, 4, scale=2.0), "k": f32(1, 2, 4, 4, scale=2.0), "v": f32(1, 2, 4, 4)}, opset=23))
+    c.append(Case("attention_nonpad_short_mask", [N("Attention", ["q", "k", "v", "m", "", "", "n"], ["y"])],
+                  [("q", F, [2, 2, 2, 4]), ("k", F, [2, 2, 6, 4]), ("v", F, [2, 2, 6, 4]), ("m", F, [2, 1, 2, 4]), ("n", I64, [2])], [("y", F, [2, 2, 2, 4])],
+                  {"q": f32(2, 2, 2, 4), "k": f32(2, 2, 6, 4), "v": f32(2, 2, 6, 4), "m": f32(2, 1, 2, 4), "n": np.array([3, 4], np.int64)}, opset=24))
+    c.append(Case("refuse_attention_softmax_precision", [N("Attention", ["q", "k", "v"], ["y"], softmax_precision=11)],
+                  [("q", F, [1, 2, 3, 4]), ("k", F, [1, 2, 4, 4]), ("v", F, [1, 2, 4, 4])], [("y", F, [1, 2, 3, 4])],
+                  {"q": f32(1, 2, 3, 4), "k": f32(1, 2, 4, 4), "v": f32(1, 2, 4, 4)}, opset=23, refuse="softmax is FLOAT"))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

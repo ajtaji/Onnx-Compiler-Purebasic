@@ -73,7 +73,7 @@ Indexing        Gather  GatherElements  GatherND  Slice  Expand  Pad  NonZero
 Shape           Reshape  Flatten  Squeeze  Unsqueeze  Transpose  Concat  Split
                 Tile  DepthToSpace  SpaceToDepth  Size  EyeLike  Col2Im
                 CenterCropPad
-Transformer     RotaryEmbedding  TensorScatter
+Transformer     Attention  RotaryEmbedding  TensorScatter
 Other           Cast  CastLike  BitCast  Identity  Dropout (inference)
 Random          RandomNormal  RandomNormalLike  RandomUniform  RandomUniformLike
                 Bernoulli  Multinomial
@@ -249,7 +249,7 @@ refused by name. The operators added in September 2026 each start at the
 opset whose definition they compute (Mish at 18, Gelu at 20, Trilu and
 HardSwish at 14, GridSample at 16, DFT and the windows at 17, the bitwise
 operators, GroupNormalization, Col2Im and CenterCropPad at 18, DeformConv at
-19, AffineGrid at 20, RMSNormalization and RotaryEmbedding at 23, Swish and TensorScatter at
+19, AffineGrid at 20, RMSNormalization, RotaryEmbedding and Attention at 23, Swish and TensorScatter at
 24, CumProd and BitCast at 26,
 most of the rest at 11 or earlier), and LogSoftmax and Hardmax before 13 are
 accepted only on the last axis, where the old flattening definition and the

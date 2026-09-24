@@ -86,6 +86,7 @@ Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
     Case "BitCast" : ProcedureReturn "|to|"
     Case "RotaryEmbedding" : ProcedureReturn "|interleaved|num_heads|rotary_embedding_dim|"
     Case "TensorScatter" : ProcedureReturn "|axis|mode|"
+    Case "Attention" : ProcedureReturn "|is_causal|kv_num_heads|q_num_heads|qk_matmul_output_mode|scale|softcap|softmax_precision|"
     Case "DeformConv" : ProcedureReturn "|dilations|group|kernel_shape|offset_group|pads|strides|"
     Case "RoiAlign"
       If Opset >= 16 : ProcedureReturn "|coordinate_transformation_mode|mode|output_height|output_width|sampling_ratio|spatial_scale|" : EndIf
@@ -301,6 +302,17 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "cos_cache", "|1|") : EndIf
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 2, "sin_cache", "|1|") : EndIf
         If Reason = "" And PmdNsInputPresent(*Node, 3) : Reason = PmdNsTypeReason(*Node, 3, "position_ids", "|7|") : EndIf
+      Case "Attention"
+        Reason = PmdNsTypeReason(*Node, 0, "Q", "|1|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "K", "|1|") : EndIf
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 2, "V", "|1|") : EndIf
+        If Reason = "" And PmdNsInputPresent(*Node, 3) : Reason = PmdNsTypeReason(*Node, 3, "attn_mask", "|1|9|") : EndIf
+        If Reason = "" And PmoEmitNsAttributePresent(*Node, "softmax_precision") And PmoEmitAttrI(*Node, "softmax_precision", 1) <> 1
+          Reason = "softmax_precision = " + Str(PmoEmitAttrI(*Node, "softmax_precision", 1)) + "; the softmax is FLOAT (1)."
+        EndIf
+        If Reason = "" And (PmoEmitAttrI(*Node, "qk_matmul_output_mode", 0) < 0 Or PmoEmitAttrI(*Node, "qk_matmul_output_mode", 0) > 3)
+          Reason = "qk_matmul_output_mode = " + Str(PmoEmitAttrI(*Node, "qk_matmul_output_mode", 0)) + "; 0 to 3 are defined."
+        EndIf
       Case "TensorScatter"
         Reason = PmdNsTypeReason(*Node, 0, "past_cache", "|1|2|3|6|7|9|")
         If Reason = "" And PmoEmitAttrS(*Node, "mode", "linear") <> "linear" And PmoEmitAttrS(*Node, "mode", "linear") <> "circular"
@@ -418,6 +430,10 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         If ListSize(*Node\Outputs()) <> 3 Or PmdNsNamedOutputs(*Node) <> 3
           Reason = "it declares " + Str(PmdNsNamedOutputs(*Node)) + " named outputs; DynamicQuantizeLinear has three (y, y_scale, y_zero_point)."
         EndIf
+      Case "Attention"
+        If ListSize(*Node\Outputs()) < 1 Or ListSize(*Node\Outputs()) > 4 Or PmoEmitOutput(*Node, 0) = ""
+          Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; Attention has one to four (Y, present_key, present_value, qk_matmul_output), Y first."
+        EndIf
       Case "Unique"
         If ListSize(*Node\Outputs()) < 1 Or ListSize(*Node\Outputs()) > 4 Or PmdNsNamedOutputs(*Node) < 1
           Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; Unique has one to four (Y, indices, inverse_indices, counts)."
@@ -451,6 +467,12 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
     Case "RMSNormalization"
       Call = "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "epsilon", 0.00001)) + ") : DOpRmsNorm(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," +
              Str(PmoEmitAttrI(*Node, "axis", -1)) + ")"
+    Case "Attention"
+      Pre = "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "scale", 1.0)) + ") : PmOpSetBits(@PmOpF(1)," + PmoOpsBits(PmoEmitAttrF(*Node, "softcap", 0.0)) + ") : "
+      Call = Pre + "DOpAttention(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 1)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 2)) + "," +
+             PmdNsId(Ids(), PmoEmitOutput(*Node, 3)) + "," + a(0) + "," + a(1) + "," + a(2) + "," + a(3) + "," + a(4) + "," + a(5) + "," + a(6) + "," +
+             Str(PmoEmitAttrI(*Node, "q_num_heads", 0)) + "," + Str(PmoEmitAttrI(*Node, "kv_num_heads", 0)) + "," + Str(Bool(PmoEmitAttrI(*Node, "is_causal", 0) <> 0)) + "," +
+             Str(PmoEmitAttrI(*Node, "qk_matmul_output_mode", 0)) + "," + Str(PmoEmitNsAttributePresent(*Node, "scale")) + "," + Str(Bool(PmoEmitAttrF(*Node, "softcap", 0.0) > 0.0)) + ")"
     Case "BitCast"
       Call = "DOpBitCast(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + Str(PmoEmitAttrI(*Node, "to", 0)) + ")"
     Case "RotaryEmbedding"
