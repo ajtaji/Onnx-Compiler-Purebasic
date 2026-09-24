@@ -19,7 +19,10 @@ Procedure.i PmoOpsOwns(Operation.s)
                                   "ThresholdedRelu|Shrink|IsNaN|IsInf|Min|Max|Sum|Mean|Mod|PRelu|Or|Xor|ReduceMin|ReduceL1|ReduceL2|" +
                                   "ReduceSumSquare|ReduceLogSum|ReduceLogSumExp|ArgMax|ArgMin|LogSoftmax|MaxPool|AveragePool|LpPool|" +
                                   "GlobalMaxPool|GlobalAveragePool|GlobalLpPool|Split|Tile|DepthToSpace|SpaceToDepth|Trilu|" +
-                                  "GatherElements|GatherND|OneHot|Einsum|Dropout|CastLike|Size|", "|" + Operation + "|"))
+                                  "GatherElements|GatherND|OneHot|Einsum|Dropout|CastLike|Size|Tan|Asin|Acos|Sinh|Cosh|Asinh|" +
+                                  "Acosh|Atanh|BitwiseNot|BitwiseAnd|BitwiseOr|BitwiseXor|Hardmax|LpNormalization|" +
+                                  "MeanVarianceNormalization|LRN|GroupNormalization|EyeLike|Det|Compress|ReverseSequence|Upsample|" +
+                                  "RNN|GRU|NonMaxSuppression|RoiAlign|", "|" + Operation + "|"))
 EndProcedure
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
@@ -31,17 +34,20 @@ Procedure.i PmoOpsFloor(Operation.s)
          "ArgMax", "ArgMin", "LogSoftmax", "MaxPool", "AveragePool", "GlobalMaxPool", "GlobalAveragePool", "DepthToSpace",
          "SpaceToDepth", "Size"
       ProcedureReturn 1
+    Case "Hardmax", "LpNormalization", "LRN" : ProcedureReturn 1
     Case "LpPool", "GlobalLpPool", "Split" : ProcedureReturn 2
     Case "Reciprocal", "Ceil", "Elu", "Selu", "HardSigmoid", "Tile" : ProcedureReturn 6
-    Case "PRelu", "Or", "Xor", "Dropout" : ProcedureReturn 7
+    Case "PRelu", "Or", "Xor", "Dropout", "Tan", "Asin", "Acos", "Upsample", "RNN", "GRU" : ProcedureReturn 7
     Case "Min", "Max", "Sum", "Mean" : ProcedureReturn 8
-    Case "Erf", "Sign", "Shrink", "IsNaN", "OneHot" : ProcedureReturn 9
-    Case "Mod", "ThresholdedRelu", "IsInf" : ProcedureReturn 10
-    Case "GatherElements", "GatherND" : ProcedureReturn 11
+    Case "Erf", "Sign", "Shrink", "IsNaN", "OneHot", "Sinh", "Cosh", "Asinh", "Acosh", "Atanh", "MeanVarianceNormalization",
+         "EyeLike"
+      ProcedureReturn 9
+    Case "Mod", "ThresholdedRelu", "IsInf", "ReverseSequence", "NonMaxSuppression", "RoiAlign" : ProcedureReturn 10
+    Case "GatherElements", "GatherND", "Det", "Compress" : ProcedureReturn 11
     Case "Celu", "Einsum" : ProcedureReturn 12
     Case "HardSwish", "Trilu" : ProcedureReturn 14
     Case "CastLike" : ProcedureReturn 15
-    Case "Mish" : ProcedureReturn 18
+    Case "Mish", "BitwiseNot", "BitwiseAnd", "BitwiseOr", "BitwiseXor", "GroupNormalization" : ProcedureReturn 18
     Case "Gelu" : ProcedureReturn 20
   EndSelect
   ProcedureReturn 0
@@ -86,6 +92,15 @@ Procedure.i PmoOpsUnaryCode(*Node.PmoOnnxNode)
     Case "Shrink" : ProcedureReturn 15
     Case "IsNaN" : ProcedureReturn 16
     Case "IsInf" : ProcedureReturn 17
+    Case "Tan" : ProcedureReturn 19
+    Case "Asin" : ProcedureReturn 20
+    Case "Acos" : ProcedureReturn 21
+    Case "Sinh" : ProcedureReturn 22
+    Case "Cosh" : ProcedureReturn 23
+    Case "Asinh" : ProcedureReturn 24
+    Case "Acosh" : ProcedureReturn 25
+    Case "Atanh" : ProcedureReturn 26
+    Case "BitwiseNot" : ProcedureReturn 27
   EndSelect
   ProcedureReturn -1
 EndProcedure
@@ -154,6 +169,9 @@ Procedure.i PmoOpsVariadicCode(*Node.PmoOnnxNode)
     Case "Or" : ProcedureReturn 6
     Case "Xor" : ProcedureReturn 7
     Case "PRelu" : ProcedureReturn 8
+    Case "BitwiseAnd" : ProcedureReturn 9
+    Case "BitwiseOr" : ProcedureReturn 10
+    Case "BitwiseXor" : ProcedureReturn 11
   EndSelect
   ProcedureReturn -1
 EndProcedure
@@ -168,6 +186,7 @@ Procedure.i PmoOpsVariadicKinds(*Node.PmoOnnxNode)
       If PmoEmitAttrI(*Node, "fmod", 0) <> 0 : ProcedureReturn 7 : EndIf
       ProcedureReturn 6
     Case "Or", "Xor" : ProcedureReturn 8
+    Case "BitwiseAnd", "BitwiseOr", "BitwiseXor" : ProcedureReturn 6
   EndSelect
   ProcedureReturn 0
 EndProcedure
@@ -321,6 +340,44 @@ Procedure.s PmoOpsEinsumParse(Equation.s, Count.i, Array Ranks.i(1), Array AxisL
   ProcedureReturn ""
 EndProcedure
 
+; Working memory a node's kernel needs on the fixed-shape path: Det a copy of
+; one matrix, RNN and GRU the state of every direction and batch and three
+; gate rows. 0 for every other node.
+Procedure.q PmoOpsNodeScratch(*Ir.PmoIrModel, *Node.PmoOnnxNode)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *W.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected N.q, H.q
+  If *X = 0 : ProcedureReturn 0 : EndIf
+  Select *Node\Operation
+    Case "Det"
+      N = PmoEmitDim(*X, PmoEmitRank(*X) - 1)
+      ProcedureReturn N * N * 4
+    Case "RNN", "GRU"
+      *W = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+      If *W = 0 Or PmoEmitRank(*X) <> 3 Or PmoEmitRank(*W) <> 3 : ProcedureReturn 0 : EndIf
+      H = PmoEmitDim(*W, 2)
+      ProcedureReturn (PmoEmitDim(*W, 0) * PmoEmitDim(*X, 1) * H + 3 * H) * 4
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; One region, sized for the largest such node, after everything else in the
+; arena: nodes run one at a time. A model without such a node keeps its arena.
+Procedure PmoOpsPlanScratch(*Ir.PmoIrModel)
+  Protected Largest.q, Bytes.q
+  *Ir\OpsScratchOffset = 0 : *Ir\OpsScratchBytes = 0
+  ForEach *Ir\Nodes()
+    If PmoOpsOwns(*Ir\Nodes()\Node\Operation)
+      Bytes = PmoOpsNodeScratch(*Ir, *Ir\Nodes()\Node)
+      If Bytes > Largest : Largest = Bytes : EndIf
+    EndIf
+  Next
+  If Largest = 0 : ProcedureReturn : EndIf
+  *Ir\OpsScratchOffset = PmoIrAlign(*Ir\ArenaBytes)
+  *Ir\OpsScratchBytes = PmoIrAlign(Largest)
+  *Ir\ArenaBytes = *Ir\OpsScratchOffset + *Ir\OpsScratchBytes
+EndProcedure
+
 ; ============================================================================
 ; Fixed-shape emission
 ; ============================================================================
@@ -401,6 +458,7 @@ Procedure.i PmoEmitOpsUnary(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.
   Reason = PmoOpsUnaryForm(*Node)
   If Reason <> "" : ProcedureReturn PmoEmitNsFail(*Node, Reason) : EndIf
   If *Node\Operation = "Sign" : Bits = 5 : EndIf
+  If *Node\Operation = "BitwiseNot" : Bits = 6 : EndIf
   If PmoOpsTypeOk(*Node, *X, "input", Bits) = 0 : ProcedureReturn #False : EndIf
   OutType = *X\ElementType
   If Code = 16 Or Code = 17 : OutType = 9 : EndIf
@@ -424,7 +482,7 @@ Procedure.i PmoEmitOpsVariadic(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcNa
   If *Y = 0 : ProcedureReturn PmoEmitNsFail(*Node, "the output needs a concrete shape.") : EndIf
   Count = ListSize(*Node\Inputs())
   If Count < 1 Or Count > 16 : ProcedureReturn PmoEmitNsFail(*Node, "it has " + Str(Count) + " inputs; one to sixteen are implemented.") : EndIf
-  If (*Node\Operation = "Mod" Or *Node\Operation = "PRelu" Or *Node\Operation = "Or" Or *Node\Operation = "Xor") And Count <> 2
+  If FindString("|Mod|PRelu|Or|Xor|BitwiseAnd|BitwiseOr|BitwiseXor|", "|" + *Node\Operation + "|") And Count <> 2
     ProcedureReturn PmoEmitNsFail(*Node, "it has " + Str(Count) + " inputs; the specification gives it two.")
   EndIf
   If *Node\Operation = "Mod" And PmoEmitAttrI(*Node, "fmod", 0) = 0
@@ -1084,16 +1142,412 @@ Procedure.i PmoEmitOpsDropout(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcNam
   ProcedureReturn #True
 EndProcedure
 
+; An axis attribute of a one-input FLOAT operator whose output has the
+; input's shape; -1 (after the refusal) when out of range.
+Procedure.i PmoOpsAxisForm(*Ir.PmoIrModel, *Node.PmoOnnxNode, Fallback.i, *X.PmoIrValue)
+  Protected Rank.i = PmoEmitRank(*X), Axis.i = PmoEmitAttrI(*Node, "axis", Fallback)
+  If Axis < 0 : Axis + Rank : EndIf
+  If Axis < 0 Or Axis >= Rank
+    PmoEmitNsFail(*Node, "attribute axis = " + Str(PmoEmitAttrI(*Node, "axis", Fallback)) + " is outside the input rank " + Str(Rank) + ".")
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn Axis
+EndProcedure
+
+; Hardmax and LpNormalization along an axis.
+Procedure.i PmoEmitOpsAxisNorm(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Axis.i, Rank.i, P.q
+  If *Node\Operation = "Hardmax"
+    If PmoEmitNsAttributesAllowed(*Node, "|axis|", Opset) = 0 : ProcedureReturn #False : EndIf
+  ElseIf PmoEmitNsAttributesAllowed(*Node, "|axis|p|", Opset) = 0
+    ProcedureReturn #False
+  EndIf
+  If PmoOpsTypeOk(*Node, *X, "input", 1) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsSameShape(*Node, *X, *Y, 1) = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*X)
+  If *Node\Operation = "Hardmax"
+    If Opset >= 13 : Axis = PmoOpsAxisForm(*Ir, *Node, -1, *X) : Else : Axis = PmoOpsAxisForm(*Ir, *Node, 1, *X) : EndIf
+    If Axis < 0 : ProcedureReturn #False : EndIf
+    If Opset < 13 And Axis <> Rank - 1
+      ProcedureReturn PmoEmitNsFail(*Node, "the model imports opset " + Str(Opset) + ", where Hardmax flattens the input to two dimensions at axis " + Str(Axis) +
+                                           "; that equals Hardmax-13 only on the last axis, which is what is implemented.")
+    EndIf
+  Else
+    Axis = PmoOpsAxisForm(*Ir, *Node, -1, *X)
+    If Axis < 0 : ProcedureReturn #False : EndIf
+    P = PmoEmitAttrI(*Node, "p", 2)
+    If P <> 1 And P <> 2 : ProcedureReturn PmoEmitNsFail(*Node, "attribute p = " + Str(P) + "; the specification allows 1 and 2.") : EndIf
+  EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  If *Node\Operation = "Hardmax"
+    PmoEmitLine(File, "  PmOpHardmax(*i0, *o0, " + Str(PmoEmitProduct(*X, 0, Axis - 1)) + ", " + Str(PmoEmitDim(*X, Axis)) + ", " + Str(PmoEmitProduct(*X, Axis + 1, Rank - 1)) + ")")
+  Else
+    PmoEmitLine(File, "  PmOpLpNorm(*i0, *o0, " + Str(PmoEmitProduct(*X, 0, Axis - 1)) + ", " + Str(PmoEmitDim(*X, Axis)) + ", " + Str(PmoEmitProduct(*X, Axis + 1, Rank - 1)) + ", " + Str(P) + ")")
+  EndIf
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsMvn(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Rank.i, Count.i, Index.i, Axis.q, Mask.i, d.i
+  If PmoEmitNsAttributesAllowed(*Node, "|axes|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "input", 1) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsSameShape(*Node, *X, *Y, 1) = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*X)
+  Count = PmoEmitAttrListCount(*Node, "axes")
+  If PmoEmitNsAttributePresent(*Node, "axes") = 0
+    If Rank < 4 : ProcedureReturn PmoEmitNsFail(*Node, "attribute axes is absent and defaults to [0, 2, 3], which needs an input of rank 4 or more; this one has " + Str(Rank) + ".") : EndIf
+    Mask = 1 | 4 | 8
+  EndIf
+  For Index = 0 To Count - 1
+    Axis = PmoEmitAttrListI(*Node, "axes", Index, 0)
+    If Axis < 0 : Axis + Rank : EndIf
+    If Axis < 0 Or Axis >= Rank : ProcedureReturn PmoEmitNsFail(*Node, "attribute axes names an axis outside the input rank " + Str(Rank) + ".") : EndIf
+    Mask | (1 << Axis)
+  Next
+  PmoOpsHead(File, ProcName, *Node)
+  For d = 0 To Rank - 1 : PmoEmitLine(File, "  PmOpDA(" + Str(d) + ") = " + Str(PmoEmitDim(*X, d))) : Next
+  PmoEmitLine(File, "  PmOpMvn(*i0, *o0, " + Str(Rank) + ", " + Str(Mask) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsLrn(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Size.q
+  If PmoEmitNsAttributesAllowed(*Node, "|alpha|beta|bias|size|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "input", 1) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsSameShape(*Node, *X, *Y, 1) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitRank(*X) < 3 : ProcedureReturn PmoEmitNsFail(*Node, "the input has rank " + Str(PmoEmitRank(*X)) + "; LRN takes N x C x D1 ... Dk.") : EndIf
+  If PmoEmitNsAttributePresent(*Node, "size") = 0 : ProcedureReturn PmoEmitNsFail(*Node, "attribute size is required.") : EndIf
+  Size = PmoEmitAttrI(*Node, "size", 1)
+  If Size < 1 : ProcedureReturn PmoEmitNsFail(*Node, "attribute size = " + Str(Size) + " must be positive.") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpSetBits(@PmOpF(0), " + PmoOpsBits(PmoEmitAttrF(*Node, "alpha", 0.0001)) + ")")
+  PmoEmitLine(File, "  PmOpSetBits(@PmOpF(1), " + PmoOpsBits(PmoEmitAttrF(*Node, "beta", 0.75)) + ")")
+  PmoEmitLine(File, "  PmOpSetBits(@PmOpF(2), " + PmoOpsBits(PmoEmitAttrF(*Node, "bias", 1.0)) + ")")
+  PmoEmitLine(File, "  PmOpLrn(*i0, *o0, " + Str(PmoEmitDim(*X, 0)) + ", " + Str(PmoEmitDim(*X, 1)) + ", " + Str(PmoEmitProduct(*X, 2, PmoEmitRank(*X) - 1)) + ", " + Str(Size) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsGroupNorm(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *S.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *B.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Groups.q
+  If Opset > 20 : ProcedureReturn PmoEmitNsFail(*Node, "the model imports opset " + Str(Opset) + "; GroupNormalization-21 scales per channel, and the definition implemented is GroupNormalization-18's, per group.") : EndIf
+  If PmoEmitNsAttributesAllowed(*Node, "|epsilon|num_groups|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "X", 1) = 0 Or PmoOpsTypeOk(*Node, *S, "scale", 1) = 0 Or PmoOpsTypeOk(*Node, *B, "bias", 1) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsSameShape(*Node, *X, *Y, 1) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitRank(*X) < 3 : ProcedureReturn PmoEmitNsFail(*Node, "the input has rank " + Str(PmoEmitRank(*X)) + "; GroupNormalization takes N x C x D1 ... Dn.") : EndIf
+  If PmoEmitNsAttributePresent(*Node, "num_groups") = 0 : ProcedureReturn PmoEmitNsFail(*Node, "attribute num_groups is required.") : EndIf
+  Groups = PmoEmitAttrI(*Node, "num_groups", 1)
+  If Groups < 1 Or PmoEmitDim(*X, 1) % Groups <> 0 : ProcedureReturn PmoEmitNsFail(*Node, "num_groups = " + Str(Groups) + " must divide the " + Str(PmoEmitDim(*X, 1)) + " channels.") : EndIf
+  If *S\Elements <> Groups Or *B\Elements <> Groups : ProcedureReturn PmoEmitNsFail(*Node, "scale and bias must hold num_groups = " + Str(Groups) + " elements each (GroupNormalization-18).") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpSetBits(@PmOpF(0), " + PmoOpsBits(PmoEmitAttrF(*Node, "epsilon", 0.00001)) + ")")
+  PmoEmitLine(File, "  PmOpGroupNorm(*i0, *i1, *i2, *o0, " + Str(PmoEmitDim(*X, 0)) + ", " + Str(PmoEmitDim(*X, 1)) + ", " + Str(PmoEmitProduct(*X, 2, PmoEmitRank(*X) - 1)) + ", " + Str(Groups) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsEyeLike(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Kind.i
+  If PmoEmitNsAttributesAllowed(*Node, "|dtype|k|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If *X = 0 Or PmoEmitRank(*X) <> 2 : ProcedureReturn PmoEmitNsFail(*Node, "the input must be a two-dimensional tensor.") : EndIf
+  Kind = PmoEmitAttrI(*Node, "dtype", *X\ElementType)
+  If Kind <> 1 And Kind <> 7 And Kind <> 9 : ProcedureReturn PmoEmitNsFail(*Node, "dtype " + PmoEmitNsTypeName(Kind) + " is not implemented by fixed-shape emission; FLOAT, INT64 and BOOL are.") : EndIf
+  If *Y = 0 Or PmoEmitShapeEqual(*X, *Y) = 0 Or *Y\ElementType <> Kind : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must have the input's shape and the element type dtype names.") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpEyeLike(*o0, " + Str(PmoEmitDim(*X, 0)) + ", " + Str(PmoEmitDim(*X, 1)) + ", " + Str(PmoEmitAttrI(*Node, "k", 0)) + ", " + Str(Kind) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsDet(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Rank.i, N.q
+  If PmoEmitNsAttributesAllowed(*Node, "|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "X", 1) = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*X)
+  If Rank < 2 Or PmoEmitDim(*X, Rank - 1) <> PmoEmitDim(*X, Rank - 2) : ProcedureReturn PmoEmitNsFail(*Node, "the input must end in two equal axes, [*, M, M].") : EndIf
+  N = PmoEmitDim(*X, Rank - 1)
+  If *Y = 0 Or *Y\ElementType <> 1 Or *Y\Elements * N * N <> *X\Elements : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT with the input's leading axes.") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  If *Y\Elements > 0
+    PmoEmitLine(File, "  PmOpDet(*i0, *o0, " + Str(*Y\Elements) + ", " + Str(N) + ", PmOnnxArenaBase + " + Str(*Ir\OpsScratchOffset) + ")")
+  EndIf
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsCompress(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *C.PmoIrConstant = PmoEmitConstant(*Ir, PmoEmitInput(*Node, 1))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Rank.i, Axis.i, Kept.q, i.q, Width.q, Outer.q, Inner.q, Ok.Integer, d.i, Flat.i
+  If PmoEmitNsAttributesAllowed(*Node, "|axis|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "input", 13) = 0 : ProcedureReturn #False : EndIf
+  If *C = 0 Or *C\ElementType <> 9 : ProcedureReturn PmoEmitNsFail(*Node, "input condition must be a constant BOOL tensor for fixed-shape emission, which sizes the output when the source is written.") : EndIf
+  Rank = PmoEmitRank(*X)
+  Flat = Bool(PmoEmitNsAttributePresent(*Node, "axis") = 0)
+  If Flat
+    Outer = 1 : Width = *X\Elements : Inner = 1
+  Else
+    Axis = PmoOpsAxisForm(*Ir, *Node, 0, *X)
+    If Axis < 0 : ProcedureReturn #False : EndIf
+    Outer = PmoEmitProduct(*X, 0, Axis - 1) : Width = PmoEmitDim(*X, Axis) : Inner = PmoEmitProduct(*X, Axis + 1, Rank - 1)
+  EndIf
+  If *C\Elements > Width : ProcedureReturn PmoEmitNsFail(*Node, "condition holds " + Str(*C\Elements) + " values for an extent of " + Str(Width) + ".") : EndIf
+  For i = 0 To *C\Elements - 1
+    If PmoEmitConstI(*Ir, PmoEmitInput(*Node, 1), i, @Ok) <> 0 : Kept + 1 : EndIf
+  Next
+  If *Y = 0 Or *Y\ElementType <> *X\ElementType Or *Y\Elements <> Outer * Kept * Inner : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must hold the " + Str(Outer * Kept * Inner) + " selected elements.") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  Protected Dim cond.a(" + Str(*C\Elements) + ")")
+  For i = 0 To *C\Elements - 1
+    PmoEmitLine(File, "  cond(" + Str(i) + ") = " + Str(Bool(PmoEmitConstI(*Ir, PmoEmitInput(*Node, 1), i, @Ok) <> 0)))
+  Next
+  PmoEmitLine(File, "  PmOpCompress(*i0, @cond(0), *o0, " + Str(Outer) + ", " + Str(Width) + ", " + Str(Inner) + ", " + Str(PmoIrElementBytes(*X\ElementType)) + ", " + Str(*C\Elements) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsReverseSequence(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *L.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected TimeAxis.i = PmoEmitAttrI(*Node, "time_axis", 0), BatchAxis.i = PmoEmitAttrI(*Node, "batch_axis", 1)
+  If PmoEmitNsAttributesAllowed(*Node, "|batch_axis|time_axis|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "input", 13) = 0 Or PmoOpsTypeOk(*Node, *L, "sequence_lens", 4) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsSameShape(*Node, *X, *Y, *X\ElementType) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitRank(*X) < 2 : ProcedureReturn PmoEmitNsFail(*Node, "the input must have rank two or more.") : EndIf
+  If Not ((TimeAxis = 0 And BatchAxis = 1) Or (TimeAxis = 1 And BatchAxis = 0))
+    ProcedureReturn PmoEmitNsFail(*Node, "time_axis = " + Str(TimeAxis) + " and batch_axis = " + Str(BatchAxis) + "; the specification allows 0 and 1 or 1 and 0.")
+  EndIf
+  If *L\Elements <> PmoEmitDim(*X, BatchAxis) : ProcedureReturn PmoEmitNsFail(*Node, "sequence_lens must hold one length per batch, " + Str(PmoEmitDim(*X, BatchAxis)) + ".") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  If PmOpReverseSequence(*i0, *i1, *o0, " + Str(PmoEmitDim(*X, 0)) + ", " + Str(PmoEmitDim(*X, 1)) + ", " + Str(PmoEmitProduct(*X, 2, PmoEmitRank(*X) - 1)) + ", " +
+                    Str(Bool(TimeAxis = 0)) + ", " + Str(PmoIrElementBytes(*X\ElementType)) + ", 7) <> 0 : PmOnnxRuntimeOk = 0 : EndIf")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsUpsample(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected *S.PmoIrConstant, Mode.s = PmoEmitAttrS(*Node, "mode", "nearest"), Rank.i, d.i, Ok.Integer, Linear.i
+  Protected Dim Scale.f(8)
+  If Opset > 9 : ProcedureReturn PmoEmitNsFail(*Node, "Upsample is deprecated from opset 10 (use Resize), and the model imports opset " + Str(Opset) + ".") : EndIf
+  If Opset >= 9
+    If PmoEmitNsAttributesAllowed(*Node, "|mode|", Opset) = 0 : ProcedureReturn #False : EndIf
+  ElseIf PmoEmitNsAttributesAllowed(*Node, "|mode|scales|", Opset) = 0
+    ProcedureReturn #False
+  EndIf
+  If Mode <> "nearest" And Mode <> "linear" : ProcedureReturn PmoEmitNsFail(*Node, "attribute mode = " + Mode + " is not an Upsample mode; nearest and linear are.") : EndIf
+  If PmoOpsTypeOk(*Node, *X, "X", 13) = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*X)
+  If Rank < 1 Or Rank > 8 : ProcedureReturn PmoEmitNsFail(*Node, "the input rank must be one to eight.") : EndIf
+  If Opset >= 9
+    *S = PmoEmitConstant(*Ir, PmoEmitInput(*Node, 1))
+    If *S = 0 Or *S\ElementType <> 1 Or *S\Elements <> Rank : ProcedureReturn PmoEmitNsFail(*Node, "input scales must be a constant FLOAT tensor with one scale per axis.") : EndIf
+    For d = 0 To Rank - 1 : Scale(d) = PmoEmitConstF(*Ir, PmoEmitInput(*Node, 1), d, @Ok) : Next
+  Else
+    d = 0
+    ForEach *Node\Attributes()
+      If *Node\Attributes()\Name = "scales"
+        ForEach *Node\Attributes()\Floats()
+          If d < 8 : Scale(d) = *Node\Attributes()\Floats() : EndIf
+          d + 1
+        Next
+      EndIf
+    Next
+    If d <> Rank : ProcedureReturn PmoEmitNsFail(*Node, "attribute scales must hold one scale per axis.") : EndIf
+  EndIf
+  Linear = Bool(Mode = "linear")
+  For d = 0 To Rank - 1
+    If Scale(d) < 1.0 : ProcedureReturn PmoEmitNsFail(*Node, "scale " + StrF(Scale(d)) + " on axis " + Str(d) + " is below 1; Upsample only enlarges.") : EndIf
+    If Linear And d < Rank - 2 And Scale(d) <> 1.0 : ProcedureReturn PmoEmitNsFail(*Node, "linear mode is implemented over the last two axes (bilinear); axis " + Str(d) + " has scale " + StrF(Scale(d)) + ".") : EndIf
+  Next
+  If Linear And (*X\ElementType <> 1 Or Rank < 2) : ProcedureReturn PmoEmitNsFail(*Node, "linear mode is implemented for FLOAT inputs of rank two or more.") : EndIf
+  If *Y = 0 Or PmoEmitRank(*Y) <> Rank Or *Y\ElementType <> *X\ElementType : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must have the input's rank and element type.") : EndIf
+  For d = 0 To Rank - 1
+    If PmoEmitDim(*Y, d) <> Int(PmoEmitDim(*X, d) * Scale(d)) : ProcedureReturn PmoEmitNsFail(*Node, "the declared output extent on axis " + Str(d) + " is " + Str(PmoEmitDim(*Y, d)) + "; floor(input * scale) gives " + Str(Int(PmoEmitDim(*X, d) * Scale(d))) + ".") : EndIf
+  Next
+  PmoOpsHead(File, ProcName, *Node)
+  For d = 0 To Rank - 1
+    PmoEmitLine(File, "  PmOpDA(" + Str(d) + ") = " + Str(PmoEmitDim(*X, d)))
+    PmoEmitLine(File, "  PmOpDY(" + Str(d) + ") = " + Str(PmoEmitDim(*Y, d)))
+    PmoEmitLine(File, "  PmOpSetBits(@PmOpF(" + Str(d) + "), " + PmoOpsBits(Scale(d)) + ")")
+  Next
+  PmoEmitLine(File, "  PmOpUpsample(*i0, *o0, " + Str(Rank) + ", " + Str(Linear) + ", " + Str(PmoIrElementBytes(*X\ElementType)) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+; The activation codes of an RNN or GRU node (0 Sigmoid, 1 Tanh, 2 Relu), two
+; per direction, or "" with the refusal's reason.
+Procedure.s PmoOpsRecurrentActivations(*Node.PmoOnnxNode, Directions.i, Array Codes.i(1))
+  Protected Gru.i = Bool(*Node\Operation = "GRU"), Per.i, Count.i, i.i, Name.s, *A.PmoOnnxAttribute
+  Per = 1 + Gru
+  For i = 0 To 3
+    If Gru
+      If i % 2 = 0 : Codes(i) = 0 : Else : Codes(i) = 1 : EndIf
+    Else
+      Codes(i) = 1
+    EndIf
+  Next
+  ForEach *Node\Attributes()
+    If *Node\Attributes()\Name = "activations" : *A = @*Node\Attributes() : EndIf
+  Next
+  If *A = 0 : ProcedureReturn "" : EndIf
+  Count = ListSize(*A\Strings())
+  If Count <> Per * Directions : ProcedureReturn "attribute activations holds " + Str(Count) + " functions; " + *Node\Operation + " takes " + Str(Per) + " per direction, " + Str(Per * Directions) + " here." : EndIf
+  i = 0
+  ForEach *A\Strings()
+    Name = *A\Strings()
+    Select LCase(Name)
+      Case "sigmoid" : Codes((i / Per) * 2 + i % Per) = 0
+      Case "tanh" : Codes((i / Per) * 2 + i % Per) = 1
+      Case "relu" : Codes((i / Per) * 2 + i % Per) = 2
+      Default : ProcedureReturn "activation " + Name + " is not implemented; Sigmoid, Tanh and Relu are."
+    EndSelect
+    i + 1
+  Next
+  ProcedureReturn ""
+EndProcedure
+
+Procedure.i PmoEmitOpsRecurrent(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *W.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *R.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+  Protected *B.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 3))
+  Protected *L.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 4))
+  Protected *H0.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 5))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected *YH.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 1))
+  Protected Gru.i = Bool(*Node\Operation = "GRU"), G.i, D.i, T.q, Bt.q, I.q, H.q, Dir.s, DirCode.i, Reason.s, k.i, Allowed.s
+  Protected Dim Codes.i(3)
+  G = 1 + 2 * Gru
+  Allowed = "|activation_alpha|activation_beta|activations|clip|direction|hidden_size|layout|"
+  If Gru : Allowed + "linear_before_reset|" : EndIf
+  If PmoEmitNsAttributesAllowed(*Node, Allowed, Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitNsAttributePresent(*Node, "activation_alpha") Or PmoEmitNsAttributePresent(*Node, "activation_beta")
+    ProcedureReturn PmoEmitNsFail(*Node, "activation_alpha and activation_beta are not implemented; the activations implemented (Sigmoid, Tanh, Relu) take none.")
+  EndIf
+  If PmoEmitAttrI(*Node, "layout", 0) <> 0 : ProcedureReturn PmoEmitNsFail(*Node, "attribute layout = 1 (batch first) is not implemented; layout 0 is.") : EndIf
+  If PmoOpsTypeOk(*Node, *X, "X", 1) = 0 Or PmoOpsTypeOk(*Node, *W, "W", 1) = 0 Or PmoOpsTypeOk(*Node, *R, "R", 1) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitRank(*X) <> 3 Or PmoEmitRank(*W) <> 3 Or PmoEmitRank(*R) <> 3 : ProcedureReturn PmoEmitNsFail(*Node, "X, W and R must have rank three.") : EndIf
+  T = PmoEmitDim(*X, 0) : Bt = PmoEmitDim(*X, 1) : I = PmoEmitDim(*X, 2) : D = PmoEmitDim(*W, 0) : H = PmoEmitDim(*R, 2)
+  Dir = PmoEmitAttrS(*Node, "direction", "forward")
+  Select Dir
+    Case "forward" : DirCode = 0
+    Case "reverse" : DirCode = 1
+    Case "bidirectional" : DirCode = 2
+    Default : ProcedureReturn PmoEmitNsFail(*Node, "attribute direction = " + Dir + "; forward, reverse and bidirectional are.")
+  EndSelect
+  If D <> 1 + Bool(DirCode = 2) : ProcedureReturn PmoEmitNsFail(*Node, "W has " + Str(D) + " directions and direction = " + Dir + ".") : EndIf
+  If PmoEmitDim(*W, 1) <> G * H Or PmoEmitDim(*W, 2) <> I Or PmoEmitDim(*R, 0) <> D Or PmoEmitDim(*R, 1) <> G * H
+    ProcedureReturn PmoEmitNsFail(*Node, "W and R must be [" + Str(D) + ", " + Str(G * H) + ", input size] and [" + Str(D) + ", " + Str(G * H) + ", " + Str(H) + "].")
+  EndIf
+  If PmoEmitNsAttributePresent(*Node, "hidden_size") And PmoEmitAttrI(*Node, "hidden_size", 0) <> H : ProcedureReturn PmoEmitNsFail(*Node, "hidden_size does not match R.") : EndIf
+  If *B And (*B\ElementType <> 1 Or *B\Elements <> D * 2 * G * H) : ProcedureReturn PmoEmitNsFail(*Node, "B must be FLOAT [" + Str(D) + ", " + Str(2 * G * H) + "].") : EndIf
+  If *L And (*L\ElementType <> 6 Or *L\Elements <> Bt) : ProcedureReturn PmoEmitNsFail(*Node, "sequence_lens must be INT32 with one length per batch.") : EndIf
+  If *H0 And (*H0\ElementType <> 1 Or *H0\Elements <> D * Bt * H) : ProcedureReturn PmoEmitNsFail(*Node, "initial_h must be FLOAT [" + Str(D) + ", " + Str(Bt) + ", " + Str(H) + "].") : EndIf
+  If *Y And (*Y\ElementType <> 1 Or *Y\Elements <> T * D * Bt * H) : ProcedureReturn PmoEmitNsFail(*Node, "Y must be FLOAT [" + Str(T) + ", " + Str(D) + ", " + Str(Bt) + ", " + Str(H) + "].") : EndIf
+  If *YH And (*YH\ElementType <> 1 Or *YH\Elements <> D * Bt * H) : ProcedureReturn PmoEmitNsFail(*Node, "Y_h must be FLOAT [" + Str(D) + ", " + Str(Bt) + ", " + Str(H) + "].") : EndIf
+  Reason = PmoOpsRecurrentActivations(*Node, D, Codes())
+  If Reason <> "" : ProcedureReturn PmoEmitNsFail(*Node, Reason) : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(T))
+  PmoEmitLine(File, "  PmOpI(1) = " + Str(Bt))
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(I))
+  PmoEmitLine(File, "  PmOpI(3) = " + Str(H))
+  PmoEmitLine(File, "  PmOpI(4) = " + Str(D))
+  PmoEmitLine(File, "  PmOpI(5) = " + Str(DirCode))
+  PmoEmitLine(File, "  PmOpI(6) = " + Str(Gru))
+  PmoEmitLine(File, "  PmOpI(7) = " + Str(Bool(PmoEmitAttrI(*Node, "linear_before_reset", 0) <> 0)))
+  PmoEmitLine(File, "  PmOpI(8) = " + Str(PmoEmitNsAttributePresent(*Node, "clip")))
+  PmoEmitLine(File, "  PmOpSetBits(@PmOpF(0), " + PmoOpsBits(PmoEmitAttrF(*Node, "clip", 0.0)) + ")")
+  For k = 0 To 3 : PmoEmitLine(File, "  PmOpI(" + Str(10 + k) + ") = " + Str(Codes(k))) : Next
+  PmoEmitLine(File, "  PmOpRecurrent(*i0, *i1, *i2, " + PmoOpsIn(*Node, 3) + ", " + PmoOpsIn(*Node, 4) + ", " + PmoOpsIn(*Node, 5) + ", " + PmoOpsOut(*Node, 0) + ", " + PmoOpsOut(*Node, 1) +
+                    ", PmOnnxArenaBase + " + Str(*Ir\OpsScratchOffset) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsRoiAlign(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Rois.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *Idx.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Mode.s = PmoEmitAttrS(*Node, "mode", "avg"), Ctm.s, OH.q, OW.q, Half.i
+  If Opset >= 16
+    If PmoEmitNsAttributesAllowed(*Node, "|coordinate_transformation_mode|mode|output_height|output_width|sampling_ratio|spatial_scale|", Opset) = 0 : ProcedureReturn #False : EndIf
+    Ctm = PmoEmitAttrS(*Node, "coordinate_transformation_mode", "half_pixel")
+  Else
+    If PmoEmitNsAttributesAllowed(*Node, "|mode|output_height|output_width|sampling_ratio|spatial_scale|", Opset) = 0 : ProcedureReturn #False : EndIf
+    Ctm = "output_half_pixel"
+  EndIf
+  If Ctm <> "half_pixel" And Ctm <> "output_half_pixel" : ProcedureReturn PmoEmitNsFail(*Node, "attribute coordinate_transformation_mode = " + Ctm + "; half_pixel and output_half_pixel are.") : EndIf
+  If Mode <> "avg" And Mode <> "max" : ProcedureReturn PmoEmitNsFail(*Node, "attribute mode = " + Mode + "; avg and max are.") : EndIf
+  Half = Bool(Ctm = "half_pixel")
+  If PmoOpsTypeOk(*Node, *X, "X", 1) = 0 Or PmoOpsTypeOk(*Node, *Rois, "rois", 1) = 0 Or PmoOpsTypeOk(*Node, *Idx, "batch_indices", 4) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitRank(*X) <> 4 Or PmoEmitRank(*Rois) <> 2 Or PmoEmitDim(*Rois, 1) <> 4 Or *Idx\Elements <> PmoEmitDim(*Rois, 0)
+    ProcedureReturn PmoEmitNsFail(*Node, "X must be N x C x H x W, rois [num_rois, 4] and batch_indices [num_rois].")
+  EndIf
+  OH = PmoEmitAttrI(*Node, "output_height", 1) : OW = PmoEmitAttrI(*Node, "output_width", 1)
+  If OH < 1 Or OW < 1 Or PmoEmitAttrI(*Node, "sampling_ratio", 0) < 0 : ProcedureReturn PmoEmitNsFail(*Node, "output_height and output_width must be positive and sampling_ratio not negative.") : EndIf
+  If *Y = 0 Or *Y\ElementType <> 1 Or *Y\Elements <> PmoEmitDim(*Rois, 0) * PmoEmitDim(*X, 1) * OH * OW : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [num_rois, C, output_height, output_width].") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(PmoEmitDim(*X, 0)))
+  PmoEmitLine(File, "  PmOpI(1) = " + Str(PmoEmitDim(*X, 1)))
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(PmoEmitDim(*X, 2)))
+  PmoEmitLine(File, "  PmOpI(3) = " + Str(PmoEmitDim(*X, 3)))
+  PmoEmitLine(File, "  PmOpI(4) = " + Str(PmoEmitDim(*Rois, 0)))
+  PmoEmitLine(File, "  PmOpI(5) = " + Str(OH))
+  PmoEmitLine(File, "  PmOpI(6) = " + Str(OW))
+  PmoEmitLine(File, "  PmOpI(7) = " + Str(PmoEmitAttrI(*Node, "sampling_ratio", 0)))
+  PmoEmitLine(File, "  PmOpI(8) = " + Str(Bool(Mode = "max")))
+  PmoEmitLine(File, "  PmOpI(9) = " + Str(Half))
+  PmoEmitLine(File, "  PmOpSetBits(@PmOpF(0), " + PmoOpsBits(PmoEmitAttrF(*Node, "spatial_scale", 1.0)) + ")")
+  PmoEmitLine(File, "  If PmOpRoiAlign(*i0, *i1, *i2, *o0) <> 0 : PmOnnxRuntimeOk = 0 : EndIf")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
 ; One generated procedure for a node of these operators, registered in Calls.
 Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Calls.s())
   Protected ProcName.s = "PmOnnxNode" + Str(*Ref\Index), Opset.i = PmoEmitNsOpset(*Ir), Done.i, *Node.PmoOnnxNode = *Ref\Node
   If PmoOpsOpsetOk(*Node, Opset) = 0 : ProcedureReturn #False : EndIf
   Select *Node\Operation
     Case "Erf", "Reciprocal", "Ceil", "Sign", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish", "Gelu",
-         "ThresholdedRelu", "Shrink", "IsNaN", "IsInf"
+         "ThresholdedRelu", "Shrink", "IsNaN", "IsInf", "Tan", "Asin", "Acos", "Sinh", "Cosh", "Asinh", "Acosh", "Atanh", "BitwiseNot"
       Done = PmoEmitOpsUnary(File, *Ir, *Node, ProcName, Opset)
-    Case "Min", "Max", "Sum", "Mean", "Mod", "PRelu", "Or", "Xor"
+    Case "Min", "Max", "Sum", "Mean", "Mod", "PRelu", "Or", "Xor", "BitwiseAnd", "BitwiseOr", "BitwiseXor"
       Done = PmoEmitOpsVariadic(File, *Ir, *Node, ProcName, Opset)
+    Case "Hardmax", "LpNormalization" : Done = PmoEmitOpsAxisNorm(File, *Ir, *Node, ProcName, Opset)
+    Case "MeanVarianceNormalization" : Done = PmoEmitOpsMvn(File, *Ir, *Node, ProcName, Opset)
+    Case "LRN" : Done = PmoEmitOpsLrn(File, *Ir, *Node, ProcName, Opset)
+    Case "GroupNormalization" : Done = PmoEmitOpsGroupNorm(File, *Ir, *Node, ProcName, Opset)
+    Case "EyeLike" : Done = PmoEmitOpsEyeLike(File, *Ir, *Node, ProcName, Opset)
+    Case "Det" : Done = PmoEmitOpsDet(File, *Ir, *Node, ProcName, Opset)
+    Case "Compress" : Done = PmoEmitOpsCompress(File, *Ir, *Node, ProcName, Opset)
+    Case "ReverseSequence" : Done = PmoEmitOpsReverseSequence(File, *Ir, *Node, ProcName, Opset)
+    Case "Upsample" : Done = PmoEmitOpsUpsample(File, *Ir, *Node, ProcName, Opset)
+    Case "RNN", "GRU" : Done = PmoEmitOpsRecurrent(File, *Ir, *Node, ProcName, Opset)
+    Case "RoiAlign" : Done = PmoEmitOpsRoiAlign(File, *Ir, *Node, ProcName, Opset)
+    Case "NonMaxSuppression" : ProcedureReturn PmoEmitNsFail(*Node, "its output size depends on the scores, which the fixed-shape path cannot plan.")
     Case "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp"
       Done = PmoEmitOpsReduce(File, *Ir, *Node, ProcName, Opset)
     Case "ArgMax", "ArgMin" : Done = PmoEmitOpsArg(File, *Ir, *Node, ProcName, Opset)

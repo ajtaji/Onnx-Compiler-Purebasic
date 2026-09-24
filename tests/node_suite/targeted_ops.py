@@ -57,7 +57,17 @@ OPS = ("erf", "reciprocal", "ceil", "sign", "softplus", "softsign", "elu", "selu
        "xor", "reduce_min", "reduce_l1", "reduce_l2", "reduce_sum_square", "reduce_log_sum", "argmax", "argmin",
        "logsoftmax", "maxpool", "averagepool", "lppool", "globalmaxpool", "globalaveragepool", "globallppool", "split",
        "tile", "depthtospace", "spacetodepth", "tril", "triu", "gather_elements", "gathernd", "onehot", "einsum",
-       "dropout", "castlike", "size")
+       "dropout", "castlike", "size",
+       # second group (GroupNormalization is left out: its official cases are
+       # GroupNormalization-21, whose per-channel scale differs from 18's)
+       "tan", "asin", "acos", "sinh", "cosh", "asinh", "acosh", "atanh", "bitwise_not", "bitwise_and", "bitwise_or",
+       "bitwise_xor", "hardmax", "lpnormalization", "l1normalization", "l2normalization", "mvn", "lrn", "eyelike", "det",
+       "compress", "reversesequence", "upsample", "rnn", "simple_rnn", "gru", "nonmaxsuppression", "roialign")
+
+# re-imported official cases of a form that is refused, and the sentence that
+# must refuse them
+R20_REFUSED = {"r20_test_gru_batchwise": "attribute layout = 1 (batch first) is not implemented",
+               "r20_test_simple_rnn_batchwise": "attribute layout = 1 (batch first) is not implemented"}
 
 
 class Case:
@@ -83,6 +93,13 @@ def model_for(case: Case, symbolic: bool) -> onnx.ModelProto:
 
 
 def expected(case: Case, m: onnx.ModelProto):
+    if case.oracle == "ort":
+        # forms the reference evaluator does not implement (RNN and GRU with
+        # sequence lengths or two directions, NonMaxSuppression's options):
+        # onnxruntime alone decides
+        options = ort.SessionOptions()
+        options.log_severity_level = 4
+        return [np.asarray(v) for v in ort.InferenceSession(m.SerializeToString(), options, providers=["CPUExecutionProvider"]).run(None, case.feeds)]
     source = case.oracle(case.feeds) if case.oracle else ReferenceEvaluator(m).run(None, case.feeds)
     got = [np.asarray(x) for x in source]
     if ort is not None:
@@ -104,7 +121,8 @@ def expected(case: Case, m: onnx.ModelProto):
 
 def write(folder: Path, case: Case, symbolic: bool):
     m = model_for(case, symbolic)
-    onnx.checker.check_model(m)
+    if not any(n.op_type == "GroupNormalization" for n in m.graph.node):
+        onnx.checker.check_model(m)
     outs = [] if case.refuse else expected(case, m)
     ns.write_case(folder, m, [case.feeds[n] for n, _, _ in case.inputs], outs)
 
@@ -329,7 +347,193 @@ def cases() -> list[Case]:
     c.append(Case("castlike", [N("CastLike", ["x", "t"], ["y"])], [("x", F, [3, 4]), ("t", I64, [1])], [("y", I64, [3, 4])],
                   {"x": (dr * 10).astype(np.float32), "t": np.array([0], np.int64)}, opset=15))
     c.append(Case("size", [N("Size", ["x"], ["y"])], [("x", F, [3, 4])], [("y", I64, [])], {"x": dr}))
+
+    # ---- second group ------------------------------------------------------
+    u = RNG.uniform(-3, 3, (3, 4, 5)).astype(np.float32)
+    unary("tan", "Tan", feed=u)
+    unary("asin", "Asin", feed=RNG.uniform(-1, 1, (3, 4, 5)).astype(np.float32))
+    unary("acos", "Acos", feed=RNG.uniform(-1, 1, (3, 4, 5)).astype(np.float32))
+    unary("sinh", "Sinh", feed=(u * 2).astype(np.float32))
+    unary("cosh", "Cosh", feed=(u * 2).astype(np.float32))
+    unary("asinh", "Asinh", feed=(u * 3).astype(np.float32))
+    unary("acosh", "Acosh", feed=RNG.uniform(1, 6, (3, 4, 5)).astype(np.float32))
+    unary("atanh", "Atanh", feed=RNG.uniform(-0.95, 0.95, (3, 4, 5)).astype(np.float32))
+    bi = RNG.integers(-2 ** 40, 2 ** 40, (3, 4)).astype(np.int64)
+    bj = RNG.integers(-2 ** 40, 2 ** 40, (4,)).astype(np.int64)
+    unary("bitwise_not", "BitwiseNot", feed=bi, out=I64, elem=I64, opset=18)
+    for op in ("BitwiseAnd", "BitwiseOr", "BitwiseXor"):
+        c.append(Case(op.lower(), [N(op, ["a", "b"], ["y"])], [("a", I64, [3, 4]), ("b", I64, [4])], [("y", I64, [3, 4])],
+                      {"a": bi, "b": bj}, opset=18))
+    # the same with values the 32-bit targets' INT64 contract carries, so the
+    # Pico and Pico 2 run them too (the forms above are refused there at the
+    # request: their inputs leave the 32-bit range)
+    si = (bi >> 10).astype(np.int64)
+    sj = (bj >> 10).astype(np.int64)
+    unary("bitwise_not_int32_range", "BitwiseNot", feed=si, out=I64, elem=I64, opset=18)
+    for op in ("BitwiseAnd", "BitwiseOr", "BitwiseXor"):
+        c.append(Case(op.lower() + "_int32_range", [N(op, ["a", "b"], ["y"])], [("a", I64, [3, 4]), ("b", I64, [4])],
+                      [("y", I64, [3, 4])], {"a": si, "b": sj}, opset=18))
+    b32 = RNG.integers(-2 ** 30, 2 ** 30, (3, 4)).astype(np.int32)
+    c.append(Case("bitwise_and_int32", [N("BitwiseAnd", ["a", "b"], ["y"])], [("a", I32, [3, 4]), ("b", I32, [3, 4])],
+                  [("y", I32, [3, 4])], {"a": b32, "b": b32[::-1].copy()}, opset=18, fixed=False))
+    hm = RNG.integers(-3, 4, (2, 5, 3)).astype(np.float32)
+    c.append(Case("hardmax_default", [N("Hardmax", ["x"], ["y"])], [("x", F, [2, 5, 3])], [("y", F, [2, 5, 3])], {"x": hm}, opset=13))
+    c.append(Case("hardmax_axis1", [N("Hardmax", ["x"], ["y"], axis=1)], [("x", F, [2, 5, 3])], [("y", F, [2, 5, 3])], {"x": hm}, opset=13))
+    c.append(Case("hardmax_opset11_last", [N("Hardmax", ["x"], ["y"], axis=-1)], [("x", F, [2, 5, 3])], [("y", F, [2, 5, 3])], {"x": hm}, opset=11))
+    c.append(Case("refuse_hardmax_opset11_axis1", [N("Hardmax", ["x"], ["y"], axis=1)], [("x", F, [2, 5, 3])], [("y", F, [2, 5, 3])],
+                  {"x": hm}, opset=11, refuse="Hardmax"))
+    lp = f32(3, 4, 5)
+    lp[1, 2] = 0.0
+    def lp_oracle(axis, p):
+        def run(feeds):
+            x = feeds["x"].astype(np.float64)
+            n = np.sum(np.abs(x), axis=axis, keepdims=True) if p == 1 else np.sqrt(np.sum(x * x, axis=axis, keepdims=True))
+            return [np.where(n == 0, 0, x / np.where(n == 0, 1, n)).astype(np.float32)]
+        return run
+    c.append(Case("lpnormalization_p1_axis0", [N("LpNormalization", ["x"], ["y"], axis=0, p=1)], [("x", F, [3, 4, 5])], [("y", F, [3, 4, 5])],
+                  {"x": lp}, oracle=lp_oracle(0, 1)))
+    c.append(Case("lpnormalization_p2_default", [N("LpNormalization", ["x"], ["y"])], [("x", F, [3, 4, 5])], [("y", F, [3, 4, 5])],
+                  {"x": lp}, oracle=lp_oracle(-1, 2)))
+    mv = (f32(2, 3, 4, 5) * 2 + 1).astype(np.float32)
+    c.append(Case("mvn_default_axes", [N("MeanVarianceNormalization", ["x"], ["y"])], [("x", F, [2, 3, 4, 5])], [("y", F, [2, 3, 4, 5])],
+                  {"x": mv}, opset=13))
+    c.append(Case("mvn_axes_2_3", [N("MeanVarianceNormalization", ["x"], ["y"], axes=[2, 3])], [("x", F, [2, 3, 4, 5])],
+                  [("y", F, [2, 3, 4, 5])], {"x": mv}, opset=13))
+    lr = f32(2, 5, 3, 3)
+    def lrn_oracle(size, alpha, beta, bias):
+        def run(feeds):
+            x = feeds["x"].astype(np.float64)
+            sq = np.zeros_like(x)
+            for ch in range(x.shape[1]):
+                lo, hi = max(0, ch - (size - 1) // 2), min(x.shape[1], ch + int(np.ceil((size - 1) / 2)) + 1)
+                sq[:, ch] = np.sum(x[:, lo:hi] ** 2, axis=1)
+            return [(x / (bias + alpha / size * sq) ** beta).astype(np.float32)]
+        return run
+    c.append(Case("lrn_size3", [N("LRN", ["x"], ["y"], size=3, alpha=0.01, beta=0.75, bias=1.5)], [("x", F, [2, 5, 3, 3])],
+                  [("y", F, [2, 5, 3, 3])], {"x": lr}, oracle=lrn_oracle(3, 0.01, 0.75, 1.5)))
+    c.append(Case("lrn_size4_defaults", [N("LRN", ["x"], ["y"], size=4)], [("x", F, [2, 5, 3, 3])], [("y", F, [2, 5, 3, 3])], {"x": lr},
+                  oracle=lrn_oracle(4, 0.0001, 0.75, 1.0)))
+    gx = f32(2, 6, 4)
+    gs, gb = f32(3), f32(3)
+    def gn_oracle(feeds):
+        x = feeds["x"].astype(np.float64).reshape(2, 3, -1)
+        m = x.mean(axis=2, keepdims=True)
+        v = ((x - m) ** 2).mean(axis=2, keepdims=True)
+        y = (x - m) / np.sqrt(v + 1e-4) * gs.reshape(1, 3, 1) + gb.reshape(1, 3, 1)
+        return [y.reshape(2, 6, 4).astype(np.float32)]
+    # GroupNormalization-18 is marked deprecated in onnx 1.22 (GroupNormalization-21
+    # replaced it), so the checker refuses the model; the specification's formula decides
+    c.append(Case("groupnormalization", [N("GroupNormalization", ["x", "s", "b"], ["y"], num_groups=3, epsilon=1e-4)], [("x", F, [2, 6, 4])],
+                  [("y", F, [2, 6, 4])], {"x": gx}, [init("s", gs), init("b", gb)], opset=18, oracle=gn_oracle))
+    c.append(Case("eyelike_float_k1", [N("EyeLike", ["x"], ["y"], k=1, dtype=F)], [("x", I64, [3, 5])], [("y", F, [3, 5])],
+                  {"x": np.zeros((3, 5), np.int64)}))
+    c.append(Case("eyelike_int64_kneg", [N("EyeLike", ["x"], ["y"], k=-1)], [("x", I64, [4, 4])], [("y", I64, [4, 4])],
+                  {"x": np.zeros((4, 4), np.int64)}))
+    c.append(Case("det_batch", [N("Det", ["x"], ["y"])], [("x", F, [3, 3, 3])], [("y", F, [3])], {"x": f32(3, 3, 3)}))
+    cx = f32(3, 5)
+    c.append(Case("compress_axis1_constant", [N("Compress", ["x", "c"], ["y"], axis=1)], [("x", F, [3, 5])], [("y", F, [3, 3])],
+                  {"x": cx}, [init("c", np.array([True, False, True, True], bool))]))
+    c.append(Case("compress_flat_constant", [N("Compress", ["x", "c"], ["y"])], [("x", F, [3, 5])], [("y", F, [2])],
+                  {"x": cx}, [init("c", np.array([False, True, False, False, True], bool))]))
+    c.append(Case("compress_runtime_condition", [N("Compress", ["x", "c"], ["y"], axis=0)], [("x", F, [3, 5]), ("c", B, [3])],
+                  [("y", F, [2, 5])], {"x": cx, "c": np.array([True, False, True])}, fixed=False))
+    rs = f32(4, 3, 2)
+    c.append(Case("reversesequence_time_first", [N("ReverseSequence", ["x", "l"], ["y"], time_axis=0, batch_axis=1)],
+                  [("x", F, [4, 3, 2]), ("l", I64, [3])], [("y", F, [4, 3, 2])], {"x": rs, "l": np.array([4, 1, 3], np.int64)},
+                  symbolic_axes=(2,)))
+    c.append(Case("reversesequence_batch_first", [N("ReverseSequence", ["x", "l"], ["y"], time_axis=1, batch_axis=0)],
+                  [("x", F, [3, 4, 2]), ("l", I64, [3])], [("y", F, [3, 4, 2])], {"x": f32(3, 4, 2), "l": np.array([2, 4, 1], np.int64)},
+                  symbolic_axes=(2,)))
+    up = f32(1, 2, 3, 4)
+    c.append(Case("upsample_nearest_opset9", [N("Upsample", ["x", "s"], ["y"], mode="nearest")], [("x", F, [1, 2, 3, 4])],
+                  [("y", F, [1, 2, 6, 12])], {"x": up}, [init("s", np.array([1, 1, 2, 3], np.float32))], opset=9, dynamic=False))
+    def bilinear_oracle(sh, sw):
+        def run(feeds):
+            x = feeds["x"]
+            n, ch, h, w = x.shape
+            oh, ow = int(h * sh), int(w * sw)
+            y = np.empty((n, ch, oh, ow), np.float32)
+            for i in range(oh):
+                iy = min(i / sh, h - 1)
+                y1 = int(iy); y2 = min(y1 + 1, h - 1); dy1 = iy - y1; dy2 = 1 - dy1
+                for j in range(ow):
+                    ix = min(j / sw, w - 1)
+                    x1 = int(ix); x2 = min(x1 + 1, w - 1); dx1 = ix - x1; dx2 = 1 - dx1
+                    y[:, :, i, j] = dx2 * dy2 * x[:, :, y1, x1] + dx1 * dy2 * x[:, :, y1, x2] + dx2 * dy1 * x[:, :, y2, x1] + dx1 * dy1 * x[:, :, y2, x2]
+            return [y]
+        return run
+    c.append(Case("upsample_linear_opset9", [N("Upsample", ["x", "s"], ["y"], mode="linear")], [("x", F, [1, 2, 3, 4])],
+                  [("y", F, [1, 2, 6, 8])], {"x": up}, [init("s", np.array([1, 1, 2, 2], np.float32))], opset=9, dynamic=False,
+                  oracle=bilinear_oracle(2, 2)))
+    c.append(Case("upsample_attr_opset7", [N("Upsample", ["x"], ["y"], mode="nearest", scales=[1.0, 1.0, 2.0, 2.0])], [("x", F, [1, 2, 3, 4])],
+                  [("y", F, [1, 2, 6, 8])], {"x": up}, opset=7, dynamic=False,
+                  oracle=lambda feeds: [np.repeat(np.repeat(feeds["x"], 2, axis=2), 2, axis=3)]))
+    c.append(Case("refuse_upsample_runtime_dimensions", [N("Upsample", ["x", "s"], ["y"], mode="nearest")], [("x", F, [1, 2, 3, 4])],
+                  [("y", F, [1, 2, 6, 12])], {"x": up}, [init("s", np.array([1, 1, 2, 3], np.float32))], opset=9, fixed=False,
+                  refuse="Upsample is implemented by fixed-shape emission only"))
+    T, Bt, I, H = 5, 3, 4, 3
+    xs = f32(T, Bt, I)
+    def rnn_case(name, op, G, D, attrs, bias=False, lens=None, h0=False, outs=("Y", "Y_h"), oracle="ort"):
+        inits = [init("W", (f32(D, G * H, I) * 0.5).astype(np.float32)), init("R", (f32(D, G * H, H) * 0.5).astype(np.float32))]
+        ins = ["x", "W", "R"]
+        if bias or lens is not None or h0:
+            ins.append("B" if bias else "")
+            if bias:
+                inits.append(init("B", f32(D, 2 * G * H)))
+        if lens is not None or h0:
+            ins.append("L" if lens is not None else "")
+            if lens is not None:
+                inits.append(init("L", np.array(lens, np.int32)))
+        if h0:
+            ins.append("H0")
+            inits.append(init("H0", f32(D, Bt, H)))
+        shapes = {"Y": [T, D, Bt, H], "Y_h": [D, Bt, H]}
+        c.append(Case(name, [N(op, ins, list(outs), hidden_size=H, **attrs)], [("x", F, [T, Bt, I])],
+                      [(o, F, shapes[o]) for o in outs if o], {"x": xs}, inits, opset=14, oracle=oracle, symbolic_axes=(0,)))
+    rnn_case("rnn_forward", "RNN", 1, 1, {}, oracle=None)
+    rnn_case("rnn_bidirectional_bias_lens_h0", "RNN", 1, 2, {"direction": "bidirectional"}, bias=True, lens=[5, 2, 4], h0=True)
+    rnn_case("rnn_relu_reverse", "RNN", 1, 1, {"direction": "reverse", "activations": ["Relu"]}, bias=True)
+    rnn_case("gru_forward", "GRU", 3, 1, {}, oracle=None)
+    rnn_case("gru_linear_before_reset", "GRU", 3, 1, {"linear_before_reset": 1}, bias=True, oracle=None)
+    rnn_case("gru_bidirectional_lens_h0", "GRU", 3, 2, {"direction": "bidirectional"}, bias=True, lens=[5, 3, 1], h0=True)
+    rnn_case("gru_y_h_only_clip", "GRU", 3, 1, {"clip": 0.5, "direction": "reverse"}, bias=True, outs=("", "Y_h"))
+    boxes = np.array([[[0.0, 0.0, 1.0, 1.0], [0.0, 0.1, 1.0, 1.1], [0.0, -0.1, 1.0, 0.9], [0.0, 10.0, 1.0, 11.0],
+                       [0.0, 10.1, 1.0, 11.1], [0.0, 100.0, 1.0, 101.0]]], np.float32)
+    scores = np.array([[[0.9, 0.75, 0.6, 0.95, 0.5, 0.3], [0.1, 0.8, 0.7, 0.2, 0.9, 0.95]]], np.float32)
+    for center, name in ((0, "corners"), (1, "center")):
+        bx = boxes if center == 0 else np.array([[[0.5, 0.5, 1.0, 1.0], [0.5, 0.6, 1.0, 1.0], [0.5, 0.4, 1.0, 1.0], [0.5, 10.5, 1.0, 1.0],
+                                                   [0.5, 10.6, 1.0, 1.0], [0.5, 100.5, 1.0, 1.0]]], np.float32)
+        c.append(Case("nms_" + name, [N("NonMaxSuppression", ["b", "s", "m", "i", "t"], ["y"], center_point_box=center)],
+                      [("b", F, [1, 6, 4]), ("s", F, [1, 2, 6])], [("y", I64, [None, 3])], {"b": bx, "s": scores},
+                      [init("m", np.array([3], np.int64)), init("i", np.array([0.5], np.float32)), init("t", np.array([0.2], np.float32))],
+                      opset=11, symbolic_axes=()))
+    c.append(Case("nms_no_threshold", [N("NonMaxSuppression", ["b", "s", "m"], ["y"])], [("b", F, [1, 6, 4]), ("s", F, [1, 2, 6])],
+                  [("y", I64, [None, 3])], {"b": boxes, "s": scores}, [init("m", np.array([2], np.int64))], opset=11, symbolic_axes=(), oracle="ort"))
+    rx = f32(2, 3, 6, 7)
+    rois = np.array([[0.5, 0.2, 4.0, 5.5], [-1.0, -0.5, 7.5, 6.5], [2.0, 2.0, 2.2, 2.6]], np.float32)
+    ri2 = np.array([0, 1, 1], np.int64)
+    for mode in ("avg", "max"):
+        c.append(Case("roialign_" + mode, [N("RoiAlign", ["x", "r", "i"], ["y"], mode=mode, output_height=3, output_width=4, sampling_ratio=2)],
+                      [("x", F, [2, 3, 6, 7]), ("r", F, [3, 4]), ("i", I64, [3])], [("y", F, [3, 3, 3, 4])], {"x": rx, "r": rois, "i": ri2},
+                      opset=16, symbolic_axes=(0,)))
+    c.append(Case("roialign_output_half_pixel_adaptive", [N("RoiAlign", ["x", "r", "i"], ["y"], output_height=2, output_width=2, spatial_scale=0.5)],
+                  [("x", F, [2, 3, 6, 7]), ("r", F, [3, 4]), ("i", I64, [3])], [("y", F, [3, 3, 2, 2])], {"x": rx, "r": rois * 2, "i": ri2},
+                  opset=10, dynamic=False, oracle=roialign_legacy))
     return c
+
+
+def roialign_legacy(feeds):
+    # the reference evaluator applies the opset-16 default (half_pixel) to an
+    # opset-10 node, whose only behaviour is output_half_pixel: run the same
+    # node at opset 16 with that mode spelled out
+    node = helper.make_node("RoiAlign", ["x", "r", "i"], ["y"], output_height=2, output_width=2, spatial_scale=0.5,
+                            coordinate_transformation_mode="output_half_pixel")
+    g = helper.make_graph([node], "g", [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3, 6, 7]),
+                                        helper.make_tensor_value_info("r", TensorProto.FLOAT, [3, 4]),
+                                        helper.make_tensor_value_info("i", TensorProto.INT64, [3])],
+                          [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 16)])
+    return ReferenceEvaluator(m).run(None, feeds)
 
 
 def reexported(node_dir: Path, corpus: Path) -> list[tuple[str, str | None]]:
@@ -386,10 +590,13 @@ def main() -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         records = list(pool.map(lambda t: (t[1], ns.run_case(corpus / t[0], t[0], args.work / "cases", tools, set(), False)), todo))
     bad = 0
-    tally = {"pass": 0, "type": 0, "expanded": 0}
+    tally = {"pass": 0, "type": 0, "expanded": 0, "form": 0}
     for refuse, r in sorted(records, key=lambda t: t[1]["case"]):
+        if refuse is None:
+            refuse = R20_REFUSED.get(r["case"])
         if refuse is not None:
             ok = r["outcome"] == "REFUSED" and refuse in r["detail"]
+            tally["form"] += 1 if ok and r["case"].startswith("r20_") else 0
         elif r["case"].startswith("r20_") and r["outcome"] == "REFUSED" and any(
                 t in r["detail"] for t in ("unsupported ONNX type", "unsupported runtime type", "float8", "is not implemented by fixed-shape emission; it casts to",
                                            "element type", "ONNX tensor type")):
@@ -408,7 +615,8 @@ def main() -> int:
         bad += 0 if ok else 1
         print("%-4s %-58s %-12s %-18s %s" % ("ok" if ok else "BAD", r["case"], r["outcome"], r.get("path") or "", r["detail"][:260]))
     print("ops: %d of %d as expected; re-imported official cases: %d PASS, %d refused for their element type, %d function-expanded "
-          "without intermediate shapes" % (len(records) - bad, len(records), tally["pass"], tally["type"], tally["expanded"]))
+          "without intermediate shapes, %d refused for a form not implemented" % (len(records) - bad, len(records), tally["pass"],
+                                                                                  tally["type"], tally["expanded"], tally["form"]))
     return 0 if bad == 0 else 1
 
 

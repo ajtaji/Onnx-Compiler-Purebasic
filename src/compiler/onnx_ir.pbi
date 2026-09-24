@@ -80,6 +80,8 @@ Structure PmoIrModel
   StftScratchOffset.q
   StftScratchBytes.q
   StftScratchComplex.q
+  OpsScratchOffset.q
+  OpsScratchBytes.q
   WeightBytes.q
   WeightDataBytes.q
 EndStructure
@@ -121,7 +123,8 @@ Procedure.i PmoIrCompileTimeInput(Operation.s, Position.i)
     ; The operator set completed in onnx_emit_ops.pbi: inputs that decide
     ; shapes or the form (Split's sizes, Tile's repeats, OneHot's depth, a
     ; reduction's axes, Dropout's ratio and training_mode).
-    Case "Split", "Tile", "OneHot", "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp"
+    Case "Split", "Tile", "OneHot", "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp",
+         "Compress", "Upsample"
       ProcedureReturn Bool(Position = 1)
     Case "Dropout"
       ProcedureReturn Bool(Position = 1 Or Position = 2)

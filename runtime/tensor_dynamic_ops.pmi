@@ -77,6 +77,11 @@ Procedure DOpUnary(Y.i, A.i, Op.i)
       DFail("Sign computes FLOAT, INT32 and INT64 tensors only.")
       ProcedureReturn
     EndIf
+  ElseIf Op = 27
+    If DOpKindOk(kind, 6) = 0
+      DFail("BitwiseNot computes INT32 and INT64 tensors only.")
+      ProcedureReturn
+    EndIf
   ElseIf kind <> 1
     DFail("This elementwise operator computes FLOAT tensors only.")
     ProcedureReturn
@@ -1039,4 +1044,522 @@ Procedure DOpSize(Y.i, A.i)
     ProcedureReturn
   EndIf
   PmTensorPutI64(Dt(Y)\Data, 0, Dt(A)\Count)
+EndProcedure
+
+; The axis of a FLOAT input of rank one or more, inside its rank, or -1.
+Procedure.i DOpFloatAxis(A.i, Axis.i)
+  If A = 0
+    ProcedureReturn -1
+  EndIf
+  If Dt(A)\Kind <> 1 Or Dt(A)\Rank < 1
+    ProcedureReturn -1
+  EndIf
+  If Axis < 0
+    Axis = Axis + Dt(A)\Rank
+  EndIf
+  If Axis < 0 Or Axis >= Dt(A)\Rank
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn Axis
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Hardmax-13 and LpNormalization-1 (P 1 or 2) along Axis, FLOAT.
+; ----------------------------------------------------------------------
+Procedure DOpHardmax(Y.i, A.i, Axis.i)
+  Protected rank.i
+  Axis = DOpFloatAxis(A, Axis)
+  If Axis < 0
+    DFail("Hardmax takes a FLOAT input of rank one or more and an axis inside its rank.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, A, 0) = 0
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  If Dt(A)\Count > 0
+    PmOpHardmax(Dt(A)\Data, Dt(Y)\Data, DProduct(A, 0, Axis - 1), DOpDim(A, Axis), DProduct(A, Axis + 1, rank - 1))
+  EndIf
+EndProcedure
+
+Procedure DOpLpNorm(Y.i, A.i, Axis.i, P.i)
+  Protected rank.i
+  Axis = DOpFloatAxis(A, Axis)
+  If Axis < 0
+    DFail("LpNormalization takes a FLOAT input of rank one or more and an axis inside its rank.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, A, 0) = 0
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  PmOpLpNorm(Dt(A)\Data, Dt(Y)\Data, DProduct(A, 0, Axis - 1), DOpDim(A, Axis), DProduct(A, Axis + 1, rank - 1), P)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MeanVarianceNormalization-13: PmOpT(0) axes given (0: the default
+; [0, 2, 3]), PmOpT(1 ..) the axes.
+; ----------------------------------------------------------------------
+Procedure DOpMvn(Y.i, A.i)
+  Protected rank.i
+  Protected mask.i
+  Protected i.i
+  Protected axis.i
+  If A = 0
+    DFail("MeanVarianceNormalization requires an input.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind <> 1
+    DFail("MeanVarianceNormalization computes FLOAT tensors only.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  mask = 0
+  If PmOpT(0) = 0
+    If rank < 4
+      DFail("MeanVarianceNormalization's default axes [0, 2, 3] need an input of rank four or more.")
+      ProcedureReturn
+    EndIf
+    mask = 13
+  EndIf
+  i = 0
+  While i < PmOpT(0)
+    axis = PmOpT(1 + i)
+    If axis < 0
+      axis = axis + rank
+    EndIf
+    If axis < 0 Or axis >= rank
+      DFail("A MeanVarianceNormalization axis is outside the input rank.")
+      ProcedureReturn
+    EndIf
+    mask = mask | (1 << axis)
+    i = i + 1
+  Wend
+  If DLike(Y, A, 0) = 0
+    ProcedureReturn
+  EndIf
+  i = 0
+  While i < rank
+    PmOpDA(i) = DOpDim(A, i)
+    i = i + 1
+  Wend
+  PmOpMvn(Dt(A)\Data, Dt(Y)\Data, rank, mask)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; LRN-13 (PmOpF(0..2) alpha, beta, bias set by the call) and
+; GroupNormalization-18 (PmOpF(0) epsilon).
+; ----------------------------------------------------------------------
+Procedure DOpLrn(Y.i, A.i, Size.i)
+  If A = 0
+    DFail("LRN requires an input.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind <> 1 Or Dt(A)\Rank < 3
+    DFail("LRN takes a FLOAT input N x C x D1 ... Dk.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, A, 0) = 0
+    ProcedureReturn
+  EndIf
+  PmOpLrn(Dt(A)\Data, Dt(Y)\Data, DOpDim(A, 0), DOpDim(A, 1), DProduct(A, 2, Dt(A)\Rank - 1), Size)
+EndProcedure
+
+Procedure DOpGroupNorm(Y.i, A.i, S.i, B.i, Groups.i)
+  If A = 0 Or S = 0 Or B = 0
+    DFail("GroupNormalization requires X, scale and bias.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind <> 1 Or Dt(S)\Kind <> 1 Or Dt(B)\Kind <> 1 Or Dt(A)\Rank < 3
+    DFail("GroupNormalization takes FLOAT X (N x C x D1 ... Dn), scale and bias.")
+    ProcedureReturn
+  EndIf
+  If Groups < 1 Or DOpDim(A, 1) % Groups <> 0 Or Dt(S)\Count <> Groups Or Dt(B)\Count <> Groups
+    DFail("GroupNormalization num_groups must divide the channels, and scale and bias hold one value per group.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, A, 0) = 0
+    ProcedureReturn
+  EndIf
+  PmOpGroupNorm(Dt(A)\Data, Dt(S)\Data, Dt(B)\Data, Dt(Y)\Data, DOpDim(A, 0), DOpDim(A, 1), DProduct(A, 2, Dt(A)\Rank - 1), Groups)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; EyeLike-9 (Kind 0: the input's element type), Det-11.
+; ----------------------------------------------------------------------
+Procedure DOpEyeLike(Y.i, A.i, Kind.i, K.i)
+  If A = 0
+    DFail("EyeLike requires an input.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Rank <> 2
+    DFail("EyeLike takes a two-dimensional input.")
+    ProcedureReturn
+  EndIf
+  If Kind = 0
+    Kind = Dt(A)\Kind
+  EndIf
+  If DOpKindOk(Kind, 15) = 0
+    DFail("EyeLike makes FLOAT, INT32, INT64 and BOOL tensors only.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, A, Kind) = 0
+    ProcedureReturn
+  EndIf
+  PmOpEyeLike(Dt(Y)\Data, DOpDim(A, 0), DOpDim(A, 1), K, Kind)
+EndProcedure
+
+Procedure DOpDet(Y.i, A.i)
+  Protected Dim dims.i(8)
+  Protected rank.i
+  Protected n.i
+  Protected d.i
+  Protected scratch.i
+  If A = 0
+    DFail("Det requires an input.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  If Dt(A)\Kind <> 1 Or rank < 2
+    DFail("Det takes FLOAT square matrices, [*, M, M].")
+    ProcedureReturn
+  EndIf
+  n = DOpDim(A, rank - 1)
+  If DOpDim(A, rank - 2) <> n
+    DFail("Det takes FLOAT square matrices, [*, M, M].")
+    ProcedureReturn
+  EndIf
+  d = 0
+  While d < rank - 2
+    dims(d) = DOpDim(A, d)
+    d = d + 1
+  Wend
+  If DAlloc(Y, 1, rank - 2, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  If Dt(Y)\Count = 0
+    ProcedureReturn
+  EndIf
+  scratch = DNsScratch(n * n * 4)
+  If scratch = 0
+    ProcedureReturn
+  EndIf
+  PmOpDet(Dt(A)\Data, Dt(Y)\Data, Dt(Y)\Count, n, scratch)
+  DNsScratchFree(scratch, n * n * 4)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Compress-11 (HasAxis 0: the flattened input) and ReverseSequence-10.
+; ----------------------------------------------------------------------
+Procedure DOpCompress(Y.i, A.i, Cond.i, Axis.i, HasAxis.i)
+  Protected Dim dims.i(8)
+  Protected rank.i
+  Protected outer.i
+  Protected width.i
+  Protected inner.i
+  Protected kept.i
+  Protected i.i
+  If A = 0 Or Cond = 0
+    DFail("Compress requires input and condition.")
+    ProcedureReturn
+  EndIf
+  If Dt(Cond)\Kind <> 9 Or Dt(Cond)\Rank <> 1
+    DFail("Compress condition must be a one-dimensional BOOL tensor.")
+    ProcedureReturn
+  EndIf
+  If DOpKindOk(Dt(A)\Kind, 15) = 0
+    DFail("Compress computes FLOAT, INT32, INT64 and BOOL tensors only.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  If HasAxis = 0
+    outer = 1
+    width = Dt(A)\Count
+    inner = 1
+  Else
+    If Axis < 0
+      Axis = Axis + rank
+    EndIf
+    If Axis < 0 Or Axis >= rank
+      DFail("Compress axis is outside the input rank.")
+      ProcedureReturn
+    EndIf
+    outer = DProduct(A, 0, Axis - 1)
+    width = DOpDim(A, Axis)
+    inner = DProduct(A, Axis + 1, rank - 1)
+  EndIf
+  If Dt(Cond)\Count > width
+    DFail("Compress condition is longer than the axis it selects from.")
+    ProcedureReturn
+  EndIf
+  kept = 0
+  i = 0
+  While i < Dt(Cond)\Count
+    If PeekA(Dt(Cond)\Data + i) <> 0
+      kept = kept + 1
+    EndIf
+    i = i + 1
+  Wend
+  If HasAxis = 0
+    dims(0) = kept
+    If DAlloc(Y, Dt(A)\Kind, 1, @dims(0)) = 0
+      ProcedureReturn
+    EndIf
+  Else
+    i = 0
+    While i < rank
+      dims(i) = DOpDim(A, i)
+      i = i + 1
+    Wend
+    dims(Axis) = kept
+    If DAlloc(Y, Dt(A)\Kind, rank, @dims(0)) = 0
+      ProcedureReturn
+    EndIf
+  EndIf
+  If Dt(Y)\Count > 0
+    PmOpCompress(Dt(A)\Data, Dt(Cond)\Data, Dt(Y)\Data, outer, width, inner, PmOpKindBytes(Dt(A)\Kind), Dt(Cond)\Count)
+  EndIf
+EndProcedure
+
+Procedure DOpReverseSequence(Y.i, A.i, Lens.i, TimeAxis.i, BatchAxis.i)
+  Protected rank.i
+  If A = 0 Or Lens = 0
+    DFail("ReverseSequence requires input and sequence_lens.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  If rank < 2 Or DOpKindOk(Dt(A)\Kind, 15) = 0 Or Dt(Lens)\Kind <> 7
+    DFail("ReverseSequence takes a FLOAT, INT32, INT64 or BOOL input of rank two or more and INT64 sequence_lens.")
+    ProcedureReturn
+  EndIf
+  If Dt(Lens)\Count <> DOpDim(A, BatchAxis)
+    DFail("ReverseSequence sequence_lens must hold one length per batch.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, A, 0) = 0
+    ProcedureReturn
+  EndIf
+  If PmOpReverseSequence(Dt(A)\Data, Dt(Lens)\Data, Dt(Y)\Data, DOpDim(A, 0), DOpDim(A, 1), DProduct(A, 2, rank - 1), Bool(TimeAxis = 0), PmOpKindBytes(Dt(A)\Kind), 7) <> 0
+    DFail("ReverseSequence sequence length is outside 0 .. the time extent.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+; RNN-14 and GRU-14 (Gru 1), layout 0. The call has set PmOpI(5) direction,
+; 7 linear_before_reset, 8 clip given, 10 .. 13 the activations and
+; PmOpF(0) clip; the shapes are checked and set here.
+; ----------------------------------------------------------------------
+Procedure DOpRecurrent(Y.i, YH.i, X.i, W.i, R.i, B.i, L.i, H0.i, Gru.i)
+  Protected Dim dims.i(8)
+  Protected steps.i
+  Protected batch.i
+  Protected isz.i
+  Protected hsz.i
+  Protected dirs.i
+  Protected gates.i
+  Protected bytes.i
+  Protected scratch.i
+  Protected yAt.i
+  Protected yhAt.i
+  If X = 0 Or W = 0 Or R = 0
+    DFail("RNN and GRU require X, W and R.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(W)\Kind <> 1 Or Dt(R)\Kind <> 1 Or Dt(X)\Rank <> 3 Or Dt(W)\Rank <> 3 Or Dt(R)\Rank <> 3
+    DFail("RNN and GRU take FLOAT X, W and R of rank three.")
+    ProcedureReturn
+  EndIf
+  gates = 1
+  If Gru <> 0
+    gates = 3
+  EndIf
+  steps = DOpDim(X, 0)
+  batch = DOpDim(X, 1)
+  isz = DOpDim(X, 2)
+  dirs = DOpDim(W, 0)
+  hsz = DOpDim(R, 2)
+  If dirs <> 1 + Bool(PmOpI(5) = 2) Or DOpDim(W, 1) <> gates * hsz Or DOpDim(W, 2) <> isz Or DOpDim(R, 0) <> dirs Or DOpDim(R, 1) <> gates * hsz
+    DFail("RNN and GRU weights do not match the input, the hidden size and the direction.")
+    ProcedureReturn
+  EndIf
+  If B <> 0
+    If Dt(B)\Kind <> 1 Or Dt(B)\Count <> dirs * 2 * gates * hsz
+      DFail("RNN and GRU B must be FLOAT [directions, 2 * gates * hidden].")
+      ProcedureReturn
+    EndIf
+  EndIf
+  If L <> 0
+    If Dt(L)\Kind <> 6 Or Dt(L)\Count <> batch
+      DFail("RNN and GRU sequence_lens must be INT32 with one length per batch.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  If H0 <> 0
+    If Dt(H0)\Kind <> 1 Or Dt(H0)\Count <> dirs * batch * hsz
+      DFail("RNN and GRU initial_h must be FLOAT [directions, batch, hidden].")
+      ProcedureReturn
+    EndIf
+  EndIf
+  yAt = 0
+  yhAt = 0
+  If Y <> 0
+    dims(0) = steps
+    dims(1) = dirs
+    dims(2) = batch
+    dims(3) = hsz
+    If DAlloc(Y, 1, 4, @dims(0)) = 0
+      ProcedureReturn
+    EndIf
+    yAt = Dt(Y)\Data
+  EndIf
+  If YH <> 0
+    dims(0) = dirs
+    dims(1) = batch
+    dims(2) = hsz
+    If DAlloc(YH, 1, 3, @dims(0)) = 0
+      ProcedureReturn
+    EndIf
+    yhAt = Dt(YH)\Data
+  EndIf
+  bytes = (dirs * batch * hsz + 3 * hsz) * 4
+  scratch = DNsScratch(bytes)
+  If scratch = 0
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = steps
+  PmOpI(1) = batch
+  PmOpI(2) = isz
+  PmOpI(3) = hsz
+  PmOpI(4) = dirs
+  PmOpI(6) = Gru
+  If B <> 0
+    B = Dt(B)\Data
+  EndIf
+  If L <> 0
+    L = Dt(L)\Data
+  EndIf
+  If H0 <> 0
+    H0 = Dt(H0)\Data
+  EndIf
+  PmOpRecurrent(Dt(X)\Data, Dt(W)\Data, Dt(R)\Data, B, L, H0, yAt, yhAt, scratch)
+  DNsScratchFree(scratch, bytes)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; NonMaxSuppression-11. The selected triples are gathered in scratch, then
+; the INT64 output [selected, 3] is allocated and filled.
+; ----------------------------------------------------------------------
+Procedure DOpNms(Y.i, Boxes.i, Scores.i, MaxOut.i, Iou.i, ScoreThr.i, Center.i)
+  Protected Dim dims.i(8)
+  Protected nb.i
+  Protected nc.i
+  Protected n.i
+  Protected limit.i
+  Protected selBytes.i
+  Protected orderBytes.i
+  Protected sel.i
+  Protected order.i
+  Protected count.i
+  If Boxes = 0 Or Scores = 0
+    DFail("NonMaxSuppression requires boxes and scores.")
+    ProcedureReturn
+  EndIf
+  If Dt(Boxes)\Kind <> 1 Or Dt(Scores)\Kind <> 1 Or Dt(Boxes)\Rank <> 3 Or Dt(Scores)\Rank <> 3
+    DFail("NonMaxSuppression takes FLOAT boxes [B, N, 4] and scores [B, C, N].")
+    ProcedureReturn
+  EndIf
+  nb = DOpDim(Boxes, 0)
+  n = DOpDim(Boxes, 1)
+  nc = DOpDim(Scores, 1)
+  If DOpDim(Boxes, 2) <> 4 Or DOpDim(Scores, 0) <> nb Or DOpDim(Scores, 2) <> n
+    DFail("NonMaxSuppression takes FLOAT boxes [B, N, 4] and scores [B, C, N].")
+    ProcedureReturn
+  EndIf
+  limit = 0
+  If MaxOut <> 0
+    If Dt(MaxOut)\Kind <> 7 Or Dt(MaxOut)\Count <> 1
+      DFail("NonMaxSuppression max_output_boxes_per_class must be one INT64 element.")
+      ProcedureReturn
+    EndIf
+    limit = DInt(MaxOut, 0)
+    If limit < 0
+      limit = 0
+    EndIf
+  EndIf
+  PmOpF(0) = 0.0
+  PmOpF(1) = 0.0
+  PmOpI(4) = 0
+  If Iou <> 0
+    If Dt(Iou)\Kind <> 1 Or Dt(Iou)\Count <> 1
+      DFail("NonMaxSuppression iou_threshold must be one FLOAT element.")
+      ProcedureReturn
+    EndIf
+    PmOpF(0) = PmTensorGet(Dt(Iou)\Data, 0)
+  EndIf
+  If ScoreThr <> 0
+    If Dt(ScoreThr)\Kind <> 1 Or Dt(ScoreThr)\Count <> 1
+      DFail("NonMaxSuppression score_threshold must be one FLOAT element.")
+      ProcedureReturn
+    EndIf
+    PmOpF(1) = PmTensorGet(Dt(ScoreThr)\Data, 0)
+    PmOpI(4) = 1
+  EndIf
+  PmOpI(0) = nb
+  PmOpI(1) = nc
+  PmOpI(2) = n
+  PmOpI(3) = limit
+  PmOpI(5) = Bool(Center <> 0)
+  selBytes = nb * nc * n * 24 + 8
+  orderBytes = 3 * n * 4 + 4
+  sel = DNsScratch(selBytes)
+  If sel = 0
+    ProcedureReturn
+  EndIf
+  order = DNsScratch(orderBytes)
+  If order = 0
+    DNsScratchFree(sel, selBytes)
+    ProcedureReturn
+  EndIf
+  count = PmOpNms(Dt(Boxes)\Data, Dt(Scores)\Data, sel, order)
+  dims(0) = count
+  dims(1) = 3
+  If DAlloc(Y, 7, 2, @dims(0)) <> 0
+    PmOpCopyBytes(sel, Dt(Y)\Data, count * 24)
+  EndIf
+  DNsScratchFree(order, orderBytes)
+  DNsScratchFree(sel, selBytes)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; RoiAlign-16. The call has set PmOpI(5 .. 9) and PmOpF(0).
+; ----------------------------------------------------------------------
+Procedure DOpRoiAlign(Y.i, X.i, Rois.i, Idx.i)
+  Protected Dim dims.i(8)
+  If X = 0 Or Rois = 0 Or Idx = 0
+    DFail("RoiAlign requires X, rois and batch_indices.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(X)\Rank <> 4 Or Dt(Rois)\Kind <> 1 Or Dt(Rois)\Rank <> 2 Or Dt(Idx)\Kind <> 7
+    DFail("RoiAlign takes FLOAT X [N, C, H, W], FLOAT rois [R, 4] and INT64 batch_indices [R].")
+    ProcedureReturn
+  EndIf
+  If DOpDim(Rois, 1) <> 4 Or Dt(Idx)\Count <> DOpDim(Rois, 0)
+    DFail("RoiAlign takes FLOAT X [N, C, H, W], FLOAT rois [R, 4] and INT64 batch_indices [R].")
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = DOpDim(X, 0)
+  PmOpI(1) = DOpDim(X, 1)
+  PmOpI(2) = DOpDim(X, 2)
+  PmOpI(3) = DOpDim(X, 3)
+  PmOpI(4) = DOpDim(Rois, 0)
+  dims(0) = PmOpI(4)
+  dims(1) = PmOpI(1)
+  dims(2) = PmOpI(5)
+  dims(3) = PmOpI(6)
+  If DAlloc(Y, 1, 4, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  If PmOpRoiAlign(Dt(X)\Data, Dt(Rois)\Data, Dt(Idx)\Data, Dt(Y)\Data) <> 0
+    DFail("RoiAlign batch index is outside the input's batch.")
+  EndIf
 EndProcedure

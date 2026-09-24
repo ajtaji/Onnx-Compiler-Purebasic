@@ -432,6 +432,56 @@ are not known when the source is written); pooling with explicit pads and
 an auto_pad; and on the Pico and Pico 2, an INT64 Sum, PRelu, ReduceL1 or
 ReduceSumSquare whose result the 32-bit INT64 contract cannot prove in range.
 
+## Operator set, second group — September 24, 2026
+
+Twenty-six more operators, on both paths and for every target unless noted:
+Tan, Asin, Acos, Sinh, Cosh, Asinh, Acosh and Atanh; BitwiseNot,
+BitwiseAnd, BitwiseOr and BitwiseXor on INT32 and INT64; Hardmax,
+LpNormalization, MeanVarianceNormalization, LRN and GroupNormalization
+(opset 18 to 20); EyeLike and Det; Compress and ReverseSequence; RNN and GRU
+(forward, reverse and bidirectional, sequence lengths, initial state, clip,
+the Sigmoid, Tanh and Relu activations, GRU's linear_before_reset);
+RoiAlign (avg and max, half_pixel and output_half_pixel);
+NonMaxSuppression, always on the runtime-dimension path because its output
+size depends on the scores; and Upsample, opset 7 to 9, fixed shapes only
+(nearest on any axes, linear on the last two). Their kernels join the first group's
+in `runtime/tensor_ops.pmi` under the same three rules. tan reduces its
+argument by pi/2 in integer arithmetic against 288 bits of 2/pi, so a large
+argument keeps its quadrant on every target; asin and acos use a fitted
+polynomial; the hyperbolic functions are built on the file's exp,
+expm1, log and log1p.
+
+A node whose first output is left out (a GRU or RNN listing only `Y_h`)
+now builds on the fixed-shape path: the generated procedure receives the
+null address for it, as forum 988 made it for the other positions.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 268 kernel cases - the first group's 189, and tan, asin, acos and the hyperbolic functions over special values, branch boundaries and large arguments; the bitwise operators; Hardmax with a tie; every normalization on several axes; LRN with even and odd sizes; Det with pivoting and singular matrices; RNN and GRU in every direction with lengths; NonMaxSuppression with both box formats; RoiAlign in both modes; Upsample - against the numpy definition | Windows, Pi 4 (A64 in unicorn), Pico and Pico 2 (Thumb in unicorn): 268 of 268 bit-identical on every target |
+| The same with `--mutants`: 28 planted defects, the first group's 18 and ten more (tan's reduction started at the wrong limb, the quadrant rule, a shorter asin polynomial, LRN's scale, Det's sign on a swap, EyeLike's diagonal, GRU's update gate, NonMaxSuppression's union, RoiAlign's interpolation, Upsample's scale) | 28 of 28 caught |
+| Accuracy of the new math functions against the true function, 80,000 arguments each | tan 3.9, asin 1.8, acos 1.2, sinh 1.8, cosh 1.5, asinh 4.2, acosh 1.1, atanh 4.1 units in the last place at most |
+| `tests/node_suite/targeted_ops.py`: 512 cases - the first group's; the official cases of the second group's operators published only above opset 20, re-imported at opset 20; and 99 new builds of the second group's forms with declared extents and with a symbolic extent; expected outputs from the ONNX reference evaluator cross-checked against ONNX Runtime; ONNX Runtime alone where the reference cannot run a form (RNN and GRU with lengths or both directions, NonMaxSuppression without thresholds); a numpy definition, cross-checked against ONNX Runtime where it runs, where the reference lacks a form or answers otherwise than the definition (GroupNormalization-18, Upsample-7, LpNormalization, LRN, bilinear Upsample) | 512 of 512 as expected. Re-imported official cases: 109 PASS (75 before); 67 refused for their element type; 2 function-expanded cases whose intermediate values carry no shape; RNN and GRU in batch-first layout refused with their sentence. Every refusal case is refused with its sentence |
+| Official node tests at opset 20 or lower, this change against the previous compiler | PASS 442 of 964 before, 468 after (468 of 481 attempted); no case that passed fails. The 26 new passes are the Compress, Hardmax, LRN, MeanVarianceNormalization, NonMaxSuppression and ReverseSequence cases; the official cases of the other new operators are published above opset 20 and are scored by `targeted_ops.py` above. The official bitwise cases are over INT8, INT16, INT32 and the unsigned types with declared extents and stay refused for their element type |
+| `ops_targets_gate.py`: the 320 targeted builds of both groups that must pass, compiled for the Pi 4, Pico and Pico 2 and run in unicorn | 960 of 960 as expected: every output within the node-suite tolerance of the reference and bit-identical to the Windows program's; on the Pico and Pico 2, besides the first group's compile-time refusals, the bitwise forms whose INT64 inputs hold values beyond 32 bits refused at the request by the contract's check (their twins with values inside the range run and match) |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `a2aecab` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape PureMetal images byte-identical |
+| Kokoro-82M FP32 for Windows | source and pack byte-identical to the previous compiler's; the reference request's waveform byte-identical |
+
+**Refused, with a sentence naming operator, node and value:** Upsample on
+the runtime-dimension path and from opset 10 (deprecated for Resize), with
+a scale below 1, or linear on an axis before the last two;
+GroupNormalization from opset 21 (its scale becomes per channel); Hardmax
+before opset 13 on an axis other than the last; LpNormalization with p
+other than 1 and 2; RNN and GRU with activation_alpha or activation_beta,
+activations other than Sigmoid, Tanh and Relu, or layout 1; RoiAlign
+coordinate modes and pooling modes outside those named above; EyeLike to
+an element type other than FLOAT, INT64 and BOOL on the fixed-shape path;
+Compress on the fixed-shape path with a condition that is not a constant
+(the runtime-dimension path takes it); and, on the Pico and Pico 2, a
+bitwise operator's INT64 input outside the 32-bit range, refused at the
+request by the contract's check (on the fixed-shape path and for the
+two-input operators; BitwiseNot on the runtime-dimension path carries all
+64 bits).
+
 
 ## Explicit limitations
 

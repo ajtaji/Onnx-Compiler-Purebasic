@@ -1028,8 +1028,10 @@ Procedure.i PmoEmitNode(File.i, *Ir.PmoIrModel, *Profile.PmoTargetProfile,
     If Name <> "" : Out(Index) = PmoEmitAddress(*Ir, Name) : Else : Out(Index) = "0" : EndIf
   Next
   *Y = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
-  If *Y = 0 : ProcedureReturn PmoEmitFail("node output has no value") : EndIf
-  Count = *Y\Elements
+  ; A node emitted as its own procedure may leave its first output absent
+  ; (RNN or GRU listing only Y_h): the procedure receives "0" for it.
+  If *Y = 0 And FindMapElement(Calls(), Str(*Ref\Index)) = 0 : ProcedureReturn PmoEmitFail("node output has no value") : EndIf
+  If *Y : Count = *Y\Elements : EndIf
   PmoEmitLine(File, "  ; " + Str(*Ref\Index) + ": " + *Node\Name + " (" + Op + ")")
   If FindMapElement(Calls(), Str(*Ref\Index))
     For Index = 0 To InputCount - 1

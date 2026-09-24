@@ -475,9 +475,12 @@ float expression on the x87 stack at extended precision; a statement with
 one operation rounds once on the way back to memory and gives the correctly
 rounded result, which is what the Arm cores and the Pico's software floats
 give. The functions the kernels need - exp, expm1, log, log1p, tanh, erf,
-sqrt - are written into the file as fixed sequences of such statements
-(erf follows fdlibm's s_erff.c; sqrt is the integer square root of the
-significand, correctly rounded), not taken from each target's library.
+sqrt, tan, asin, acos and the hyperbolic functions - are written into the
+file as fixed sequences of such statements (erf follows fdlibm's s_erff.c;
+sqrt is the integer square root of the significand, correctly rounded; tan
+reduces its argument by pi/2 in integer arithmetic against 288 bits of
+2/pi, so a large argument keeps its quadrant), not taken from each
+target's library.
 
 **Decide NaN on the bits.** The host compiler's float comparisons do not
 order a NaN the way IEEE 754 does - a NaN compares below and equal to
@@ -489,20 +492,20 @@ invalid operation such as infinity times zero.
 
 **A definition to be held to.** `ops_scheme.py` in the compiler
 repository's `tools/onnx/tests/Diagnostics` writes every kernel out in numpy
-one binary32 operation per line. `ops_kernel_check.py` runs 189 cases -
+one binary32 operation per line. `ops_kernel_check.py` runs 268 cases -
 the math functions over tables of special values and branch boundaries,
 every operator's kernel, and the awkward cases - on Windows and, in the
 unicorn instruction emulator, on the Pi 4, Pico and Pico 2 builds, and
 requires every output to equal the definition bit for bit; with
-`--mutants` it plants 18 defects and requires each to be caught:
+`--mutants` it plants 28 defects and requires each to be caught:
 
 @FRAG
 py -3.12 ops_kernel_check.py --pbcompiler <pbcompiler.exe> --compiler PureMetalForge.exe --runtime <ONNX repository>\runtime --mutants
-windows 189 of 189 cases as the definition
-pi4     189 of 189 cases as the definition
-pico    189 of 189 cases as the definition
-pico2   189 of 189 cases as the definition
-mutants: 18 of 18 killed
+windows 268 of 268 cases as the definition
+pi4     268 of 268 cases as the definition
+pico    268 of 268 cases as the definition
+pico2   268 of 268 cases as the definition
+mutants: 28 of 28 killed
 @ENDFRAG
 
 That says the kernels compute what they were written to compute. Whether
@@ -510,7 +513,15 @@ that is what ONNX specifies is the node tests' question:
 `tests/node_suite/targeted_ops.py` re-imports the official cases these
 operators have above opset 20 at opset 20, adds its own forms for both
 emitters, and scores everything against the ONNX reference evaluator,
-cross-checked with ONNX Runtime. `ops_targets_gate.py`, beside the kernel
+cross-checked with ONNX Runtime. Where the reference evaluator cannot run a
+form (RNN and GRU with sequence lengths or both directions, NonMaxSuppression
+without its thresholds) ONNX Runtime decides alone; where it lacks one
+(GroupNormalization-18, Upsample-7) or answers otherwise than the
+operator's definition (LpNormalization, LRN, bilinear Upsample) a numpy
+definition decides, still cross-checked with ONNX Runtime wherever ONNX
+Runtime runs the form; RoiAlign at opset 10, to which it applies opset 16's
+default, is run at 16 with the old mode spelled out.
+`ops_targets_gate.py`, beside the kernel
 check, then compiles the same cases for the Pi 4, Pico and Pico 2, runs the
 generated programs in the emulator, and requires their outputs to pass the
 same comparison and to equal the Windows program's bits.

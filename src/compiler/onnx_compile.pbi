@@ -32,6 +32,7 @@ Procedure.s PmoCompileRuntimeDimensions(*Model.PmoOnnxModel)
     If FindString("|If|Loop|SequenceEmpty|SequenceConstruct|SequenceInsert|SequenceAt|SequenceLength|SplitToSequence|ConcatFromSequence|", "|" + Op + "|")
       ProcedureReturn Op + " is control flow or a sequence operator, so its values are decided at run time"
     EndIf
+    If Op = "NonMaxSuppression" : ProcedureReturn "NonMaxSuppression output size depends on the scores" : EndIf
     ForEach *Model\Graph\Nodes()\Inputs()
       If *Model\Graph\Nodes()\Inputs() <> "" And Constants(*Model\Graph\Nodes()\Inputs()) = 0 : Known = 0 : EndIf
     Next
@@ -47,7 +48,8 @@ Procedure.s PmoCompileRuntimeDimensions(*Model.PmoOnnxModel)
           Case "Pad" : Control = Bool(Position = 1 Or Position = 3)
           Case "Resize" : Control = Bool(Position >= 1)
           Case "STFT" : Control = Bool(Position = 1 Or Position = 3)
-          Case "Split", "Tile", "OneHot", "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp"
+          Case "Split", "Tile", "OneHot", "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp",
+               "Compress", "Upsample"
             Control = Bool(Position = 1)
           Case "Dropout" : Control = Bool(Position = 2)
         EndSelect
@@ -855,6 +857,7 @@ Procedure.i PmoCompileCommand(ModelPath.s)
     PmoCompileFail(PmoQuantError) : Goto PmoCompileCommandFailed
   EndIf
   If PmoCompilePlanStftScratch(@Ir) = 0 : Goto PmoCompileCommandFailed : EndIf
+  PmoOpsPlanScratch(@Ir)
   If PmoStorageReduce(@Ir,Precision)=0 : PmoCompileFail(PmoQuantError) : Goto PmoCompileCommandFailed : EndIf
   Source = OutputPrefix + PmoTargets(TargetIndex)\SourceSuffix
   Weights = OutputPrefix + ".pmw"

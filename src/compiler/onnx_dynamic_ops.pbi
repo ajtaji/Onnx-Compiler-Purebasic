@@ -48,6 +48,20 @@ Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
     Case "CastLike"
       If Opset >= 19 : ProcedureReturn "|saturate|" : EndIf
       ProcedureReturn "|"
+    Case "Hardmax", "Compress" : ProcedureReturn "|axis|"
+    Case "LpNormalization" : ProcedureReturn "|axis|p|"
+    Case "MeanVarianceNormalization" : ProcedureReturn "|axes|"
+    Case "LRN" : ProcedureReturn "|alpha|beta|bias|size|"
+    Case "GroupNormalization" : ProcedureReturn "|epsilon|num_groups|"
+    Case "EyeLike" : ProcedureReturn "|dtype|k|"
+    Case "ReverseSequence" : ProcedureReturn "|batch_axis|time_axis|"
+    Case "RNN" : ProcedureReturn "|activation_alpha|activation_beta|activations|clip|direction|hidden_size|layout|"
+    Case "GRU" : ProcedureReturn "|activation_alpha|activation_beta|activations|clip|direction|hidden_size|layout|linear_before_reset|"
+    Case "NonMaxSuppression" : ProcedureReturn "|center_point_box|"
+    Case "Upsample" : ProcedureReturn "|mode|scales|"  ; so its own refusal, not an attribute's, is the sentence
+    Case "RoiAlign"
+      If Opset >= 16 : ProcedureReturn "|coordinate_transformation_mode|mode|output_height|output_width|sampling_ratio|spatial_scale|" : EndIf
+      ProcedureReturn "|mode|output_height|output_width|sampling_ratio|spatial_scale|"
   EndSelect
   ProcedureReturn PmoOpsUnaryAllowed(Op)
 EndProcedure
@@ -87,6 +101,7 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
   Protected Labels.Integer, Kept.Integer, k.i, Found.Integer, Ratio.d
   Protected Dim Ranks.i(7)
   Protected Dim AxisLabel.i(7, 15)
+  Protected Dim Codes.i(3)
   ForEach *Node\Attributes()
     If FindString(Allowed, "|" + *Node\Attributes()\Name + "|") = 0
       Name = *Node\Attributes()\Name
@@ -163,6 +178,64 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         Next
       Case "MaxPool", "AveragePool", "LpPool"
         If PmoEmitAttrListCount(*Node, "kernel_shape") < 1 : Reason = "attribute kernel_shape is required." : EndIf
+      Case "Tan", "Asin", "Acos", "Sinh", "Cosh", "Asinh", "Acosh", "Atanh", "Hardmax", "LpNormalization", "MeanVarianceNormalization",
+           "LRN", "Det"
+        Reason = PmdNsTypeReason(*Node, 0, "input", "|1|")
+      Case "BitwiseNot" : Reason = PmdNsTypeReason(*Node, 0, "X", "|6|7|")
+      Case "BitwiseAnd", "BitwiseOr", "BitwiseXor"
+        Reason = PmdNsTypeReason(*Node, 0, "A", "|6|7|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "B", "|6|7|") : EndIf
+      Case "Upsample"
+        Reason = "Upsample is implemented by fixed-shape emission only - declared extents and a constant scales input, opset 7 to 9 (from 10 it is deprecated for Resize)."
+      Case "GroupNormalization"
+        Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
+        If Reason = "" And PmoEmitNsAttributePresent(*Node, "num_groups") = 0 : Reason = "attribute num_groups is required." : EndIf
+      Case "RNN", "GRU"
+        Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
+        If Reason = "" And (PmoEmitNsAttributePresent(*Node, "activation_alpha") Or PmoEmitNsAttributePresent(*Node, "activation_beta"))
+          Reason = "activation_alpha and activation_beta are not implemented; the activations implemented (Sigmoid, Tanh, Relu) take none."
+        EndIf
+        If Reason = "" And PmoEmitAttrI(*Node, "layout", 0) <> 0 : Reason = "attribute layout = 1 (batch first) is not implemented; layout 0 is." : EndIf
+        Text = PmoEmitAttrS(*Node, "direction", "forward")
+        If Reason = "" And Text <> "forward" And Text <> "reverse" And Text <> "bidirectional"
+          Reason = "attribute direction = " + Text + "; forward, reverse and bidirectional are."
+        EndIf
+        If Reason = ""
+          k = 1 + Bool(Text = "bidirectional")
+          Reason = PmoOpsRecurrentActivations(*Node, k, Codes())
+        EndIf
+      Case "NonMaxSuppression"
+        Reason = PmdNsTypeReason(*Node, 0, "boxes", "|1|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "scores", "|1|") : EndIf
+      Case "RoiAlign"
+        Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
+        Text = PmoEmitAttrS(*Node, "coordinate_transformation_mode", "half_pixel")
+        If Reason = "" And Text <> "half_pixel" And Text <> "output_half_pixel" : Reason = "attribute coordinate_transformation_mode = " + Text + "; half_pixel and output_half_pixel are." : EndIf
+        Text = PmoEmitAttrS(*Node, "mode", "avg")
+        If Reason = "" And Text <> "avg" And Text <> "max" : Reason = "attribute mode = " + Text + "; avg and max are." : EndIf
+    EndSelect
+  EndIf
+  If Reason = ""
+    Select Op
+      Case "Hardmax"
+        If PmdNsOpset < 13 And PmoEmitAttrI(*Node, "axis", 1) <> -1
+          Reason = "the model imports opset " + Str(PmdNsOpset) + ", where Hardmax flattens the input at its axis; runtime-dimension emission implements that only as axis = -1, the last axis, where it equals Hardmax-13."
+        EndIf
+      Case "LpNormalization"
+        If PmoEmitAttrI(*Node, "p", 2) <> 1 And PmoEmitAttrI(*Node, "p", 2) <> 2 : Reason = "attribute p = " + Str(PmoEmitAttrI(*Node, "p", 2)) + "; the specification allows 1 and 2." : EndIf
+      Case "LRN"
+        If PmoEmitNsAttributePresent(*Node, "size") = 0 Or PmoEmitAttrI(*Node, "size", 1) < 1 : Reason = "attribute size is required and must be positive." : EndIf
+      Case "ReverseSequence"
+        k = PmoEmitAttrI(*Node, "time_axis", 0)
+        n = PmoEmitAttrI(*Node, "batch_axis", 1)
+        If Not ((k = 0 And n = 1) Or (k = 1 And n = 0)) : Reason = "time_axis = " + Str(k) + " and batch_axis = " + Str(n) + "; the specification allows 0 and 1 or 1 and 0." : EndIf
+      Case "EyeLike"
+        n = PmoEmitAttrI(*Node, "dtype", 0)
+        If n <> 0 And n <> 1 And n <> 6 And n <> 7 And n <> 9 : Reason = "dtype " + PmdNsTypeName(n) + " is not implemented; FLOAT, INT32, INT64 and BOOL are." : EndIf
+      Case "RoiAlign"
+        If PmoEmitAttrI(*Node, "output_height", 1) < 1 Or PmoEmitAttrI(*Node, "output_width", 1) < 1 Or PmoEmitAttrI(*Node, "sampling_ratio", 0) < 0
+          Reason = "output_height and output_width must be positive and sampling_ratio not negative."
+        EndIf
     EndSelect
   EndIf
   If Reason = ""
@@ -208,7 +281,7 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
   If Reason = ""
     Select Op
       Case "Split"
-      Case "MaxPool", "Dropout"
+      Case "MaxPool", "Dropout", "RNN", "GRU"
         If ListSize(*Node\Outputs()) < 1 Or ListSize(*Node\Outputs()) > 2
           Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; " + Op + " has one or two."
         EndIf
@@ -235,11 +308,59 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
   For i = 0 To 7 : a(i) = PmdNsId(Ids(), PmoEmitInput(*Node, i)) : Next
   Select Op
     Case "Erf", "Reciprocal", "Ceil", "Sign", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish", "Gelu",
-         "ThresholdedRelu", "Shrink", "IsNaN", "IsInf"
+         "ThresholdedRelu", "Shrink", "IsNaN", "IsInf", "Tan", "Asin", "Acos", "Sinh", "Cosh", "Asinh", "Acosh", "Atanh", "BitwiseNot"
       PmoOpsUnaryParams(*Node, Lines())
       ForEach Lines() : Pre + Lines() + " : " : Next
       Call = Pre + "DOpUnary(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + Str(PmoOpsUnaryCode(*Node)) + ")"
-    Case "Min", "Max", "Sum", "Mean", "Mod", "PRelu", "Or", "Xor"
+    Case "Hardmax"
+      Call = "DOpHardmax(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + Str(PmoEmitAttrI(*Node, "axis", -1)) + ")"
+    Case "LpNormalization"
+      Call = "DOpLpNorm(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + Str(PmoEmitAttrI(*Node, "axis", -1)) + "," + Str(PmoEmitAttrI(*Node, "p", 2)) + ")"
+    Case "MeanVarianceNormalization"
+      n = PmoEmitAttrListCount(*Node, "axes")
+      Pre = "PmOpT(0)=" + Str(n) + " : "
+      For k = 0 To n - 1 : Pre + "PmOpT(" + Str(1 + k) + ")=" + Str(PmoEmitAttrListI(*Node, "axes", k, 0)) + " : " : Next
+      Call = Pre + "DOpMvn(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + ")"
+    Case "LRN"
+      Pre = "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "alpha", 0.0001)) + ") : PmOpSetBits(@PmOpF(1)," + PmoOpsBits(PmoEmitAttrF(*Node, "beta", 0.75)) + ") : "
+      Pre + "PmOpSetBits(@PmOpF(2)," + PmoOpsBits(PmoEmitAttrF(*Node, "bias", 1.0)) + ") : "
+      Call = Pre + "DOpLrn(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + Str(PmoEmitAttrI(*Node, "size", 1)) + ")"
+    Case "GroupNormalization"
+      Call = "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "epsilon", 0.00001)) + ") : DOpGroupNorm(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," +
+             a(0) + "," + a(1) + "," + a(2) + "," + Str(PmoEmitAttrI(*Node, "num_groups", 1)) + ")"
+    Case "EyeLike"
+      Call = "DOpEyeLike(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + Str(PmoEmitAttrI(*Node, "dtype", 0)) + "," + Str(PmoEmitAttrI(*Node, "k", 0)) + ")"
+    Case "Det"
+      Call = "DOpDet(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + ")"
+    Case "Compress"
+      Call = "DOpCompress(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + Str(PmoEmitAttrI(*Node, "axis", 0)) + "," +
+             Str(PmoEmitNsAttributePresent(*Node, "axis")) + ")"
+    Case "ReverseSequence"
+      Call = "DOpReverseSequence(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + Str(PmoEmitAttrI(*Node, "time_axis", 0)) + "," +
+             Str(PmoEmitAttrI(*Node, "batch_axis", 1)) + ")"
+    Case "RNN", "GRU"
+      Text = PmoEmitAttrS(*Node, "direction", "forward")
+      Code = 0
+      If Text = "reverse" : Code = 1 : ElseIf Text = "bidirectional" : Code = 2 : EndIf
+      For k = 0 To 3 : Ranks(k) = 0 : Next
+      PmoOpsRecurrentActivations(*Node, 1 + Bool(Code = 2), Ranks())
+      Pre = "PmOpI(5)=" + Str(Code) + " : PmOpI(7)=" + Str(Bool(PmoEmitAttrI(*Node, "linear_before_reset", 0) <> 0)) + " : PmOpI(8)=" +
+            Str(PmoEmitNsAttributePresent(*Node, "clip")) + " : PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "clip", 0.0)) + ") : "
+      For k = 0 To 3 : Pre + "PmOpI(" + Str(10 + k) + ")=" + Str(Ranks(k)) + " : " : Next
+      Call = Pre + "DOpRecurrent(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 1)) + "," + a(0) + "," + a(1) + "," + a(2) + "," +
+             a(3) + "," + a(4) + "," + a(5) + "," + Str(Bool(Op = "GRU")) + ")"
+    Case "NonMaxSuppression"
+      Call = "DOpNms(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + "," + a(3) + "," + a(4) + "," +
+             Str(Bool(PmoEmitAttrI(*Node, "center_point_box", 0) <> 0)) + ")"
+    Case "RoiAlign"
+      Text = "half_pixel"
+      If PmdNsOpset < 16 : Text = "output_half_pixel" : EndIf
+      Text = PmoEmitAttrS(*Node, "coordinate_transformation_mode", Text)
+      Pre = "PmOpI(5)=" + Str(PmoEmitAttrI(*Node, "output_height", 1)) + " : PmOpI(6)=" + Str(PmoEmitAttrI(*Node, "output_width", 1)) + " : PmOpI(7)=" +
+            Str(PmoEmitAttrI(*Node, "sampling_ratio", 0)) + " : PmOpI(8)=" + Str(Bool(PmoEmitAttrS(*Node, "mode", "avg") = "max")) + " : PmOpI(9)=" +
+            Str(Bool(Text = "half_pixel")) + " : PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "spatial_scale", 1.0)) + ") : "
+      Call = Pre + "DOpRoiAlign(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + ")"
+    Case "Min", "Max", "Sum", "Mean", "Mod", "PRelu", "Or", "Xor", "BitwiseAnd", "BitwiseOr", "BitwiseXor"
       n = ListSize(*Node\Inputs())
       For k = 0 To n - 1
         If k > 7
