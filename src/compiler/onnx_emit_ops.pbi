@@ -23,7 +23,8 @@ Procedure.i PmoOpsOwns(Operation.s)
                                   "Acosh|Atanh|BitwiseNot|BitwiseAnd|BitwiseOr|BitwiseXor|Hardmax|LpNormalization|" +
                                   "MeanVarianceNormalization|LRN|GroupNormalization|EyeLike|Det|Compress|ReverseSequence|Upsample|" +
                                   "RNN|GRU|NonMaxSuppression|RoiAlign|GridSample|QuantizeLinear|DequantizeLinear|" +
-                                  "DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|", "|" + Operation + "|"))
+                                  "DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|HannWindow|HammingWindow|" +
+                                  "BlackmanWindow|DFT|MelWeightMatrix|NegativeLogLikelihoodLoss|SoftmaxCrossEntropyLoss|", "|" + Operation + "|"))
 EndProcedure
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
@@ -51,6 +52,8 @@ Procedure.i PmoOpsFloor(Operation.s)
     Case "GridSample" : ProcedureReturn 16
     Case "QuantizeLinear", "DequantizeLinear", "MatMulInteger", "QLinearMatMul", "ConvInteger", "QLinearConv" : ProcedureReturn 10
     Case "DynamicQuantizeLinear" : ProcedureReturn 11
+    Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss" : ProcedureReturn 12
+    Case "HannWindow", "HammingWindow", "BlackmanWindow", "DFT", "MelWeightMatrix" : ProcedureReturn 17
     Case "Mish", "BitwiseNot", "BitwiseAnd", "BitwiseOr", "BitwiseXor", "GroupNormalization" : ProcedureReturn 18
     Case "Gelu" : ProcedureReturn 20
   EndSelect
@@ -351,6 +354,12 @@ EndProcedure
 ; Working memory a node's kernel needs on the fixed-shape path: Det a copy of
 ; one matrix, RNN and GRU the state of every direction and batch and three
 ; gate rows. 0 for every other node.
+; MelWeightMatrix is folded to a constant before either path runs when its
+; five inputs are initializers (onnx_compile.pbi); a node left is refused.
+Procedure.s PmoOpsMelSentence()
+  ProcedureReturn "MelWeightMatrix is implemented for five initializer inputs, from which the compiler computes the matrix in binary64 as the reference does; a band edge computed in binary32 at run time can fall in another bin."
+EndProcedure
+
 Procedure.q PmoOpsNodeScratch(*Ir.PmoIrModel, *Node.PmoOnnxNode)
   Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
   Protected *W.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
@@ -360,6 +369,8 @@ Procedure.q PmoOpsNodeScratch(*Ir.PmoIrModel, *Node.PmoOnnxNode)
     Case "Det"
       N = PmoEmitDim(*X, PmoEmitRank(*X) - 1)
       ProcedureReturn N * N * 4
+    Case "SoftmaxCrossEntropyLoss"
+      If PmoEmitOutput(*Node, 1) = "" : ProcedureReturn *X\Elements * 4 : EndIf
     Case "RNN", "GRU"
       *W = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
       If *W = 0 Or PmoEmitRank(*X) <> 3 Or PmoEmitRank(*W) <> 3 : ProcedureReturn 0 : EndIf
@@ -1534,6 +1545,137 @@ Procedure.i PmoEmitOpsRoiAlign(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcNa
   ProcedureReturn #True
 EndProcedure
 
+; ---- the signal operators and the losses -----------------------------------
+Procedure.i PmoEmitOpsWindow(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Ok.Integer, Size.q, Kind.i
+  If PmoEmitNsAttributesAllowed(*Node, "|output_datatype|periodic|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitAttrI(*Node, "output_datatype", 1) <> 1
+    ProcedureReturn PmoEmitNsFail(*Node, "output_datatype " + PmoEmitNsTypeName(PmoEmitAttrI(*Node, "output_datatype", 1)) + " is not implemented; FLOAT is.")
+  EndIf
+  Size = PmoEmitConstI(*Ir, PmoEmitInput(*Node, 0), 0, @Ok)
+  If Ok\i = 0 : ProcedureReturn PmoEmitNsFail(*Node, "input size must be a constant for fixed-shape emission, which sizes the output when the source is written.") : EndIf
+  If Size < 1 : ProcedureReturn PmoEmitNsFail(*Node, "size = " + Str(Size) + " must be positive.") : EndIf
+  If *Y = 0 Or *Y\ElementType <> 1 Or PmoEmitRank(*Y) <> 1 Or *Y\Elements <> Size
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [" + Str(Size) + "].")
+  EndIf
+  Select *Node\Operation
+    Case "HannWindow" : Kind = 0
+    Case "HammingWindow" : Kind = 1
+    Default : Kind = 2
+  EndSelect
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpWindow(*o0, " + Str(Size) + ", " + Str(Kind) + ", " + Str(Bool(PmoEmitAttrI(*Node, "periodic", 1) <> 0)) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+; DFT-17 (axis an attribute, default 1) and DFT-20 (axis an input, default -2).
+Procedure.i PmoEmitOpsDft(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Ok.Integer, Rank.i, Axis.q, L.q, N.q, Inv.i, Ones.i, Comp.q, Outer.q = 1, Inner.q = 1, d.i, OutAxis.q, OutLast.q, Allowed.s
+  Allowed = "|inverse|onesided|"
+  If Opset < 20 : Allowed = "|axis|inverse|onesided|" : EndIf
+  If PmoEmitNsAttributesAllowed(*Node, Allowed, Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "input", 1) = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*X)
+  If Rank < 2 : ProcedureReturn PmoEmitNsFail(*Node, "the input must have rank two or more, its last axis holding the real part (1) or the real and imaginary parts (2).") : EndIf
+  Comp = PmoEmitDim(*X, Rank - 1)
+  If Comp <> 1 And Comp <> 2 : ProcedureReturn PmoEmitNsFail(*Node, "the input's last axis must be 1 (real) or 2 (complex); it is " + Str(Comp) + ".") : EndIf
+  If Opset < 20
+    Axis = PmoEmitAttrI(*Node, "axis", 1)
+  ElseIf PmoEmitInput(*Node, 2) <> ""
+    Axis = PmoEmitConstI(*Ir, PmoEmitInput(*Node, 2), 0, @Ok)
+    If Ok\i = 0 : ProcedureReturn PmoEmitNsFail(*Node, "input axis must be a constant for fixed-shape emission.") : EndIf
+  Else
+    Axis = -2
+  EndIf
+  If Axis < 0 : Axis + Rank : EndIf
+  If Axis < 0 Or Axis >= Rank - 1 : ProcedureReturn PmoEmitNsFail(*Node, "the signal axis must be one of the input's axes before the last; it is " + Str(Axis) + ".") : EndIf
+  L = PmoEmitDim(*X, Axis)
+  Inv = Bool(PmoEmitAttrI(*Node, "inverse", 0) <> 0)
+  Ones = Bool(PmoEmitAttrI(*Node, "onesided", 0) <> 0)
+  If Inv And Ones And Comp <> 2 : ProcedureReturn PmoEmitNsFail(*Node, "an inverse one-sided transform takes a complex (last axis 2) spectrum.") : EndIf
+  If PmoEmitInput(*Node, 1) <> ""
+    N = PmoEmitConstI(*Ir, PmoEmitInput(*Node, 1), 0, @Ok)
+    If Ok\i = 0 : ProcedureReturn PmoEmitNsFail(*Node, "input dft_length must be a constant for fixed-shape emission.") : EndIf
+  ElseIf Inv And Ones
+    N = 2 * (L - 1)
+  Else
+    N = L
+  EndIf
+  If N < 1 : ProcedureReturn PmoEmitNsFail(*Node, "dft_length = " + Str(N) + " must be positive.") : EndIf
+  OutAxis = N : OutLast = 2
+  If Ones And Inv = 0 : OutAxis = N / 2 + 1 : EndIf
+  If Ones And Inv : OutLast = 1 : EndIf
+  For d = 0 To Axis - 1 : Outer * PmoEmitDim(*X, d) : Next
+  For d = Axis + 1 To Rank - 2 : Inner * PmoEmitDim(*X, d) : Next
+  If *Y = 0 Or *Y\ElementType <> 1 Or PmoEmitRank(*Y) <> Rank Or PmoEmitDim(*Y, Axis) <> OutAxis Or PmoEmitDim(*Y, Rank - 1) <> OutLast
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT with " + Str(OutAxis) + " on the signal axis and " + Str(OutLast) + " last.")
+  EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(Outer))
+  PmoEmitLine(File, "  PmOpI(1) = " + Str(L))
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(Inner))
+  PmoEmitLine(File, "  PmOpI(3) = " + Str(Comp))
+  PmoEmitLine(File, "  PmOpI(4) = " + Str(N))
+  PmoEmitLine(File, "  PmOpI(5) = " + Str(Inv))
+  PmoEmitLine(File, "  PmOpI(6) = " + Str(Ones))
+  PmoEmitLine(File, "  PmOpDft(*i0, *o0)")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+; NegativeLogLikelihoodLoss-12/13 and SoftmaxCrossEntropyLoss-12/13.
+Procedure.i PmoEmitOpsLoss(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected Sce.i = Bool(*Node\Operation = "SoftmaxCrossEntropyLoss")
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *T.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *W.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected *LP.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 1))
+  Protected Red.s = PmoEmitAttrS(*Node, "reduction", "mean"), Code.i, Rank.i, N.q, C.q, Dn.q = 1, d.i, LpAddr.s
+  If PmoEmitNsAttributesAllowed(*Node, "|ignore_index|reduction|", Opset) = 0 : ProcedureReturn #False : EndIf
+  Select Red
+    Case "none" : Code = 0
+    Case "sum" : Code = 1
+    Case "mean" : Code = 2
+    Default : ProcedureReturn PmoEmitNsFail(*Node, "attribute reduction = " + Red + "; none, sum and mean are.")
+  EndSelect
+  If PmoOpsTypeOk(*Node, *X, "the scores", 1) = 0 Or PmoOpsTypeOk(*Node, *T, "the target", 2 | 4) = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*X)
+  If Rank < 2 : ProcedureReturn PmoEmitNsFail(*Node, "the scores must be [N, C] or [N, C, D1 ...].") : EndIf
+  N = PmoEmitDim(*X, 0) : C = PmoEmitDim(*X, 1)
+  For d = 2 To Rank - 1 : Dn * PmoEmitDim(*X, d) : Next
+  If PmoEmitRank(*T) <> Rank - 1 Or *T\Elements <> N * Dn : ProcedureReturn PmoEmitNsFail(*Node, "the target must be [N, D1 ...], the scores' shape without C.") : EndIf
+  If *W And (*W\ElementType <> 1 Or PmoEmitRank(*W) <> 1 Or *W\Elements <> C) : ProcedureReturn PmoEmitNsFail(*Node, "weight must be FLOAT [C].") : EndIf
+  If *Y = 0 Or *Y\ElementType <> 1 : ProcedureReturn PmoEmitNsFail(*Node, "the declared loss must be FLOAT.") : EndIf
+  If (Code = 0 And PmoEmitShapeEqual(*Y, *T) = 0) Or (Code <> 0 And *Y\Elements <> 1)
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared loss must have the target's shape with reduction none, one value otherwise.")
+  EndIf
+  If Sce = 0 And *LP : ProcedureReturn PmoEmitNsFail(*Node, "NegativeLogLikelihoodLoss has one output.") : EndIf
+  If *LP And (*LP\ElementType <> 1 Or PmoEmitShapeEqual(*LP, *X) = 0) : ProcedureReturn PmoEmitNsFail(*Node, "log_prob must be FLOAT with the scores' shape.") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  LpAddr = "*i0"
+  If Sce
+    LpAddr = "PmOnnxArenaBase + " + Str(*Ir\OpsScratchOffset)
+    If *LP : LpAddr = "*o1" : EndIf
+    PmoEmitLine(File, "  PmOpLogSoftmax(*i0, " + LpAddr + ", " + Str(N) + ", " + Str(C) + ", " + Str(Dn) + ")")
+  EndIf
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(N))
+  PmoEmitLine(File, "  PmOpI(1) = " + Str(C))
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(Dn))
+  PmoEmitLine(File, "  PmOpI(3) = " + Str(*T\ElementType))
+  PmoEmitLine(File, "  PmOpI(4) = " + Str(Code))
+  PmoEmitLine(File, "  PmOpI(5) = " + Str(PmoEmitNsAttributePresent(*Node, "ignore_index")))
+  PmoEmitLine(File, "  PmOpI(6) = " + Str(PmoEmitAttrI(*Node, "ignore_index", 0)))
+  PmoEmitLine(File, "  PmOpI(7) = " + Str(Bool(*W <> 0)))
+  PmoEmitLine(File, "  If PmOpNllLoss(" + LpAddr + ", *i1, " + PmoOpsIn(*Node, 2) + ", *o0) <> 0 : PmOnnxRuntimeOk = 0 : EndIf")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
 ; ---- the quantized operators ------------------------------------------------
 ; One value (a scalar or a one-element tensor) or one per element of Extent.
 Procedure.i PmoOpsQCount(*V.PmoIrValue, Extent.q)
@@ -1925,6 +2067,10 @@ Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
     Case "DynamicQuantizeLinear" : Done = PmoEmitOpsDynQuantize(File, *Ir, *Node, ProcName, Opset)
     Case "MatMulInteger", "QLinearMatMul" : Done = PmoEmitOpsQMatMul(File, *Ir, *Node, ProcName, Opset)
     Case "ConvInteger", "QLinearConv" : Done = PmoEmitOpsQConv(File, *Ir, *Node, ProcName, Opset)
+    Case "HannWindow", "HammingWindow", "BlackmanWindow" : Done = PmoEmitOpsWindow(File, *Ir, *Node, ProcName, Opset)
+    Case "DFT" : Done = PmoEmitOpsDft(File, *Ir, *Node, ProcName, Opset)
+    Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss" : Done = PmoEmitOpsLoss(File, *Ir, *Node, ProcName, Opset)
+    Case "MelWeightMatrix" : ProcedureReturn PmoEmitNsFail(*Node, PmoOpsMelSentence())
     Case "NonMaxSuppression" : ProcedureReturn PmoEmitNsFail(*Node, "its output size depends on the scores, which the fixed-shape path cannot plan.")
     Case "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp"
       Done = PmoEmitOpsReduce(File, *Ir, *Node, ProcName, Opset)

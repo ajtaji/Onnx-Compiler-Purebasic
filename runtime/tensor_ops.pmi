@@ -5279,3 +5279,329 @@ Procedure PmOpQConv(x.i, w.i, xzp.i, wzp.i, bias.i, y.i, xScale.i, wScale.i, ySc
     n = n + 1
   Wend
 EndProcedure
+
+; ----------------------------------------------------------------------
+; sin and cos over the binary32 range: the reduction by pi/2, then the
+; kernels of Tan's file part. A NaN or an infinity gives the quiet NaN.
+; ----------------------------------------------------------------------
+Global PmOpPiF.f
+Global PmOpTwoPiF.f
+Global PmOpHamA.f
+Global PmOpHamB.f
+Global PmOpBlkA.f
+Global PmOpBlkC.f
+
+Procedure.f PmOpSinF(x.f)
+  Protected r.f
+  If (PmOpBits(x) & $7FFFFFFF) >= $7F800000
+    ProcedureReturn PmOpNaN()
+  EndIf
+  r = PmOpReducePio2(x)
+  Select PmOpQuadrant
+    Case 0
+      ProcedureReturn PmOpKSin(r)
+    Case 1
+      ProcedureReturn PmOpKCos(r)
+    Case 2
+      ProcedureReturn PmOpNeg(PmOpKSin(r))
+  EndSelect
+  ProcedureReturn PmOpNeg(PmOpKCos(r))
+EndProcedure
+
+Procedure.f PmOpCosF(x.f)
+  Protected r.f
+  If (PmOpBits(x) & $7FFFFFFF) >= $7F800000
+    ProcedureReturn PmOpNaN()
+  EndIf
+  r = PmOpReducePio2(x)
+  Select PmOpQuadrant
+    Case 0
+      ProcedureReturn PmOpKCos(r)
+    Case 1
+      ProcedureReturn PmOpNeg(PmOpKSin(r))
+    Case 2
+      ProcedureReturn PmOpNeg(PmOpKCos(r))
+  EndSelect
+  ProcedureReturn PmOpKSin(r)
+EndProcedure
+
+Procedure PmOpSignalInit()
+  PmOpInit()
+  PmOpTrigInit()
+  PmOpSetBits(@PmOpPiF, $40490FDB)
+  PmOpSetBits(@PmOpTwoPiF, $40C90FDB)
+  PmOpSetBits(@PmOpHamA, $3F0B2164)
+  PmOpSetBits(@PmOpHamB, $3EE9BD38)
+  PmOpSetBits(@PmOpBlkA, $3ED70A3D)
+  PmOpSetBits(@PmOpBlkC, $3DA3D70A)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; HannWindow (kind 0), HammingWindow (1), BlackmanWindow (2), opset 17:
+; a = n * pi / N' (N' = size, or size - 1 when not periodic);
+;   Hann      sin(a)^2
+;   Hamming   25/46 - cos(2a) * 21/46
+;   Blackman  0.42 - 0.5 cos(2a) + 0.08 cos(4a)
+; ----------------------------------------------------------------------
+Procedure PmOpWindow(dst.i, size.i, kind.i, periodic.i)
+  Protected n.i
+  Protected n1.f
+  Protected a.f
+  Protected t.f
+  Protected u.f
+  PmOpSignalInit()
+  If periodic <> 0
+    n1 = size
+  Else
+    n1 = size - 1
+  EndIf
+  n = 0
+  While n < size
+    a = n
+    a = a * PmOpPiF
+    a = a / n1
+    If kind = 0
+      t = PmOpSinF(a)
+      t = t * t
+    ElseIf kind = 1
+      a = a + a
+      t = PmOpCosF(a)
+      t = t * PmOpHamB
+      t = PmOpHamA - t
+    Else
+      a = a + a
+      t = PmOpCosF(a)
+      t = PmOpHalf * t
+      t = PmOpBlkA - t
+      a = a + a
+      u = PmOpCosF(a)
+      u = PmOpBlkC * u
+      t = t + u
+    EndIf
+    PmOpStoreF(dst, n, t)
+    n = n + 1
+  Wend
+EndProcedure
+
+; cos and sin of 2 pi r / n into PmOpDftC and PmOpDftS, r < n.
+Global PmOpDftC.f
+Global PmOpDftS.f
+Procedure PmOpTwiddle(r.i, n.i)
+  Protected a.f
+  Protected fn.f
+  a = r
+  fn = n
+  a = a / fn
+  a = a * PmOpTwoPiF
+  PmOpDftC = PmOpCosF(a)
+  PmOpDftS = PmOpSinF(a)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DFT-17 and DFT-20 by the definition (n^2 products). The signal of length
+; PmOpI(1) runs along the axis between PmOpI(0) outer and PmOpI(2) inner
+; positions, each element PmOpI(3) wide (1 real, 2 complex). PmOpI(4) the
+; transform length n, (5) inverse, (6) onesided. Forward: K = n / 2 + 1
+; outputs when onesided, n otherwise, complex; inverse: n complex outputs
+; scaled by 1 / n, or with onesided the real inverse of a one-sided
+; spectrum (n real outputs). Each sum runs in index order.
+; ----------------------------------------------------------------------
+Procedure PmOpDft(src.i, dst.i)
+  Protected outer.i
+  Protected L.i
+  Protected inner.i
+  Protected comp.i
+  Protected n.i
+  Protected inv.i
+  Protected ones.i
+  Protected kc.i
+  Protected o.i
+  Protected p.i
+  Protected k.i
+  Protected t.i
+  Protected at.i
+  Protected lim.i
+  Protected xr.f
+  Protected xi.f
+  Protected re.f
+  Protected im.f
+  Protected v.f
+  Protected w.f
+  Protected fn.f
+  PmOpSignalInit()
+  outer = PmOpI(0)
+  L = PmOpI(1)
+  inner = PmOpI(2)
+  comp = PmOpI(3)
+  n = PmOpI(4)
+  inv = PmOpI(5)
+  ones = PmOpI(6)
+  fn = n
+  If inv <> 0 And ones <> 0
+    kc = n / 2 + 1
+    lim = kc
+    If L < lim
+      lim = L
+    EndIf
+    o = 0
+    While o < outer
+      p = 0
+      While p < inner
+        t = 0
+        While t < n
+          re = 0.0
+          k = 0
+          While k < lim
+            at = ((o * L + k) * inner + p) * comp
+            xr = PmTensorGet(src, at)
+            xi = 0.0
+            If comp = 2
+              xi = PmTensorGet(src, at + 1)
+            EndIf
+            PmOpTwiddle((k * t) % n, n)
+            v = xr * PmOpDftC
+            w = xi * PmOpDftS
+            v = v - w
+            If k <> 0 And 2 * k <> n
+              v = v + v
+            EndIf
+            If k = 0
+              re = v
+            Else
+              re = PmOpAddF(re, v)
+            EndIf
+            k = k + 1
+          Wend
+          re = re / fn
+          PmOpStoreF(dst, (o * n + t) * inner + p, re)
+          t = t + 1
+        Wend
+        p = p + 1
+      Wend
+      o = o + 1
+    Wend
+    ProcedureReturn
+  EndIf
+  kc = n
+  If ones <> 0
+    kc = n / 2 + 1
+  EndIf
+  lim = n
+  If L < lim
+    lim = L
+  EndIf
+  o = 0
+  While o < outer
+    p = 0
+    While p < inner
+      k = 0
+      While k < kc
+        re = 0.0
+        im = 0.0
+        t = 0
+        While t < lim
+          at = ((o * L + t) * inner + p) * comp
+          xr = PmTensorGet(src, at)
+          xi = 0.0
+          If comp = 2
+            xi = PmTensorGet(src, at + 1)
+          EndIf
+          PmOpTwiddle((k * t) % n, n)
+          If inv <> 0
+            v = xr * PmOpDftC
+            w = xi * PmOpDftS
+            v = v - w
+            re = PmOpAddF(re, v)
+            v = xi * PmOpDftC
+            w = xr * PmOpDftS
+            v = v + w
+            im = PmOpAddF(im, v)
+          Else
+            v = xr * PmOpDftC
+            w = xi * PmOpDftS
+            v = v + w
+            re = PmOpAddF(re, v)
+            v = xi * PmOpDftC
+            w = xr * PmOpDftS
+            v = v - w
+            im = PmOpAddF(im, v)
+          EndIf
+          t = t + 1
+        Wend
+        If inv <> 0
+          re = re / fn
+          im = im / fn
+        EndIf
+        at = ((o * kc + k) * inner + p) * 2
+        PmOpStoreF(dst, at, re)
+        PmOpStoreF(dst, at + 1, im)
+        k = k + 1
+      Wend
+      p = p + 1
+    Wend
+    o = o + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; NegativeLogLikelihoodLoss-13 on log-probabilities lp [N, C, D] (D the
+; product of the trailing extents) and SoftmaxCrossEntropyLoss-13 (the
+; caller has made lp the log-softmax of the scores over C). PmOpI(0) N,
+; (1) C, (2) D, (3) the target's kind (6 or 7), (4) reduction (0 none,
+; 1 sum, 2 mean: divided by the summed weights of the targets that count),
+; (5) 1 when ignore_index is set, (6) ignore_index, (7) 1 for a weight.
+; Returns 1 for a target outside [0, C) that is not ignore_index.
+; ----------------------------------------------------------------------
+Procedure.i PmOpNllLoss(lp.i, target.i, weight.i, y.i)
+  Protected i.i
+  Protected d.i
+  Protected t.i
+  Protected at.i
+  Protected v.f
+  Protected w.f
+  Protected total.f
+  Protected wsum.f
+  PmOpInit()
+  total = 0.0
+  wsum = 0.0
+  i = 0
+  While i < PmOpI(0)
+    d = 0
+    While d < PmOpI(2)
+      at = i * PmOpI(2) + d
+      If PmOpI(3) = 7
+        t = PmTensorGetI64(target, at)
+      Else
+        t = PeekL(target + at * 4)
+      EndIf
+      v = 0.0
+      If PmOpI(5) <> 0 And t = PmOpI(6)
+        v = 0.0
+      Else
+        If t < 0 Or t >= PmOpI(1)
+          ProcedureReturn 1
+        EndIf
+        w = PmOpOne
+        If PmOpI(7) <> 0
+          w = PmTensorGet(weight, t)
+        EndIf
+        v = PmOpNeg(PmTensorGet(lp, (i * PmOpI(1) + t) * PmOpI(2) + d))
+        v = w * v
+        wsum = PmOpAddF(wsum, w)
+      EndIf
+      If PmOpI(4) = 0
+        PmOpStoreF(y, at, v)
+      EndIf
+      total = PmOpAddF(total, v)
+      d = d + 1
+    Wend
+    i = i + 1
+  Wend
+  If PmOpI(4) = 1
+    PmOpStoreF(y, 0, total)
+  ElseIf PmOpI(4) = 2
+    total = total / wsum
+    PmOpStoreF(y, 0, total)
+  EndIf
+  ProcedureReturn 0
+EndProcedure
