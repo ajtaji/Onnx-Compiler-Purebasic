@@ -395,6 +395,72 @@ py -3.12 tests\node_suite\targeted_norm_small.py --pbcompiler "<install>\Compile
 norm_small: 132 of 132 as expected
 @ENDFRAG
 
+@SECTION INT8: one definition, the same bits on every target
+
+Chapter 4 states the INT8 arithmetic step by step. Every step is an exact
+integer operation or one binary32 operation, rounded to nearest-even, in a
+stated order - a row maximum taken on bit patterns, one division each for
+the scale and its reciprocal, one multiply and a round-half-even per value,
+exact integer sums, and per tap and per 512-element chunk one conversion,
+one multiply and one add. Nothing is fused and nothing is reassociated. That
+makes identity, not a tolerance, the contract between the Windows kernels
+(with AVX2 and without), the 64-bit Arm Advanced SIMD kernels of the Pi 4
+and UNO Q, and the Cortex-M kernels of the Pico and Pico 2, whose binary32
+arithmetic is done in software on the Pico.
+
+**What is proven**, by gates in the private tree, with no board:
+
+- The definition is also written in numpy, from the description rather than
+  from either implementation. On 51 cases - MatMul, Gemm in all four
+  transpose forms with its bias, Conv1D with padding, strides up to 6,
+  dilation and groups, Conv2D, the recurrent layer's gate rows - covering
+  narrow and wide weights, reductions that cross the 512-element chunk,
+  rows of zeros, rows below 1e-30, subnormal rows and values that land
+  exactly halfway between two integers, the Windows kernels with AVX2, the
+  same kernels without it, and numpy give the same bits. The Pi 4 build (run
+  as A64 code under an instruction emulator), the Pico build and the Pico 2
+  build (run as Thumb code) give those bits too, and the working memory they
+  are handed is filled with NaN first, so a kernel that read memory it had
+  not written would show it.
+- A NaN or an infinity in the activations is refused on every target with
+  the output left unwritten, and working memory one byte short of what an
+  operator needs is refused rather than overrun.
+- A recurrent layer's output passes through its sigmoid and tanh, which are
+  each target's own FP32 functions, so the layer is held to its gate rows
+  exactly (read back out of working memory on the embedded targets) and to
+  its outputs within 1e-6 of the largest value for one step. Over a
+  sequence the requantization of the hidden state can round a value the
+  other way, so sequences are held to 1e-5 - measured 1.5e-7, against 2.5e-7
+  for the same layer with its weights left in FP32.
+- Seventeen runtime mutants - rounding half away from zero, truncation in the
+  vector quantizer, a 1024-element wide chunk, the scale distributed over
+  the two planes, uncleared padding scales, rows below 1e-30 kept, NaN not
+  refused, a vector step that drops a channel, a multiply where the epilogue
+  divides, and more - are each rebuilt and each caught.
+- A small model with every INT8 operator form, compiled by this tool for
+  both model interfaces and built for Windows, the Pi 4, the Pico and the
+  Pico 2, gives the same bits from the generated programs end to end.
+- Nine nodes taken out of a real request of the speech model - the text
+  encoder's wide convolution, the ALBERT feed-forward MatMul, a stride-6
+  wide convolution of the waveform generator, 7.1 billion multiply-
+  accumulates of one generator convolution, and more - were fed their real
+  inputs on the Pi 4 build (whole) and on the Pico and Pico 2 builds (their
+  first output channels or rows): every output bit matches the Windows run.
+- The Pi 4's four-core convolution: each partition's worker, run on a
+  hand-built partition block, writes only its own channels (the others are
+  poisoned first) and the pieces reassemble to the whole, bit for bit, in
+  one to four pieces; the vector tile runs and no FP32 tile does once an
+  INT8 weight is bound.
+
+**What was measured, and on what.** The emulators count instructions; the
+Pico one also models cycles. On real speech-model convolutions the Pi 4
+build issues 0.38-0.41 A64 instructions per multiply-accumulate on the
+narrow layers against 0.63-0.68 for the FP32 kernel, and 0.88 against 0.82
+on the wide ones - 1.58 times fewer over four representative layers. On the
+Pico and Pico 2, in the cycle model, the gate model's INT8 request takes a
+third of the FP32 one's time. **Neither is a measurement on silicon, and
+the Pi 4 speed of this scheme is still to be measured on the board.**
+
 @SECTION Where the gates live, and why not here
 
 `tests/` is **not tracked by this repository**, with one exception. Its

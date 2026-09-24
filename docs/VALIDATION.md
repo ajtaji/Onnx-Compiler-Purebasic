@@ -329,6 +329,39 @@ program runs, which the fixed-shape planner cannot express. On that path a
 | Kokoro-82M generated for Windows and Pi 4 with and without this change, on the same commit | source closure identical, file for file |
 | Windows dynamic-runtime and SIMD self-tests | PASS |
 
+## INT8 — September 23, 2026
+
+INT8 now quantizes activations with one scale per row (per token, per input
+position across the channels of a convolution, per recurrent step), and a
+model may carry a measured precision plan of wide weights (two INT8 planes,
+16-bit activations). The pinned Kokoro-82M graph has one; every other model
+is narrow. The arithmetic is defined step by step, each step exact in
+integers or one binary32 operation, and every target is held to the same
+bits. [Chapter 4 of the book](guide/04_reading_a_model.txt) states the
+definition; [chapter 8](guide/08_how_it_is_proved.txt) how it is checked.
+
+| Check | Result |
+|---|---|
+| Full Kokoro-82M at INT8 on Windows (i9-14900HX), reference input, against ONNX Runtime FP32 on the pinned graph | 0 of 143 durations changed; log-mel 0.588 dB (this tool's FP32: 0.294; FP16 storage: 0.442; the earlier INT8 scheme: 9 of 143, about 5.2 dB) |
+| The same, a 295-token and a 69-token sentence | 0 of 295, 0.647 dB (FP16 storage: 1 of 295, 1.835 dB); 0 of 69, 0.442 dB |
+| Kokoro weight pack at INT8 | 119,358,848 bytes, 183 quantized weights of which 59 wide |
+| Windows speed, reference request, the two builds alternated, five rounds | FP32 5.51 s, INT8 4.47 s (medians); INT8 1.23 times faster |
+| 51 kernel cases (MatMul, Gemm in four transpose forms, Conv1D with pads, strides to 6, dilation and groups, Conv2D, LSTM gate rows; narrow and wide; rows of zeros, below 1e-30, subnormal, exactly halfway) | Windows with AVX2, without it, and a numpy statement of the definition: bit-identical. Pi 4 (Advanced SIMD, run as A64 code), Pico and Pico 2 (run as Thumb code) in an instruction emulator, NaN-filled working memory: bit-identical. NaN/infinity and one-byte-short working memory refused |
+| LSTM end to end | gate rows bit-identical on every target; outputs within 1.5e-7 of Windows relative to the largest (its sigmoid and tanh are each target's FP32 functions; the same layer in FP32: 2.5e-7) |
+| Runtime mutants (rounding, chunk length, epilogue order, padding scales, NaN refusal, vector-body faults, stride phases, Windows plain path) | 17 of 17 caught; the four-core split: 4 of 4 |
+| Pi 4 four-core INT8 convolution | whole = split in one to four partitions, each partition writes only its own channels, the vector tile runs and no FP32 tile after an INT8 weight is bound |
+| A model with every INT8 operator form, fixed-shape and runtime-dimension, generated and built for Windows, Pi 4, Pico, Pico 2 | outputs bit-identical to Windows on every target (LSTM output within 1.8e-7) |
+| Nine nodes of a real Kokoro request (wide text-encoder convolution, ALBERT FFN, stride-6 wide convolution, a 7.1-billion-MAC generator convolution, LSTM, Gemm) re-run on the Pi 4 build whole and on the Pico / Pico 2 builds cut to their first channels, rows or steps | every output bit equal to the Windows run (LSTM within 8.3e-6) |
+| Pi 4 instruction count, real Kokoro convolutions (emulator; no cycle model) | 0.38-0.41 A64 instructions per multiply-accumulate on narrow layers against 0.63-0.68 for FP32; 0.88 against 0.82 wide; 1.58 times fewer over four layers |
+| Pico and Pico 2, the gate model, the parts' own timers in the ARM emulator's cycle model | INT8 2.6-2.9 times faster than FP32 |
+| Models without INT8 (four models, fp32/fp16/bf16/int4, five targets), this change against the previous compiler | 80 of 80 emitted sources, packs and manifests byte-identical; 32 of 32 fixed-shape PureMetal images byte-identical; Kokoro FP32 on Windows: source, pack and both waveforms byte-identical |
+| Node-test corpus, this change against the previous compiler | identical outcomes, case for case |
+| Full Kokoro at INT8 for the Pi 4 | generated and built into a payload image (1,512,760 bytes) carrying the INT8 vector kernels |
+
+**Not established:** any board run. The Pi 4 speed and audio of this scheme
+are to be measured on the board; the Pico cannot hold the speech model.
+
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

@@ -49,7 +49,7 @@ All of these live under `src/compiler/`.
 | [onnx_runtime.pbi](../src/compiler/onnx_runtime.pbi) | Optional ONNX Runtime C API bridge for host reference execution, pinned to API version 29. Not generated inference. |
 | [onnx_trace.pbi](../src/compiler/onnx_trace.pbi) | Loads supplied feeds, runs optional host tracing, and records concrete output shapes. |
 | [onnx_ir.pbi](../src/compiler/onnx_ir.pbi) | Target-neutral graph representation, constant folding, aliases, lifetimes, and arena planning. |
-| [onnx_quant.pbi](../src/compiler/onnx_quant.pbi) | Eligible constant-weight INT8 conversion, scales, layouts, and quantization scratch planning. |
+| [onnx_quant.pbi](../src/compiler/onnx_quant.pbi) | Eligible constant-weight INT8 conversion, scales, layouts, the measured wide-weight precision plan of the pinned speech model, and quantization scratch planning. |
 | [onnx_storage.pbi](../src/compiler/onnx_storage.pbi) | FP16/BF16/INT4 storage conversion, rounding, decoded-memory budgets, and decoder template embedding. |
 | [onnx_pack.pbi](../src/compiler/onnx_pack.pbi) | Deterministic checked PMONNXW weight-pack construction, identity, CRC, and alignment. |
 | [onnx_targets.pbi](../src/compiler/onnx_targets.pbi) | Five target profiles: dialect, suffix, launch contract, kernels, and capacity defaults. |
@@ -73,10 +73,10 @@ An emitted application uses its exported runtime, not files from this checkout.
 
 | File | Responsibility |
 |---|---|
-| [tensor_fp32.pmi](../runtime/tensor_fp32.pmi) | Portable tensor foundation and scalar kernels, plus selected target INT8 inner loops. |
+| [tensor_fp32.pmi](../runtime/tensor_fp32.pmi) | Portable tensor foundation and scalar kernels, and the INT8 scheme: its portable definition and the AArch64 Advanced SIMD bodies that compute the same bits. |
 | [tensor_fp32_windows.pbi](../runtime/tensor_fp32_windows.pbi) | Windows-native tensor foundation and host execution support. |
 | [tensor_simd_windows.pbi](../runtime/tensor_simd_windows.pbi) | Native x64 SSE2/AVX kernels, threaded dense operations, convolution, and reductions. No inference DLL. |
-| [tensor_fp32_neon.pmi](../runtime/tensor_fp32_neon.pmi) | AArch64 NEON acceleration selected by the Pi 4 and UNO Q profiles. |
+| [tensor_fp32_neon.pmi](../runtime/tensor_fp32_neon.pmi) | AArch64 NEON acceleration selected by the Pi 4 and UNO Q profiles, including the four-core split of FP32 and INT8 convolution. |
 | [tensor_fp32_a64.pmi](../runtime/tensor_fp32_a64.pmi) | Retained ordered scalar-register AArch64 acceleration; distinct from the current NEON profile. |
 | [tensor_dynamic_windows.pbi](../runtime/tensor_dynamic_windows.pbi) | Runtime tensor descriptors, dimensions, typed operators, checked heap allocation, errors, and live/peak storage tracking. |
 | [tensor_dynamic_portable.pmi](../runtime/tensor_dynamic_portable.pmi) | Portable dynamic tensor implementation using a caller-owned arena with splitting and coalescing. |

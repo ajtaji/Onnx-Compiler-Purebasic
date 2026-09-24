@@ -1,4 +1,4 @@
-﻿; ============================================================================
+; ============================================================================
 ; onnx_emit.pbi - deterministic host-language/PureMetal source emission
 ; ----------------------------------------------------------------------------
 ; This is the native compiler backend.  It consumes the checked, folded IR;
@@ -1327,6 +1327,13 @@ Procedure.i PmoEmitNode(File.i, *Ir.PmoIrModel, *Profile.PmoTargetProfile,
   Else
     ProcedureReturn PmoEmitFail("validated operator reached no source emitter: " + Op)
   EndIf
+  ; An INT8 operator refuses a NaN or an infinity in its activations (fault 1)
+  ; and working memory smaller than it needs (fault 2) by leaving its output
+  ; unwritten and saying so in PmTensorInt8Fault; that fails the node here.
+  If (Op = "MatMul" Or Op = "Gemm" Or Op = "Conv" Or Op = "LSTM") And
+     (PmoEmitQuantWeight(*Ir, PmoEmitInput(*Node, 1)) Or (Op = "LSTM" And PmoEmitQuantWeight(*Ir, PmoEmitInput(*Node, 2))))
+    PmoEmitLine(File, "  If PmTensorInt8Fault <> 0 : PmOnnxRuntimeOk = 0 : EndIf")
+  EndIf
   If Op <> "Identity" And Op <> "Flatten" And Op <> "Squeeze" And Op <> "Unsqueeze"
     PmoEmitLine(File, "  If PmOnnxRuntimeOk = 0 : PmOnnxRuntimeErrorNode = " + Str(*Ref\Index) + " : ProcedureReturn 0 : EndIf")
   EndIf
@@ -1618,6 +1625,7 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
   EndIf
   PmoEmitLine(File, "  If PmOnnxWeightsBase = 0 Or PmOnnxArenaBase = 0 : ProcedureReturn 0 : EndIf")
   PmoEmitLine(File, "  PmOnnxRuntimeOk = 1 : PmOnnxRuntimeErrorNode = 0")
+  If *Ir\Int8ScratchBytes > 0 : PmoEmitLine(File, "  PmTensorInt8Fault = 0") : EndIf
   If RandomNodes : PmoEmitLine(File, "  PmRandomBeginRequest()") : EndIf
   If *Profile\NativeIntegerBytes = 4
     PmoEmitLine(File, "  PmTensorInt64Ok = 1")

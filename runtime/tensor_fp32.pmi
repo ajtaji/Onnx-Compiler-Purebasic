@@ -536,16 +536,6 @@ Procedure PmTensorClip(*src.i, *dst.i, count.i, lo.f, hi.f)
   Wend
 EndProcedure
 
-Structure PmTensorInt8RowArgs
-  A.i
-  B.i
-  Dst.i
-  K.i
-  N.i
-  Scales.i
-  AScale.f
-EndStructure
-
 Structure PmTensorInt8DotArgs
   A.i
   B.i
@@ -562,51 +552,85 @@ Structure PmTensorDotInt8Args
   WeightScale.f
 EndStructure
 
+; ---------------------------------------------------------------------------
+; INT8 execution (forum 671). One scheme on every target, and on every target
+; the same bits:
+;
+;  * weights: symmetric INT8, one FP32 scale per output channel. A WIDE weight
+;    (the compiler's precision plan) holds a second INT8 plane right after the
+;    first: w ~= scale * (Q1 + Q2 / 254);
+;  * activations: quantized at run time with ONE SCALE PER ROW of the
+;    reduction - per token (MatMul, Gemm), per input position (Conv), per step
+;    (LSTM). Narrow rows are INT8 (+-127), wide rows INT16 (+-32767). For a
+;    row whose largest magnitude is m (taken as the bit pattern of |x|):
+;    m below 1e-30 gives scale 0 and a row of zeros; otherwise scale = m / qmax
+;    and q = round-half-even(x * (qmax / m)), each FP32 operation rounded once;
+;  * products are exact integers summed in INT32. A wide sum is converted to
+;    FP32 every 512 reduction elements (16-bit x 8-bit products; 512 of them
+;    stay inside INT32). For each output, F starts at +0.0 and takes
+;    F = F + float(acc) * rowScale once per tap and per chunk, taps outermost;
+;    then y = F * wScale, or (F1 + F2 / 254) * wScale for a wide weight, and a
+;    Conv adds its bias last as bias + y.
+;
+; The Windows runtime (tensor_fp32_windows.pbi) is the same definition; every
+; value these kernels produce is bit-identical to it, which the desk gates
+; check on every target.
+;
+; Working memory is PmTensorInt8Scratch: the quantized rows, then one scale
+; and one reciprocal per row, then #PMI8_TILE_BYTES of per-core tiles, each
+; region on a 16-byte boundary. PmI8ScratchBytes gives the size. A NaN or an
+; infinity in the activations sets PmTensorInt8Fault = 1 and leaves the output
+; unwritten; working memory smaller than the operator needs sets it to 2.
+; ---------------------------------------------------------------------------
 CompilerIf #PMO_USE_INT8 = 1
 Global PmTensorInt8Scratch.i
 Global PmTensorInt8ScratchBytes.i
+Global PmTensorInt8Fault.i
 
+; The bit pattern of the binary32 value nearest 1e-30. A row whose largest
+; magnitude is below it is a row of zeros.
+#PMI8_TINY_BITS = $0DA24260
+; Per-core tile areas. The Advanced SIMD bodies use four of 1024 bytes (F1, F2,
+; an epilogue row block and the row scales and pointers); the scalar bodies use
+; 32 bytes of the first.
 CompilerIf #PMO_INT8_BACKEND = 1
-Procedure PmTensorInt8Row8(*g.PmTensorInt8RowArgs)
-  ASM
-    ldr x1, [x0, #0]
-    ldr x2, [x0, #8]
-    ldr x3, [x0, #16]
-    ldr x4, [x0, #24]
-    ldr x5, [x0, #32]
-    ldr x6, [x0, #40]
-    movi v0.4s, #0
-    movi v1.4s, #0
-    cbz x4, pmoInt8RowStore
-pmoInt8RowLoop:
-    ld1 {v2.8b}, [x2]
-    ld1 {v3.b}[0], [x1]
-    dup v3.8b, v3.b[0]
-    smull v4.8h, v2.8b, v3.8b
-    sxtl v5.4s, v4.4h
-    sxtl2 v6.4s, v4.8h
-    add v0.4s, v0.4s, v5.4s
-    add v1.4s, v1.4s, v6.4s
-    add x1, x1, #1
-    add x2, x2, x5
-    subs x4, x4, #1
-    b.ne pmoInt8RowLoop
-pmoInt8RowStore:
-    scvtf v0.4s, v0.4s
-    scvtf v1.4s, v1.4s
-    ldr s2, [x0, #48]
-    dup v2.4s, v2.s[0]
-    fmul v0.4s, v0.4s, v2.4s
-    fmul v1.4s, v1.4s, v2.4s
-    ld1 {v3.4s}, [x6], #16
-    ld1 {v4.4s}, [x6]
-    fmul v0.4s, v0.4s, v3.4s
-    fmul v1.4s, v1.4s, v4.4s
-    st1 {v0.4s}, [x3], #16
-    st1 {v1.4s}, [x3]
-  EndASM
-EndProcedure
+#PMI8_TILE_BYTES = 4096
+CompilerElse
+#PMI8_TILE_BYTES = 64
 CompilerEndIf
+#PMI8_TILE_STRIDE = 1024
+
+; One FP32 value at an address.
+Procedure.f PmI8GetF(address.i)
+  Protected p.i
+  p = address
+  ProcedureReturn *p.f
+EndProcedure
+
+Procedure PmI8PutF(address.i, value.f)
+  Protected p.i
+  p = address
+  *p.f = value
+EndProcedure
+
+; Nothing is kept between calls on these targets.
+Procedure PmTensorInt8Release()
+EndProcedure
+
+Procedure.i PmI8Align(bytes.i)
+  ProcedureReturn (bytes + 15) & -16
+EndProcedure
+
+; Working memory for `elements` quantized activations in `rows` rows.
+Procedure.i PmI8ScratchBytes(elements.i, rows.i, wide.i)
+  ProcedureReturn 16 + PmI8Align(elements * (1 + wide)) + PmI8Align(rows * 4) * 2 + #PMI8_TILE_BYTES
+EndProcedure
+
+; Working memory for an LSTM: one quantized input row, one hidden row, the
+; 4*Hidden gate sums of W.x and of R.h, and the scales.
+Procedure.i PmI8LstmScratchBytes(inputSize.i, hidden.i, wWide.i, rWide.i)
+  ProcedureReturn 16 + PmI8Align(inputSize * (1 + wWide)) + PmI8Align(hidden * (1 + rWide)) + PmI8Align(hidden * 16) * 2 + 64 + #PMI8_TILE_BYTES
+EndProcedure
 
 ; Exact signed-byte dot, with strides selected outside the reduction loop.
 Procedure.i PmTensorInt8Dot(*g.PmTensorInt8DotArgs)
@@ -757,60 +781,1035 @@ pmoInt8M33Done:
   CompilerEndIf
 EndProcedure
 
-Procedure.i PmTensorGetInt8(*base.i, index.i)
-  ProcedureReturn PeekB(*base + index)
+; Exact dot of `Count` signed 16-bit activations (StepA bytes apart) with
+; signed INT8 weights (StepB bytes apart). The wide path's chunk is at most
+; 512 elements, so the sum stays inside INT32.
+Structure PmI8Dot16Args
+  A.i
+  B.i
+  Count.i
+  StepA.i
+  StepB.i
+EndStructure
+
+Procedure.i PmI8Dot16(*g.PmI8Dot16Args)
+  CompilerIf #PMO_INT8_BACKEND >= 2
+  ASM
+    push {r4, r5, r6, r7}
+    ldr r1, [r0, #0]
+    ldr r2, [r0, #4]
+    ldr r3, [r0, #8]
+    ldr r4, [r0, #12]
+    ldr r5, [r0, #16]
+    movs r6, #0
+    cmp r3, #0
+    beq pmoI8Dot16ThumbDone
+pmoI8Dot16ThumbLoop:
+    ldrh r0, [r1]
+    ldrb r7, [r2]
+    sxth r0, r0
+    sxtb r7, r7
+    muls r0, r7
+    adds r6, r6, r0
+    adds r1, r1, r4
+    adds r2, r2, r5
+    subs r3, r3, #1
+    bne pmoI8Dot16ThumbLoop
+pmoI8Dot16ThumbDone:
+    movs r0, r6
+    pop {r4, r5, r6, r7}
+  EndASM
+  CompilerElse
+  Protected pa.i
+  Protected pb.i
+  Protected left.i
+  Protected total.i
+  pa = *g\A : pb = *g\B : left = *g\Count : total = 0
+  While left > 0
+    total = total + PeekW(pa) * PeekB(pb)
+    pa = pa + *g\StepA : pb = pb + *g\StepB : left = left - 1
+  Wend
+  ProcedureReturn total
+  CompilerEndIf
 EndProcedure
 
-Procedure.f PmTensorDynamicScale(*base.i, count.i)
+CompilerIf #PMO_INT8_BACKEND = 1
+; ---- Advanced SIMD bodies (Pi 4, UNO Q) ------------------------------------
+; Each one is the scalar definition below computed several lanes at a time:
+; integer products are exact, and every FP32 step is the same single
+; operation on the same operands (no fused multiply-add, no reassociation).
+
+; Largest |x| of `count` contiguous FP32 values, as its bit pattern.
+Procedure.i PmI8MaxBitsNeon(*src.i, count.i)
+  ASM
+    mov x2, x0
+    mvni v31.4s, #0x80, lsl #24
+    movi v0.4s, #0
+pmoI8MaxBits16:
+    cmp x1, #16
+    b.lt pmoI8MaxBits4
+    ld1 {v2.4s, v3.4s, v4.4s, v5.4s}, [x2], #64
+    and v2.16b, v2.16b, v31.16b
+    and v3.16b, v3.16b, v31.16b
+    and v4.16b, v4.16b, v31.16b
+    and v5.16b, v5.16b, v31.16b
+    umax v2.4s, v2.4s, v3.4s
+    umax v4.4s, v4.4s, v5.4s
+    umax v0.4s, v0.4s, v2.4s
+    umax v0.4s, v0.4s, v4.4s
+    sub x1, x1, #16
+    b pmoI8MaxBits16
+pmoI8MaxBits4:
+    cmp x1, #4
+    b.lt pmoI8MaxBits1
+    ld1 {v2.4s}, [x2], #16
+    and v2.16b, v2.16b, v31.16b
+    umax v0.4s, v0.4s, v2.4s
+    sub x1, x1, #4
+    b pmoI8MaxBits4
+pmoI8MaxBits1:
+    cbz x1, pmoI8MaxBitsDone
+    movi v2.4s, #0
+    ld1 {v2.s}[0], [x2], #4
+    and v2.16b, v2.16b, v31.16b
+    umax v0.4s, v0.4s, v2.4s
+    sub x1, x1, #1
+    b pmoI8MaxBits1
+pmoI8MaxBitsDone:
+    umaxv s0, v0.4s
+    umov w0, v0.s[0]
+  EndASM
+EndProcedure
+
+; out[c] = largest |src[r*RowBytes + c*4]| over Rows rows, as bit patterns.
+Structure PmI8ColumnArgs
+  Src.i
+  Rows.i
+  RowBytes.i
+  Cols.i
+  Out.i
+EndStructure
+
+Procedure PmI8ColMaxNeon(*a.PmI8ColumnArgs)
+  ASM
+    ldr x1, [x0, #0]
+    ldr x2, [x0, #8]
+    ldr x3, [x0, #16]
+    ldr x4, [x0, #24]
+    ldr x5, [x0, #32]
+    mvni v31.4s, #0x80, lsl #24
+pmoI8Col16:
+    cmp x4, #16
+    b.lt pmoI8Col4
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    mov x6, x1
+    mov x7, x2
+    cbz x7, pmoI8Col16Store
+pmoI8Col16Row:
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x6], x3
+    and v0.16b, v0.16b, v31.16b
+    and v1.16b, v1.16b, v31.16b
+    and v2.16b, v2.16b, v31.16b
+    and v3.16b, v3.16b, v31.16b
+    umax v16.4s, v16.4s, v0.4s
+    umax v17.4s, v17.4s, v1.4s
+    umax v18.4s, v18.4s, v2.4s
+    umax v19.4s, v19.4s, v3.4s
+    subs x7, x7, #1
+    b.ne pmoI8Col16Row
+pmoI8Col16Store:
+    st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5], #64
+    add x1, x1, #64
+    sub x4, x4, #16
+    b pmoI8Col16
+pmoI8Col4:
+    cmp x4, #4
+    b.lt pmoI8Col1
+    movi v16.4s, #0
+    mov x6, x1
+    mov x7, x2
+    cbz x7, pmoI8Col4Store
+pmoI8Col4Row:
+    ld1 {v0.4s}, [x6], x3
+    and v0.16b, v0.16b, v31.16b
+    umax v16.4s, v16.4s, v0.4s
+    subs x7, x7, #1
+    b.ne pmoI8Col4Row
+pmoI8Col4Store:
+    st1 {v16.4s}, [x5], #16
+    add x1, x1, #16
+    sub x4, x4, #4
+    b pmoI8Col4
+pmoI8Col1:
+    cbz x4, pmoI8ColDone
+    movi v16.4s, #0
+    mov x6, x1
+    mov x7, x2
+    cbz x7, pmoI8Col1Store
+pmoI8Col1Row:
+    movi v0.4s, #0
+    ld1 {v0.s}[0], [x6], x3
+    and v0.16b, v0.16b, v31.16b
+    umax v16.4s, v16.4s, v0.4s
+    subs x7, x7, #1
+    b.ne pmoI8Col1Row
+pmoI8Col1Store:
+    st1 {v16.s}[0], [x5], #4
+    add x1, x1, #4
+    sub x4, x4, #1
+    b pmoI8Col1
+pmoI8ColDone:
+  EndASM
+EndProcedure
+
+; dst = saturate(round-half-even(src * inv)), Count values, INT8 or INT16.
+; InvStep 0: one reciprocal for every value; 4: one per value.
+Structure PmI8QuantArgs
+  Src.i
+  Inv.i
+  InvStep.i
+  Dst.i
+  Count.i
+  Wide.i
+EndStructure
+
+Procedure PmI8QuantNeon(*a.PmI8QuantArgs)
+  ASM
+    ldr x1, [x0, #0]
+    ldr x2, [x0, #8]
+    ldr x3, [x0, #16]
+    ldr x4, [x0, #24]
+    ldr x5, [x0, #32]
+    ldr x6, [x0, #40]
+    ld1r {v7.4s}, [x2]
+    mov v6.16b, v7.16b
+pmoI8Quant8:
+    cmp x5, #8
+    b.lt pmoI8QuantTail
+    ld1 {v0.4s, v1.4s}, [x1], #32
+    cbz x3, pmoI8QuantMul
+    ld1 {v6.4s, v7.4s}, [x2], #32
+pmoI8QuantMul:
+    fmul v0.4s, v0.4s, v6.4s
+    fmul v1.4s, v1.4s, v7.4s
+    fcvtns v0.4s, v0.4s
+    fcvtns v1.4s, v1.4s
+    sqxtn v0.4h, v0.4s
+    sqxtn2 v0.8h, v1.4s
+    cbnz x6, pmoI8QuantStore16
+    sqxtn v0.8b, v0.8h
+    st1 {v0.8b}, [x4], #8
+    sub x5, x5, #8
+    b pmoI8Quant8
+pmoI8QuantStore16:
+    st1 {v0.8h}, [x4], #16
+    sub x5, x5, #8
+    b pmoI8Quant8
+pmoI8QuantTail:
+    cbz x5, pmoI8QuantDone
+    ld1 {v0.s}[0], [x1], #4
+    ld1 {v1.s}[0], [x2], x3
+    fmul v0.4s, v0.4s, v1.4s
+    fcvtns v0.4s, v0.4s
+    sqxtn v0.4h, v0.4s
+    cbnz x6, pmoI8QuantTail16
+    sqxtn v0.8b, v0.8h
+    st1 {v0.b}[0], [x4], #1
+    sub x5, x5, #1
+    b pmoI8QuantTail
+pmoI8QuantTail16:
+    st1 {v0.h}[0], [x4], #2
+    sub x5, x5, #1
+    b pmoI8QuantTail
+pmoI8QuantDone:
+  EndASM
+EndProcedure
+
+; Four broadcast rows by sixteen lanes over `Count` reduction steps, then the
+; flush F[r][l] = F[r][l] + float(acc[r][l]) * scale. Lane l of step c is the
+; value at L + c*LStep + l*size; row r's value at step c is at Pr + c*PStep.
+;   Kind 0: INT8 lanes x INT8 rows (narrow). Two steps share one 16-bit
+;           partial sum - two products of +-127 values stay inside +-32258.
+;   Kind 1: INT16 lanes x INT8 rows (wide Conv: activations in the lanes).
+;   Kind 2: INT8 lanes x INT16 rows (wide MatMul: weights in the lanes).
+; RowScale 0: sixteen per-lane scales at S; 1: four per-row scales at S.
+; Zero 1: F starts at +0.0 instead of being read.
+Structure PmI8TileArgs
+  L.i
+  LStep.i
+  P0.i
+  P1.i
+  P2.i
+  P3.i
+  PStep.i
+  Count.i
+  F.i
+  S.i
+  RowScale.i
+  Kind.i
+  Zero.i
+EndStructure
+
+Procedure PmI8TileNeon(*a.PmI8TileArgs)
+  ASM
+    ldr x1, [x0, #0]
+    ldr x2, [x0, #8]
+    ldr x10, [x0, #16]
+    ldr x11, [x0, #24]
+    ldr x12, [x0, #32]
+    ldr x13, [x0, #40]
+    ldr x14, [x0, #48]
+    ldr x3, [x0, #56]
+    ldr x4, [x0, #88]
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    movi v20.4s, #0
+    movi v21.4s, #0
+    movi v22.4s, #0
+    movi v23.4s, #0
+    movi v24.4s, #0
+    movi v25.4s, #0
+    movi v26.4s, #0
+    movi v27.4s, #0
+    movi v28.4s, #0
+    movi v29.4s, #0
+    movi v30.4s, #0
+    movi v31.4s, #0
+    cbz x3, pmoI8TileFlush
+    cbz x4, pmoI8TileK0
+    subs x4, x4, #1
+    b.ne pmoI8TileK2
+pmoI8TileK1:
+    ld1 {v1.8h, v2.8h}, [x1], x2
+    ld1r {v4.8b}, [x10], x14
+    sxtl v4.8h, v4.8b
+    smlal v16.4s, v1.4h, v4.4h
+    smlal2 v17.4s, v1.8h, v4.8h
+    smlal v18.4s, v2.4h, v4.4h
+    smlal2 v19.4s, v2.8h, v4.8h
+    ld1r {v4.8b}, [x11], x14
+    sxtl v4.8h, v4.8b
+    smlal v20.4s, v1.4h, v4.4h
+    smlal2 v21.4s, v1.8h, v4.8h
+    smlal v22.4s, v2.4h, v4.4h
+    smlal2 v23.4s, v2.8h, v4.8h
+    ld1r {v4.8b}, [x12], x14
+    sxtl v4.8h, v4.8b
+    smlal v24.4s, v1.4h, v4.4h
+    smlal2 v25.4s, v1.8h, v4.8h
+    smlal v26.4s, v2.4h, v4.4h
+    smlal2 v27.4s, v2.8h, v4.8h
+    ld1r {v4.8b}, [x13], x14
+    sxtl v4.8h, v4.8b
+    smlal v28.4s, v1.4h, v4.4h
+    smlal2 v29.4s, v1.8h, v4.8h
+    smlal v30.4s, v2.4h, v4.4h
+    smlal2 v31.4s, v2.8h, v4.8h
+    subs x3, x3, #1
+    b.ne pmoI8TileK1
+    b pmoI8TileFlush
+pmoI8TileK2:
+    ld1 {v0.16b}, [x1], x2
+    sxtl v1.8h, v0.8b
+    sxtl2 v2.8h, v0.16b
+    ld1r {v4.8h}, [x10], x14
+    smlal v16.4s, v1.4h, v4.4h
+    smlal2 v17.4s, v1.8h, v4.8h
+    smlal v18.4s, v2.4h, v4.4h
+    smlal2 v19.4s, v2.8h, v4.8h
+    ld1r {v4.8h}, [x11], x14
+    smlal v20.4s, v1.4h, v4.4h
+    smlal2 v21.4s, v1.8h, v4.8h
+    smlal v22.4s, v2.4h, v4.4h
+    smlal2 v23.4s, v2.8h, v4.8h
+    ld1r {v4.8h}, [x12], x14
+    smlal v24.4s, v1.4h, v4.4h
+    smlal2 v25.4s, v1.8h, v4.8h
+    smlal v26.4s, v2.4h, v4.4h
+    smlal2 v27.4s, v2.8h, v4.8h
+    ld1r {v4.8h}, [x13], x14
+    smlal v28.4s, v1.4h, v4.4h
+    smlal2 v29.4s, v1.8h, v4.8h
+    smlal v30.4s, v2.4h, v4.4h
+    smlal2 v31.4s, v2.8h, v4.8h
+    subs x3, x3, #1
+    b.ne pmoI8TileK2
+    b pmoI8TileFlush
+pmoI8TileK0:
+    cmp x3, #2
+    b.lt pmoI8TileK0One
+    ld1 {v0.16b}, [x1], x2
+    ld1 {v1.16b}, [x1], x2
+    ld1r {v4.16b}, [x10], x14
+    ld1r {v5.16b}, [x10], x14
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    smlal v6.8h, v1.8b, v5.8b
+    smlal2 v7.8h, v1.16b, v5.16b
+    saddw v16.4s, v16.4s, v6.4h
+    saddw2 v17.4s, v17.4s, v6.8h
+    saddw v18.4s, v18.4s, v7.4h
+    saddw2 v19.4s, v19.4s, v7.8h
+    ld1r {v4.16b}, [x11], x14
+    ld1r {v5.16b}, [x11], x14
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    smlal v6.8h, v1.8b, v5.8b
+    smlal2 v7.8h, v1.16b, v5.16b
+    saddw v20.4s, v20.4s, v6.4h
+    saddw2 v21.4s, v21.4s, v6.8h
+    saddw v22.4s, v22.4s, v7.4h
+    saddw2 v23.4s, v23.4s, v7.8h
+    ld1r {v4.16b}, [x12], x14
+    ld1r {v5.16b}, [x12], x14
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    smlal v6.8h, v1.8b, v5.8b
+    smlal2 v7.8h, v1.16b, v5.16b
+    saddw v24.4s, v24.4s, v6.4h
+    saddw2 v25.4s, v25.4s, v6.8h
+    saddw v26.4s, v26.4s, v7.4h
+    saddw2 v27.4s, v27.4s, v7.8h
+    ld1r {v4.16b}, [x13], x14
+    ld1r {v5.16b}, [x13], x14
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    smlal v6.8h, v1.8b, v5.8b
+    smlal2 v7.8h, v1.16b, v5.16b
+    saddw v28.4s, v28.4s, v6.4h
+    saddw2 v29.4s, v29.4s, v6.8h
+    saddw v30.4s, v30.4s, v7.4h
+    saddw2 v31.4s, v31.4s, v7.8h
+    sub x3, x3, #2
+    b pmoI8TileK0
+pmoI8TileK0One:
+    cbz x3, pmoI8TileFlush
+    ld1 {v0.16b}, [x1], x2
+    ld1r {v4.16b}, [x10], x14
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    saddw v16.4s, v16.4s, v6.4h
+    saddw2 v17.4s, v17.4s, v6.8h
+    saddw v18.4s, v18.4s, v7.4h
+    saddw2 v19.4s, v19.4s, v7.8h
+    ld1r {v4.16b}, [x11], x14
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    saddw v20.4s, v20.4s, v6.4h
+    saddw2 v21.4s, v21.4s, v6.8h
+    saddw v22.4s, v22.4s, v7.4h
+    saddw2 v23.4s, v23.4s, v7.8h
+    ld1r {v4.16b}, [x12], x14
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    saddw v24.4s, v24.4s, v6.4h
+    saddw2 v25.4s, v25.4s, v6.8h
+    saddw v26.4s, v26.4s, v7.4h
+    saddw2 v27.4s, v27.4s, v7.8h
+    ld1r {v4.16b}, [x13], x14
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    saddw v28.4s, v28.4s, v6.4h
+    saddw2 v29.4s, v29.4s, v6.8h
+    saddw v30.4s, v30.4s, v7.4h
+    saddw2 v31.4s, v31.4s, v7.8h
+pmoI8TileFlush:
+    ldr x5, [x0, #64]
+    ldr x6, [x0, #72]
+    ldr x7, [x0, #80]
+    ldr x8, [x0, #96]
+    scvtf v16.4s, v16.4s
+    scvtf v17.4s, v17.4s
+    scvtf v18.4s, v18.4s
+    scvtf v19.4s, v19.4s
+    scvtf v20.4s, v20.4s
+    scvtf v21.4s, v21.4s
+    scvtf v22.4s, v22.4s
+    scvtf v23.4s, v23.4s
+    scvtf v24.4s, v24.4s
+    scvtf v25.4s, v25.4s
+    scvtf v26.4s, v26.4s
+    scvtf v27.4s, v27.4s
+    scvtf v28.4s, v28.4s
+    scvtf v29.4s, v29.4s
+    scvtf v30.4s, v30.4s
+    scvtf v31.4s, v31.4s
+    cbnz x7, pmoI8TileRowScale
+    ld1 {v4.4s, v5.4s, v6.4s, v7.4s}, [x6]
+    fmul v16.4s, v16.4s, v4.4s
+    fmul v17.4s, v17.4s, v5.4s
+    fmul v18.4s, v18.4s, v6.4s
+    fmul v19.4s, v19.4s, v7.4s
+    fmul v20.4s, v20.4s, v4.4s
+    fmul v21.4s, v21.4s, v5.4s
+    fmul v22.4s, v22.4s, v6.4s
+    fmul v23.4s, v23.4s, v7.4s
+    fmul v24.4s, v24.4s, v4.4s
+    fmul v25.4s, v25.4s, v5.4s
+    fmul v26.4s, v26.4s, v6.4s
+    fmul v27.4s, v27.4s, v7.4s
+    fmul v28.4s, v28.4s, v4.4s
+    fmul v29.4s, v29.4s, v5.4s
+    fmul v30.4s, v30.4s, v6.4s
+    fmul v31.4s, v31.4s, v7.4s
+    b pmoI8TileAdd
+pmoI8TileRowScale:
+    ld1r {v4.4s}, [x6], #4
+    fmul v16.4s, v16.4s, v4.4s
+    fmul v17.4s, v17.4s, v4.4s
+    fmul v18.4s, v18.4s, v4.4s
+    fmul v19.4s, v19.4s, v4.4s
+    ld1r {v4.4s}, [x6], #4
+    fmul v20.4s, v20.4s, v4.4s
+    fmul v21.4s, v21.4s, v4.4s
+    fmul v22.4s, v22.4s, v4.4s
+    fmul v23.4s, v23.4s, v4.4s
+    ld1r {v4.4s}, [x6], #4
+    fmul v24.4s, v24.4s, v4.4s
+    fmul v25.4s, v25.4s, v4.4s
+    fmul v26.4s, v26.4s, v4.4s
+    fmul v27.4s, v27.4s, v4.4s
+    ld1r {v4.4s}, [x6], #4
+    fmul v28.4s, v28.4s, v4.4s
+    fmul v29.4s, v29.4s, v4.4s
+    fmul v30.4s, v30.4s, v4.4s
+    fmul v31.4s, v31.4s, v4.4s
+pmoI8TileAdd:
+    cbnz x8, pmoI8TileZero
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v16.4s, v0.4s, v16.4s
+    fadd v17.4s, v1.4s, v17.4s
+    fadd v18.4s, v2.4s, v18.4s
+    fadd v19.4s, v3.4s, v19.4s
+    st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5], #64
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v20.4s, v0.4s, v20.4s
+    fadd v21.4s, v1.4s, v21.4s
+    fadd v22.4s, v2.4s, v22.4s
+    fadd v23.4s, v3.4s, v23.4s
+    st1 {v20.4s, v21.4s, v22.4s, v23.4s}, [x5], #64
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v24.4s, v0.4s, v24.4s
+    fadd v25.4s, v1.4s, v25.4s
+    fadd v26.4s, v2.4s, v26.4s
+    fadd v27.4s, v3.4s, v27.4s
+    st1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x5], #64
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v28.4s, v0.4s, v28.4s
+    fadd v29.4s, v1.4s, v29.4s
+    fadd v30.4s, v2.4s, v30.4s
+    fadd v31.4s, v3.4s, v31.4s
+    st1 {v28.4s, v29.4s, v30.4s, v31.4s}, [x5]
+    b pmoI8TileDone
+pmoI8TileZero:
+    movi v0.4s, #0
+    fadd v16.4s, v0.4s, v16.4s
+    fadd v17.4s, v0.4s, v17.4s
+    fadd v18.4s, v0.4s, v18.4s
+    fadd v19.4s, v0.4s, v19.4s
+    fadd v20.4s, v0.4s, v20.4s
+    fadd v21.4s, v0.4s, v21.4s
+    fadd v22.4s, v0.4s, v22.4s
+    fadd v23.4s, v0.4s, v23.4s
+    fadd v24.4s, v0.4s, v24.4s
+    fadd v25.4s, v0.4s, v25.4s
+    fadd v26.4s, v0.4s, v26.4s
+    fadd v27.4s, v0.4s, v27.4s
+    fadd v28.4s, v0.4s, v28.4s
+    fadd v29.4s, v0.4s, v29.4s
+    fadd v30.4s, v0.4s, v30.4s
+    fadd v31.4s, v0.4s, v31.4s
+    st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5], #64
+    st1 {v20.4s, v21.4s, v22.4s, v23.4s}, [x5], #64
+    st1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x5], #64
+    st1 {v28.4s, v29.4s, v30.4s, v31.4s}, [x5]
+pmoI8TileDone:
+  EndASM
+EndProcedure
+
+; Four contiguous INT8 weight rows dotted with one contiguous activation row
+; (INT8, or INT16 when Wide), then F[r] = F[r] + float(acc[r]) * scale, the
+; scale being the one float at S. Wide callers pass at most 512 elements.
+Structure PmI8DotArgs
+  X.i
+  W0.i
+  W1.i
+  W2.i
+  W3.i
+  Count.i
+  F.i
+  S.i
+  Wide.i
+  Zero.i
+EndStructure
+
+Procedure PmI8DotNeon(*a.PmI8DotArgs)
+  ASM
+    ldr x1, [x0, #0]
+    ldr x10, [x0, #8]
+    ldr x11, [x0, #16]
+    ldr x12, [x0, #24]
+    ldr x13, [x0, #32]
+    ldr x3, [x0, #40]
+    ldr x4, [x0, #64]
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    movi v20.4s, #0
+    movi v21.4s, #0
+    movi v22.4s, #0
+    movi v23.4s, #0
+    mov w8, wzr
+    mov w9, wzr
+    mov w15, wzr
+    mov w16, wzr
+    cbnz x4, pmoI8DotW8
+pmoI8DotN16:
+    cmp x3, #16
+    b.lt pmoI8DotNTail
+    ld1 {v0.16b}, [x1], #16
+    ld1 {v1.16b}, [x10], #16
+    smull v2.8h, v0.8b, v1.8b
+    smull2 v3.8h, v0.16b, v1.16b
+    sadalp v16.4s, v2.8h
+    sadalp v17.4s, v3.8h
+    ld1 {v1.16b}, [x11], #16
+    smull v2.8h, v0.8b, v1.8b
+    smull2 v3.8h, v0.16b, v1.16b
+    sadalp v18.4s, v2.8h
+    sadalp v19.4s, v3.8h
+    ld1 {v1.16b}, [x12], #16
+    smull v2.8h, v0.8b, v1.8b
+    smull2 v3.8h, v0.16b, v1.16b
+    sadalp v20.4s, v2.8h
+    sadalp v21.4s, v3.8h
+    ld1 {v1.16b}, [x13], #16
+    smull v2.8h, v0.8b, v1.8b
+    smull2 v3.8h, v0.16b, v1.16b
+    sadalp v22.4s, v2.8h
+    sadalp v23.4s, v3.8h
+    sub x3, x3, #16
+    b pmoI8DotN16
+pmoI8DotNTail:
+    cbz x3, pmoI8DotSum
+    ldrb w5, [x1]
+    add x1, x1, #1
+    sxtb w5, w5
+    ldrb w6, [x10]
+    add x10, x10, #1
+    sxtb w6, w6
+    madd w8, w5, w6, w8
+    ldrb w6, [x11]
+    add x11, x11, #1
+    sxtb w6, w6
+    madd w9, w5, w6, w9
+    ldrb w6, [x12]
+    add x12, x12, #1
+    sxtb w6, w6
+    madd w15, w5, w6, w15
+    ldrb w6, [x13]
+    add x13, x13, #1
+    sxtb w6, w6
+    madd w16, w5, w6, w16
+    sub x3, x3, #1
+    b pmoI8DotNTail
+pmoI8DotW8:
+    cmp x3, #8
+    b.lt pmoI8DotWTail
+    ld1 {v0.8h}, [x1], #16
+    ld1 {v1.8b}, [x10], #8
+    sxtl v1.8h, v1.8b
+    smlal v16.4s, v0.4h, v1.4h
+    smlal2 v17.4s, v0.8h, v1.8h
+    ld1 {v1.8b}, [x11], #8
+    sxtl v1.8h, v1.8b
+    smlal v18.4s, v0.4h, v1.4h
+    smlal2 v19.4s, v0.8h, v1.8h
+    ld1 {v1.8b}, [x12], #8
+    sxtl v1.8h, v1.8b
+    smlal v20.4s, v0.4h, v1.4h
+    smlal2 v21.4s, v0.8h, v1.8h
+    ld1 {v1.8b}, [x13], #8
+    sxtl v1.8h, v1.8b
+    smlal v22.4s, v0.4h, v1.4h
+    smlal2 v23.4s, v0.8h, v1.8h
+    sub x3, x3, #8
+    b pmoI8DotW8
+pmoI8DotWTail:
+    cbz x3, pmoI8DotSum
+    ldrh w5, [x1]
+    add x1, x1, #2
+    sxth w5, w5
+    ldrb w6, [x10]
+    add x10, x10, #1
+    sxtb w6, w6
+    madd w8, w5, w6, w8
+    ldrb w6, [x11]
+    add x11, x11, #1
+    sxtb w6, w6
+    madd w9, w5, w6, w9
+    ldrb w6, [x12]
+    add x12, x12, #1
+    sxtb w6, w6
+    madd w15, w5, w6, w15
+    ldrb w6, [x13]
+    add x13, x13, #1
+    sxtb w6, w6
+    madd w16, w5, w6, w16
+    sub x3, x3, #1
+    b pmoI8DotWTail
+pmoI8DotSum:
+    add v16.4s, v16.4s, v17.4s
+    add v18.4s, v18.4s, v19.4s
+    add v20.4s, v20.4s, v21.4s
+    add v22.4s, v22.4s, v23.4s
+    addp v16.4s, v16.4s, v18.4s
+    addp v20.4s, v20.4s, v22.4s
+    addp v16.4s, v16.4s, v20.4s
+    movi v0.4s, #0
+    mov v0.s[0], w8
+    mov v0.s[1], w9
+    mov v0.s[2], w15
+    mov v0.s[3], w16
+    add v16.4s, v16.4s, v0.4s
+    scvtf v16.4s, v16.4s
+    ldr x6, [x0, #56]
+    ld1r {v1.4s}, [x6]
+    fmul v16.4s, v16.4s, v1.4s
+    ldr x5, [x0, #48]
+    ldr x7, [x0, #72]
+    movi v2.4s, #0
+    cbnz x7, pmoI8DotAdd
+    ld1 {v2.4s}, [x5]
+pmoI8DotAdd:
+    fadd v16.4s, v2.4s, v16.4s
+    st1 {v16.4s}, [x5]
+  EndASM
+EndProcedure
+
+; y[r][l] = (F1 or F1 + F2 / 254) * wScale (+ bias), for Rows rows of sixteen
+; lanes; row r lands at Dst + r*DStride. The weight scale is per row (the four
+; floats at WS, one per row) or, with LaneScale, per lane (sixteen at WS). The
+; bias, when present, is per row.
+Structure PmI8EpiArgs
+  F1.i
+  F2.i
+  WS.i
+  Bias.i
+  Dst.i
+  DStride.i
+  Rows.i
+  LaneScale.i
+EndStructure
+
+Procedure PmI8EpiNeon(*a.PmI8EpiArgs)
+  ASM
+    ldr x1, [x0, #0]
+    ldr x2, [x0, #8]
+    ldr x3, [x0, #16]
+    ldr x4, [x0, #24]
+    ldr x5, [x0, #32]
+    ldr x6, [x0, #40]
+    ldr x7, [x0, #48]
+    ldr x8, [x0, #56]
+    movz w9, #0x437e, lsl #16
+    dup v31.4s, w9
+    cbz x8, pmoI8EpiRow
+    ld1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x3]
+pmoI8EpiRow:
+    cbz x7, pmoI8EpiDone
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x1], #64
+    cbz x2, pmoI8EpiScale
+    ld1 {v4.4s, v5.4s, v6.4s, v7.4s}, [x2], #64
+    fdiv v4.4s, v4.4s, v31.4s
+    fdiv v5.4s, v5.4s, v31.4s
+    fdiv v6.4s, v6.4s, v31.4s
+    fdiv v7.4s, v7.4s, v31.4s
+    fadd v0.4s, v0.4s, v4.4s
+    fadd v1.4s, v1.4s, v5.4s
+    fadd v2.4s, v2.4s, v6.4s
+    fadd v3.4s, v3.4s, v7.4s
+pmoI8EpiScale:
+    cbnz x8, pmoI8EpiLane
+    ld1r {v4.4s}, [x3], #4
+    fmul v0.4s, v0.4s, v4.4s
+    fmul v1.4s, v1.4s, v4.4s
+    fmul v2.4s, v2.4s, v4.4s
+    fmul v3.4s, v3.4s, v4.4s
+    b pmoI8EpiBias
+pmoI8EpiLane:
+    fmul v0.4s, v0.4s, v24.4s
+    fmul v1.4s, v1.4s, v25.4s
+    fmul v2.4s, v2.4s, v26.4s
+    fmul v3.4s, v3.4s, v27.4s
+pmoI8EpiBias:
+    cbz x4, pmoI8EpiStore
+    ld1r {v4.4s}, [x4], #4
+    fadd v0.4s, v4.4s, v0.4s
+    fadd v1.4s, v4.4s, v1.4s
+    fadd v2.4s, v4.4s, v2.4s
+    fadd v3.4s, v4.4s, v3.4s
+pmoI8EpiStore:
+    st1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    add x5, x5, x6
+    sub x7, x7, #1
+    b pmoI8EpiRow
+pmoI8EpiDone:
+  EndASM
+EndProcedure
+CompilerEndIf
+
+; ---- the scalar definition ---------------------------------------------------
+; Round half to even of one FP32 value, from its bits, for |x| < 32768; any
+; larger magnitude comes back as 65536 with its sign and the caller clamps.
+Procedure.i PmI8RoundEven(x.f)
+  Protected bits.i
+  Protected a.i
+  Protected e.i
+  Protected m.i
+  Protected sh.i
+  Protected r.i
+  Protected rem.i
+  Protected half.i
+  bits = PeekL(@x)
+  a = bits & $7FFFFFFF
+  e = a >> 23
+  If e < 126
+    ProcedureReturn 0
+  EndIf
+  If e > 141
+    r = 65536
+  Else
+    m = (a & $7FFFFF) | $800000
+    sh = 150 - e
+    r = m >> sh
+    rem = m & ((1 << sh) - 1)
+    half = 1 << (sh - 1)
+    If rem > half
+      r = r + 1
+    ElseIf rem = half And (r & 1) = 1
+      r = r + 1
+    EndIf
+  EndIf
+  If (bits & $80000000) <> 0
+    r = 0 - r
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; Largest |x| of `count` values `stride` bytes apart, as its bit pattern. Bit
+; patterns of finite magnitudes order like the magnitudes; any pattern at or
+; above $7F800000 is a NaN or an infinity.
+Procedure.i PmI8MaxBits(*src.i, count.i, stride.i)
   Protected i.i
-  Protected value.f
-  Protected magnitude.f
-  Protected maximum.f
-  i = 0 : maximum = 0.0
+  Protected p.i
+  Protected v.i
+  Protected best.i
+  CompilerIf #PMO_INT8_BACKEND = 1
+  If stride = 4
+    ProcedureReturn PmI8MaxBitsNeon(*src, count)
+  EndIf
+  CompilerEndIf
+  i = 0 : p = *src : best = 0
   While i < count
-    value = PmTensorGet(*base, i)
-    magnitude = value
-    If magnitude < 0.0 : magnitude = 0.0 - magnitude : EndIf
-    If magnitude > maximum : maximum = magnitude : EndIf
+    v = PeekL(p) & $7FFFFFFF
+    If v > best : best = v : EndIf
+    p = p + stride : i = i + 1
+  Wend
+  ProcedureReturn best
+EndProcedure
+
+; Scale and reciprocal of one row maximum. Returns 0 for a NaN or an infinity.
+Procedure.i PmI8RowScale(bits.i, qmax.i, *scale.i, *inv.i)
+  Protected m.f
+  Protected q.f
+  Protected s.f
+  If bits >= $7F800000 Or bits < 0
+    ProcedureReturn 0
+  EndIf
+  If bits < #PMI8_TINY_BITS
+    PmI8PutF(*scale, 0.0) : PmI8PutF(*inv, 0.0)
+    ProcedureReturn 1
+  EndIf
+  PokeL(@m, bits)
+  q = qmax
+  s = m / q : PmI8PutF(*scale, s)
+  s = q / m : PmI8PutF(*inv, s)
+  ProcedureReturn 1
+EndProcedure
+
+; Quantize `count` values `stride` bytes apart with one reciprocal into a
+; contiguous row: one byte each when qmax is 127, two when it is 32767.
+Procedure PmI8QuantWith(*src.i, count.i, stride.i, inv.f, qmax.i, *dst.i)
+  Protected i.i
+  Protected p.i
+  Protected d.i
+  Protected q.i
+  Protected x.f
+  CompilerIf #PMO_INT8_BACKEND = 1
+  Protected qa.PmI8QuantArgs
+  If stride = 4
+    qa\Src = *src : qa\Inv = @inv : qa\InvStep = 0 : qa\Dst = *dst : qa\Count = count
+    qa\Wide = Bool(qmax <> 127)
+    PmI8QuantNeon(@qa)
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+  i = 0 : p = *src : d = *dst
+  While i < count
+    x = PmI8GetF(p)
+    x = x * inv
+    q = PmI8RoundEven(x)
+    If q > qmax : q = qmax : EndIf
+    If q < 0 - qmax : q = 0 - qmax : EndIf
+    If qmax = 127
+      PokeA(d, q & 255) : d = d + 1
+    Else
+      PokeW(d, q) : d = d + 2
+    EndIf
+    p = p + stride : i = i + 1
+  Wend
+EndProcedure
+
+; Quantize `count` contiguous values, each with its own reciprocal.
+Procedure PmI8QuantLanes(*src.i, *inv.i, count.i, qmax.i, *dst.i)
+  Protected i.i
+  Protected d.i
+  Protected q.i
+  Protected x.f
+  Protected r.f
+  CompilerIf #PMO_INT8_BACKEND = 1
+  Protected qa.PmI8QuantArgs
+  qa\Src = *src : qa\Inv = *inv : qa\InvStep = 4 : qa\Dst = *dst : qa\Count = count
+  qa\Wide = Bool(qmax <> 127)
+  PmI8QuantNeon(@qa)
+  ProcedureReturn
+  CompilerEndIf
+  i = 0 : d = *dst
+  While i < count
+    x = PmI8GetF(*src + i * 4)
+    r = PmI8GetF(*inv + i * 4)
+    x = x * r
+    q = PmI8RoundEven(x)
+    If q > qmax : q = qmax : EndIf
+    If q < 0 - qmax : q = 0 - qmax : EndIf
+    If qmax = 127
+      PokeA(d, q & 255) : d = d + 1
+    Else
+      PokeW(d, q) : d = d + 2
+    EndIf
     i = i + 1
   Wend
-  If maximum = 0.0 : ProcedureReturn 1.0 : EndIf
-  ProcedureReturn maximum / 127.0
 EndProcedure
 
-Procedure.i PmTensorQuantizeInt8(value.f, scale.f)
-  Protected quantized.i
-  Protected bit.i
-  Protected negative.i
-  Protected threshold.f
-  quantized = 0 : negative = 0
-  If value < 0.0 : negative = 1 : value = 0.0 - value : EndIf
-  bit = 64 : threshold = scale * 64.0
-  While bit > 0
-    If value >= threshold : quantized = quantized + bit : value = value - threshold : EndIf
-    threshold = threshold * 0.5 : bit = bit / 2
-  Wend
-  If value >= scale * 0.5 : quantized = quantized + 1 : EndIf
-  If quantized > 127 : quantized = 127 : EndIf
-  If negative <> 0 : quantized = 0 - quantized : EndIf
-  ProcedureReturn quantized
+; One whole row: its scale at *scale, its reciprocal at *inv, its values at
+; *dst. Returns 0 for a NaN or an infinity (nothing is written then).
+Procedure.i PmI8QuantRow(*src.i, count.i, stride.i, qmax.i, *dst.i, *scale.i, *inv.i)
+  Protected bits.i
+  bits = PmI8MaxBits(*src, count, stride)
+  If PmI8RowScale(bits, qmax, *scale, *inv) = 0
+    ProcedureReturn 0
+  EndIf
+  PmI8QuantWith(*src, count, stride, PmI8GetF(*inv), qmax, *dst)
+  ProcedureReturn 1
 EndProcedure
 
-Procedure PmTensorQuantizeBuffer(*src.i, *dst.i, count.i, scale.f)
-  Protected index.i
-  index = 0
-  While index < count
-    PokeA(*dst + index, PmTensorQuantizeInt8(PmTensorGet(*src, index), scale) & 255)
-    index = index + 1
-  Wend
-EndProcedure
-
-Procedure.f PmTensorDotInt8Scaled(*g.PmTensorDotInt8Args)
+; F + the scaled sums of one weight row against one quantized row: per chunk
+; (the whole row narrow, 512 elements wide) F = F + float(acc) * scale.
+; Activations are stepQ bytes apart, weights stepW bytes apart.
+Procedure.f PmI8RowF(f.f, *q.i, stepQ.i, *w.i, stepW.i, count.i, wide.i, scale.f)
   Protected dot.PmTensorInt8DotArgs
-  Protected converted.f
-  dot\A=*g\A : dot\B=*g\B : dot\Count=*g\Count : dot\StepA=1 : dot\StepB=1
-  converted=PmTensorInt8Dot(@dot)
-  ProcedureReturn converted * *g\AScale * *g\WeightScale
+  Protected d16.PmI8Dot16Args
+  Protected k.i
+  Protected n.i
+  Protected acc.i
+  Protected v.f
+  If wide = 0
+    dot\A = *q : dot\B = *w : dot\Count = count : dot\StepA = stepQ : dot\StepB = stepW
+    acc = PmTensorInt8Dot(@dot)
+    v = acc : v = v * scale : f = f + v
+    ProcedureReturn f
+  EndIf
+  d16\StepA = stepQ : d16\StepB = stepW : k = 0
+  While k < count
+    n = count - k
+    If n > 512 : n = 512 : EndIf
+    d16\A = *q + k * stepQ : d16\B = *w + k * stepW : d16\Count = n
+    acc = PmI8Dot16(@d16)
+    v = acc : v = v * scale : f = f + v
+    k = k + n
+  Wend
+  ProcedureReturn f
+EndProcedure
+
+; y = F1 * wScale, or (F1 + F2 / 254) * wScale for a wide weight.
+Procedure.f PmI8Finish(f1.f, f2.f, wide.i, ws.f)
+  Protected v.f
+  Protected t.f
+  v = f1
+  If wide <> 0
+    t = f2 / 254.0
+    v = v + t
+  EndIf
+  v = v * ws
+  ProcedureReturn v
+EndProcedure
+
+; F1/F2 of four consecutive weight rows (rowStride bytes apart, elements
+; contiguous, plane 2 `plane` bytes after plane 1) against one quantized row.
+Procedure PmI8Block4(*q.i, *w.i, rowStride.i, plane.i, count.i, wide.i, *scale.i, *f1.i, *f2.i)
+  Protected r.i
+  Protected f.f
+  CompilerIf #PMO_INT8_BACKEND = 1
+  Protected da.PmI8DotArgs
+  Protected k.i
+  Protected n.i
+  Protected p.i
+  p = 0
+  While p <= wide
+    k = 0
+    da\Zero = 1 : da\Wide = wide : da\S = *scale
+    da\F = *f1 : If p = 1 : da\F = *f2 : EndIf
+    If count = 0
+      da\X = *q : da\W0 = *w : da\W1 = *w : da\W2 = *w : da\W3 = *w : da\Count = 0
+      PmI8DotNeon(@da)
+    EndIf
+    While k < count
+      n = count - k
+      If wide <> 0 And n > 512 : n = 512 : EndIf
+      da\X = *q + k * (1 + wide)
+      da\W0 = *w + p * plane + k : da\W1 = da\W0 + rowStride
+      da\W2 = da\W1 + rowStride : da\W3 = da\W2 + rowStride
+      da\Count = n
+      PmI8DotNeon(@da)
+      da\Zero = 0
+      k = k + n
+    Wend
+    p = p + 1
+  Wend
+  ProcedureReturn
+  CompilerEndIf
+  r = 0
+  While r < 4
+    f = PmI8RowF(0.0, *q, 1 + wide, *w + r * rowStride, 1, count, wide, PmI8GetF(*scale))
+    PmI8PutF(*f1 + r * 4, f)
+    If wide <> 0
+      f = PmI8RowF(0.0, *q, 2, *w + plane + r * rowStride, 1, count, wide, PmI8GetF(*scale))
+      PmI8PutF(*f2 + r * 4, f)
+    EndIf
+    r = r + 1
+  Wend
+EndProcedure
+
+; The start of the scratch's tile areas (16-byte aligned).
+Procedure.i PmI8Base()
+  ProcedureReturn PmI8Align(PmTensorInt8Scratch)
 EndProcedure
 CompilerEndIf
 
@@ -846,38 +1845,179 @@ Procedure PmTensorMatMul2(*a.i, *b.i, *dst.i, m.i, k.i, n.i)
 EndProcedure
 
 CompilerIf #PMO_USE_INT8 = 1
-Procedure PmTensorMatMul2Int8(*a.i, *b.i, *dst.i, m.i, k.i, n.i, *weightScales.i)
-  Protected row.i
-  Protected col.i
-  Protected aScale.f
-  Protected converted.f
-  Protected dot.PmTensorInt8DotArgs
-  aScale = PmTensorDynamicScale(*a, m * k)
-  Protected eight.PmTensorInt8RowArgs
-  PmTensorQuantizeBuffer(*a, PmTensorInt8Scratch, m * k, aScale)
-  dot\Count=k : dot\StepA=1 : dot\StepB=n
-  row=0
-  While row<m
-    dot\A=PmTensorInt8Scratch+row*k : col=0
-    CompilerIf #PMO_INT8_BACKEND = 1
-    eight\A=dot\A : eight\K=k : eight\N=n : eight\AScale=aScale
-    While col+7<n
-      eight\B=*b+col : eight\Dst=*dst+(row*n+col)*4 : eight\Scales=*weightScales+col*4
-      PmTensorInt8Row8(@eight)
-      col=col+8
+; MatMul with an INT8 B ([K][N], one batch slice): one scale per row of A.
+Structure PmI8MatMulArgs
+  A.i
+  B.i
+  Dst.i
+  M.i
+  K.i
+  N.i
+  Scales.i
+  Wide.i
+  Elements.i
+EndStructure
+
+CompilerIf #PMO_INT8_BACKEND = 1
+; F1 (and F2) of rows at the four pointers stored at tile+784 against sixteen
+; columns c0.. of a [K][N] INT8 weight: lanes are weight columns, the
+; broadcast rows are quantized activations, one scale per row at tile+768.
+Procedure PmI8ColumnTileNeon(*b.i, elements.i, n.i, c0.i, k.i, wide.i, tile.i)
+  Protected ta.PmI8TileArgs
+  Protected k0.i
+  Protected cnt.i
+  Protected p.i
+  Protected es.i
+  Protected more.i
+  es = 1 + wide
+  ta\LStep = n : ta\PStep = es : ta\RowScale = 1 : ta\S = tile + 768
+  ta\Kind = 0 : If wide <> 0 : ta\Kind = 2 : EndIf
+  p = 0
+  While p <= wide
+    ta\F = tile + p * 256 : ta\Zero = 1 : k0 = 0 : more = 1
+    While more
+      cnt = k - k0
+      If wide <> 0 And cnt > 512 : cnt = 512 : EndIf
+      ta\L = *b + p * elements + k0 * n + c0
+      ta\P0 = PeekI(tile + 784) + k0 * es : ta\P1 = PeekI(tile + 792) + k0 * es
+      ta\P2 = PeekI(tile + 800) + k0 * es : ta\P3 = PeekI(tile + 808) + k0 * es
+      ta\Count = cnt
+      PmI8TileNeon(@ta)
+      ta\Zero = 0
+      k0 = k0 + cnt
+      If k0 >= k : more = 0 : EndIf
     Wend
-    CompilerEndIf
-    While col<n
-      dot\B=*b+col
-      converted=PmTensorInt8Dot(@dot)
-      PmTensorPut(*dst,row*n+col,converted*aScale*PmTensorGet(*weightScales,col))
-      col=col+1
-    Wend
-    row=row+1
+    p = p + 1
   Wend
+EndProcedure
+
+; Row block r0 (up to four rows, the last one repeated to fill the tile):
+; store its row pointers and scales in the tile.
+Procedure.i PmI8RowBlock(q.i, s.i, m.i, k.i, es.i, r0.i, tile.i)
+  Protected i.i
+  Protected rr.i
+  Protected rows.i
+  rows = m - r0 : If rows > 4 : rows = 4 : EndIf
+  i = 0
+  While i < 4
+    rr = r0 + i : If rr >= m : rr = m - 1 : EndIf
+    PmI8PutF(tile + 768 + i * 4, PmI8GetF(s + rr * 4))
+    PokeI(tile + 784 + i * 8, q + rr * k * es)
+    i = i + 1
+  Wend
+  ProcedureReturn rows
+EndProcedure
+
+; Columns [0, N & -16) of every row. Returns the first column not written.
+Procedure.i PmI8MatMulNeon(*g.PmI8MatMulArgs, q.i, s.i, tile.i)
+  Protected ea.PmI8EpiArgs
+  Protected n16.i
+  Protected r0.i
+  Protected rows.i
+  Protected c0.i
+  n16 = *g\N & -16
+  If n16 = 0 : ProcedureReturn 0 : EndIf
+  r0 = 0
+  While r0 < *g\M
+    rows = PmI8RowBlock(q, s, *g\M, *g\K, 1 + *g\Wide, r0, tile)
+    c0 = 0
+    While c0 < n16
+      PmI8ColumnTileNeon(*g\B, *g\Elements, *g\N, c0, *g\K, *g\Wide, tile)
+      ea\F1 = tile : ea\F2 = 0 : If *g\Wide <> 0 : ea\F2 = tile + 256 : EndIf
+      ea\WS = *g\Scales + c0 * 4 : ea\Bias = 0
+      ea\Dst = *g\Dst + (r0 * *g\N + c0) * 4 : ea\DStride = *g\N * 4
+      ea\Rows = rows : ea\LaneScale = 1
+      PmI8EpiNeon(@ea)
+      c0 = c0 + 16
+    Wend
+    r0 = r0 + 4
+  Wend
+  ProcedureReturn n16
 EndProcedure
 CompilerEndIf
 
+; Returns 0 on a fault (PmTensorInt8Fault says which), 1 otherwise.
+Procedure.i PmI8MatMul(*g.PmI8MatMulArgs)
+  Protected es.i
+  Protected qmax.i
+  Protected need.i
+  Protected q.i
+  Protected s.i
+  Protected inv.i
+  Protected tile.i
+  Protected r.i
+  Protected c.i
+  Protected col0.i
+  Protected f1.f
+  Protected f2.f
+  Protected v.f
+  If *g\M <= 0 Or *g\N <= 0 : ProcedureReturn 1 : EndIf
+  es = 1 + *g\Wide
+  qmax = 127 : If *g\Wide <> 0 : qmax = 32767 : EndIf
+  need = PmI8ScratchBytes(*g\M * *g\K, *g\M, *g\Wide)
+  If PmTensorInt8Scratch = 0 Or need > PmTensorInt8ScratchBytes
+    PmTensorInt8Fault = 2 : ProcedureReturn 0
+  EndIf
+  q = PmI8Base()
+  s = q + PmI8Align(*g\M * *g\K * es)
+  inv = s + PmI8Align(*g\M * 4)
+  tile = inv + PmI8Align(*g\M * 4)
+  r = 0
+  While r < *g\M
+    If PmI8QuantRow(*g\A + r * *g\K * 4, *g\K, 4, qmax, q + r * *g\K * es, s + r * 4, inv + r * 4) = 0
+      PmTensorInt8Fault = 1 : ProcedureReturn 0
+    EndIf
+    r = r + 1
+  Wend
+  col0 = 0
+  CompilerIf #PMO_INT8_BACKEND = 1
+  col0 = PmI8MatMulNeon(*g, q, s, tile)
+  CompilerEndIf
+  r = 0
+  While r < *g\M
+    c = col0
+    While c < *g\N
+      f1 = PmI8RowF(0.0, q + r * *g\K * es, es, *g\B + c, *g\N, *g\K, *g\Wide, PmI8GetF(s + r * 4))
+      f2 = 0.0
+      If *g\Wide <> 0
+        f2 = PmI8RowF(0.0, q + r * *g\K * es, es, *g\B + *g\Elements + c, *g\N, *g\K, 1, PmI8GetF(s + r * 4))
+      EndIf
+      v = PmI8Finish(f1, f2, *g\Wide, PmI8GetF(*g\Scales + c * 4))
+      PmI8PutF(*g\Dst + (r * *g\N + c) * 4, v)
+      c = c + 1
+    Wend
+    r = r + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; The fixed-shape entry: narrow weights.
+Procedure PmTensorMatMul2Int8(*a.i, *b.i, *dst.i, m.i, k.i, n.i, *weightScales.i)
+  Protected mm.PmI8MatMulArgs
+  mm\A = *a : mm\B = *b : mm\Dst = *dst : mm\M = m : mm\K = k : mm\N = n
+  mm\Scales = *weightScales : mm\Wide = 0 : mm\Elements = k * n
+  If PmI8MatMul(@mm) = 0 And PmTensorInt8Fault = 0 : PmTensorInt8Fault = 2 : EndIf
+EndProcedure
+CompilerEndIf
+
+CompilerIf #PMO_USE_INT8 = 1
+Structure PmTensorGemmArgs
+  A.i
+  B.i
+  C.i
+  Dst.i
+  M.i
+  K.i
+  N.i
+  TransA.i
+  TransB.i
+  Alpha.f
+  Beta.f
+  CCount.i
+  WeightScales.i
+  Wide.i
+EndStructure
+CompilerElse
 Structure PmTensorGemmArgs
   A.i
   B.i
@@ -893,6 +2033,143 @@ Structure PmTensorGemmArgs
   CCount.i
   WeightScales.i
 EndStructure
+CompilerEndIf
+
+CompilerIf #PMO_USE_INT8 = 1
+; y = alpha * (F1 or F1 + F2 / 254) * wScale + beta * C, one rounding per step.
+Procedure PmI8GemmStore(*g.PmTensorGemmArgs, row.i, col.i, f1.f, f2.f)
+  Protected v.f
+  Protected t.f
+  Protected ic.i
+  v = f1
+  If *g\Wide <> 0
+    t = f2 / 254.0
+    v = v + t
+  EndIf
+  v = v * PmI8GetF(*g\WeightScales + col * 4)
+  v = v * *g\Alpha
+  If *g\C <> 0 And *g\CCount > 0
+    ic = row * *g\N + col
+    If *g\CCount = 1
+      ic = 0
+    ElseIf *g\CCount = *g\N
+      ic = col
+    EndIf
+    t = PmI8GetF(*g\C + ic * 4)
+    t = *g\Beta * t
+    v = v + t
+  EndIf
+  PmI8PutF(*g\Dst + (row * *g\N + col) * 4, v)
+EndProcedure
+
+; ONNX Gemm with an INT8 B: one scale per row of A' (per token).
+Procedure.i PmI8Gemm(*g.PmTensorGemmArgs)
+  Protected es.i
+  Protected qmax.i
+  Protected need.i
+  Protected q.i
+  Protected s.i
+  Protected inv.i
+  Protected tile.i
+  Protected r.i
+  Protected c.i
+  Protected i.i
+  Protected col0.i
+  Protected elements.i
+  Protected src.i
+  Protected stride.i
+  Protected rows.i
+  Protected r0.i
+  Protected f1.f
+  Protected f2.f
+  If *g\M <= 0 Or *g\N <= 0 : ProcedureReturn 1 : EndIf
+  es = 1 + *g\Wide
+  qmax = 127 : If *g\Wide <> 0 : qmax = 32767 : EndIf
+  need = PmI8ScratchBytes(*g\M * *g\K, *g\M, *g\Wide)
+  If PmTensorInt8Scratch = 0 Or need > PmTensorInt8ScratchBytes
+    PmTensorInt8Fault = 2 : ProcedureReturn 0
+  EndIf
+  q = PmI8Base()
+  s = q + PmI8Align(*g\M * *g\K * es)
+  inv = s + PmI8Align(*g\M * 4)
+  tile = inv + PmI8Align(*g\M * 4)
+  elements = *g\K * *g\N
+  r = 0
+  While r < *g\M
+    src = *g\A + r * *g\K * 4 : stride = 4
+    If *g\TransA <> 0 : src = *g\A + r * 4 : stride = *g\M * 4 : EndIf
+    If PmI8QuantRow(src, *g\K, stride, qmax, q + r * *g\K * es, s + r * 4, inv + r * 4) = 0
+      PmTensorInt8Fault = 1 : ProcedureReturn 0
+    EndIf
+    r = r + 1
+  Wend
+  col0 = 0
+  If *g\TransB <> 0
+    ; Weight rows are contiguous: four columns at a time.
+    col0 = *g\N & -4
+    r = 0
+    While r < *g\M
+      c = 0
+      While c < col0
+        PmI8Block4(q + r * *g\K * es, *g\B + c * *g\K, *g\K, elements, *g\K, *g\Wide, s + r * 4, tile, tile + 16)
+        i = 0
+        While i < 4
+          PmI8GemmStore(*g, r, c + i, PmI8GetF(tile + i * 4), PmI8GetF(tile + 16 + i * 4))
+          i = i + 1
+        Wend
+        c = c + 4
+      Wend
+      r = r + 1
+    Wend
+  Else
+    CompilerIf #PMO_INT8_BACKEND = 1
+    col0 = *g\N & -16
+    r0 = 0
+    While r0 < *g\M And col0 > 0
+      rows = PmI8RowBlock(q, s, *g\M, *g\K, es, r0, tile)
+      c = 0
+      While c < col0
+        PmI8ColumnTileNeon(*g\B, elements, *g\N, c, *g\K, *g\Wide, tile)
+        r = 0
+        While r < rows
+          i = 0
+          While i < 16
+            PmI8GemmStore(*g, r0 + r, c + i, PmI8GetF(tile + (r * 16 + i) * 4), PmI8GetF(tile + 256 + (r * 16 + i) * 4))
+            i = i + 1
+          Wend
+          r = r + 1
+        Wend
+        c = c + 16
+      Wend
+      r0 = r0 + 4
+    Wend
+    CompilerEndIf
+  EndIf
+  r = 0
+  While r < *g\M
+    c = col0
+    While c < *g\N
+      If *g\TransB <> 0
+        f1 = PmI8RowF(0.0, q + r * *g\K * es, es, *g\B + c * *g\K, 1, *g\K, *g\Wide, PmI8GetF(s + r * 4))
+        f2 = 0.0
+        If *g\Wide <> 0
+          f2 = PmI8RowF(0.0, q + r * *g\K * es, es, *g\B + elements + c * *g\K, 1, *g\K, 1, PmI8GetF(s + r * 4))
+        EndIf
+      Else
+        f1 = PmI8RowF(0.0, q + r * *g\K * es, es, *g\B + c, *g\N, *g\K, *g\Wide, PmI8GetF(s + r * 4))
+        f2 = 0.0
+        If *g\Wide <> 0
+          f2 = PmI8RowF(0.0, q + r * *g\K * es, es, *g\B + elements + c, *g\N, *g\K, 1, PmI8GetF(s + r * 4))
+        EndIf
+      EndIf
+      PmI8GemmStore(*g, r, c, f1, f2)
+      c = c + 1
+    Wend
+    r = r + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+CompilerEndIf
 
 ; ONNX Gemm: Y = alpha * A' * B' + beta * C. C may be absent (0), a
 ; scalar (cCount=1), one value per column (cCount=n), or a full MxN matrix.
@@ -912,31 +2189,7 @@ Procedure PmTensorGemm(*g.PmTensorGemmArgs)
   Protected sum.f
   CompilerIf #PMO_USE_INT8 = 1
   If *g\WeightScales <> 0
-    aScale = PmTensorDynamicScale(*g\A, *g\M * *g\K)
-    PmTensorQuantizeBuffer(*g\A, PmTensorInt8Scratch, *g\M * *g\K, aScale)
-    dot\Count=*g\K : dot\StepA=1 : dot\StepB=*g\N
-    If *g\TransA : dot\StepA=*g\M : EndIf
-    If *g\TransB : dot\StepB=1 : EndIf
-    row=0
-    While row<*g\M
-      ia=row* *g\K : If *g\TransA : ia=row : EndIf
-      dot\A=PmTensorInt8Scratch+ia : col=0
-      While col<*g\N
-        ib=col : If *g\TransB : ib=col* *g\K : EndIf
-        dot\B=*g\B+ib
-        converted=PmTensorInt8Dot(@dot)
-        sum=converted*aScale*PmTensorGet(*g\WeightScales,col)
-        sum=sum* *g\Alpha
-        If *g\C<>0 And *g\CCount>0
-          ic=row* *g\N+col
-          If *g\CCount=1 : ic=0 : ElseIf *g\CCount=*g\N : ic=col : EndIf
-          sum=sum+*g\Beta*PmTensorGet(*g\C,ic)
-        EndIf
-        PmTensorPut(*g\Dst,row* *g\N+col,sum)
-        col=col+1
-      Wend
-      row=row+1
-    Wend
+    If PmI8Gemm(*g) = 0 And PmTensorInt8Fault = 0 : PmTensorInt8Fault = 2 : EndIf
     ProcedureReturn
   EndIf
   CompilerEndIf
@@ -1710,6 +2963,27 @@ EndProcedure
 CompilerEndIf
 
 ; NCW 1-D convolution. W is [outChannels, inChannels/group, kernel].
+CompilerIf #PMO_USE_INT8 = 1
+Structure PmTensorConv1DArgs
+  Src.i
+  Weight.i
+  Bias.i
+  Dst.i
+  Batches.i
+  InChannels.i
+  InWidth.i
+  OutChannels.i
+  OutWidth.i
+  Kernel.i
+  PadLeft.i
+  Stride.i
+  Dilation.i
+  Groups.i
+  WeightScales.i
+  Wide.i
+  QuantBatch.i
+EndStructure
+CompilerElse
 Structure PmTensorConv1DArgs
   Src.i
   Weight.i
@@ -1727,63 +3001,352 @@ Structure PmTensorConv1DArgs
   Groups.i
   WeightScales.i
 EndStructure
+CompilerEndIf
 
 CompilerIf #PMO_USE_CONV = 1
 CompilerIf #PMO_USE_INT8 = 1
-; Padding is clipped once per output, not checked for every multiply.
-Procedure PmTensorConv1DInt8Range(*g.PmTensorConv1DArgs, first.i, last.i, aScale.f)
-  Protected work.i
-  Protected bn.i
-  Protected oc.i
-  Protected ox.i
-  Protected start.i
-  Protected beginK.i
-  Protected endK.i
-  Protected ic.i
-  Protected channels.i
-  Protected groupBase.i
-  Protected srcBase.i
-  Protected weightBase.i
-  Protected total.i
-  Protected value.f
-  Protected bias.f
-  Protected wScale.f
-  Protected dot.PmTensorInt8DotArgs
-  channels=*g\InChannels / *g\Groups
-  dot\StepA=*g\Dilation : dot\StepB=1
-  work=first
-  While work<last
-    bn=work / *g\OutChannels : oc=work % *g\OutChannels
-    groupBase=(oc / (*g\OutChannels / *g\Groups))*channels
-    srcBase=PmTensorInt8Scratch+(bn* *g\InChannels+groupBase)* *g\InWidth
-    weightBase=*g\Weight+oc*channels* *g\Kernel
-    bias=0.0 : If *g\Bias : bias=PmTensorGet(*g\Bias,oc) : EndIf
-    wScale=PmTensorGet(*g\WeightScales,oc)
-    ox=0
-    While ox<*g\OutWidth
-      start=ox* *g\Stride-*g\PadLeft
-      beginK=0
-      If start<0 : beginK=(0-start+*g\Dilation-1) / *g\Dilation : EndIf
-      endK=*g\Kernel
-      If start+(*g\Kernel-1)* *g\Dilation>=*g\InWidth
-        endK=(*g\InWidth-1-start) / *g\Dilation+1
-        If start>=*g\InWidth : endK=0 : EndIf
+; ---- INT8 Conv1D --------------------------------------------------------------
+; The input of one batch is quantized once into a PADDED, PHASE-SPLIT layout.
+; Padded position x' (input position x at x' = PadLeft + x; every other
+; position is 0 with scale 0) lives in phase r = x' % Stride at index
+; t = x' / Stride; channel c's row is Stride phases of `qps` positions each.
+; Output p's tap j reads padded position p*Stride + j*Dilation, which is phase
+; (j*Dilation) % Stride, index p + (j*Dilation) / Stride: sixteen neighbouring
+; outputs read sixteen neighbouring values, whatever the stride, and no read
+; needs a bounds test (a padded tap adds float(0) * 0 = +0, which leaves F as
+; it was). With Stride 1 there is one phase and this is the padded row.
+Procedure.i PmI8ConvPhase(*g.PmTensorConv1DArgs)
+  Protected owt.i
+  Protected qp.i
+  Protected a.i
+  Protected b.i
+  owt = (*g\OutWidth + 15) & -16
+  qp = *g\PadLeft + *g\InWidth
+  a = (qp + *g\Stride - 1) / *g\Stride
+  b = owt + ((*g\Kernel - 1) * *g\Dilation) / *g\Stride + 1
+  If b > a : a = b : EndIf
+  ProcedureReturn (a + 15) & -16
+EndProcedure
+
+; Positions in one channel's row (every phase).
+Procedure.i PmI8ConvRow(*g.PmTensorConv1DArgs)
+  ProcedureReturn PmI8ConvPhase(*g) * *g\Stride
+EndProcedure
+
+Procedure.i PmI8ConvScratchBytes(*g.PmTensorConv1DArgs)
+  Protected qp.i
+  qp = PmI8ConvRow(*g)
+  ProcedureReturn PmI8ScratchBytes(*g\InChannels * qp, qp, *g\Wide)
+EndProcedure
+
+; Tile area `part` (0..3) of a Conv1D's working memory.
+Procedure.i PmI8ConvTile(*g.PmTensorConv1DArgs, part.i)
+  Protected qp.i
+  qp = PmI8ConvRow(*g)
+  ProcedureReturn PmI8Base() + PmI8Align(*g\InChannels * qp * (1 + *g\Wide)) + PmI8Align(qp * 4) * 2 + part * #PMI8_TILE_STRIDE
+EndProcedure
+
+; Quantize batch bn: one scale per input position over every channel.
+; Returns 0 on a fault.
+Procedure.i PmI8ConvQuantize(*g.PmTensorConv1DArgs, bn.i)
+  Protected qp.i
+  Protected qps.i
+  Protected st.i
+  Protected es.i
+  Protected qmax.i
+  Protected q.i
+  Protected s.i
+  Protected inv.i
+  Protected src.i
+  Protected c.i
+  Protected x.i
+  Protected at.i
+  Protected row.i
+  Protected bits.i
+  Protected v.i
+  Protected r.f
+  Protected xv.f
+  CompilerIf #PMO_INT8_BACKEND = 1
+  Protected ca.PmI8ColumnArgs
+  CompilerEndIf
+  qps = PmI8ConvPhase(*g)
+  st = *g\Stride
+  qp = qps * st
+  es = 1 + *g\Wide
+  qmax = 127 : If *g\Wide <> 0 : qmax = 32767 : EndIf
+  If PmTensorInt8Scratch = 0 Or PmI8ConvScratchBytes(*g) > PmTensorInt8ScratchBytes
+    PmTensorInt8Fault = 2 : ProcedureReturn 0
+  EndIf
+  q = PmI8Base()
+  s = q + PmI8Align(*g\InChannels * qp * es)
+  inv = s + PmI8Align(qp * 4)
+  src = *g\Src + bn * *g\InChannels * *g\InWidth * 4
+  x = 0
+  While x < qp
+    PokeL(s + x * 4, 0) : PokeL(inv + x * 4, 0)
+    x = x + 1
+  Wend
+  If st = 1
+    ; One phase: the scales and each channel's row are contiguous.
+    CompilerIf #PMO_INT8_BACKEND = 1
+    ca\Src = src : ca\Rows = *g\InChannels : ca\RowBytes = *g\InWidth * 4
+    ca\Cols = *g\InWidth : ca\Out = s + *g\PadLeft * 4
+    PmI8ColMaxNeon(@ca)
+    CompilerElse
+    x = 0
+    While x < *g\InWidth
+      PokeL(s + (*g\PadLeft + x) * 4, PmI8MaxBits(src + x * 4, *g\InChannels, *g\InWidth * 4))
+      x = x + 1
+    Wend
+    CompilerEndIf
+    x = 0
+    While x < *g\InWidth
+      bits = PeekL(s + (*g\PadLeft + x) * 4)
+      If PmI8RowScale(bits, qmax, s + (*g\PadLeft + x) * 4, inv + (*g\PadLeft + x) * 4) = 0
+        PmTensorInt8Fault = 1 : ProcedureReturn 0
       EndIf
-      dot\Count=endK-beginK : total=0 : ic=0
-      If dot\Count>0
-        dot\A=srcBase+start+beginK* *g\Dilation
-        dot\B=weightBase+beginK
-        While ic<channels
-          total=total+PmTensorInt8Dot(@dot)
-          dot\A=dot\A+*g\InWidth : dot\B=dot\B+*g\Kernel
-          ic=ic+1
+      x = x + 1
+    Wend
+    c = 0
+    While c < *g\InChannels
+      row = q + c * qp * es
+      x = 0
+      While x < *g\PadLeft * es
+        PokeA(row + x, 0) : x = x + 1
+      Wend
+      x = (*g\PadLeft + *g\InWidth) * es
+      While x < qp * es
+        PokeA(row + x, 0) : x = x + 1
+      Wend
+      PmI8QuantLanes(src + c * *g\InWidth * 4, inv + *g\PadLeft * 4, *g\InWidth, qmax, row + *g\PadLeft * es)
+      c = c + 1
+    Wend
+    ProcedureReturn 1
+  EndIf
+  ; Several phases: every value goes to its phase's position.
+  x = 0
+  While x < *g\InWidth
+    at = ((*g\PadLeft + x) % st) * qps + (*g\PadLeft + x) / st
+    If PmI8RowScale(PmI8MaxBits(src + x * 4, *g\InChannels, *g\InWidth * 4), qmax, s + at * 4, inv + at * 4) = 0
+      PmTensorInt8Fault = 1 : ProcedureReturn 0
+    EndIf
+    x = x + 1
+  Wend
+  c = 0
+  While c < *g\InChannels
+    row = q + c * qp * es
+    x = 0
+    While x < qp * es
+      PokeL(row + x, 0) : x = x + 4
+    Wend
+    x = 0
+    While x < *g\InWidth
+      at = ((*g\PadLeft + x) % st) * qps + (*g\PadLeft + x) / st
+      xv = PmI8GetF(src + (c * *g\InWidth + x) * 4)
+      r = PmI8GetF(inv + at * 4)
+      xv = xv * r
+      v = PmI8RoundEven(xv)
+      If v > qmax : v = qmax : EndIf
+      If v < 0 - qmax : v = 0 - qmax : EndIf
+      If es = 1
+        PokeA(row + at, v & 255)
+      Else
+        PokeW(row + at * 2, v)
+      EndIf
+      x = x + 1
+    Wend
+    c = c + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+CompilerIf #PMO_INT8_BACKEND = 1
+; Output channels [ocFirst, ocLast) of batch bn: four channels by sixteen
+; positions per tile, any stride (the phase layout makes every tap's sixteen
+; values neighbours); the last tile of a row is computed whole and stored as
+; far as the row goes.
+Procedure PmI8Conv1DNeonRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, ocLast.i, tile.i)
+  Protected ta.PmI8TileArgs
+  Protected ea.PmI8EpiArgs
+  Protected qp.i
+  Protected es.i
+  Protected cg.i
+  Protected og.i
+  Protected q.i
+  Protected s.i
+  Protected elements.i
+  Protected oc.i
+  Protected grp.i
+  Protected rows.i
+  Protected i.i
+  Protected r.i
+  Protected p0.i
+  Protected p.i
+  Protected j.i
+  Protected c0.i
+  Protected cnt.i
+  Protected valid.i
+  Protected qrow.i
+  Protected w0.i
+  Protected w1.i
+  Protected w2.i
+  Protected w3.i
+  Protected wlast.i
+  Protected qps.i
+  Protected ph.i
+  qps = PmI8ConvPhase(*g)
+  qp = qps * *g\Stride
+  es = 1 + *g\Wide
+  cg = *g\InChannels / *g\Groups
+  og = *g\OutChannels / *g\Groups
+  q = PmI8Base()
+  s = q + PmI8Align(*g\InChannels * qp * es)
+  elements = *g\OutChannels * cg * *g\Kernel
+  ta\LStep = qp * es : ta\PStep = *g\Kernel : ta\RowScale = 0 : ta\Kind = *g\Wide
+  oc = ocFirst
+  While oc < ocLast
+    grp = oc / og
+    rows = ocLast - oc
+    If rows > 4 : rows = 4 : EndIf
+    If rows > (grp + 1) * og - oc : rows = (grp + 1) * og - oc : EndIf
+    wlast = *g\Weight + (oc + rows - 1) * cg * *g\Kernel
+    w0 = *g\Weight + oc * cg * *g\Kernel
+    w1 = wlast : If rows > 1 : w1 = w0 + cg * *g\Kernel : EndIf
+    w2 = wlast : If rows > 2 : w2 = w1 + cg * *g\Kernel : EndIf
+    w3 = wlast : If rows > 3 : w3 = w2 + cg * *g\Kernel : EndIf
+    qrow = q + grp * cg * qp * es
+    p0 = 0
+    While p0 < *g\OutWidth
+      p = 0
+      While p <= *g\Wide
+        ta\F = tile + p * 256 : ta\Zero = 1
+        j = 0
+        While j < *g\Kernel
+          c0 = 0
+          While c0 < cg
+            cnt = cg - c0
+            If *g\Wide <> 0 And cnt > 512 : cnt = 512 : EndIf
+            ph = ((j * *g\Dilation) % *g\Stride) * qps + p0 + (j * *g\Dilation) / *g\Stride
+            ta\L = qrow + (c0 * qp + ph) * es
+            ta\P0 = w0 + p * elements + c0 * *g\Kernel + j
+            ta\P1 = w1 + p * elements + c0 * *g\Kernel + j
+            ta\P2 = w2 + p * elements + c0 * *g\Kernel + j
+            ta\P3 = w3 + p * elements + c0 * *g\Kernel + j
+            ta\Count = cnt : ta\S = s + ph * 4
+            PmI8TileNeon(@ta)
+            ta\Zero = 0
+            c0 = c0 + cnt
+          Wend
+          j = j + 1
+        Wend
+        p = p + 1
+      Wend
+      ea\F1 = tile : ea\F2 = 0 : If *g\Wide <> 0 : ea\F2 = tile + 256 : EndIf
+      ea\WS = *g\WeightScales + oc * 4
+      ea\Bias = 0 : If *g\Bias <> 0 : ea\Bias = *g\Bias + oc * 4 : EndIf
+      ea\Rows = rows : ea\LaneScale = 0
+      valid = *g\OutWidth - p0
+      If valid >= 16
+        ea\Dst = *g\Dst + ((bn * *g\OutChannels + oc) * *g\OutWidth + p0) * 4
+        ea\DStride = *g\OutWidth * 4
+        PmI8EpiNeon(@ea)
+      Else
+        ea\Dst = tile + 512 : ea\DStride = 64
+        PmI8EpiNeon(@ea)
+        r = 0
+        While r < rows
+          i = 0
+          While i < valid
+            PokeL(*g\Dst + ((bn * *g\OutChannels + oc + r) * *g\OutWidth + p0 + i) * 4, PeekL(tile + 512 + (r * 16 + i) * 4))
+            i = i + 1
+          Wend
+          r = r + 1
         Wend
       EndIf
-      value=total : value=bias+value*aScale*wScale
-      PmTensorPut(*g\Dst,work* *g\OutWidth+ox,value)
-      ox=ox+1
+      p0 = p0 + 16
     Wend
-    work=work+1
+    oc = oc + rows
+  Wend
+EndProcedure
+CompilerEndIf
+
+; Output channels [ocFirst, ocLast) of batch bn, from the quantized batch.
+Procedure PmI8Conv1DRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, ocLast.i, tile.i)
+  Protected qp.i
+  Protected es.i
+  Protected cg.i
+  Protected og.i
+  Protected q.i
+  Protected s.i
+  Protected elements.i
+  Protected oc.i
+  Protected ox.i
+  Protected j.i
+  Protected pos.i
+  Protected wrow.i
+  Protected qrow.i
+  Protected f1.f
+  Protected f2.f
+  Protected sc.f
+  Protected v.f
+  Protected b.f
+  Protected qps.i
+  If ocFirst < 0 : ocFirst = 0 : EndIf
+  If ocLast > *g\OutChannels : ocLast = *g\OutChannels : EndIf
+  If ocFirst >= ocLast Or *g\OutWidth <= 0
+    ProcedureReturn
+  EndIf
+  CompilerIf #PMO_INT8_BACKEND = 1
+  PmI8Conv1DNeonRange(*g, bn, ocFirst, ocLast, tile)
+  ProcedureReturn
+  CompilerEndIf
+  qps = PmI8ConvPhase(*g)
+  qp = qps * *g\Stride
+  es = 1 + *g\Wide
+  cg = *g\InChannels / *g\Groups
+  og = *g\OutChannels / *g\Groups
+  q = PmI8Base()
+  s = q + PmI8Align(*g\InChannels * qp * es)
+  elements = *g\OutChannels * cg * *g\Kernel
+  oc = ocFirst
+  While oc < ocLast
+    wrow = *g\Weight + oc * cg * *g\Kernel
+    qrow = q + (oc / og) * cg * qp * es
+    ox = 0
+    While ox < *g\OutWidth
+      f1 = 0.0 : f2 = 0.0
+      j = 0
+      While j < *g\Kernel
+        pos = ((j * *g\Dilation) % *g\Stride) * qps + ox + (j * *g\Dilation) / *g\Stride
+        sc = PmI8GetF(s + pos * 4)
+        f1 = PmI8RowF(f1, qrow + pos * es, qp * es, wrow + j, *g\Kernel, cg, *g\Wide, sc)
+        If *g\Wide <> 0
+          f2 = PmI8RowF(f2, qrow + pos * es, qp * es, wrow + elements + j, *g\Kernel, cg, 1, sc)
+        EndIf
+        j = j + 1
+      Wend
+      v = PmI8Finish(f1, f2, *g\Wide, PmI8GetF(*g\WeightScales + oc * 4))
+      If *g\Bias <> 0
+        b = PmI8GetF(*g\Bias + oc * 4)
+        v = b + v
+      EndIf
+      PmI8PutF(*g\Dst + ((bn * *g\OutChannels + oc) * *g\OutWidth + ox) * 4, v)
+      ox = ox + 1
+    Wend
+    oc = oc + 1
+  Wend
+EndProcedure
+
+; Every batch, on the calling core.
+Procedure PmI8Conv1D(*g.PmTensorConv1DArgs)
+  Protected bn.i
+  bn = 0
+  While bn < *g\Batches
+    If PmI8ConvQuantize(*g, bn) = 0
+      ProcedureReturn
+    EndIf
+    PmI8Conv1DRange(*g, bn, 0, *g\OutChannels, PmI8ConvTile(*g, 0))
+    bn = bn + 1
   Wend
 EndProcedure
 CompilerEndIf
@@ -1808,9 +3371,7 @@ Procedure PmTensorConv1D(*g.PmTensorConv1DArgs)
   outPerGroup = *g\OutChannels / *g\Groups
   CompilerIf #PMO_USE_INT8 = 1
   If *g\WeightScales <> 0
-    aScale = PmTensorDynamicScale(*g\Src, *g\Batches * *g\InChannels * *g\InWidth)
-    PmTensorQuantizeBuffer(*g\Src, PmTensorInt8Scratch, *g\Batches * *g\InChannels * *g\InWidth, aScale)
-    PmTensorConv1DInt8Range(*g,0,*g\Batches* *g\OutChannels,aScale)
+    PmI8Conv1D(*g)
     ProcedureReturn
   EndIf
   CompilerEndIf
@@ -1875,80 +3436,95 @@ EndStructure
 
 CompilerIf #PMO_USE_CONV = 1
 CompilerIf #PMO_USE_INT8 = 1
-Procedure PmTensorConv2DInt8(*g.PmTensorConv2DArgs, aScale.f)
+; 2-D convolution with INT8 weights (the fixed-shape path; narrow only): one
+; scale per input position (y, x) over every channel, one FP32 partial per
+; tap, and the bias added last (0.0 when there is none).
+Procedure PmI8Conv2D(*g.PmTensorConv2DArgs)
+  Protected positions.i
+  Protected cg.i
+  Protected og.i
+  Protected q.i
+  Protected s.i
+  Protected inv.i
+  Protected src.i
   Protected bn.i
   Protected oc.i
   Protected oy.i
   Protected ox.i
-  Protected ic.i
   Protected ky.i
-  Protected sx.i
-  Protected sy.i
-  Protected bx.i
-  Protected ex.i
-  Protected by.i
-  Protected ey.i
-  Protected channels.i
-  Protected srcBase.i
-  Protected weightBase.i
-  Protected sourceRow.i
-  Protected weightRow.i
-  Protected total.i
-  Protected value.f
-  Protected bias.f
-  Protected wScale.f
+  Protected kx.i
+  Protected iy.i
+  Protected ix.i
+  Protected c.i
+  Protected pos.i
+  Protected acc.i
   Protected dot.PmTensorInt8DotArgs
-  channels=*g\InChannels / *g\Groups
-  dot\StepA=*g\DilationW : dot\StepB=1
-  bn=0
-  While bn<*g\Batches
-    oc=0
-    While oc<*g\OutChannels
-      srcBase=PmTensorInt8Scratch+(bn* *g\InChannels+(oc / (*g\OutChannels / *g\Groups))*channels)* *g\InH* *g\InW
-      weightBase=*g\Weight+oc*channels* *g\KernelH* *g\KernelW
-      bias=0.0 : If *g\Bias : bias=PmTensorGet(*g\Bias,oc) : EndIf
-      wScale=PmTensorGet(*g\WeightScales,oc)
-      oy=0
-      While oy<*g\OutH
-        sy=oy* *g\StrideH-*g\PadTop : by=0 : ey=*g\KernelH
-        If sy<0 : by=(0-sy+*g\DilationH-1) / *g\DilationH : EndIf
-        If sy+(*g\KernelH-1)* *g\DilationH>=*g\InH
-          ey=(*g\InH-1-sy) / *g\DilationH+1
-          If sy>=*g\InH : ey=0 : EndIf
-        EndIf
-        ox=0
-        While ox<*g\OutW
-          sx=ox* *g\StrideW-*g\PadLeft : bx=0 : ex=*g\KernelW
-          If sx<0 : bx=(0-sx+*g\DilationW-1) / *g\DilationW : EndIf
-          If sx+(*g\KernelW-1)* *g\DilationW>=*g\InW
-            ex=(*g\InW-1-sx) / *g\DilationW+1
-            If sx>=*g\InW : ex=0 : EndIf
-          EndIf
-          dot\Count=ex-bx : total=0 : ic=0
-          If dot\Count>0 And ey>by
-            sourceRow=srcBase+(sy+by* *g\DilationH)* *g\InW+sx+bx* *g\DilationW
-            weightRow=weightBase+by* *g\KernelW+bx
-            While ic<channels
-              dot\A=sourceRow : dot\B=weightRow : ky=by
-              While ky<ey
-                total=total+PmTensorInt8Dot(@dot)
-                dot\A=dot\A+*g\DilationH* *g\InW : dot\B=dot\B+*g\KernelW
-                ky=ky+1
-              Wend
-              sourceRow=sourceRow+*g\InH* *g\InW
-              weightRow=weightRow+*g\KernelH* *g\KernelW
-              ic=ic+1
-            Wend
-          EndIf
-          value=total : value=bias+value*aScale*wScale
-          PmTensorPut(*g\Dst,((bn* *g\OutChannels+oc)* *g\OutH+oy)* *g\OutW+ox,value)
-          ox=ox+1
-        Wend
-        oy=oy+1
-      Wend
-      oc=oc+1
+  Protected f.f
+  Protected v.f
+  Protected bias.f
+  positions = *g\InH * *g\InW
+  cg = *g\InChannels / *g\Groups
+  og = *g\OutChannels / *g\Groups
+  If PmTensorInt8Scratch = 0 Or PmI8ScratchBytes(*g\InChannels * positions, positions, 0) > PmTensorInt8ScratchBytes
+    PmTensorInt8Fault = 2 : ProcedureReturn
+  EndIf
+  q = PmI8Base()
+  s = q + PmI8Align(*g\InChannels * positions)
+  inv = s + PmI8Align(positions * 4)
+  dot\Count = cg : dot\StepA = positions : dot\StepB = *g\KernelH * *g\KernelW
+  bn = 0
+  While bn < *g\Batches
+    src = *g\Src + bn * *g\InChannels * positions * 4
+    pos = 0
+    While pos < positions
+      If PmI8RowScale(PmI8MaxBits(src + pos * 4, *g\InChannels, positions * 4), 127, s + pos * 4, inv + pos * 4) = 0
+        PmTensorInt8Fault = 1 : ProcedureReturn
+      EndIf
+      pos = pos + 1
     Wend
-    bn=bn+1
+    c = 0
+    While c < *g\InChannels
+      PmI8QuantLanes(src + c * positions * 4, inv, positions, 127, q + c * positions)
+      c = c + 1
+    Wend
+    oc = 0
+    While oc < *g\OutChannels
+      bias = 0.0
+      If *g\Bias <> 0 : bias = PmI8GetF(*g\Bias + oc * 4) : EndIf
+      oy = 0
+      While oy < *g\OutH
+        ox = 0
+        While ox < *g\OutW
+          f = 0.0
+          ky = 0
+          While ky < *g\KernelH
+            iy = oy * *g\StrideH - *g\PadTop + ky * *g\DilationH
+            If iy >= 0 And iy < *g\InH
+              kx = 0
+              While kx < *g\KernelW
+                ix = ox * *g\StrideW - *g\PadLeft + kx * *g\DilationW
+                If ix >= 0 And ix < *g\InW
+                  pos = iy * *g\InW + ix
+                  dot\A = q + (oc / og) * cg * positions + pos
+                  dot\B = *g\Weight + (oc * cg * *g\KernelH + ky) * *g\KernelW + kx
+                  acc = PmTensorInt8Dot(@dot)
+                  v = acc : v = v * PmI8GetF(s + pos * 4) : f = f + v
+                EndIf
+                kx = kx + 1
+              Wend
+            EndIf
+            ky = ky + 1
+          Wend
+          v = f * PmI8GetF(*g\WeightScales + oc * 4)
+          v = bias + v
+          PmI8PutF(*g\Dst + (((bn * *g\OutChannels + oc) * *g\OutH + oy) * *g\OutW + ox) * 4, v)
+          ox = ox + 1
+        Wend
+        oy = oy + 1
+      Wend
+      oc = oc + 1
+    Wend
+    bn = bn + 1
   Wend
 EndProcedure
 CompilerEndIf
@@ -1978,9 +3554,7 @@ Procedure PmTensorConv2D(*g.PmTensorConv2DArgs)
   outPerGroup = *g\OutChannels / *g\Groups
   CompilerIf #PMO_USE_INT8 = 1
   If *g\WeightScales <> 0
-    aScale = PmTensorDynamicScale(*g\Src, *g\Batches * *g\InChannels * *g\InH * *g\InW)
-    PmTensorQuantizeBuffer(*g\Src, PmTensorInt8Scratch, *g\Batches * *g\InChannels * *g\InH * *g\InW, aScale)
-    PmTensorConv2DInt8(*g,aScale)
+    PmI8Conv2D(*g)
     ProcedureReturn
   EndIf
   CompilerEndIf
@@ -2032,6 +3606,29 @@ CompilerEndIf
 
 ; ONNX LSTM, layout=0, default activation triplet, without peepholes.
 ; Gate order in ONNX weights is input, output, forget, cell (iofc).
+CompilerIf #PMO_USE_INT8 = 1
+Structure PmTensorLstmArgs
+  X.i
+  W.i
+  R.i
+  B.i
+  SeqLens.i
+  InitialH.i
+  InitialC.i
+  Y.i
+  YH.i
+  YC.i
+  Sequence.i
+  Batch.i
+  InputSize.i
+  Hidden.i
+  Directions.i
+  WScales.i
+  RScales.i
+  WWide.i
+  RWide.i
+EndStructure
+CompilerElse
 Structure PmTensorLstmArgs
   X.i
   W.i
@@ -2051,6 +3648,7 @@ Structure PmTensorLstmArgs
   WScales.i
   RScales.i
 EndStructure
+CompilerEndIf
 
 CompilerIf #PMO_USE_LSTM = 1
 Structure PmTensorLstmFloatFourArgs
@@ -2139,6 +3737,194 @@ pmoLstmFloatFourStore:
   CompilerEndIf
 EndProcedure
 
+CompilerIf #PMO_USE_INT8 = 1
+; ONNX LSTM with at least one INT8 weight. Per step: x(t) quantized with one
+; scale, h(t-1) with one scale; every gate row of W.x and of R.h is the
+; scheme's row value (y = F * wScale, or (F1 + F2/254) * wScale), and a gate's
+; pre-activation is (bias sum) + W.x + R.h in that order. A weight left in
+; FP32 contributes the float dot of the reference instead.
+; Returns 0 on a fault (PmTensorInt8Fault says which).
+Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
+  Protected width.i
+  Protected ww.i
+  Protected rw.i
+  Protected qx.i
+  Protected qh.i
+  Protected xq.i
+  Protected hq.i
+  Protected gw.i
+  Protected gr.i
+  Protected misc.i
+  Protected tile.i
+  Protected wElements.i
+  Protected rElements.i
+  Protected dir.i
+  Protected stepIndex.i
+  Protected bn.i
+  Protected t.i
+  Protected valid.i
+  Protected unit.i
+  Protected gate.i
+  Protected row.i
+  Protected i.i
+  Protected state.i
+  Protected inputRow.i
+  Protected outRow.i
+  Protected bbase.i
+  Protected wbase.i
+  Protected rbase.i
+  Protected iv.f
+  Protected ov.f
+  Protected fv.f
+  Protected cv.f
+  Protected previousC.f
+  Protected newC.f
+  Protected f1.f
+  Protected f2.f
+  Protected floatFour.PmTensorLstmFloatFourArgs
+  width = 4 * *g\Hidden
+  ww = 0 : If *g\WScales <> 0 : ww = *g\WWide : EndIf
+  rw = 0 : If *g\RScales <> 0 : rw = *g\RWide : EndIf
+  If PmTensorInt8Scratch = 0 Or PmI8LstmScratchBytes(*g\InputSize, *g\Hidden, ww, rw) > PmTensorInt8ScratchBytes
+    PmTensorInt8Fault = 2 : ProcedureReturn 0
+  EndIf
+  xq = PmI8Base()
+  hq = xq + PmI8Align(*g\InputSize * (1 + ww))
+  gw = hq + PmI8Align(*g\Hidden * (1 + rw))
+  gr = gw + PmI8Align(width * 4)
+  misc = gr + PmI8Align(width * 4)
+  tile = misc + 64
+  wElements = *g\Directions * width * *g\InputSize
+  rElements = *g\Directions * width * *g\Hidden
+  qx = 127 : If ww <> 0 : qx = 32767 : EndIf
+  qh = 127 : If rw <> 0 : qh = 32767 : EndIf
+  i = 0
+  While i < *g\Directions * *g\Batch * *g\Hidden
+    iv = 0.0 : cv = 0.0
+    If *g\InitialH <> 0 : iv = PmI8GetF(*g\InitialH + i * 4) : EndIf
+    If *g\InitialC <> 0 : cv = PmI8GetF(*g\InitialC + i * 4) : EndIf
+    PmI8PutF(*g\YH + i * 4, iv) : PmI8PutF(*g\YC + i * 4, cv)
+    i = i + 1
+  Wend
+  dir = 0
+  While dir < *g\Directions
+    stepIndex = 0
+    While stepIndex < *g\Sequence
+      bn = 0
+      While bn < *g\Batch
+        valid = *g\Sequence
+        If *g\SeqLens <> 0 : valid = PmTensorGetI64(*g\SeqLens, bn) : EndIf
+        If stepIndex < valid
+          t = stepIndex
+          If dir = 1 : t = valid - 1 - stepIndex : EndIf
+          inputRow = *g\X + (t * *g\Batch + bn) * *g\InputSize * 4
+          state = (dir * *g\Batch + bn) * *g\Hidden
+          outRow = ((t * *g\Directions + dir) * *g\Batch + bn) * *g\Hidden
+          ; W . x(t), every gate row, into gw
+          If *g\WScales <> 0
+            If PmI8QuantRow(inputRow, *g\InputSize, 4, qx, xq, misc, misc + 4) = 0
+              PmTensorInt8Fault = 1 : ProcedureReturn 0
+            EndIf
+            wbase = *g\W + dir * width * *g\InputSize
+            row = 0
+            While row < width
+              PmI8Block4(xq, wbase + row * *g\InputSize, *g\InputSize, wElements, *g\InputSize, ww, misc, tile, tile + 16)
+              i = 0
+              While i < 4
+                f1 = PmI8GetF(tile + i * 4) : f2 = PmI8GetF(tile + 16 + i * 4)
+                PmI8PutF(gw + (row + i) * 4, PmI8Finish(f1, f2, ww, PmI8GetF(*g\WScales + (dir * width + row + i) * 4)))
+                i = i + 1
+              Wend
+              row = row + 4
+            Wend
+          Else
+            unit = 0
+            While unit < *g\Hidden
+              floatFour\A = inputRow : floatFour\B = *g\W + dir * width * *g\InputSize * 4
+              floatFour\Count = *g\InputSize : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
+              PmTensorLstmFloatFour(@floatFour)
+              PmI8PutF(gw + unit * 4, floatFour\IValue)
+              PmI8PutF(gw + (*g\Hidden + unit) * 4, floatFour\OValue)
+              PmI8PutF(gw + (2 * *g\Hidden + unit) * 4, floatFour\FValue)
+              PmI8PutF(gw + (3 * *g\Hidden + unit) * 4, floatFour\CValue)
+              unit = unit + 1
+            Wend
+          EndIf
+          ; R . h(t-1), every gate row, into gr
+          If *g\RScales <> 0
+            If PmI8QuantRow(*g\YH + state * 4, *g\Hidden, 4, qh, hq, misc + 8, misc + 12) = 0
+              PmTensorInt8Fault = 1 : ProcedureReturn 0
+            EndIf
+            rbase = *g\R + dir * width * *g\Hidden
+            row = 0
+            While row < width
+              PmI8Block4(hq, rbase + row * *g\Hidden, *g\Hidden, rElements, *g\Hidden, rw, misc + 8, tile, tile + 16)
+              i = 0
+              While i < 4
+                f1 = PmI8GetF(tile + i * 4) : f2 = PmI8GetF(tile + 16 + i * 4)
+                PmI8PutF(gr + (row + i) * 4, PmI8Finish(f1, f2, rw, PmI8GetF(*g\RScales + (dir * width + row + i) * 4)))
+                i = i + 1
+              Wend
+              row = row + 4
+            Wend
+          Else
+            unit = 0
+            While unit < *g\Hidden
+              floatFour\A = *g\YH + state * 4 : floatFour\B = *g\R + dir * width * *g\Hidden * 4
+              floatFour\Count = *g\Hidden : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
+              PmTensorLstmFloatFour(@floatFour)
+              PmI8PutF(gr + unit * 4, floatFour\IValue)
+              PmI8PutF(gr + (*g\Hidden + unit) * 4, floatFour\OValue)
+              PmI8PutF(gr + (2 * *g\Hidden + unit) * 4, floatFour\FValue)
+              PmI8PutF(gr + (3 * *g\Hidden + unit) * 4, floatFour\CValue)
+              unit = unit + 1
+            Wend
+          EndIf
+          bbase = dir * 8 * *g\Hidden
+          unit = 0
+          While unit < *g\Hidden
+            iv = 0.0 : ov = 0.0 : fv = 0.0 : cv = 0.0
+            If *g\B <> 0
+              iv = PmTensorGet(*g\B, bbase + unit) + PmTensorGet(*g\B, bbase + 4 * *g\Hidden + unit)
+              ov = PmTensorGet(*g\B, bbase + *g\Hidden + unit) + PmTensorGet(*g\B, bbase + 5 * *g\Hidden + unit)
+              fv = PmTensorGet(*g\B, bbase + 2 * *g\Hidden + unit) + PmTensorGet(*g\B, bbase + 6 * *g\Hidden + unit)
+              cv = PmTensorGet(*g\B, bbase + 3 * *g\Hidden + unit) + PmTensorGet(*g\B, bbase + 7 * *g\Hidden + unit)
+            EndIf
+            iv = iv + PmI8GetF(gw + unit * 4)
+            iv = iv + PmI8GetF(gr + unit * 4)
+            ov = ov + PmI8GetF(gw + (*g\Hidden + unit) * 4)
+            ov = ov + PmI8GetF(gr + (*g\Hidden + unit) * 4)
+            fv = fv + PmI8GetF(gw + (2 * *g\Hidden + unit) * 4)
+            fv = fv + PmI8GetF(gr + (2 * *g\Hidden + unit) * 4)
+            cv = cv + PmI8GetF(gw + (3 * *g\Hidden + unit) * 4)
+            cv = cv + PmI8GetF(gr + (3 * *g\Hidden + unit) * 4)
+            previousC = PmI8GetF(*g\YC + (state + unit) * 4)
+            iv = PmTensorSigmoidValue(iv)
+            ov = PmTensorSigmoidValue(ov)
+            fv = PmTensorSigmoidValue(fv)
+            cv = PmTensorTanhValue(cv)
+            newC = fv * previousC + iv * cv
+            PmI8PutF(*g\YC + (state + unit) * 4, newC)
+            PmI8PutF(*g\Y + (outRow + unit) * 4, ov * PmTensorTanhValue(newC))
+            unit = unit + 1
+          Wend
+          ; The completed step becomes h only after every recurrent read used h(t-1).
+          unit = 0
+          While unit < *g\Hidden
+            PmI8PutF(*g\YH + (state + unit) * 4, PmI8GetF(*g\Y + (outRow + unit) * 4))
+            unit = unit + 1
+          Wend
+        EndIf
+        bn = bn + 1
+      Wend
+      stepIndex = stepIndex + 1
+    Wend
+    dir = dir + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+CompilerEndIf
+
 Procedure PmTensorLstm(*g.PmTensorLstmArgs)
   Protected dir.i
   Protected step.i
@@ -2167,6 +3953,12 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
   Protected dotValue.f
   Protected dot.PmTensorDotInt8Args
   Protected floatFour.PmTensorLstmFloatFourArgs
+  CompilerIf #PMO_USE_INT8 = 1
+  If *g\WScales <> 0 Or *g\RScales <> 0
+    If PmI8Lstm(*g) = 0 And PmTensorInt8Fault = 0 : PmTensorInt8Fault = 2 : EndIf
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
 
   ; Initial state becomes the mutable final-state buffers.
   dir = 0
@@ -2209,18 +4001,6 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
         If step < valid
           xIndex = (t * *g\Batch + bn) * *g\InputSize
           stateIndex = (dir * *g\Batch + bn) * *g\Hidden
-          CompilerIf #PMO_USE_INT8 = 1
-          If *g\WScales <> 0
-            leftPointer = *g\X : k = xIndex : k = k * 4 : leftPointer = leftPointer + k
-            xScale = PmTensorDynamicScale(leftPointer, *g\InputSize)
-            PmTensorQuantizeBuffer(leftPointer, PmTensorInt8Scratch, *g\InputSize, xScale)
-          EndIf
-          If *g\RScales <> 0
-            leftPointer = *g\YH : k = stateIndex : k = k * 4 : leftPointer = leftPointer + k
-            hScale = PmTensorDynamicScale(leftPointer, *g\Hidden)
-            PmTensorQuantizeBuffer(leftPointer, PmTensorInt8Scratch + *g\InputSize, *g\Hidden, hScale)
-          EndIf
-          CompilerEndIf
           unit = 0
           While unit < *g\Hidden
             iv = 0.0 : ov = 0.0 : fv = 0.0 : cv = 0.0
@@ -2232,28 +4012,6 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
               cv = PmTensorGet(*g\B, bBase + 3 * *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 7 * *g\Hidden + unit)
             EndIf
             wBase = (dir * 4 * *g\Hidden) * *g\InputSize
-            CompilerIf #PMO_USE_INT8 = 1
-            If *g\WScales <> 0
-              dot\A = PmTensorInt8Scratch : dot\Count = *g\InputSize
-              dot\AScale = xScale
-              scaleIndex = dir : scaleIndex = scaleIndex * 4 : scaleIndex = scaleIndex * *g\Hidden : scaleIndex = scaleIndex + unit
-              rightPointer = *g\W : rightPointer = rightPointer + wBase
-              k = unit : k = k * *g\InputSize : rightPointer = rightPointer + k
-              dot\WeightScale = PmTensorGet(*g\WScales, scaleIndex)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : iv = iv + dotValue
-              rightPointer = *g\W : rightPointer = rightPointer + wBase
-              k = *g\Hidden : k = k + unit : k = k * *g\InputSize : rightPointer = rightPointer + k
-              scaleIndex = scaleIndex + *g\Hidden : dot\WeightScale = PmTensorGet(*g\WScales, scaleIndex)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : ov = ov + dotValue
-              rightPointer = *g\W : rightPointer = rightPointer + wBase
-              k = *g\Hidden : k = k * 2 : k = k + unit : k = k * *g\InputSize : rightPointer = rightPointer + k
-              scaleIndex = scaleIndex + *g\Hidden : dot\WeightScale = PmTensorGet(*g\WScales, scaleIndex)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : fv = fv + dotValue
-              rightPointer = *g\W : rightPointer = rightPointer + wBase
-              k = *g\Hidden : k = k * 3 : k = k + unit : k = k * *g\InputSize : rightPointer = rightPointer + k
-              scaleIndex = scaleIndex + *g\Hidden : dot\WeightScale = PmTensorGet(*g\WScales, scaleIndex)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : cv = cv + dotValue
-            Else
               leftPointer = *g\X : k = xIndex : k = k * 4 : leftPointer = leftPointer + k
               rightPointer = *g\W : k = wBase : k = k * 4 : rightPointer = rightPointer + k
               floatFour\A = leftPointer : floatFour\B = rightPointer
@@ -2261,40 +4019,8 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
               PmTensorLstmFloatFour(@floatFour)
               iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
               fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
-            EndIf
-            CompilerElse
-              leftPointer = *g\X : k = xIndex : k = k * 4 : leftPointer = leftPointer + k
-              rightPointer = *g\W : k = wBase : k = k * 4 : rightPointer = rightPointer + k
-              floatFour\A = leftPointer : floatFour\B = rightPointer
-              floatFour\Count = *g\InputSize : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
-              PmTensorLstmFloatFour(@floatFour)
-              iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
-              fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
-            CompilerEndIf
             stateIndex = (dir * *g\Batch + bn) * *g\Hidden
             rBase = (dir * 4 * *g\Hidden) * *g\Hidden
-            CompilerIf #PMO_USE_INT8 = 1
-            If *g\RScales <> 0
-              dot\A = PmTensorInt8Scratch + *g\InputSize : dot\Count = *g\Hidden
-              dot\AScale = hScale
-              scaleIndex = dir : scaleIndex = scaleIndex * 4 : scaleIndex = scaleIndex * *g\Hidden : scaleIndex = scaleIndex + unit
-              rightPointer = *g\R : rightPointer = rightPointer + rBase
-              k = unit : k = k * *g\Hidden : rightPointer = rightPointer + k
-              dot\WeightScale = PmTensorGet(*g\RScales, scaleIndex)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : iv = iv + dotValue
-              rightPointer = *g\R : rightPointer = rightPointer + rBase
-              k = *g\Hidden : k = k + unit : k = k * *g\Hidden : rightPointer = rightPointer + k
-              scaleIndex = scaleIndex + *g\Hidden : dot\WeightScale = PmTensorGet(*g\RScales, scaleIndex)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : ov = ov + dotValue
-              rightPointer = *g\R : rightPointer = rightPointer + rBase
-              k = *g\Hidden : k = k * 2 : k = k + unit : k = k * *g\Hidden : rightPointer = rightPointer + k
-              scaleIndex = scaleIndex + *g\Hidden : dot\WeightScale = PmTensorGet(*g\RScales, scaleIndex)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : fv = fv + dotValue
-              rightPointer = *g\R : rightPointer = rightPointer + rBase
-              k = *g\Hidden : k = k * 3 : k = k + unit : k = k * *g\Hidden : rightPointer = rightPointer + k
-              scaleIndex = scaleIndex + *g\Hidden : dot\WeightScale = PmTensorGet(*g\RScales, scaleIndex)
-              dot\B = rightPointer : dotValue = PmTensorDotInt8Scaled(@dot) : cv = cv + dotValue
-            Else
               leftPointer = *g\YH : k = stateIndex : k = k * 4 : leftPointer = leftPointer + k
               rightPointer = *g\R : k = rBase : k = k * 4 : rightPointer = rightPointer + k
               floatFour\A = leftPointer : floatFour\B = rightPointer
@@ -2302,16 +4028,6 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
               PmTensorLstmFloatFour(@floatFour)
               iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
               fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
-            EndIf
-            CompilerElse
-              leftPointer = *g\YH : k = stateIndex : k = k * 4 : leftPointer = leftPointer + k
-              rightPointer = *g\R : k = rBase : k = k * 4 : rightPointer = rightPointer + k
-              floatFour\A = leftPointer : floatFour\B = rightPointer
-              floatFour\Count = *g\Hidden : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
-              PmTensorLstmFloatFour(@floatFour)
-              iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
-              fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
-            CompilerEndIf
             stateIndex = (dir * *g\Batch + bn) * *g\Hidden + unit
             previousC = PmTensorGet(*g\YC, stateIndex)
             iv = PmTensorSigmoidValue(iv)

@@ -61,8 +61,8 @@ Neither is a companion-microcontroller sketch.
 PASS: generated ONNX source for pi4 (int8)
 Source: ...\out/dense-pi4.pi4
 Weights: ...\out/dense-pi4.pmw (196 B)
-Quantized weights: 1 (per-output-channel signed INT8, dynamic activation scales, INT32 accumulation)
-Arena: 192 B including bounded inputs/outputs
+Quantized weights: 1 (per-output-channel signed INT8, dynamic per-row activation scales, INT32 accumulation)
+Arena: 4.19 KiB including bounded inputs/outputs
 Manifest: ...\out/dense-pi4.json
 Resident model: bind weights/arena once, fill inputs and execute repeatedly, then unbind when finished.
 @ENDFRAG
@@ -129,10 +129,16 @@ side of that branch had no split at all - so an INT8 model ran every
 convolution on one core no matter what this call returned. It is the same
 shape of mistake as the trap above, one layer down, and it was equally
 invisible: one core returns the same bytes as four. Both precisions now take
-the same route, with one difference that is forced by the arithmetic - the
-activation scale is computed and the activations quantized once, on the core
-you were entered on, before any partition starts, because that pass covers
-the whole input and writes the buffer every partition then reads.
+the same route, with one difference that is forced by the arithmetic - each
+batch of the input is quantized once, on the core you were entered on,
+before any partition starts, because every input position's scale needs
+every channel and that pass writes the buffer every partition then reads.
+Each partition then computes its own output channels in its own tile area
+of the model's working memory, so no two cores ever write the same bytes.
+
+The four kilobytes of those tile areas are why an INT8 model's arena is
+4 KiB larger on these two targets than on the others: the dense model above
+needs 4.19 KiB here and 256 bytes on a Pico.
 
 @NOTE The evidence that a split really ran is the service's dispatch
 counter and the elapsed time, never the number `PmOnnxAnvilEnter` handed

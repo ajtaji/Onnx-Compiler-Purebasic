@@ -417,11 +417,12 @@ about a reduced precision is a claim relative to this.
 
 **INT8 changes the arithmetic, selectively.** Eligible constant linear
 weights become per-output-channel signed INT8; activations are quantized
-dynamically; accumulation is INT32; the boundaries stay FP32. The tool
-tells you how much of your model that touched:
+at run time, one scale per row; products are integers summed in INT32; the
+boundaries stay FP32. The tool tells you how much of your model that
+touched:
 
 @FRAG
-Quantized weights: 1 (per-output-channel signed INT8, dynamic activation scales, INT32 accumulation)
+Quantized weights: 1 (per-output-channel signed INT8, dynamic per-row activation scales, INT32 accumulation)
 @ENDFRAG
 
 If that count is zero, INT8 did nothing for this model, and no amount of
@@ -430,10 +431,9 @@ their FP32 path in the same program.
 
 @SECTION What INT8 actually runs, and what it does not
 
-The count above says how many weights were quantized. It does not say
-which kernel each of them will reach, and on the 64-bit Arm targets that
-is a separate question with a real cost attached. Four things are worth
-knowing before you read a timing.
+The count above says how many weights were quantized. It does not say how
+each one is computed, and that is worth knowing before you read a timing or
+an error figure.
 
 **The eligible set is linear weights, and it is not everything.** Constant
 weights of convolution, the recurrent layer's two weight matrices, general
@@ -444,41 +444,93 @@ build by construction rather than by omission. Everything that is not a
 linear weight - element-wise arithmetic, the activations, normalisation,
 the transforms, the shape operators - is FP32 and untouched.
 
-**The tensors between operators stay FP32.** Only the stored weights are
-narrow. Each eligible operator quantizes its own activations at run time
-against one scale taken over the whole input tensor, accumulates in INT32,
-and converts back to FP32 before it returns. That is why the boundaries of
-an INT8 model look exactly like the boundaries of an FP32 one.
+**The tensors between operators stay FP32, and each operator quantizes its
+own input one row at a time.** A row is what one output is summed over: a
+token for matrix multiply and the matrix-multiply-with-bias operator, one
+input position across every channel for a convolution, one step for the
+recurrent layer. Each row gets its own scale from its own largest
+magnitude, so one loud token or one loud moment of audio no longer
+flattens the resolution of every other one - which is exactly what a
+single scale per tensor did, and why the scheme changed.
 
-**The vector convolution kernel requires unit stride.** A quantized
-convolution with any other stride falls back to the fully portable scalar
-body - correct, and much slower than the vector one. In one real speech
-model, three of eighty-eight convolutions are strided and take that path.
-Nothing warns you; the manifest counts the weight as quantized either way.
-If a profile shows a handful of convolutions costing far more than their
-multiply count suggests, check their strides first.
+**Some weights are wide.** A model can carry a measured precision plan
+naming weights that need more than eight bits. A wide weight is stored as
+two INT8 planes - the weight, and its rounding error on a grid 254 times
+finer - and its activations are quantized to 16 bits; the arithmetic is
+still integer products and integer sums. Today exactly one model has a
+plan: the pinned speech model of chapter 7, whose text, duration and pitch
+front end and three nodes next to the waveform (59 of its 183 quantized
+weights, about 8% of its multiply-accumulates) are wide. Every other model
+is compiled narrow. A runtime-dimension manifest says how many weights are
+wide (`wide_weight_count`).
 
-**Quantizing the activations is not free, and it is per operator.** Before
-an eligible operator computes anything it walks its input three times: once
-to refuse a non-finite value, once for the maximum magnitude that sets the
-scale, and once to quantize, with a per-element step that is a short search
-rather than a single multiply and round. On large tensors that is a single-
-digit percentage; on small ones it can be most of the operator.
+**The arithmetic is defined exactly, and every target computes the same
+bits.** A row's maximum is taken on the bit patterns of the magnitudes; a
+row below 1e-30 is a row of zeros; the scale is maximum/127 (32767 when
+wide) and each value is rounded half to even after one multiply. Each
+output starts at zero and adds, once per kernel tap and once per 512
+reduction elements when wide, the exact integer sum converted to FP32
+times the row's scale; then it is multiplied by the weight's channel scale
+(for a wide weight, the two planes are joined as F1 + F2/254 first), and a
+convolution adds its bias last. Every one of those steps is a single
+binary32 operation, so the Windows kernels, the 64-bit Arm vector kernels
+and the Cortex-M kernels give **identical output bits for identical
+input**. Chapter 8 says how that is checked.
 
-@TRAP INT8 is not automatically faster. It moves a quarter of the bytes,
-which is the whole reason it can win, but on a processor without a
-dot-product instruction the arithmetic is not cheaper per multiply-
-accumulate than a well-blocked FP32 kernel - and the three activation
-passes above are pure addition. Whether it wins depends on whether the
-FP32 path was memory-bound. Measure your own model on your own target;
-do not reason from the weight-file size.
+**A NaN or an infinity in an INT8 operator's input is refused.** The row
+maximum sees it first; the operator writes nothing and the request fails
+at that node, in a sentence, on every target and on both model
+interfaces.
 
-@SECTION Measured: on the Pi 4, INT8 runs the speech model at HALF the speed
+**Convolutions of any stride take the vector kernel.** The input is
+quantized into one row per phase of the stride, so the sixteen outputs a
+vector step computes always read sixteen neighbouring values. A strided
+convolution used to fall back to a slow scalar body; it no longer does.
 
-This is the honest answer to the obvious question, and it is a measurement
-on the board rather than an opinion. The full speech model of chapter 7,
-the same graph, the same request, the same four cores, timed with the
-board's own 54 MHz counter:
+**Quantizing the activations costs one pass for the row maxima and one
+multiply-and-round pass.** On a convolution that is a small fraction of the
+work; on a tiny operator it can be most of it.
+
+@TRAP INT8 is not automatically faster. It moves a quarter of the weight
+bytes, and on a processor without an integer dot-product instruction its
+products are not cheaper to issue than a well-blocked FP32 kernel's. Whether
+it wins depends on the kernel and the processor. Measure your own model on
+your own target; do not reason from the weight-file size.
+
+@SECTION Measured: the speech model at INT8
+
+The full speech model of chapter 7 at `--precision int8`, built for Windows
+and run on a desk machine (Intel i9-14900HX), scored against ONNX Runtime
+running the same pinned FP32 graph. "Durations changed" counts the tokens
+whose predicted length in frames differs from FP32's; the log-mel figure is
+the mean distance between the two spectrograms after aligning them, in dB.
+
+@FRAG
+reference input (143 tokens)     durations changed   log-mel vs ONNX Runtime FP32
+  this tool, FP32                    0 of 143            0.294 dB  (the floor)
+  this tool, FP16 weight storage     0 of 143            0.442 dB
+  this tool, INT8                    0 of 143            0.588 dB
+  the earlier INT8 scheme            9 of 143            about 5.2 dB
+
+a 295-token sentence, INT8           0 of 295            0.647 dB
+                  FP16 storage       1 of 295            1.835 dB
+a 69-token sentence, INT8            0 of 69             0.442 dB
+@ENDFRAG
+
+Speed on the same machine, the two builds alternated request by request
+because the processor throttles: the reference request took **5.51 s at FP32 and 4.47 s at INT8** (medians of five rounds): INT8 is 1.23 times faster. The rest of the model - element-wise arithmetic, the transforms, the transposed convolutions - is FP32 in both builds.
+
+The Pi 4 and UNO Q (Advanced SIMD) and the Pico and Pico 2 run the same
+INT8 arithmetic bit for bit (chapter 8). The speech model does not fit a
+Pico. **It has not yet been measured on Pi 4 silicon with this scheme**; the
+table below is the earlier scheme's board run, kept because it is why the
+scheme changed.
+
+@SECTION The earlier scheme on the Pi 4, and why it was replaced
+
+On 2026-09-16 the same model, with one activation scale per whole tensor,
+the unit-stride-only vector convolution and three activation passes per
+operator, ran on the Pi 4 on four cores:
 
 @FRAG
 request 2 ("You are hearing a complete sentence produced on this
@@ -487,50 +539,23 @@ small computer.")            FP32 1 core   FP32 4 cores   INT8 4 cores
   Conv           (88 nodes)      70.450         17.149      51.500
   MatMul        (102 nodes)       2.783          2.784       7.250
   Gemm           (73 nodes)       0.378          0.378       0.015
-  ConvTranspose   (6 nodes)       1.804          1.804       1.750
-  everything else                     -              -   unchanged
-
-the longer sentence (295 tokens)               158.2 s     328.080 s
 @ENDFRAG
 
-INT8 is **2.10 times slower than FP32 on the same four cores**. The
-convolutions are three times slower and the matrix multiplies two and a
-half; the one family that gets faster is the general matrix-multiply-with-
-bias, twenty-five times faster - and it is four tenths of one per cent of
-the run, so it cannot pay for the rest. The families that keep their FP32
-kernels in both builds come back within three per cent, which is what says
-the clock and the attribution did not move and the difference really is
-the kernels.
+It was 2.10 times slower than FP32 on the same four cores, and 9 of 143
+durations changed, so the audio was differently timed and judged worse by
+ear. The kernels that ran then are gone: the scheme above replaced the
+per-tensor scale (the durations) and the vector kernels were rewritten
+around it (the speed). The replacement's Pi 4 run is pending, and until it
+exists the honest statement is the desk table above plus the instruction
+counts in chapter 8.
 
-Two causes, and neither is a tuning problem. This processor has no
-integer dot-product instruction, so the kernel widens each 8x8 product to
-16 bits and accumulates in 32 - about 0.75 instructions per multiply-
-accumulate against 0.649 for the blocked FP32 kernel. And the three
-activation passes described above are work the FP32 path never does at
-all. The weight file is three and a half times smaller and that buys
-nothing, because this model on this processor is limited by arithmetic
-and not by memory bandwidth.
-
-@TRAP Do not choose INT8 for this speech model on this board. It is
-slower, and the audio was judged worse by ear: quantizing the duration
-predictor changes the predicted durations, so the output is not merely a
-noisier version of the FP32 waveform - it is a differently-timed one.
-Sample-by-sample error metrics against an FP32 reference therefore do not
-apply to it at all, and a person listening is the only acceptance test
-that means anything for a precision change.
-
-@NOTE None of this says INT8 is useless. It says it is the wrong choice
-for THIS model on THIS processor. A model that is memory-bound rather than
-arithmetic-bound, or a processor with an integer dot-product instruction,
-changes both of the causes above.
+@NOTE For a precision change the acceptance test is still a person
+listening. Durations and spectrogram distance say the INT8 build predicts
+the same timing as FP32 and sounds close to it; they do not replace an ear.
 
 INT8 output is **not** bit-identical to FP32 output and is not meant to be.
-It is also not bit-identical to the tool's own portable INT8 reference: the
-vector body scales a run of interior outputs by one product of the two
-scales where the scalar bodies multiply by each scale in turn, and those
-round differently. The two agree to a measured worst relative difference of
-3.5e-05 across the arithmetic gate's cases, against a 2.0e-03 limit. Bit
-identity is a contract the FP32 kernels carry (chapter 8) and INT8 does not.
+What IS bit-identical is INT8 against INT8: the same model on every target
+computes each INT8 operator's output to the same bits.
 
 **FP16, BF16 and INT4 change storage only.** The weights are stored
 narrow and **decoded once, at bind time, into resident FP32 memory**. The

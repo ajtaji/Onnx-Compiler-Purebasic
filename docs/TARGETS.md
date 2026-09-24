@@ -92,7 +92,7 @@ that every model/request fits that limit.
 | Option | What changes | What does not automatically shrink |
 |---|---|---|
 | `fp32` | Baseline floating-point weights and execution. | Nothing reduced. |
-| `int8` | Eligible constant linear weights; dynamic activation quantization, INT32 accumulation, FP32 boundaries. | Untransformed operators and general activation storage. |
+| `int8` | Eligible constant linear weights; dynamic per-row activation quantization, INT32 accumulation, FP32 boundaries; the same bits on every target. | Untransformed operators and general activation storage. |
 | `fp16` | Stored weights, decoded once for resident use. | Decoded FP32 weights and activation requirements. |
 | `bf16` | Stored weights with a different precision/range tradeoff, decoded once. | Decoded FP32 weights and activations. |
 | `int4` | Aggressively reduced stored weights with scales, decoded once. | Resident FP32 decode buffers and activations. |

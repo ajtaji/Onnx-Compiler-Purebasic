@@ -1085,11 +1085,11 @@ Procedure.i PmI8GroupRows(outPerGroup.i, wide.i)
 EndProcedure
 
 Procedure.i PmI8PrepareConv(*w, outCh.i, groups.i, chPerGroup.i, kernel.i, wide.i, elements.i)
-  Protected key.s=Hex(*w)+":c", pairs.i=(chPerGroup+1)/2, og.i=outCh/groups, rpg.i=PmI8GroupRows(og,wide)
+  Protected key.s=Hex(*w)+":c"+Str(outCh)+"/"+Str(groups)+"/"+Str(chPerGroup)+"/"+Str(kernel)+"/"+Str(wide), pairs.i=(chPerGroup+1)/2, og.i=outCh/groups, rpg.i=PmI8GroupRows(og,wide)
   Protected *p, o.i, plane.i, j.i, i.i, row.i, lo.i, hi.i, src.i, rowBytes.i=kernel*pairs*4
   LockMutex(PmI8PrepareMutex)
   If FindMapElement(PmI8Prepared(),key) : *p=PmI8Prepared() : UnlockMutex(PmI8PrepareMutex) : ProcedureReturn *p : EndIf
-  *p=AllocateMemory(groups*rpg*rowBytes)
+  *p=AllocateMemory(groups*rpg*rowBytes+64)
   If *p
     For o=0 To outCh-1
       For plane=0 To wide
@@ -1113,11 +1113,11 @@ EndProcedure
 ; MatMul B is [K][N] (one batch slice), or [N][K] rows when bRows (an LSTM
 ; input weight); prepared rows are the N output columns either way.
 Procedure.i PmI8PrepareMatMul(*w, k.i, n.i, wide.i, elements.i, bRows.i=0)
-  Protected key.s=Hex(*w)+":m"+Str(bRows), pairs.i=(k+1)/2, rows.i=n*(1+wide), padded.i=(rows+3)&~3
+  Protected key.s=Hex(*w)+":m"+Str(bRows)+"/"+Str(k)+"/"+Str(n)+"/"+Str(wide), pairs.i=(k+1)/2, rows.i=n*(1+wide), padded.i=(rows+3)&~3
   Protected *p, c.i, plane.i, i.i, row.i, lo.i, hi.i, src.i, rowBytes.i=pairs*4
   LockMutex(PmI8PrepareMutex)
   If FindMapElement(PmI8Prepared(),key) : *p=PmI8Prepared() : UnlockMutex(PmI8PrepareMutex) : ProcedureReturn *p : EndIf
-  *p=AllocateMemory(padded*rowBytes)
+  *p=AllocateMemory(padded*rowBytes+64)
   If *p
     For c=0 To n-1
       For plane=0 To wide
@@ -1148,10 +1148,10 @@ EndProcedure
 ; Gemm B with transB=0 is [K][N]; the dot path wants rows of K, so keep a
 ; transposed INT8 copy (both planes).
 Procedure.i PmI8PrepareRows(*w, k.i, n.i, wide.i, elements.i)
-  Protected key.s=Hex(*w)+":t", *p, c.i, i.i, plane.i
+  Protected key.s=Hex(*w)+":t"+Str(k)+"/"+Str(n)+"/"+Str(wide), *p, c.i, i.i, plane.i
   LockMutex(PmI8PrepareMutex)
   If FindMapElement(PmI8Prepared(),key) : *p=PmI8Prepared() : UnlockMutex(PmI8PrepareMutex) : ProcedureReturn *p : EndIf
-  *p=AllocateMemory(k*n*(1+wide))
+  *p=AllocateMemory(k*n*(1+wide)+64)
   If *p
     For plane=0 To wide
       For c=0 To n-1
@@ -1418,7 +1418,7 @@ CompilerIf #PMO_USE_INT8 = 1
 ; ONNX Gemm with an INT8 B: one scale per row of A' (per token).
 Procedure.i PmI8Gemm(*g.PmTensorGemmArgs)
   Protected wide.i=*g\Wide, qmax.i=127, row.i, col.i, i.i, ic.i, *rows, *xq, *acc, *f1, *f2, *arow, ok.i=0
-  Protected xs.f, v.f, elements.i=*g\K * *g\N, rowbytes.i=*g\K
+  Protected xs.f, v.f, t.f, elements.i=*g\K * *g\N, rowbytes.i=*g\K
   If wide : qmax=32767 : EndIf
   If *g\TransB : *rows=*g\B : Else : *rows=PmI8PrepareRows(*g\B,*g\K,*g\N,wide,elements) : EndIf
   *xq=AllocateMemory(*g\K*2+64) : *acc=AllocateMemory(*g\N*4+64)
@@ -1435,14 +1435,16 @@ Procedure.i PmI8Gemm(*g.PmTensorGemmArgs)
       PmI8DotRowsScaled(*rows,rowbytes,*g\N,*xq,*g\K,xs,wide,*acc,*f1)
       If wide : PmI8DotRowsScaled(*rows+elements,rowbytes,*g\N,*xq,*g\K,xs,wide,*acc,*f2) : EndIf
       For col=0 To *g\N-1
+        ; One rounding per operation, on every target: this host evaluates a
+        ; longer expression on the x87 stack at extended precision.
         v=PeekF(*f1+col*4)
-        If wide : v=v+PeekF(*f2+col*4)/#PMI8_WIDE_RESIDUAL : EndIf
+        If wide : t=PeekF(*f2+col*4) : t=t/#PMI8_WIDE_RESIDUAL : v=v+t : EndIf
         v=v*PeekF(*g\WeightScales+col*4)
         v=v* *g\Alpha
         If *g\C<>0 And *g\CCount>0
           ic=row* *g\N+col
           If *g\CCount=1 : ic=0 : ElseIf *g\CCount=*g\N : ic=col : EndIf
-          v=v+*g\Beta*PeekF(*g\C+ic*4)
+          t=PeekF(*g\C+ic*4) : t=*g\Beta*t : v=v+t
         EndIf
         PokeF(*g\Dst+(row* *g\N+col)*4,v)
       Next
@@ -2719,10 +2721,12 @@ EndProcedure
 
 CompilerIf #PMO_USE_INT8 = 1
 ; One gate's pre-activation from the scaled row sums: wScale * (F1 + F2 / 254).
+; One rounding per operation (see PmI8Gemm).
 Procedure.f PmI8GateValue(*f1, *f2, row.i, wide.i, *scales, scaleBase.i)
-  Protected v.f=PeekF(*f1+row*4)
-  If wide : v=v+PeekF(*f2+row*4)/#PMI8_WIDE_RESIDUAL : EndIf
-  ProcedureReturn v*PeekF(*scales+(scaleBase+row)*4)
+  Protected v.f=PeekF(*f1+row*4), t.f
+  If wide : t=PeekF(*f2+row*4) : t=t/#PMI8_WIDE_RESIDUAL : v=v+t : EndIf
+  v=v*PeekF(*scales+(scaleBase+row)*4)
+  ProcedureReturn v
 EndProcedure
 CompilerEndIf
 

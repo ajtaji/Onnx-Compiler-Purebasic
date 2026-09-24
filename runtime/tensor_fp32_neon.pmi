@@ -994,8 +994,8 @@ EndProcedure
 ; ONE OUTPUT-CHANNEL RANGE OF THE CONVOLUTION, AND THAT IS THE WHOLE
 ; CHANGE. The body below is what PmTensorConv1DFp32Neon always did; it now
 ; takes the range it covers instead of assuming the whole tensor, so the
-; same code serves one core and four. It is the shape
-; PmTensorConv1DInt8Range already has.
+; same code serves one core and four. The INT8 convolution's range body,
+; PmI8Conv1DRange in tensor_fp32.pmi, has the same shape.
 ;
 ; NOTHING ABOUT AN OUTPUT'S ARITHMETIC DEPENDS ON THE RANGE. Each output
 ; is computed entirely inside one call, icg-major then kx-minor, with
@@ -1171,15 +1171,13 @@ EndProcedure
 ;  buffer this convolution needs was taken before the call.
 ; ======================================================================
 #PMP_PARALLEL_MAX_PARTS  = 4
-; args, ocFirst, ocLast, tile, activation-scale bits.
+; args, ocFirst, ocLast, tile, and a fifth word.
 ;
-; THE FIFTH WORD EXISTS BECAUSE THE INT8 CONVOLUTION HAS A NUMBER THE FP32
-; ONE DOES NOT. Its activations are quantized against one scale computed
-; over the whole source, on the primary, before any partition starts; every
-; partition needs that same float and none of them may recompute it, since
-; a second pass over the source would be both slower and - if it ever saw
-; different bytes - a different answer. The FP32 splitter writes a zero
-; there and its worker never reads it.
+; THE FIFTH WORD EXISTS BECAUSE THE INT8 CONVOLUTION NEEDS ONE THING PER
+; PARTITION THAT THE FP32 ONE DOES NOT: its own tile area in the model's
+; working memory, where its vector tile keeps partial sums, so no two cores
+; ever write the same bytes. PmParallelConv1DInt8 fills it after the split.
+; The FP32 splitter writes a zero there and its worker never reads it.
 #PMP_PARALLEL_WORDS      = 5
 #PMP_PARALLEL_STRIDE     = 40         ; #PMP_PARALLEL_WORDS * 8
 
@@ -1255,12 +1253,9 @@ EndProcedure
 ; Split [0, OutChannels) into `count` ranges, each a whole number of tiles
 ; where the channel count allows it, and none straddling a conv group -
 ; both for speed, since the arithmetic is the same either way.
-; `scaleBits` is the INT8 activation scale's FLOAT32 BIT PATTERN, or zero
-; for the FP32 bodies, which have no such number and whose worker never
-; reads the word. It is carried as bits rather than as a float so the block
-; stays a plain array of machine words and one procedure fills it for both
-; kernels.
-Procedure pmParallelConvSplit(*g.PmTensorConv1DArgs, count.i, tile.i, scaleBits.i)
+; `word4` goes into every block's fifth word: zero from both callers, and the
+; INT8 caller then writes each partition's own tile area there.
+Procedure pmParallelConvSplit(*g.PmTensorConv1DArgs, count.i, tile.i, word4.i)
   Protected i.i
   Protected first.i
   Protected last.i
@@ -1294,7 +1289,7 @@ Procedure pmParallelConvSplit(*g.PmTensorConv1DArgs, count.i, tile.i, scaleBits.
     PmParallelParts[i*#PMP_PARALLEL_WORDS+1]=first
     PmParallelParts[i*#PMP_PARALLEL_WORDS+2]=last
     PmParallelParts[i*#PMP_PARALLEL_WORDS+3]=tile
-    PmParallelParts[i*#PMP_PARALLEL_WORDS+4]=scaleBits
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+4]=word4
     first=last
   Next
 EndProcedure
@@ -1818,305 +1813,107 @@ CompilerEndIf
 
 CompilerIf #PMO_USE_INT8 = 1
 CompilerIf #PMO_USE_CONV = 1
-Structure PmTensorConv1DNeonEightArgs
-  Src.i
-  Weight.i
-  Dst.i
-  InChannels.i
-  InWidth.i
-  OutChannels.i
-  OutWidth.i
-  Kernel.i
-  PadLeft.i
-  Dilation.i
-  InPerGroup.i
-  InputChannelBase.i
-  Batch.i
-  OutputChannel.i
-  OutputX.i
-  Scale.f
-  BiasValue.f
-EndStructure
-
-Procedure PmTensorConv1DInt8One(*g.PmTensorConv1DArgs, bn.i, oc.i, ox.i, aScale.f)
-  Protected icg.i
-  Protected kx.i
-  Protected ix.i
-  Protected group.i
-  Protected inPerGroup.i
-  Protected outPerGroup.i
-  Protected ic.i
-  Protected srcIndex.i
-  Protected weightIndex.i
-  Protected accumulator.i
-  Protected converted.f
-  Protected sum.f
-  inPerGroup = *g\InChannels / *g\Groups
-  outPerGroup = *g\OutChannels / *g\Groups
-  group = oc / outPerGroup : sum = 0.0 : accumulator = 0
-  If *g\Bias <> 0 : sum = PmTensorGet(*g\Bias, oc) : EndIf
-  icg = 0
-  While icg < inPerGroup
-    ic = group * inPerGroup + icg : kx = 0
-    While kx < *g\Kernel
-      ix = ox - *g\PadLeft + kx * *g\Dilation
-      If ix >= 0 And ix < *g\InWidth
-        srcIndex = (bn * *g\InChannels + ic) * *g\InWidth + ix
-        weightIndex = (oc * inPerGroup + icg) * *g\Kernel + kx
-        accumulator = accumulator + PeekB(PmTensorInt8Scratch + srcIndex) * PeekB(*g\Weight + weightIndex)
-      EndIf
-      kx = kx + 1
-    Wend
-    icg = icg + 1
-  Wend
-  converted = accumulator
-  sum = sum + converted * aScale * PmTensorGet(*g\WeightScales, oc)
-  PmTensorPut(*g\Dst, (bn * *g\OutChannels + oc) * *g\OutWidth + ox, sum)
-EndProcedure
-
-; Eight adjacent output positions share each signed INT8 weight.  The kernel
-; widens products to signed 16-bit and accumulates in signed 32-bit lanes.
-; The caller admits only positions whose complete dilated kernel is in range.
-Procedure PmTensorConv1DInt8Eight(*g.PmTensorConv1DNeonEightArgs)
-  ASM
-    ; x0=args; structure offsets are eight-byte A64 integers through OutputX.
-    ldr  x1, [x0, #0]               ; quantized source
-    ldr  x2, [x0, #8]               ; signed INT8 weights
-    ldr  x3, [x0, #16]              ; FP32 destination
-    ldr  x4, [x0, #32]              ; input width
-    ldr  x5, [x0, #56]              ; kernel width
-    ldr  x6, [x0, #72]              ; dilation
-    ldr  x7, [x0, #80]              ; input channels per group
-
-    ldr  x8, [x0, #96]              ; batch
-    ldr  x9, [x0, #24]              ; all input channels
-    mul  x8, x8, x9
-    ldr  x9, [x0, #88]              ; first input channel for this group
-    add  x8, x8, x9
-    mul  x8, x8, x4
-    ldr  x9, [x0, #112]             ; output x
-    add  x8, x8, x9
-    ldr  x9, [x0, #64]              ; left pad
-    sub  x8, x8, x9
-    add  x1, x1, x8                 ; channel-zero source cursor
-
-    ldr  x8, [x0, #104]             ; output channel
-    mul  x8, x8, x7
-    mul  x8, x8, x5
-    add  x2, x2, x8                 ; channel-zero weight cursor
-
-    movi v16.4s, #0
-    movi v17.4s, #0
-    movz x8, #0                     ; input-channel index
-pmoNeonConv1EightChannel:
-    mov  x9, x1
-    mov  x10, x2
-    mov  x11, x5
-pmoNeonConv1EightKernel:
-    ld1  { v1.8b }, [x9]
-    ld1  { v0.b }[0], [x10]
-    dup  v0.8b, v0.b[0]
-    smull v2.8h, v1.8b, v0.8b
-    sxtl v3.4s, v2.4h
-    sxtl2 v4.4s, v2.8h
-    add  v16.4s, v16.4s, v3.4s
-    add  v17.4s, v17.4s, v4.4s
-    add  x9, x9, x6
-    add  x10, x10, #1
-    subs x11, x11, #1
-    b.ne pmoNeonConv1EightKernel
-    add  x1, x1, x4
-    add  x2, x2, x5
-    add  x8, x8, #1
-    cmp  x8, x7
-    b.lt pmoNeonConv1EightChannel
-
-    scvtf v16.4s, v16.4s
-    scvtf v17.4s, v17.4s
-    ldr  s0, [x0, #120]
-    dup  v0.4s, v0.s[0]
-    fmul v16.4s, v16.4s, v0.4s
-    fmul v17.4s, v17.4s, v0.4s
-    ldr  s1, [x0, #124]
-    dup  v1.4s, v1.s[0]
-    fadd v16.4s, v16.4s, v1.4s
-    fadd v17.4s, v17.4s, v1.4s
-
-    ldr  x8, [x0, #96]
-    ldr  x9, [x0, #40]
-    mul  x8, x8, x9
-    ldr  x9, [x0, #104]
-    add  x8, x8, x9
-    ldr  x9, [x0, #48]
-    mul  x8, x8, x9
-    ldr  x9, [x0, #112]
-    add  x8, x8, x9
-    lsl  x8, x8, #2
-    add  x3, x3, x8
-    st1  { v16.4s }, [x3], #16
-    st1  { v17.4s }, [x3]
-  EndASM
-EndProcedure
-
 ; ======================================================================
-;  THE INT8 CONVOLUTION OVER AN OUTPUT-CHANNEL RANGE.
+;  THE INT8 CONVOLUTION ON EVERY CORE THE MONITOR WILL LEND.
 ; ----------------------------------------------------------------------
-;  This is the body that used to be the whole of PmTensorConv1DNeon, with
-;  two things taken out of it and nothing else changed: the output-channel
-;  loop now starts and stops where it is told, and the activation scale
-;  arrives as an argument instead of being computed here.
+;  The arithmetic is tensor_fp32.pmi's (PmI8Conv1DRange and the Advanced
+;  SIMD tile under it); this file only splits the output channels.
 ;
-;  BOTH REMOVALS ARE THE SAME REMOVAL. Quantizing the source is work over
-;  the WHOLE source and it must happen exactly once, on the primary,
-;  before any partition runs - it writes the shared INT8 scratch every
-;  partition then reads. A partition that quantized for itself would do
-;  the same work four times and would be reading a buffer three other
-;  cores were writing.
+;  QUANTIZING A BATCH IS WORK OVER THE WHOLE INPUT and it happens exactly
+;  once, on the primary, before any partition runs: every position's scale
+;  needs every channel. It writes the shared working memory every partition
+;  then reads, and the batch being computed is published in the argument
+;  block (QuantBatch) before the dispatch, the same way the scratch pointer
+;  is.
 ;
-;  WHAT A PARTITION TOUCHES: its own frame, the argument structure the
-;  primary filled, the read-only quantized scratch, the weights, the
-;  scales, the bias, and the output elements of channels [ocFirst,
-;  ocLast). Nothing else, and no runtime global but the scratch POINTER,
-;  which was set before the dispatch and is not written again.
+;  WHAT A PARTITION TOUCHES: its own frame, the argument block, the
+;  read-only quantized input and scales, the weights, the scales, the bias,
+;  ITS OWN tile area of the working memory (word 4 of its partition block),
+;  and the output elements of channels [ocFirst, ocLast). Nothing else.
 ; ======================================================================
-Procedure PmTensorConv1DNeonRange(*g.PmTensorConv1DArgs, ocFirst.i, ocLast.i, aScale.f)
-  Protected bn.i
-  Protected oc.i
-  Protected ox.i
-  Protected group.i
-  Protected inPerGroup.i
-  Protected outPerGroup.i
-  Protected eight.PmTensorConv1DNeonEightArgs
-  If *g = 0 Or *g\Batches <= 0 Or *g\OutChannels <= 0 Or *g\OutWidth <= 0
-    ProcedureReturn
-  EndIf
-  If ocFirst < 0 : ocFirst = 0 : EndIf
-  If ocLast > *g\OutChannels : ocLast = *g\OutChannels : EndIf
-  If ocFirst >= ocLast
-    ProcedureReturn
-  EndIf
-  inPerGroup = *g\InChannels / *g\Groups
-  outPerGroup = *g\OutChannels / *g\Groups
-  eight\Src = PmTensorInt8Scratch : eight\Weight = *g\Weight : eight\Dst = *g\Dst
-  eight\InChannels = *g\InChannels : eight\InWidth = *g\InWidth
-  eight\OutChannels = *g\OutChannels : eight\OutWidth = *g\OutWidth
-  eight\Kernel = *g\Kernel : eight\PadLeft = *g\PadLeft : eight\Dilation = *g\Dilation
-  eight\InPerGroup = inPerGroup
-  bn = 0
-  While bn < *g\Batches
-    eight\Batch = bn : oc = ocFirst
-    While oc < ocLast
-      group = oc / outPerGroup
-      eight\InputChannelBase = group * inPerGroup : eight\OutputChannel = oc
-      eight\Scale = aScale * PmTensorGet(*g\WeightScales, oc)
-      eight\BiasValue = 0.0 : If *g\Bias <> 0 : eight\BiasValue = PmTensorGet(*g\Bias, oc) : EndIf
-      ox = 0
-      While ox < *g\OutWidth And ox - *g\PadLeft < 0
-        PmTensorConv1DInt8One(*g, bn, oc, ox, aScale) : ox = ox + 1
-      Wend
-      While ox + 7 < *g\OutWidth And ox + 7 - *g\PadLeft + (*g\Kernel - 1) * *g\Dilation < *g\InWidth
-        eight\OutputX = ox : PmTensorConv1DInt8Eight(@eight) : ox = ox + 8
-      Wend
-      While ox < *g\OutWidth
-        PmTensorConv1DInt8One(*g, bn, oc, ox, aScale) : ox = ox + 1
-      Wend
-      oc = oc + 1
-    Wend
-    bn = bn + 1
-  Wend
-EndProcedure
 
-; The INT8 kernel's output-channel blocking factor, in ONE place, the way
-; PmParallelConvTile is the FP32 one. IT IS ONE, AND THAT IS NOT AN
-; OVERSIGHT: PmTensorConv1DInt8Eight blocks eight output POSITIONS of a
-; single channel, so consecutive channels share no register state and a
-; partition boundary may fall anywhere without costing a tile.
+; The INT8 kernel's output-channel blocking factor: the tile computes four
+; output channels at a time.
 Procedure.i PmParallelConvInt8Tile()
-  ProcedureReturn 1
+  ProcedureReturn 4
 EndProcedure
 
-; One INT8 partition. Same shape as PmParallelConvWorker, plus the
-; activation scale out of word 4 of the block. The float is carried as its
-; bit pattern so the block stays machine words; it is put back into a
-; float here and nowhere else.
+; The batch a dispatched convolution is on.
+Procedure.i PmI8ConvBatch(*g.PmTensorConv1DArgs)
+  ProcedureReturn *g\QuantBatch
+EndProcedure
+
+; One INT8 partition. Word 4 of the block is this partition's tile area.
 Procedure.i PmParallelConvInt8Worker(*p.i)
   Protected args.i
   Protected first.i
   Protected last.i
-  Protected aScale.f
   If *p=0
     ProcedureReturn 1
   EndIf
   args=PeekI(*p)
   first=PeekI(*p+8)
   last=PeekI(*p+16)
-  If args=0
+  If args=0 Or PeekI(*p+32)=0
     ProcedureReturn 2
   EndIf
   If first>=last
     ProcedureReturn 0
   EndIf
-  PokeL(@aScale,PeekI(*p+32))
-  PmTensorConv1DNeonRange(args,first,last,aScale)
+  PmI8Conv1DRange(args,PmI8ConvBatch(args),first,last,PeekI(*p+32))
   ProcedureReturn 0
 EndProcedure
 
-; The INT8 convolution on as many cores as the monitor will give, with the
-; same contract as PmParallelConv1D: it always runs, the fallback is the
-; ordinary single-core body, and the bytes are the same either way because
-; every output is computed entirely inside one call to the range body in
-; one order.
-;
-; THE SOURCE IS ALREADY QUANTIZED WHEN THIS IS CALLED. That is the
-; precondition and it is the caller's, because it is the one step that is
-; not per-channel.
-Procedure.i PmParallelConv1DInt8(*g.PmTensorConv1DArgs, aScale.f)
+; One quantized batch on as many cores as the monitor will give. The fallback
+; is the same range body on this core, and the bytes are the same either way:
+; every output is computed entirely inside one call of the range body.
+Procedure.i PmParallelConv1DInt8(*g.PmTensorConv1DArgs)
   Protected count.i
   Protected tile.i
   Protected status.i
-  Protected bits.i
+  Protected i.i
   If *g=0
     ProcedureReturn 0
   EndIf
   tile=PmParallelConvInt8Tile()
-  If tile<1
-    tile=1
-  EndIf
   count=pmParallelConvParts(*g,tile)
   If count<2
-    PmTensorConv1DNeonRange(*g,0,*g\OutChannels,aScale)
+    PmI8Conv1DRange(*g,*g\QuantBatch,0,*g\OutChannels,PmI8ConvTile(*g,0))
     ProcedureReturn 1
   EndIf
-  bits=PeekL(@aScale)
-  pmParallelConvSplit(*g,count,tile,bits)
+  pmParallelConvSplit(*g,count,tile,0)
+  i=0
+  While i<count
+    PmParallelParts[i*#PMP_PARALLEL_WORDS+4]=PmI8ConvTile(*g,i)
+    i=i+1
+  Wend
   status=pmSvcParRun(@PmParallelConvInt8Worker,@PmParallelParts[0],#PMP_PARALLEL_STRIDE,count)
   If status=#PMP_SVC_OK
     ProcedureReturn 1
   EndIf
-  ; Same rule as the FP32 splitter: a refusal is not a reason to produce
-  ; nothing. Every output is written again by the single-core body, over
-  ; whatever a partial run left, and the result is the same bytes.
+  ; A refusal is not a reason to produce nothing: every output is written
+  ; again by the single-core body, over whatever a partial run left.
   PmAnvilServices=0
-  PmTensorConv1DNeonRange(*g,0,*g\OutChannels,aScale)
+  PmI8Conv1DRange(*g,*g\QuantBatch,0,*g\OutChannels,PmI8ConvTile(*g,0))
   ProcedureReturn 1
 EndProcedure
 
-; The entry the graph calls. Unchanged in what it decides; the difference
-; is that once the source is quantized the channels go to every core the
-; monitor will lend, exactly as the FP32 convolution's have since ABI 1.3.
+; The entry the graph calls.
 Procedure PmTensorConv1DNeon(*g.PmTensorConv1DArgs)
-  Protected aScale.f
+  Protected bn.i
   If *g\WeightScales = 0
     PmTensorConv1DFp32Neon(*g)
     ProcedureReturn
   EndIf
-  If *g\Stride <> 1
-    PmTensorConv1D(*g)
-    ProcedureReturn
-  EndIf
-  aScale = PmTensorDynamicScale(*g\Src, *g\Batches * *g\InChannels * *g\InWidth)
-  PmTensorQuantizeBuffer(*g\Src, PmTensorInt8Scratch, *g\Batches * *g\InChannels * *g\InWidth, aScale)
-  PmParallelConv1DInt8(*g, aScale)
+  bn = 0
+  While bn < *g\Batches
+    If PmI8ConvQuantize(*g, bn) = 0
+      ProcedureReturn
+    EndIf
+    *g\QuantBatch = bn
+    PmParallelConv1DInt8(*g)
+    bn = bn + 1
+  Wend
 EndProcedure
 CompilerEndIf
 CompilerEndIf

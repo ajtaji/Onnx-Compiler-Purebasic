@@ -147,6 +147,13 @@ Use FP32 as your correctness baseline. INT8 and other reductions can be compared
 by generating distinct output prefixes. Performance depends on the graph,
 processor, request length, and precision; no real-time reading guarantee is made.
 
+At `--precision int8` this model is compiled with a measured precision plan:
+the text, duration and pitch front end and three nodes next to the waveform
+take wide (two-plane, 16-bit-activation) weights and the rest narrow INT8.
+On the reference input it predicts the same durations as FP32 for all 143
+tokens and scores 0.588 dB of log-mel distance against ONNX Runtime FP32
+(FP16 weight storage: 0.442). See [the book, chapter 4](guide/04_reading_a_model.txt).
+
 ## Pi 4 and UNO Q
 
 **A complete, reproducible Pi 4 example:** [`examples/pi4/kokoro-sentence`](../examples/pi4/kokoro-sentence/README.md)

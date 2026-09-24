@@ -1,4 +1,4 @@
-﻿; ============================================================================
+; ============================================================================
 ; onnx_quant.pbi - checked target-neutral dynamic INT8 weight lowering
 ; ----------------------------------------------------------------------------
 ; Eligible constant linear weights are stored as symmetric signed INT8 with one
@@ -289,16 +289,26 @@ Procedure.i PmoQuantizeDynamicWeights(*Ir.PmoIrModel)
   ProcedureReturn #True
 EndProcedure
 
-; Reserve one reusable activation workspace: the quantized activations (one
-; byte each on this narrow-only path) on a 16-byte boundary, then one FP32
-; scale per row of the reduction. LSTM keeps its input and recurrent vectors
-; quantized at the same time, with one scale each.
-Procedure.q PmoQuantRowBytes(Elements.q, Rows.q)
+; Reserve one reusable INT8 workspace (runtime/tensor_fp32.pmi, PmI8ScratchBytes):
+; the quantized activations on a 16-byte boundary, then one FP32 scale and one
+; reciprocal per row of the reduction, then the per-core tiles (4096 bytes on
+; the 64-bit Arm targets, whose SIMD bodies use them; 64 elsewhere). The
+; fixed-shape path is narrow, so an activation is one byte.
+Procedure.q PmoQuantScratchBytes(Elements.q, Rows.q, TileBytes.q)
   If Rows < 1 : Rows = 1 : EndIf
-  ProcedureReturn ((Elements + 15) & ~15) + Rows * 4
+  ProcedureReturn 16 + ((Elements + 15) & ~15) + ((Rows * 4 + 15) & ~15) * 2 + TileBytes
 EndProcedure
 
-Procedure.i PmoQuantPlanScratch(*Ir.PmoIrModel)
+; The first entry of an integer-list attribute (strides, dilations), or Default.
+Procedure.q PmoQuantAttrFirst(*Node.PmoOnnxNode, Name.s, DefaultValue.q)
+  ForEach *Node\Attributes()
+    If *Node\Attributes()\Name = Name And FirstElement(*Node\Attributes()\Integers())
+      ProcedureReturn *Node\Attributes()\Integers()
+    EndIf
+  Next
+  ProcedureReturn DefaultValue
+EndProcedure
+Procedure.i PmoQuantPlanScratch(*Ir.PmoIrModel, TileBytes.q)
   Protected Operation.s
   Protected WeightName.s
   Protected RecurrentName.s
@@ -307,9 +317,18 @@ Procedure.i PmoQuantPlanScratch(*Ir.PmoIrModel)
   Protected Largest.q
   Protected Reduction.q
   Protected TransA.i
+  Protected Channels.q
+  Protected Width.q
+  Protected Kernel.q
+  Protected OutWidth.q
+  Protected Padded.q
+  Protected Stride.q
+  Protected Span.q
+  Protected Pad.q
   Protected *Activation.PmoIrValue
   Protected *Weight.PmoIrValue
   Protected *Recurrent.PmoIrValue
+  Protected *Output.PmoIrValue
   If *Ir = 0 : ProcedureReturn PmoQuantFail("internal INT8 scratch IR is null") : EndIf
   ForEach *Ir\QuantWeights()
     If *Ir\QuantWeights()\Wide
@@ -341,19 +360,45 @@ Procedure.i PmoQuantPlanScratch(*Ir.PmoIrModel)
           If SelectElement(*Activation\Dims(), 1) : Reduction = *Activation\Dims() : EndIf
       EndSelect
       If Reduction < 1 : Reduction = 1 : EndIf
-      Needed = PmoQuantRowBytes(*Activation\Elements, *Activation\Elements / Reduction)
+      Needed = PmoQuantScratchBytes(*Activation\Elements, *Activation\Elements / Reduction, TileBytes)
+      ; A 1-D convolution quantizes one batch into padded, phase-split rows
+      ; (runtime PmI8ConvPhase): Stride phases of qps positions per channel,
+      ; qps = max(ceil((PadLeft + InWidth) / Stride),
+      ;           OutWidth16 + (kernel - 1) * dilation / Stride + 1), to 16.
+      If Operation = "Conv" And ListSize(*Activation\Dims()) = 3 And FindMapElement(*Ir\ValueByName(), WeightName)
+        *Weight = *Ir\ValueByName()
+        Channels = 0 : Width = 0 : Kernel = 1 : OutWidth = 0
+        If SelectElement(*Activation\Dims(), 1) : Channels = *Activation\Dims() : EndIf
+        If SelectElement(*Activation\Dims(), 2) : Width = *Activation\Dims() : EndIf
+        If SelectElement(*Weight\Dims(), 2) : Kernel = *Weight\Dims() : EndIf
+        If FirstElement(*Ir\Nodes()\Node\Outputs()) And FindMapElement(*Ir\ValueByName(), *Ir\Nodes()\Node\Outputs())
+          *Output = *Ir\ValueByName()
+          If SelectElement(*Output\Dims(), 2) : OutWidth = *Output\Dims() : EndIf
+        EndIf
+        Stride = PmoQuantAttrFirst(*Ir\Nodes()\Node, "strides", 1) : If Stride < 1 : Stride = 1 : EndIf
+        Span = (Kernel - 1) * PmoQuantAttrFirst(*Ir\Nodes()\Node, "dilations", 1)
+        ; an absent pads (auto_pad) never puts more than Span in front
+        Pad = PmoQuantAttrFirst(*Ir\Nodes()\Node, "pads", Span)
+        Padded = (Pad + Width + Stride - 1) / Stride
+        If ((OutWidth + 15) & ~15) + Span / Stride + 1 > Padded : Padded = ((OutWidth + 15) & ~15) + Span / Stride + 1 : EndIf
+        Padded = ((Padded + 15) & ~15) * Stride
+        If PmoQuantScratchBytes(Channels * Padded, Padded, TileBytes) > Needed : Needed = PmoQuantScratchBytes(Channels * Padded, Padded, TileBytes) : EndIf
+      EndIf
     ElseIf Operation = "LSTM"
       If (WeightName <> "" And FindMapElement(*Ir\QuantByName(), WeightName)) Or
          (RecurrentName <> "" And FindMapElement(*Ir\QuantByName(), RecurrentName))
+        ; PmI8LstmScratchBytes: one input row, one hidden row, the 4*Hidden
+        ; gate sums of W.x and of R.h, 64 bytes of scales, the tiles.
+        Width = 0 : Channels = 0
         If WeightName <> "" And FindMapElement(*Ir\ValueByName(), WeightName)
           *Weight = *Ir\ValueByName()
-          If LastElement(*Weight\Dims()) : Needed = *Weight\Dims() : EndIf
+          If LastElement(*Weight\Dims()) : Width = *Weight\Dims() : EndIf
         EndIf
         If RecurrentName <> "" And FindMapElement(*Ir\ValueByName(), RecurrentName)
           *Recurrent = *Ir\ValueByName()
-          If LastElement(*Recurrent\Dims()) : Needed + *Recurrent\Dims() : EndIf
+          If LastElement(*Recurrent\Dims()) : Channels = *Recurrent\Dims() : EndIf
         EndIf
-        Needed = PmoQuantRowBytes(Needed, 2)
+        Needed = 16 + ((Width + 15) & ~15) + ((Channels + 15) & ~15) + ((Channels * 16 + 15) & ~15) * 2 + 64 + TileBytes
       EndIf
     EndIf
     If Needed > Largest : Largest = Needed : EndIf

@@ -106,16 +106,16 @@ reading the source.
 "execution_contract": "resident-reusable",
 "shape_contract": "fixed-dimensions-variable-input-values",
 "weight_bytes": 196,
-"arena_bytes": 192,
+"arena_bytes": 256,
 "decoded_weight_reserve_bytes": 0,
 "reduced_storage_weight_count": 0,
-"int8_scratch": {"offset":128,"bytes":64},
+"int8_scratch": {"offset":128,"bytes":128},
 "ai_onnx_opset": 20,
 "inputs":  [{"index":0,"name":"x","type":"float32","shape":[1,2],"bytes":8,"storage":"arena","offset":0}],
 "outputs": [{"index":0,"name":"y","type":"float32","shape":[1,2],"bytes":8,"storage":"arena","offset":64}],
 "quantization": {
   "mode": "int8",
-  "scheme": "per-output-channel symmetric signed INT8 weights, dynamic per-tensor signed INT8 activations, INT32 accumulation, FP32 operator seams",
+  "scheme": "per-output-channel symmetric signed INT8 weights, dynamic per-row signed INT8 activations, INT32 accumulation, FP32 operator seams",
   "weight_count": 1, "fp32_weight_bytes": 16, "int8_weight_bytes": 4
 },
 "packed_tensors": [ {"name":"w","type":"int8","shape":[2,2],"offset":192,"bytes":4}, ... ]

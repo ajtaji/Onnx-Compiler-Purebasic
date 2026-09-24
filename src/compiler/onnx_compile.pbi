@@ -1,4 +1,4 @@
-﻿; ============================================================================
+; ============================================================================
 ; onnx_compile.pbi - native checked ONNX-to-source orchestration
 ; ----------------------------------------------------------------------------
 ; The product writes host-language or PureMetal source, packed weights and a
@@ -723,7 +723,7 @@ Procedure.i PmoCompileCommand(ModelPath.s)
   If PmoIrPlanArena(@Ir) = 0
     PmoCompileFail(PmoIrError) : Goto PmoCompileCommandFailed
   EndIf
-  If Precision = "int8" And PmoQuantPlanScratch(@Ir) = 0
+  If Precision = "int8" And PmoQuantPlanScratch(@Ir, 64 + 4032 * Bool(PmoTargets(TargetIndex)\NativeIntegerBytes = 8 And PmoTargets(TargetIndex)\SourceDialect = #PMO_SOURCE_PUREMETAL)) = 0
     PmoCompileFail(PmoQuantError) : Goto PmoCompileCommandFailed
   EndIf
   If PmoCompilePlanStftScratch(@Ir) = 0 : Goto PmoCompileCommandFailed : EndIf
