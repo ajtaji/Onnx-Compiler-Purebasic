@@ -400,6 +400,70 @@ def cases() -> list[Case]:
                   [N("SplitToSequence", ["x"], ["s"], axis=0), N("SequenceErase", ["s", "pos"], ["t"]), N("SequenceLength", ["t"], ["y"])],
                   [tv("x", F, ["n", 2]), tv("pos", I64, [])], [tv("y", I64, [])],
                   {"x": f32(3, 2), "pos": np.array(3, np.int64)}, run_refuse="SequenceErase position 3 is outside"))
+    # Scan-9 and later, rewritten into Loop: directions, axes (negative
+    # too), several scan inputs and outputs, no state, at opset 11 and 20
+    sb = graph([N("Add", ["acc", "a"], ["acc2"]), N("Mul", ["a", "b"], ["prod"]), N("Identity", ["acc2"], ["run"])], "scan_body",
+               [tv("acc", F, [3]), tv("a", F, [3]), tv("b", F, [3])],
+               [tv("acc2", F, [3]), tv("run", F, [3]), tv("prod", F, [3])])
+    x, y = f32(4, 3), f32(3, 4)
+    c.append(Case("scan_two_inputs_forward",
+                  [N("Scan", ["init", "x", "y"], ["final", "runs", "prods"], num_scan_inputs=2, body=sb, scan_input_axes=[0, 1])],
+                  [tv("init", F, [3]), tv("x", F, ["n", 3]), tv("y", F, [3, "n"])],
+                  [tv("final", F, [3]), tv("runs", F, ["n", 3]), tv("prods", F, ["n", 3])],
+                  {"init": f32(3), "x": x, "y": y}, opset=11))
+    c.append(Case("scan_reverse_and_axes",
+                  [N("Scan", ["init", "x", "y"], ["final", "runs", "prods"], num_scan_inputs=2, body=sb, scan_input_axes=[0, -1],
+                     scan_input_directions=[1, 0], scan_output_directions=[1, 0], scan_output_axes=[-1, 1])],
+                  [tv("init", F, [3]), tv("x", F, [4, 3]), tv("y", F, [3, 4])],
+                  [tv("final", F, [3]), tv("runs", F, ["p", "q"]), tv("prods", F, ["r", "s"])],
+                  {"init": f32(3), "x": x, "y": y}, opset=20))
+    nb = graph([N("Neg", ["a"], ["r"])], "scan_nostate", [tv("a", F, [2])], [tv("r", F, [2])])
+    c.append(Case("scan_no_state_reverse_output",
+                  [N("Scan", ["x"], ["rs"], num_scan_inputs=1, body=nb, scan_output_directions=[1])],
+                  [tv("x", F, ["n", 2])], [tv("rs", F, ["m", 2])], {"x": f32(5, 2)}, opset=16))
+    ib = graph([N("Add", ["s", "v"], ["s2"]), N("Gather", ["s2", "first"], ["t"])], "scan_int",
+               [tv("s", I64, [2]), tv("v", I64, [2])], [tv("s2", I64, [2]), tv("t", I64, [])], [scalar("first", 1, I64)])
+    c.append(Case("scan_int64_state_scalar_output",
+                  [N("Scan", ["s0", "v"], ["sf", "ts"], num_scan_inputs=1, body=ib)],
+                  [tv("s0", I64, [2]), tv("v", I64, ["n", 2])], [tv("sf", I64, [2]), tv("ts", I64, ["m"])],
+                  {"s0": np.array([1, -2], np.int64), "v": RNG.integers(-9, 9, (6, 2)).astype(np.int64)}, opset=13))
+    c.append(Case("refuse_scan_opset8",
+                  [N("Scan", ["", "init", "x"], ["final", "runs"], num_scan_inputs=1, body=graph(
+                      [N("Add", ["acc", "a"], ["acc2"]), N("Identity", ["acc2"], ["run"])], "scan8",
+                      [tv("acc", F, [3]), tv("a", F, [3])], [tv("acc2", F, [3]), tv("run", F, [3])]))],
+                  [tv("init", F, [1, 3]), tv("x", F, [1, 4, 3])], [tv("final", F, [1, 3]), tv("runs", F, [1, 4, 3])],
+                  {"init": f32(1, 3), "x": f32(1, 4, 3)}, opset=8, refuse="current from opset 9"))
+    # a Scan inside a Loop body, reading the Loop's carried value
+    inner = graph([N("Add", ["acc", "a"], ["acc2"]), N("Identity", ["acc2"], ["run"])], "inner_scan",
+                  [tv("acc", F, [2]), tv("a", F, [2])], [tv("acc2", F, [2]), tv("run", F, [2])])
+    lb = graph([N("Scan", ["v", "xs"], ["v2", "runs"], num_scan_inputs=1, body=inner, scan_input_directions=[1]),
+                N("Identity", ["c"], ["c2"])], "loop_scan",
+               [tv("i", I64, []), tv("c", B, []), tv("v", F, [2])], [tv("c2", B, []), tv("v2", F, [2]), tv("runs", F, [3, 2])])
+    c.append(Case("scan_inside_loop",
+                  [N("Loop", ["trip", "", "v0"], ["vf", "allruns"], body=lb)],
+                  [tv("v0", F, [2]), tv("xs", F, [3, 2])], [tv("vf", F, [2]), tv("allruns", F, ["t", 3, 2])],
+                  {"v0": f32(2), "xs": f32(3, 2)}, [scalar("trip", 2, I64)], opset=13))
+    # SequenceMap-17, rewritten into Loop: two outputs of two element types,
+    # a sequence and a tensor input, inside a Loop body
+    mb = graph([N("Mul", ["e", "w"], ["m"]), N("Shape", ["e"], ["sh"])], "map_body",
+               [tv("e", F, ["k"]), tv("w", F, [])], [tv("m", F, ["k"]), tv("sh", I64, [1])])
+    c.append(Case("sequence_map_two_outputs",
+                  [N("SplitToSequence", ["x", "lens"], ["s"], axis=0),
+                   N("SequenceMap", ["s", "w"], ["ms", "shs"], body=mb),
+                   N("ConcatFromSequence", ["ms"], ["joined"], axis=0),
+                   N("ConcatFromSequence", ["shs"], ["shapes"], axis=0)],
+                  [tv("x", F, ["n"]), tv("w", F, [])], [tv("joined", F, ["t"]), tv("shapes", I64, ["u"])],
+                  {"x": f32(9), "w": np.array(1.5, np.float32)}, [const("lens", np.array([2, 4, 3], np.int64))], opset=17))
+    c.append(Case("sequence_map_two_sequences_int32",
+                  [N("SequenceMap", ["s", "t"], ["u"], body=graph([N("Sub", ["p", "q"], ["d"])], "map2",
+                                                                  [tv("p", I32, ["k"]), tv("q", I32, ["k"])], [tv("d", I32, ["k"])])),
+                   N("SequenceAt", ["u", "one"], ["second"])],
+                  [sv("s", I32, ["k"]), sv("t", I32, ["k"])], [tv("second", I32, ["k"]), sv("u", I32, None)],
+                  {"s": [np.array([1, 2, 3], np.int32), np.array([4, 5], np.int32)], "t": [np.array([7, 7, 7], np.int32), np.array([1, 1], np.int32)]},
+                  [scalar("one", 1, I64)], opset=18))
+    c.append(Case("refuse_sequence_map_opset16",
+                  [N("SequenceMap", ["s"], ["u"], body=graph([N("Identity", ["p"], ["q"])], "map3", [tv("p", F, ["k"])], [tv("q", F, ["k"])]))],
+                  [sv("s", F, ["k"])], [sv("u", F, None)], {"s": [f32(2)]}, opset=16, refuse="SequenceMap"))
     return c
 
 

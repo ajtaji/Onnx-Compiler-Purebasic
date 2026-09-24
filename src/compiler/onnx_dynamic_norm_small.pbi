@@ -58,6 +58,8 @@ Procedure.s PmdNsOpsetRefusal(*Model.PmoOnnxModel)
     ProcedureReturn "The model imports ai.onnx opset " + Str(Version) + "; runtime-dimension emission implements the opset 20 operator definitions only."
   EndIf
   ForEach *Model\Graph\Nodes()
+    ; a node the Scan lowering added implements the Scan, whose floor was audited
+    If FindMapElement(PmcLowered(), Str(@*Model\Graph\Nodes())) : Continue : EndIf
     Operation = *Model\Graph\Nodes()\Operation
     Floor = PmdNsFloor(Operation)
     If Version < Floor

@@ -715,6 +715,42 @@ wrappers, which now carry the appended procedures (`PmRandomBernoulli`,
 `PmRandomUniformDraws`; `DRandomBernoulli`, `DRandomMultinomial`,
 `DRandomFedKind`); a model with Multinomial also carries `tensor_ops.pmi`.
 
+## Group C, fourth batch: Scan and SequenceMap — September 24, 2026
+
+Scan (opset 9 to 20) and SequenceMap (opset 17 to 20) compile on the
+runtime-dimension path for every target, with no new runtime: straight
+after loading, `onnx_control.pbi` rewrites each into the `Loop` it
+describes, with the nodes the specification implies, and the Loop emitter
+of the [control-flow section](#control-flow-and-sequences--september-16-2026)
+does the rest.
+
+| Operator | Rewritten as |
+|---|---|
+| Scan | Trip count `Gather(Shape(x0), axis0)`. In the body, scan input `j`'s slice is `Gather(xj, i, axis_j)`, or `Gather(xj, M-1-i, axis_j)` for direction 1; the state values are the Loop's carried values. Scan output `k` is the Loop's stacked output, then `Slice` with step -1 for direction 1 and `Transpose` to move the new axis to `scan_output_axes[k]`. |
+| SequenceMap | Trip count `SequenceLength(s0)`. In the body, a sequence input's element is `SequenceAt(s, i)` and a tensor input is read unchanged; output `k` starts as `SequenceEmpty` of the body output's declared element type and grows by `SequenceInsert`. That is the operator's ONNX function body. |
+
+The added nodes carry out an operator whose own opset floor has already
+been checked, so their floors are not checked again. Without that, a Scan
+in an opset-9 model would be refused for the Gather it becomes.
+
+| Check | Result |
+|---|---|
+| `tests/node_suite/targeted_control.py`: 41 cases - the 32 before; Scan with two scan inputs on different axes, reversed inputs and outputs, negative axes, output axes other than 0, no state, INT64 state with a scalar scan output, a Scan inside a Loop body that reads the Loop's carried value; SequenceMap with two outputs of two element types, a sequence and a tensor input, two INT32 sequences; Scan-8 and SequenceMap at opset 16 refused | 41 of 41 as expected; the expected values come from ONNX Runtime where the reference does not implement the form (scan axes other than 0, reversed directions) |
+| `tests/node_suite/targeted_ops.py`: 817 cases - the 813 before; a Scan with reversed directions and moved axes, and a SequenceMap between two tensors, so that every target runs them | 817 of 817 as expected |
+| `ops_targets_gate.py`: those builds on the Pi 4, Pico and Pico 2 in unicorn | 4 builds, 12 runs: 12 of 12 bit-identical to the Windows program |
+| `tests/node_suite/pi4_control_gate.py` with the A64 interpreter: the new control cases on the Pi 4 | 7 of 7 bit-identical to the expected outputs (the Scan and SequenceMap cases that must pass) |
+| Official node tests at opset 20 or lower, this change against the previous compiler | PASS 559 of 964 before, 568 after: the three Scan-9 cases and the six SequenceMap cases; no case that passed fails. test_scan_sum (Scan-8) is refused by name |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `4e6d5cd` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
+| Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
+
+**Refused, with a sentence:** Scan-8 (a batch axis and `sequence_lens`;
+the definition from opset 9 is implemented); SequenceMap before opset 17;
+a negative scan axis on an input with no declared rank; a scan output
+axis other than 0 on a body output with no declared rank; a SequenceMap
+body output with no carried element type declared. SequenceMap in its
+unexpanded form and Scan, both refused in the section on control flow and
+sequences, now compile.
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

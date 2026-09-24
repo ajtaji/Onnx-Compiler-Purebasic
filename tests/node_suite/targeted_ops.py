@@ -942,6 +942,25 @@ def cases() -> list[Case]:
                   [init("l", np.array([1, 2, 2, 1], np.int64)), init("p", np.array(-3, np.int64))], opset=11))
     c.append(Case("refuse_unique_int16", [N("Unique", ["x"], ["y"])], [("x", TensorProto.INT16, [5])], [("y", TensorProto.INT16, [None])],
                   {"x": np.array([3, 1, 3, 2, 1], np.int16)}, opset=11, refuse="implements Unique for FLOAT, UINT8, INT8, INT32, INT64 and BOOL"))
+    # Scan and SequenceMap between tensors, so every target runs the Loop
+    # they are rewritten into (the reference implements neither form here)
+    sb = helper.make_graph([N("Add", ["acc", "a"], ["acc2"]), N("Mul", ["a", "b"], ["prod"]), N("Identity", ["acc2"], ["run"])], "scan_body",
+                           [helper.make_tensor_value_info("acc", F, [3]), helper.make_tensor_value_info("a", F, [3]),
+                            helper.make_tensor_value_info("b", F, [3])],
+                           [helper.make_tensor_value_info("acc2", F, [3]), helper.make_tensor_value_info("run", F, [3]),
+                            helper.make_tensor_value_info("prod", F, [3])])
+    c.append(Case("scan_reverse_axes", [N("Scan", ["init", "x", "y"], ["final", "runs", "prods"], num_scan_inputs=2, body=sb,
+                                          scan_input_axes=[0, -1], scan_input_directions=[1, 0], scan_output_directions=[1, 0],
+                                          scan_output_axes=[-1, 1])],
+                  [("init", F, [3]), ("x", F, [4, 3]), ("y", F, [3, 4])], [("final", F, [3]), ("runs", F, [3, 4]), ("prods", F, [3, 4])],
+                  {"init": f32(3), "x": f32(4, 3), "y": f32(3, 4)}, opset=16, oracle="ort", symbolic_axes=()))
+    mb = helper.make_graph([N("Mul", ["e", "w"], ["m"])], "map_body",
+                           [helper.make_tensor_value_info("e", F, ["k"]), helper.make_tensor_value_info("w", F, [])],
+                           [helper.make_tensor_value_info("m", F, ["k"])])
+    c.append(Case("sequencemap_split_concat", [N("SplitToSequence", ["x", "l"], ["s"], axis=0), N("SequenceMap", ["s", "w"], ["ms"], body=mb),
+                                              N("ConcatFromSequence", ["ms"], ["y"], axis=0)],
+                  [("x", F, [9]), ("w", F, [])], [("y", F, [9])], {"x": f32(9), "w": np.array(-1.5, np.float32)},
+                  [init("l", np.array([2, 4, 3], np.int64))], opset=17, oracle="ort", symbolic_axes=()))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

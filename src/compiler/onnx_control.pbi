@@ -6,7 +6,7 @@
 ; (https://onnx.ai/onnx/operators/): If-11/13/16/19, Loop-11/13/16/19,
 ; SequenceEmpty-11, SequenceConstruct-11, SequenceInsert-11, SequenceAt-11,
 ; SequenceLength-11, SequenceErase-11, SplitToSequence-11 and
-; ConcatFromSequence-11.
+; ConcatFromSequence-11; Scan-9 and SequenceMap-17, rewritten into Loop.
 ;
 ; Three stages, all on the runtime-dimension path:
 ;
@@ -64,6 +64,8 @@ Global NewMap PmcSequenceElement.i()
 ; Nodes of other operators this file emits because of what they carry: an
 ; Identity whose input is a sequence.
 Global NewMap PmcOwned.i()
+; Nodes the Scan and SequenceMap lowering added (by address).
+Global NewMap PmcLowered.i()
 
 Procedure.i PmcFail(Message.s)
   If PmcError = "" : PmcError = Message : EndIf
@@ -140,6 +142,7 @@ Procedure.i PmcOperatorFloor(Operation.s)
     Case "Exp", "Log", "Sqrt", "Abs", "Neg", "Floor", "Sigmoid", "Tanh", "LeakyRelu", "Cast" : ProcedureReturn 6
     Case "Add", "Sub", "Mul", "Div", "Pow", "Equal", "Greater", "Less", "And", "Sin", "Cos", "Atan", "LSTM" : ProcedureReturn 7
     Case "Expand" : ProcedureReturn 8
+    Case "Scan" : ProcedureReturn 9
     Case "Multinomial" : ProcedureReturn 7
     Case "ConstantOfShape", "Where", "NonZero" : ProcedureReturn 9
     Case "Slice" : ProcedureReturn 10
@@ -149,7 +152,7 @@ Procedure.i PmcOperatorFloor(Operation.s)
     Case "GreaterOrEqual" : ProcedureReturn 12
     Case "Softmax" : ProcedureReturn 13
     Case "Bernoulli" : ProcedureReturn 15
-    Case "LayerNormalization", "STFT" : ProcedureReturn 17
+    Case "LayerNormalization", "STFT", "SequenceMap" : ProcedureReturn 17
   EndSelect
   ProcedureReturn 20
 EndProcedure
@@ -172,6 +175,7 @@ Procedure.i PmcAuditNode(*Node.PmoOnnxNode)
   If PmcOpset > 20
     ProcedureReturn PmcFail("The model imports ai.onnx opset " + Str(PmcOpset) + "; runtime-dimension emission implements operator definitions through opset 20.")
   EndIf
+  If FindMapElement(PmcLowered(), Str(*Node)) : ProcedureReturn #True : EndIf
   If PmcOpset < Floor And Floor = 20
     ProcedureReturn PmcFail(PmcLabel(*Node) + ": the model imports ai.onnx opset " + Str(PmcOpset) + ", and runtime-dimension emission accepts " + *Node\Operation +
                             " only from a model importing opset 20, the definition it was checked against (where it implements " + *Node\Operation + " at all).")
@@ -216,6 +220,7 @@ Procedure PmcRelease()
   ClearMap(PmcKind())
   ClearMap(PmcSequenceElement())
   ClearMap(PmcOwned())
+  ClearMap(PmcLowered())
 EndProcedure
 
 ; ---------------------------------------------------------------------------
@@ -616,6 +621,30 @@ Procedure.i PmcInferNode(*Node.PmoOnnxNode, Depth.i)
         If ThenKind = #PMC_KIND_SEQUENCE And FindMapElement(PmcSequenceElement(), *Then\Outputs()\Name) : Element = PmcSequenceElement() : EndIf
         PmcSetKind(PmcOutput(*Node, Index), ThenKind, Element)
       Next
+    Case "Scan"
+      ; first pass only: Scan is rewritten into a Loop before the final pass
+      *Body = PmcAttributeGraph(*Node, "body")
+      If *Body = 0 : ProcedureReturn PmcFail(PmcLabel(*Node) + " has no body graph attribute.") : EndIf
+      For Index = 0 To ListSize(*Node\Inputs()) - 1
+        If PmcRequireKind(*Node, Index, #PMC_KIND_TENSOR) = 0 : ProcedureReturn #False : EndIf
+      Next
+      ForEach *Body\Inputs() : PmcSetKind(*Body\Inputs()\Name, #PMC_KIND_TENSOR) : Next
+      If PmcInferGraph(*Body, #False, Depth + 1) = 0 : ProcedureReturn #False : EndIf
+      ForEach *Node\Outputs() : PmcSetKind(*Node\Outputs(), #PMC_KIND_TENSOR) : Next
+    Case "SequenceMap"
+      ; first pass only, as Scan
+      *Body = PmcAttributeGraph(*Node, "body")
+      If *Body = 0 : ProcedureReturn PmcFail(PmcLabel(*Node) + " has no body graph attribute.") : EndIf
+      If PmcRequireKind(*Node, 0, #PMC_KIND_SEQUENCE) = 0 : ProcedureReturn #False : EndIf
+      ForEach *Body\Inputs() : PmcSetKind(*Body\Inputs()\Name, #PMC_KIND_TENSOR) : Next
+      If PmcInferGraph(*Body, #False, Depth + 1) = 0 : ProcedureReturn #False : EndIf
+      Index = 0
+      ForEach *Node\Outputs()
+        Element = 0
+        If SelectElement(*Body\Outputs(), Index) : Element = *Body\Outputs()\ElementType : EndIf
+        PmcSetKind(*Node\Outputs(), #PMC_KIND_SEQUENCE, Element)
+        Index + 1
+      Next
     Case "Loop"
       If PmcRequireKind(*Node, 0, #PMC_KIND_TENSOR) = 0 Or PmcRequireKind(*Node, 1, #PMC_KIND_TENSOR) = 0 : ProcedureReturn #False : EndIf
       *Body = PmcAttributeGraph(*Node, "body")
@@ -733,6 +762,416 @@ Procedure.i PmcInferGraph(*Graph.PmoOnnxGraph, IsTop.i, Depth.i)
   ProcedureReturn #True
 EndProcedure
 
+; ---------------------------------------------------------------------------
+; Stage 1d: Scan and SequenceMap become Loop
+; ---------------------------------------------------------------------------
+; Scan-9 (the form current through opset 20) and SequenceMap-17 are both
+; defined as a loop over one axis or one sequence. Rather than a second loop
+; emitter they are rewritten here into the Loop this file already emits,
+; with the nodes the specification's own definitions imply:
+;
+;   Scan         M = Shape(x0)[axis0] iterations; each scan input's slice is
+;                Gather(x, i or M-1-i, axis); each scan output is the Loop's
+;                stacked output, reversed with Slice(step -1) when its
+;                direction is 1 and moved to its axis with Transpose.
+;   SequenceMap  SequenceLength(s0) iterations; a sequence input's element is
+;                SequenceAt(s, i), a tensor input is read as it is; each
+;                output sequence starts as SequenceEmpty of the body output's
+;                element type and grows by SequenceInsert (the operator's
+;                ONNX function body, written out).
+;
+; The nodes added implement an operator whose own opset floor was audited, so
+; their floors are not audited again (PmcLowered).
+
+Procedure.i PmcIsLoweredOp(Operation.s)
+  ProcedureReturn Bool(Operation = "Scan" Or Operation = "SequenceMap")
+EndProcedure
+
+; Adds a node before the current node of *Graph (Before = 1, the current node
+; stays current) or after it (Before = 0, the new node becomes current).
+; Inputs and Outputs are comma-separated names.
+Procedure.i PmcAddNode(*Graph.PmoOnnxGraph, Operation.s, Inputs.s, Outputs.s, Before.i)
+  Protected *Current = @*Graph\Nodes()
+  Protected *Node.PmoOnnxNode
+  Protected Index.i
+  If Before And *Current
+    InsertElement(*Graph\Nodes())
+  Else
+    AddElement(*Graph\Nodes())
+  EndIf
+  *Node = @*Graph\Nodes()
+  *Node\Operation = Operation
+  If Inputs <> ""
+    For Index = 1 To CountString(Inputs, ",") + 1
+      AddElement(*Node\Inputs()) : *Node\Inputs() = StringField(Inputs, Index, ",")
+    Next
+  EndIf
+  For Index = 1 To CountString(Outputs, ",") + 1
+    AddElement(*Node\Outputs()) : *Node\Outputs() = StringField(Outputs, Index, ",")
+  Next
+  PmcLowered(Str(*Node)) = 1
+  If Before And *Current : ChangeCurrentElement(*Graph\Nodes(), *Current) : EndIf
+  ProcedureReturn *Node
+EndProcedure
+
+Procedure PmcAddIntAttribute(*Node.PmoOnnxNode, Name.s, Value.q)
+  AddElement(*Node\Attributes())
+  *Node\Attributes()\Name = Name : *Node\Attributes()\AttributeType = 2 : *Node\Attributes()\IntegerValue = Value
+EndProcedure
+
+; An INT64 initializer of the top-level graph: a scalar, or a 1-D list.
+Procedure.s PmcAddInt64(*Top.PmoOnnxGraph, Values.s, Scalar.i, Map Taken.i())
+  Protected Name.s = PmcUniqueName("lowered", Taken())
+  Protected Index.i
+  Protected Count.i = CountString(Values, ",") + 1
+  LastElement(*Top\Initializers())
+  AddElement(*Top\Initializers())
+  *Top\Initializers()\Name = Name
+  *Top\Initializers()\DataType = 7
+  If Scalar = 0
+    AddElement(*Top\Initializers()\Dims()) : *Top\Initializers()\Dims() = Count
+  EndIf
+  For Index = 1 To Count
+    AddElement(*Top\Initializers()\Int64Data()) : *Top\Initializers()\Int64Data() = Val(StringField(Values, Index, ","))
+  Next
+  ProcedureReturn Name
+EndProcedure
+
+; A BOOL true scalar initializer (BOOL initializers are read as raw bytes).
+Procedure.s PmcAddTrue(*Top.PmoOnnxGraph, Map Taken.i())
+  Protected Name.s = PmcUniqueName("lowered", Taken())
+  Protected *Buffer = AllocateMemory(1)
+  If *Buffer = 0 : PmcFail("Cannot allocate a lowered constant.") : ProcedureReturn "" : EndIf
+  PokeA(*Buffer, 1)
+  LastElement(PmcBuffers()) : AddElement(PmcBuffers()) : PmcBuffers() = *Buffer
+  LastElement(*Top\Initializers())
+  AddElement(*Top\Initializers())
+  *Top\Initializers()\Name = Name
+  *Top\Initializers()\DataType = 9
+  *Top\Initializers()\Raw\Data = *Buffer
+  *Top\Initializers()\Raw\Bytes = 1
+  ProcedureReturn Name
+EndProcedure
+
+; A scalar value declaration for a Loop body's iteration number and condition.
+Procedure PmcScalarValue(*Value.PmoOnnxValue, Name.s, ElementType.i)
+  *Value\Name = Name : *Value\ElementType = ElementType
+  *Value\HasTensorType = #True : *Value\HasShape = #True : *Value\ValueKind = #PMO_VALUE_TENSOR
+  ClearList(*Value\Dims())
+EndProcedure
+
+; The declared rank of a value, from *Graph's and the top graph's
+; declarations and initializers; -1 when neither says.
+Procedure.i PmcDeclaredRank(*Top.PmoOnnxGraph, *Graph.PmoOnnxGraph, Name.s)
+  Protected *G.PmoOnnxGraph
+  Protected Pass.i
+  For Pass = 0 To 1
+    *G = *Graph : If Pass = 1 : *G = *Top : EndIf
+    ForEach *G\Inputs()
+      If *G\Inputs()\Name = Name And *G\Inputs()\HasShape : ProcedureReturn ListSize(*G\Inputs()\Dims()) : EndIf
+    Next
+    ForEach *G\Values()
+      If *G\Values()\Name = Name And *G\Values()\HasShape : ProcedureReturn ListSize(*G\Values()\Dims()) : EndIf
+    Next
+    ForEach *G\Outputs()
+      If *G\Outputs()\Name = Name And *G\Outputs()\HasShape : ProcedureReturn ListSize(*G\Outputs()\Dims()) : EndIf
+    Next
+    ForEach *G\Initializers()
+      If *G\Initializers()\Name = Name : ProcedureReturn ListSize(*G\Initializers()\Dims()) : EndIf
+    Next
+  Next
+  ProcedureReturn -1
+EndProcedure
+
+; Keeps only the body attribute of a node that becomes a Loop.
+Procedure PmcKeepBody(*Node.PmoOnnxNode)
+  ForEach *Node\Attributes()
+    If *Node\Attributes()\Name <> "body" : DeleteElement(*Node\Attributes()) : EndIf
+  Next
+EndProcedure
+
+; Rewrites the current node of *Graph, a Scan, into a Loop (see above).
+Procedure.i PmcLowerScan(*Top.PmoOnnxGraph, *Graph.PmoOnnxGraph, Map Taken.i())
+  Protected *Node.PmoOnnxNode = @*Graph\Nodes()
+  Protected *Body.PmoOnnxGraph = PmcAttributeGraph(*Node, "body")
+  Protected *Added.PmoOnnxNode
+  Protected Label.s = PmcLabel(*Node)
+  Protected M.i, N.i, K.i, j.i, a.i, r.i, d.i, Reverse.i
+  Protected Shp.s, Trip.s, Last.s, One.s, Iter.s, CondIn.s, CondOut.s, Truth.s, Idx.s, Stacked.s, Final.s, Perm.s
+  Protected Dim ScanIn.s(0)
+  Protected Dim Elem.s(0)
+  If PmcAllowedAttributes(*Node, "|body|num_scan_inputs|scan_input_axes|scan_input_directions|scan_output_axes|scan_output_directions|") = 0 : ProcedureReturn #False : EndIf
+  If *Body = 0 : ProcedureReturn PmcFail(Label + " has no body graph attribute.") : EndIf
+  If PmcAttribute(*Node, "num_scan_inputs") = 0 : ProcedureReturn PmcFail(Label + " has no num_scan_inputs attribute; the operator requires one.") : EndIf
+  M = PmoEmitAttrI(*Node, "num_scan_inputs", 0)
+  N = ListSize(*Node\Inputs()) - M
+  If M < 1 Or N < 0
+    ProcedureReturn PmcFail(Label + " attribute num_scan_inputs = " + Str(M) + " with " + Str(ListSize(*Node\Inputs())) + " inputs; at least one scan input and no more than the inputs are required.")
+  EndIf
+  If ListSize(*Body\Inputs()) <> N + M
+    ProcedureReturn PmcFail(Label + " body declares " + Str(ListSize(*Body\Inputs())) + " inputs; it must take the " + Str(N) + " state values and the " + Str(M) + " scan slices.")
+  EndIf
+  K = ListSize(*Body\Outputs()) - N
+  If K < 0 Or ListSize(*Node\Outputs()) <> N + K
+    ProcedureReturn PmcFail(Label + " declares " + Str(ListSize(*Node\Outputs())) + " outputs; its body returns " + Str(ListSize(*Body\Outputs())) + ", of which " + Str(N) + " are state values.")
+  EndIf
+  If (PmcAttribute(*Node, "scan_input_axes") And PmoEmitAttrListCount(*Node, "scan_input_axes") <> M) Or
+     (PmcAttribute(*Node, "scan_input_directions") And PmoEmitAttrListCount(*Node, "scan_input_directions") <> M) Or
+     (PmcAttribute(*Node, "scan_output_axes") And PmoEmitAttrListCount(*Node, "scan_output_axes") <> K) Or
+     (PmcAttribute(*Node, "scan_output_directions") And PmoEmitAttrListCount(*Node, "scan_output_directions") <> K)
+    ProcedureReturn PmcFail(Label + " has an axes or directions attribute whose length is not the number of scan inputs (" + Str(M) + ") or scan outputs (" + Str(K) + ").")
+  EndIf
+  ReDim ScanIn(M) : ReDim Elem(M)
+  For j = 0 To M - 1
+    ScanIn(j) = PmcInput(*Node, N + j)
+    If ScanIn(j) = "" : ProcedureReturn PmcFail(Label + " scan input " + Str(j) + " is missing.") : EndIf
+    SelectElement(*Body\Inputs(), N + j) : Elem(j) = *Body\Inputs()\Name
+    If PmoEmitAttrListI(*Node, "scan_input_directions", j, 0) <> 0 And PmoEmitAttrListI(*Node, "scan_input_directions", j, 0) <> 1
+      ProcedureReturn PmcFail(Label + " scan_input_directions holds " + Str(PmoEmitAttrListI(*Node, "scan_input_directions", j, 0)) + "; 0 (forward) and 1 (reverse) are defined.")
+    EndIf
+    If PmoEmitAttrListI(*Node, "scan_input_directions", j, 0) = 1 : Reverse = #True : EndIf
+  Next
+  ; the trip count: the first scan input's extent along its axis
+  a = PmoEmitAttrListI(*Node, "scan_input_axes", 0, 0)
+  If a < 0
+    r = PmcDeclaredRank(*Top, *Graph, ScanIn(0))
+    If r < 0 : ProcedureReturn PmcFail(Label + " scan input 0 has a negative axis and an undeclared rank; declare its shape.") : EndIf
+    a + r
+  EndIf
+  Shp = PmcUniqueName("lowered", Taken())
+  Trip = PmcUniqueName("lowered", Taken())
+  PmcAddNode(*Graph, "Shape", ScanIn(0), Shp, #True)
+  *Added = PmcAddNode(*Graph, "Gather", Shp + "," + PmcAddInt64(*Top, Str(a), #True, Taken()), Trip, #True)
+  PmcAddIntAttribute(*Added, "axis", 0)
+  If Reverse
+    Last = PmcUniqueName("lowered", Taken())
+    One = PmcAddInt64(*Top, "1", #True, Taken())
+    PmcAddNode(*Graph, "Sub", Trip + "," + One, Last, #True)
+  EndIf
+  Truth = PmcAddTrue(*Top, Taken())
+  If Truth = "" : ProcedureReturn #False : EndIf
+  ; the body: iteration number and condition first, the slices made inside
+  Iter = PmcUniqueName("lowered", Taken())
+  CondIn = PmcUniqueName("lowered", Taken())
+  CondOut = PmcUniqueName("lowered", Taken())
+  For j = 1 To M
+    LastElement(*Body\Inputs()) : DeleteElement(*Body\Inputs())
+  Next
+  FirstElement(*Body\Inputs())
+  InsertElement(*Body\Inputs()) : PmcScalarValue(@*Body\Inputs(), CondIn, 9)
+  InsertElement(*Body\Inputs()) : PmcScalarValue(@*Body\Inputs(), Iter, 7)
+  If FirstElement(*Body\Outputs())
+    InsertElement(*Body\Outputs())
+  Else
+    AddElement(*Body\Outputs())
+  EndIf
+  PmcScalarValue(@*Body\Outputs(), CondOut, 9)
+  FirstElement(*Body\Nodes())
+  PmcAddNode(*Body, "Identity", CondIn, CondOut, #True)
+  For j = 0 To M - 1
+    a = PmoEmitAttrListI(*Node, "scan_input_axes", j, 0)
+    If a < 0
+      r = PmcDeclaredRank(*Top, *Graph, ScanIn(j))
+      If r < 0 : ProcedureReturn PmcFail(Label + " scan input " + Str(j) + " has a negative axis and an undeclared rank; declare its shape.") : EndIf
+      a + r
+    EndIf
+    Idx = Iter
+    If PmoEmitAttrListI(*Node, "scan_input_directions", j, 0) = 1
+      Idx = PmcUniqueName("lowered", Taken())
+      PmcAddNode(*Body, "Sub", Last + "," + Iter, Idx, #True)
+    EndIf
+    *Added = PmcAddNode(*Body, "Gather", ScanIn(j) + "," + Idx, Elem(j), #True)
+    PmcAddIntAttribute(*Added, "axis", a)
+  Next
+  ; the node itself becomes the Loop
+  *Node\Operation = "Loop"
+  PmcLowered(Str(*Node)) = 1
+  For j = 1 To M
+    LastElement(*Node\Inputs()) : DeleteElement(*Node\Inputs())
+  Next
+  If FirstElement(*Node\Inputs())
+    InsertElement(*Node\Inputs())
+  Else
+    AddElement(*Node\Inputs())
+  EndIf
+  *Node\Inputs() = Truth
+  InsertElement(*Node\Inputs()) : *Node\Inputs() = Trip
+  ; scan outputs: reversed and moved to their axis after the Loop
+  For j = 0 To K - 1
+    d = PmoEmitAttrListI(*Node, "scan_output_directions", j, 0)
+    a = PmoEmitAttrListI(*Node, "scan_output_axes", j, 0)
+    If d <> 0 And d <> 1
+      ProcedureReturn PmcFail(Label + " scan_output_directions holds " + Str(d) + "; 0 (forward) and 1 (reverse) are defined.")
+    EndIf
+    If a <> 0
+      SelectElement(*Body\Outputs(), 1 + N + j)
+      r = -1
+      If *Body\Outputs()\HasShape : r = ListSize(*Body\Outputs()\Dims()) + 1 : EndIf
+      If r < 0 : ProcedureReturn PmcFail(Label + " scan output " + Str(j) + " has axis " + Str(a) + " and a body output of undeclared rank; declare the body output's shape.") : EndIf
+      If a < 0 : a + r : EndIf
+      If a < 0 Or a >= r : ProcedureReturn PmcFail(Label + " scan output " + Str(j) + " axis is outside the rank " + Str(r) + " of the stacked output.") : EndIf
+    EndIf
+    If d = 0 And a = 0 : Continue : EndIf
+    SelectElement(*Node\Outputs(), N + j)
+    Final = *Node\Outputs()
+    Stacked = PmcUniqueName("lowered", Taken())
+    *Node\Outputs() = Stacked
+    If d = 1
+      If a = 0
+        PmcAddNode(*Graph, "Slice", Stacked + "," + PmcAddInt64(*Top, "-1", #False, Taken()) + "," + PmcAddInt64(*Top, "-2147483648", #False, Taken()) + "," +
+                                    PmcAddInt64(*Top, "0", #False, Taken()) + "," + PmcAddInt64(*Top, "-1", #False, Taken()), Final, #False)
+        Continue
+      EndIf
+      Idx = PmcUniqueName("lowered", Taken())
+      PmcAddNode(*Graph, "Slice", Stacked + "," + PmcAddInt64(*Top, "-1", #False, Taken()) + "," + PmcAddInt64(*Top, "-2147483648", #False, Taken()) + "," +
+                                  PmcAddInt64(*Top, "0", #False, Taken()) + "," + PmcAddInt64(*Top, "-1", #False, Taken()), Idx, #False)
+      Stacked = Idx
+    EndIf
+    *Added = PmcAddNode(*Graph, "Transpose", Stacked, Final, #False)
+    AddElement(*Added\Attributes())
+    *Added\Attributes()\Name = "perm" : *Added\Attributes()\AttributeType = 7
+    For d = 0 To r - 1
+      AddElement(*Added\Attributes()\Integers())
+      If d < a
+        *Added\Attributes()\Integers() = d + 1
+      ElseIf d = a
+        *Added\Attributes()\Integers() = 0
+      Else
+        *Added\Attributes()\Integers() = d
+      EndIf
+    Next
+    ChangeCurrentElement(*Graph\Nodes(), *Node)
+  Next
+  PmcKeepBody(*Node)
+  ChangeCurrentElement(*Graph\Nodes(), *Node)
+  While NextElement(*Graph\Nodes())
+    If FindMapElement(PmcLowered(), Str(@*Graph\Nodes())) = 0 : PreviousElement(*Graph\Nodes()) : Break : EndIf
+  Wend
+  ProcedureReturn #True
+EndProcedure
+
+; Rewrites the current node of *Graph, a SequenceMap, into a Loop (see above).
+Procedure.i PmcLowerSequenceMap(*Top.PmoOnnxGraph, *Graph.PmoOnnxGraph, Map Taken.i())
+  Protected *Node.PmoOnnxNode = @*Graph\Nodes()
+  Protected *Body.PmoOnnxGraph = PmcAttributeGraph(*Node, "body")
+  Protected *Added.PmoOnnxNode
+  Protected Label.s = PmcLabel(*Node)
+  Protected Count.i, K.i, j.i, Kind.i
+  Protected Length.s, Truth.s, Iter.s, CondIn.s, CondOut.s, Name.s, Acc.s, AccOut.s
+  Protected Dim Element.i(0)
+  Protected Dim Outer.s(0)
+  If PmcAllowedAttributes(*Node, "|body|") = 0 : ProcedureReturn #False : EndIf
+  If *Body = 0 : ProcedureReturn PmcFail(Label + " has no body graph attribute.") : EndIf
+  Count = ListSize(*Node\Inputs())
+  K = ListSize(*Node\Outputs())
+  If ListSize(*Body\Inputs()) <> Count
+    ProcedureReturn PmcFail(Label + " has " + Str(Count) + " inputs but its body declares " + Str(ListSize(*Body\Inputs())) + ".")
+  EndIf
+  If ListSize(*Body\Outputs()) <> K Or K < 1
+    ProcedureReturn PmcFail(Label + " has " + Str(K) + " outputs but its body returns " + Str(ListSize(*Body\Outputs())) + ".")
+  EndIf
+  ReDim Element(K) : ReDim Outer(Count)
+  For j = 0 To K - 1
+    SelectElement(*Body\Outputs(), j)
+    Element(j) = *Body\Outputs()\ElementType
+    If PmcElementTypeCarried(Element(j)) = 0
+      ProcedureReturn PmcFail(Label + " body output " + Str(j) + " declares element type " + Str(Element(j)) + "; declare FLOAT, INT32, INT64 or BOOL, the element type of the output sequence.")
+    EndIf
+  Next
+  For j = 0 To Count - 1
+    Outer(j) = PmcInput(*Node, j)
+    If Outer(j) = "" : ProcedureReturn PmcFail(Label + " input " + Str(j) + " is missing.") : EndIf
+  Next
+  Length = PmcUniqueName("lowered", Taken())
+  PmcAddNode(*Graph, "SequenceLength", Outer(0), Length, #True)
+  Truth = PmcAddTrue(*Top, Taken())
+  If Truth = "" : ProcedureReturn #False : EndIf
+  ; the node's inputs become the Loop's: count, condition, empty sequences
+  ClearList(*Node\Inputs())
+  AddElement(*Node\Inputs()) : *Node\Inputs() = Length
+  AddElement(*Node\Inputs()) : *Node\Inputs() = Truth
+  For j = 0 To K - 1
+    Name = PmcUniqueName("lowered", Taken())
+    *Added = PmcAddNode(*Graph, "SequenceEmpty", "", Name, #True)
+    PmcAddIntAttribute(*Added, "dtype", Element(j))
+    AddElement(*Node\Inputs()) : *Node\Inputs() = Name
+  Next
+  ; the body: element reads first, the inserts last
+  Iter = PmcUniqueName("lowered", Taken())
+  CondIn = PmcUniqueName("lowered", Taken())
+  CondOut = PmcUniqueName("lowered", Taken())
+  FirstElement(*Body\Nodes())
+  PmcAddNode(*Body, "Identity", CondIn, CondOut, #True)
+  For j = 0 To Count - 1
+    SelectElement(*Body\Inputs(), j)
+    Name = *Body\Inputs()\Name
+    Kind = #PMC_KIND_TENSOR
+    If FindMapElement(PmcKind(), Outer(j)) : Kind = PmcKind() : EndIf
+    If Kind = #PMC_KIND_SEQUENCE
+      PmcAddNode(*Body, "SequenceAt", Outer(j) + "," + Iter, Name, #True)
+    ElseIf j = 0
+      ProcedureReturn PmcFail(Label + " input 0 is a tensor; SequenceMap maps over a sequence.")
+    Else
+      PmcAddNode(*Body, "Identity", Outer(j), Name, #True)
+    EndIf
+  Next
+  ClearList(*Body\Inputs())
+  AddElement(*Body\Inputs()) : PmcScalarValue(@*Body\Inputs(), Iter, 7)
+  AddElement(*Body\Inputs()) : PmcScalarValue(@*Body\Inputs(), CondIn, 9)
+  For j = 0 To K - 1
+    Acc = PmcUniqueName("lowered", Taken())
+    AccOut = PmcUniqueName("lowered", Taken())
+    AddElement(*Body\Inputs())
+    *Body\Inputs()\Name = Acc : *Body\Inputs()\ValueKind = #PMO_VALUE_SEQUENCE : *Body\Inputs()\SequenceElementType = Element(j)
+    SelectElement(*Body\Outputs(), j)
+    Name = *Body\Outputs()\Name
+    LastElement(*Body\Nodes())
+    PmcAddNode(*Body, "SequenceInsert", Acc + "," + Name, AccOut, #False)
+    *Body\Outputs()\Name = AccOut : *Body\Outputs()\ValueKind = #PMO_VALUE_SEQUENCE : *Body\Outputs()\SequenceElementType = Element(j)
+    *Body\Outputs()\HasTensorType = #False
+  Next
+  FirstElement(*Body\Outputs())
+  InsertElement(*Body\Outputs()) : PmcScalarValue(@*Body\Outputs(), CondOut, 9)
+  *Node\Operation = "Loop"
+  PmcLowered(Str(*Node)) = 1
+  PmcKeepBody(*Node)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmcLowerGraph(*Top.PmoOnnxGraph, *Graph.PmoOnnxGraph, Map Taken.i())
+  Protected *Child.PmoOnnxGraph
+  Protected *Node.PmoOnnxNode
+  ForEach *Graph\Nodes()
+    *Node = @*Graph\Nodes()
+    ForEach *Node\Attributes()
+      If *Node\Attributes()\Graph
+        *Child = *Node\Attributes()\Graph
+        If PmcLowerGraph(*Top, *Child, Taken()) = 0 : ProcedureReturn #False : EndIf
+      EndIf
+    Next
+    If *Node\Domain = "" Or *Node\Domain = "ai.onnx"
+      If *Node\Operation = "Scan"
+        If PmcLowerScan(*Top, *Graph, Taken()) = 0 : ProcedureReturn #False : EndIf
+      ElseIf *Node\Operation = "SequenceMap"
+        If PmcLowerSequenceMap(*Top, *Graph, Taken()) = 0 : ProcedureReturn #False : EndIf
+      EndIf
+    EndIf
+  Next
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmcGraphLowers(*Graph.PmoOnnxGraph)
+  Protected *Child.PmoOnnxGraph
+  ForEach *Graph\Nodes()
+    If PmcIsLoweredOp(*Graph\Nodes()\Operation) : ProcedureReturn #True : EndIf
+    ForEach *Graph\Nodes()\Attributes()
+      *Child = *Graph\Nodes()\Attributes()\Graph
+      If *Child And PmcGraphLowers(*Child) : ProcedureReturn #True : EndIf
+    Next
+  Next
+  ProcedureReturn #False
+EndProcedure
+
 ; Entry point of stage 1. Kokoro and every graph without subgraphs, Constant
 ; nodes or sequences leave this procedure unchanged.
 Procedure.i PmcPrepareModel(*Model.PmoOnnxModel)
@@ -755,6 +1194,13 @@ Procedure.i PmcPrepareModel(*Model.PmoOnnxModel)
   If PmcResolveGraph(*Graph, Chain(), Taken(), 0, #True) = 0 : ProcedureReturn #False : EndIf
   PmcHoist(*Graph, *Graph)
   If PmcInferGraph(*Graph, #True, 0) = 0 : ProcedureReturn #False : EndIf
+  ; Scan and SequenceMap become Loop, with the value kinds of the pass above;
+  ; the lowered graph is then inferred afresh.
+  If PmcGraphLowers(*Graph)
+    If PmcLowerGraph(*Graph, *Graph, Taken()) = 0 : ProcedureReturn #False : EndIf
+    ClearMap(PmcKind()) : ClearMap(PmcSequenceElement()) : ClearMap(PmcOwned())
+    If PmcInferGraph(*Graph, #True, 0) = 0 : ProcedureReturn #False : EndIf
+  EndIf
   ProcedureReturn #True
 EndProcedure
 

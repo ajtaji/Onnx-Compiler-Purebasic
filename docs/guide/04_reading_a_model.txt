@@ -76,10 +76,10 @@ Shape           Reshape  Flatten  Squeeze  Unsqueeze  Transpose  Concat  Split
 Other           Cast  CastLike  Identity  Dropout (inference)
 Random          RandomNormal  RandomNormalLike  RandomUniform  RandomUniformLike
                 Bernoulli  Multinomial
-Control flow    If  Loop                              (runtime dimensions)
+Control flow    If  Loop  Scan                        (runtime dimensions)
 Sequences       SequenceEmpty  SequenceConstruct  SequenceInsert  SequenceAt
                 SequenceErase  SequenceLength  SplitToSequence
-                ConcatFromSequence
+                ConcatFromSequence  SequenceMap
                                                       (runtime dimensions)
 @ENDFRAG
 
@@ -316,6 +316,18 @@ every value on this path carries its shape at run time.
 
 An `Identity` whose input is a sequence (opset 14 and later) hands the
 sequence on, or copies it when something reads it again.
+
+`Scan` (opset 9 and later) and `SequenceMap` (opset 17 and later) are
+compiled as the `Loop` they describe. A `Scan` runs its body once per
+slice of its scan inputs; each slice is a `Gather` at the iteration
+number (for a reversed input, at the last index minus the iteration
+number), and each scan output is the loop's stacked output, reversed and moved to its axis
+when the attributes ask. A `SequenceMap` reads one element of each input
+sequence per iteration and inserts each result into its output sequence,
+as the operator's ONNX function body does. A negative scan axis needs
+the input's rank declared, and a scan output on another axis than 0
+needs the body output's rank declared. `Scan-8`, with its batch axis and
+`sequence_lens`, is refused by name.
 
 A sequence is a value with its own storage: one block holding every
 element's shape and data. On the bare-metal targets that block comes out
