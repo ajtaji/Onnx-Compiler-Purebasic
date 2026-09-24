@@ -8,6 +8,7 @@
 ; ============================================================================
 
 XIncludeFile "onnx_wire.pbi"
+XIncludeFile "onnx_opsets.pbi"
 
 Declare.i PmoOnnxParseGraphAddress(*Cursor)
 

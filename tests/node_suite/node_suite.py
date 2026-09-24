@@ -7,7 +7,7 @@ family as the other developer gates under tests/. It turns "how much of ONNX
 does the compiler handle" into a number.
 
 For every official ONNX backend node test (onnx/backend/test/data/node) whose
-model imports ai.onnx at opset 20 or lower, it:
+model imports ai.onnx at opset 27 or lower, it:
 
   1. classifies the case by the operators its graph contains;
   2. runs the compiler (built fresh from this checkout's src/) with
@@ -68,7 +68,7 @@ except ImportError:  # pragma: no cover - the refusal is the point
 # ---------------------------------------------------------------------------
 PINNED_ONNX_VERSION = "1.22.0"
 PINNED_CORPUS_SHA256 = "4955443be1453848b40f58dd92d8e709907cb73a0141cf17d0a9346cb863ce6b"
-MAX_OPSET = 20
+MAX_OPSET = 27
 DEFAULT_RTOL = 1e-3   # onnx/backend/test/loader/__init__.py:31
 DEFAULT_ATOL = 1e-7   # onnx/backend/test/loader/__init__.py:32
 
@@ -323,8 +323,16 @@ def elem_name(elem: int) -> str:
         return "type %d" % elem
 
 
+# Operators whose values the ONNX specification leaves to the implementation:
+# a case that uses one is scored on shape and element type (and, where the
+# expected output holds only 0 and 1, on the program's doing the same); the
+# values themselves are this compiler's specified generator, not the
+# reference's numpy draws.
+RANDOM_OPS = {"RandomNormal", "RandomNormalLike", "RandomUniform", "RandomUniformLike", "Bernoulli", "Multinomial"}
+
+
 def compare(expected: np.ndarray, expected_elem: int, elem: int, dims: list[int], raw: bytes,
-            rtol: float, atol: float, index: int) -> tuple[str, str]:
+            rtol: float, atol: float, index: int, drawn: bool = False) -> tuple[str, str]:
     exp_shape = list(expected.shape)
     if dims != exp_shape:
         return "FAIL_SHAPE", "output %d: shape %s, expected %s" % (index, dims, exp_shape)
@@ -335,6 +343,11 @@ def compare(expected: np.ndarray, expected_elem: int, elem: int, dims: list[int]
     if len(raw) != count * np.dtype(np_dtype).itemsize:
         return "FAIL_SHAPE", "output %d: %d bytes for shape %s of %s" % (index, len(raw), exp_shape, elem_name(elem))
     actual = np.frombuffer(raw, dtype=np.dtype(np_dtype).newbyteorder("<")).reshape(exp_shape)
+    if drawn:
+        e01 = np.isin(expected.astype(np.float64), (0.0, 1.0)).all()
+        if e01 and not np.isin(actual.astype(np.float64), (0.0, 1.0)).all():
+            return "FAIL_NUMERIC", "output %d: a random operator's 0/1 output holds other values" % index
+        return "PASS", "values drawn by this compiler's specified generator; shape and element type checked"
     if np.issubdtype(expected.dtype, np.floating) or np.issubdtype(expected.dtype, np.complexfloating):
         a = actual.astype(np.float64)
         e = expected.astype(np.float64)
@@ -468,6 +481,7 @@ def _compile_build_run(case_dir, record, model, graph_inputs, loaded, scratch: P
         if len(m_in) != len(graph_inputs):
             return "FAIL_SHAPE", "the compiled model declares %d inputs; the model has %d" % (len(m_in), len(graph_inputs))
 
+    note = ""
     for ds_name, ins, outs in loaded:
         inputs = []
         for i, (kind, proto, arr) in enumerate(ins):
@@ -524,10 +538,12 @@ def _compile_build_run(case_dir, record, model, graph_inputs, loaded, scratch: P
             if not dynamic:
                 decl = manifest["outputs"][i]
                 elem, dims = decl["element_type"], list(decl["shape"])
-            outcome, detail = compare(expected, proto.data_type, elem, dims, raw, rtol, atol, i)
+            outcome, detail = compare(expected, proto.data_type, elem, dims, raw, rtol, atol, i,
+                                      drawn=bool(RANDOM_OPS & set(record["ops"])))
             if outcome != "PASS":
                 return outcome, ("%s " % ds_name if len(loaded) > 1 else "") + detail
-    return "PASS", ""
+            note = detail or note
+    return "PASS", note
 
 
 # ---------------------------------------------------------------------------

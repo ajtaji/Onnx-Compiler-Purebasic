@@ -566,8 +566,8 @@ anything measured on hardware.
 
 - A **validated subset** of ONNX, not the specification. Unsupported
   operators, attributes, element types and shape forms are rejected on
-  purpose. The runtime-dimension path checks its implemented opset 20
-  surface. Eight accepted forms are known to compute wrong answers today;
+  purpose. Each operator is accepted from its floor to its ceiling, opset
+  27 at most, on both paths. Eight accepted forms are known to compute wrong answers today;
   chapter 4 lists them.
 - Windows x64 is the verified host. Other host systems, other versions of
   the host language, and other backends are not certified by this export.

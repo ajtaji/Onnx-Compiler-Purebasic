@@ -419,8 +419,8 @@ Procedure.i PmoCompileValidate(*Ir.PmoIrModel)
       DefaultOpset = *Ir\Source\Opsets()\Version
     EndIf
   Next
-  If DefaultOpset > 23 Or (DefaultOpset < 7 And PmoNsOpsetCovers(*Ir\Source, DefaultOpset) = 0)
-    ProcedureReturn PmoCompileFail("ai.onnx opset " + Str(DefaultOpset) + " is outside the audited range 7..23")
+  If DefaultOpset > #PMO_OPSET_MAX Or (DefaultOpset < 7 And PmoNsOpsetCovers(*Ir\Source, DefaultOpset) = 0)
+    ProcedureReturn PmoCompileFail("ai.onnx opset " + Str(DefaultOpset) + " is outside the audited range 7.." + Str(#PMO_OPSET_MAX))
   EndIf
   ForEach *Ir\Constants() : Produced(*Ir\Constants()\Name) = #True : Next
   ForEach *Ir\Inputs() : Produced(*Ir\Inputs()) = #True : Next
@@ -431,6 +431,10 @@ Procedure.i PmoCompileValidate(*Ir.PmoIrModel)
     EndIf
     If PmoCompileSupportedOp(*Ir\Nodes()\Node\Operation) = 0
       ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " uses unsupported operator " + *Ir\Nodes()\Node\Operation)
+    EndIf
+    Name = PmoOpsetCeilingRefusal(*Ir\Nodes()\Node\Operation, DefaultOpset)
+    If Name <> ""
+      ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " (" + *Ir\Nodes()\Node\Operation + "): " + Name)
     EndIf
     ForEach *Ir\Nodes()\Node\Inputs()
       Name = *Ir\Nodes()\Node\Inputs()

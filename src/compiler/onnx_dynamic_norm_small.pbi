@@ -10,7 +10,8 @@
 ; the operator, the attribute or input, and the value.
 ;
 ; OPSET FLOORS. Each operator is accepted from the oldest ai.onnx opset whose
-; definition of it is the one these kernels compute, through 20:
+; definition of it is the one these kernels compute (the ceilings are in
+; onnx_opsets.pbi):
 ;   InstanceNormalization 6   (InstanceNormalization-1 carried consumed_inputs)
 ;   TopK 10                   (TopK-1 took k as an attribute; TopK-10 has no
 ;                              largest/sorted and leaves ties unordered, so
@@ -20,7 +21,8 @@
 ;   Not 1, Identity 1         (tensors; sequences and optionals are refused)
 ;   Pad 11                    (Pad-2 took pads as an attribute; axes input
 ;                              from 18, mode wrap from 19)
-; Every other operator keeps the runtime-dimension path's opset 20 surface.
+; Every other operator keeps the runtime-dimension path's floor of 20 unless
+; onnx_control.pbi lists an older one.
 ; ============================================================================
 
 Global PmdNsOpset.i
@@ -53,22 +55,25 @@ EndProcedure
 Procedure.s PmdNsOpsetRefusal(*Model.PmoOnnxModel)
   Protected Version.i = PmdNsModelOpset(*Model), Operation.s, Floor.i, Name.s
   *PmdNsModel = *Model
-  If Version = 20 : ProcedureReturn "" : EndIf
-  If Version > 20 Or Version < 1
-    ProcedureReturn "The model imports ai.onnx opset " + Str(Version) + "; runtime-dimension emission implements the opset 20 operator definitions only."
+  If Version > #PMO_OPSET_MAX Or Version < 1
+    ProcedureReturn "The model imports ai.onnx opset " + Str(Version) + "; runtime-dimension emission implements operator definitions through opset " + Str(#PMO_OPSET_MAX) + "."
   EndIf
   ForEach *Model\Graph\Nodes()
     ; a node the Scan lowering added implements the Scan, whose floor was audited
     If FindMapElement(PmcLowered(), Str(@*Model\Graph\Nodes())) : Continue : EndIf
     Operation = *Model\Graph\Nodes()\Operation
+    If PmoOpsetCeilingRefusal(Operation, Version) <> ""
+      Name = *Model\Graph\Nodes()\Name : If Name = "" : Name = "(unnamed)" : EndIf
+      ProcedureReturn Operation + " node " + Name + ": " + PmoOpsetCeilingRefusal(Operation, Version)
+    EndIf
     Floor = PmdNsFloor(Operation)
     If Version < Floor
       If PmdNsOwns(Operation)
         Name = *Model\Graph\Nodes()\Name : If Name = "" : Name = "(unnamed)" : EndIf
         ProcedureReturn Operation + " node " + Name + ": the model imports ai.onnx opset " + Str(Version) +
-                        ", whose definition of " + Operation + " differs from the one runtime-dimension emission implements, which is current from opset " + Str(Floor) + " through 20."
+                        ", whose definition of " + Operation + " differs from the one runtime-dimension emission implements, which is current from opset " + Str(Floor) + " through " + Str(#PMO_OPSET_MAX) + "."
       EndIf
-      ProcedureReturn "The model imports ai.onnx opset " + Str(Version) + "; runtime-dimension emission implements the opset 20 definition of " + Operation + " only."
+      ProcedureReturn "The model imports ai.onnx opset " + Str(Version) + "; runtime-dimension emission implements " + Operation + " as defined from opset 20."
     EndIf
   Next
   ProcedureReturn ""

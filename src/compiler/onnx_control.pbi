@@ -103,7 +103,8 @@ Procedure.i PmcOwnsNode(*Node.PmoOnnxNode)
   ProcedureReturn Bool(PmcRequestStage(*Node\Operation) Or PmcSequenceIdentity(*Node))
 EndProcedure
 
-; OPSET FLOORS. The runtime-dimension path accepts ai.onnx 11 to 20, and each
+; OPSET FLOORS. The runtime-dimension path accepts ai.onnx models through
+; #PMO_OPSET_MAX (onnx_opsets.pbi, which also holds the ceilings), and each
 ; node must also meet its operator's floor. of the runtime-dimension operators this lane audited: the
 ; oldest ai.onnx opset whose definition is the one the kernel computes, when
 ; the older attribute spellings are refused by the attribute checks (the
@@ -132,7 +133,7 @@ EndProcedure
 ;   LayerNormalization STFT                      17  (do not exist before 17)
 ;   If Loop and the sequence operators           11
 Procedure.i PmcOpsetAccepted(Version.q)
-  ProcedureReturn Bool(Version >= 11 And Version <= 20)
+  ProcedureReturn Bool(Version >= 11 And Version <= #PMO_OPSET_MAX)
 EndProcedure
 
 Procedure.i PmcOperatorFloor(Operation.s)
@@ -172,17 +173,20 @@ EndProcedure
 ; Every node, subgraphs included, is checked against its floor.
 Procedure.i PmcAuditNode(*Node.PmoOnnxNode)
   Protected Floor.i = PmcNodeFloor(*Node\Operation)
-  If PmcOpset > 20
-    ProcedureReturn PmcFail("The model imports ai.onnx opset " + Str(PmcOpset) + "; runtime-dimension emission implements operator definitions through opset 20.")
+  If PmcOpset > #PMO_OPSET_MAX
+    ProcedureReturn PmcFail("The model imports ai.onnx opset " + Str(PmcOpset) + "; runtime-dimension emission implements operator definitions through opset " + Str(#PMO_OPSET_MAX) + ".")
   EndIf
   If FindMapElement(PmcLowered(), Str(*Node)) : ProcedureReturn #True : EndIf
+  If PmoOpsetCeilingRefusal(*Node\Operation, PmcOpset) <> ""
+    ProcedureReturn PmcFail(PmcLabel(*Node) + ": " + PmoOpsetCeilingRefusal(*Node\Operation, PmcOpset))
+  EndIf
   If PmcOpset < Floor And Floor = 20
     ProcedureReturn PmcFail(PmcLabel(*Node) + ": the model imports ai.onnx opset " + Str(PmcOpset) + ", and runtime-dimension emission accepts " + *Node\Operation +
-                            " only from a model importing opset 20, the definition it was checked against (where it implements " + *Node\Operation + " at all).")
+                            " only from a model importing opset 20 or later, the definition it was checked against (where it implements " + *Node\Operation + " at all).")
   EndIf
   If PmcOpset < Floor
     ProcedureReturn PmcFail(PmcLabel(*Node) + ": the model imports ai.onnx opset " + Str(PmcOpset) + ", whose definition of " + *Node\Operation +
-                            " differs from the one runtime-dimension emission implements, which is current from opset " + Str(Floor) + " through 20.")
+                            " differs from the one runtime-dimension emission implements, which is current from opset " + Str(Floor) + " through " + Str(#PMO_OPSET_MAX) + ".")
   EndIf
   ProcedureReturn #True
 EndProcedure

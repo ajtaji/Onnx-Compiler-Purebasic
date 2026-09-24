@@ -193,11 +193,11 @@ The first is the fixed-shape path, the second the runtime-dimension path.
 @SECTION The opset range it will admit
 
 @FRAG
-> ... --compile dense25.onnx --output out\d --target windows
-ONNX COMPILER ERROR: ai.onnx opset 25 is outside the audited range 7..23
+> ... --compile dense28.onnx --output out\d --target windows
+ONNX COMPILER ERROR: ai.onnx opset 28 is outside the audited range 7..27
 
 > ... --compile dense5.onnx --output out\d --target windows
-ONNX COMPILER ERROR: ai.onnx opset 5 is outside the audited range 7..23
+ONNX COMPILER ERROR: ai.onnx opset 5 is outside the audited range 7..27
 @ENDFRAG
 
 Both ends are refusals. Too new is obvious; too old is the one that
@@ -209,15 +209,27 @@ that are wrong.
 "Audited" is the honest word. It means somebody checked what each operator
 means in that range, not that the range was chosen to look generous.
 
-@TRAP The runtime-dimension path is narrower, and it says so in its own
-words. A model with a symbolic extent goes down a second emitter that
-takes each node, subgraph nodes included, from its operator's floor - the
-oldest opset whose definition of it is the one implemented - through
-opset 20:
+Above opset 20, every version of every operator the compiler implements
+was compared with the one before it in the ONNX schema history, and a
+private gate holds that audit to the installed onnx package. Most of those
+versions only admit more element types, which the compiler refuses anyway,
+so the operator is accepted through opset 27. An operator whose meaning
+changed has a ceiling, and a model that imports an opset past it is
+refused by name:
 
 @FRAG
-ONNX COMPILER ERROR: The model imports ai.onnx opset 21; runtime-dimension emission implements operator definitions through opset 20.
-ONNX COMPILER ERROR: Softmax node (unnamed): the model imports ai.onnx opset 11, whose definition of Softmax differs from the one runtime-dimension emission implements, which is current from opset 13 through 20.
+ONNX COMPILER ERROR: node 0 (GroupNormalization): the model imports ai.onnx opset 21, where GroupNormalization is GroupNormalization-21 or later, which scales and shifts per channel, not per group; this compiler implements GroupNormalization through opset 20.
+@ENDFRAG
+
+@TRAP The runtime-dimension path is narrower at the old end, and it says so
+in its own words. A model with a symbolic extent goes down a second emitter
+that takes each node, subgraph nodes included, from its operator's floor -
+the oldest opset whose definition of it is the one implemented - through
+its ceiling, opset 27 at most:
+
+@FRAG
+ONNX COMPILER ERROR: The model imports ai.onnx opset 28; runtime-dimension emission implements operator definitions through opset 27.
+ONNX COMPILER ERROR: Softmax node (unnamed): the model imports ai.onnx opset 11, whose definition of Softmax differs from the one runtime-dimension emission implements, which is current from opset 13 through 27.
 @ENDFRAG
 
 The second one is the reason for floors. Softmax at opset 11 flattens its
@@ -244,8 +256,9 @@ where it was deprecated for Resize - and only with fixed shapes;
 MelWeightMatrix only with its five inputs as initializers, from which the
 compiler computes the matrix; Scatter,
 the same, is read at opsets 9 and 10 as ScatterElements without a
-reduction. The fixed-shape path admits 7 through 23. The two paths
-are not equally broad, and the message tells you which one you are on.
+reduction. The fixed-shape path admits 7 through 27. The two paths
+are not equally broad at the old end, and the message tells you which one
+you are on.
 
 @SECTION Fixed shapes and runtime dimensions
 

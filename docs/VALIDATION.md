@@ -751,12 +751,56 @@ body output with no carried element type declared. SequenceMap in its
 unexpanded form and Scan, both refused in the section on control flow and
 sequences, now compile.
 
+## Opsets 21 to 27 — September 24, 2026
+
+Both paths now accept models that import ai.onnx opsets up to 27, the
+newest onnx 1.22.0 defines. Until now the runtime-dimension path stopped at
+20 and the fixed-shape path at 23. Each operator is still accepted only
+from its floor, and now also only up to its **ceiling**: the last opset
+whose definition of it is the one the kernels compute.
+
+The ceilings come from an audit of onnx 1.22.0's schema history. Every
+version above 20 of every operator the compiler lists was compared with the
+version before it: attributes (names, types, defaults, whether required),
+inputs, outputs, arity and the operator's text. `src/compiler/onnx_opsets.pbi`
+holds the result.
+
+| Finding | Operators | Treatment |
+|---|---|---|
+| Only more element types (bfloat16, float16, int4, uint4, the float8 and float4 formats, int2, uint2) | 110 of the 121 version steps compared | Accepted through 27; the element-type checks refuse those types |
+| A new attribute whose absence keeps the older form | DequantizeLinear-21 (block_size), -23 (output_dtype); QuantizeLinear-21 (block_size, output_dtype), -23 (precision) | Accepted; the attribute checks refuse the attribute when it is present |
+| A new attribute that acts only on types not carried | Cast-24 and CastLike-24 (round_mode, float8 only); Range-27 (stash_type, float16 and bfloat16 only) | Accepted |
+| Text for types not carried | QuantizeLinear-25 (the int2 and uint2 ranges) | Accepted |
+| Windows that would start in the right padding are dropped | MaxPool-22, AveragePool-22 | Accepted: the kernels already drop them, and the official `-22` ceil_mode cases pass |
+| A different operation | GroupNormalization-21 (scale and bias per channel, not per group) | Ceiling 20: refused by name at opset 21 and later |
+
+`opset_ceiling_check.py` in the compiler repository's private tooling repeats
+the audit against the installed onnx package. It fails when a changed
+version is accepted, when a ceiling is lower than the history needs, or when
+the accepted maximum passes onnx's newest opset. It has three mutants: the
+GroupNormalization entry dropped, a needless Conv-22 entry added, and the
+maximum set to 28. All three are caught.
+
+The node-test harness now scores every case at opset 27 or lower, 1,750 of
+the corpus's 1,765 (15 import no ai.onnx opset). Random operators have no
+comparable values: the reference draws with numpy and this compiler with
+its own specified generator. A case that uses one is therefore scored on
+shape and element type, and on 0/1 outputs staying 0/1.
+
+| Check | Result |
+|---|---|
+| `opset_ceiling_check.py --mutants` | PASS: 182 operators listed, 121 version steps above 20 compared; 3 of 3 mutants caught |
+| Official node tests, this change against the previous compiler under the same harness (opset 27 or lower) | PASS 738 of 1,750 before, 828 after: 90 cases at opsets 22 to 27 now compile and pass (63 at opset 25, 15 at 27, 9 at 24, 3 at 22); no case that passed fails, and the 964 cases at opset 20 or lower score exactly as before (568). Seven new RUN_ERROR cases are refusals when the program runs: Dropout in training mode with a nonzero ratio (four, opset 22), and float16 or bfloat16 inputs the driver cannot supply (three) |
+| Models at opset 20 or lower: the four identity models (fp32/fp16/bf16/int4, five targets) and every targeted suite, this change against `bd07ecf` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs. Targeted suites unchanged: ops 817, defaults 148, norm_small 132, control 41, optional outputs 14 |
+| Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.
   Unsupported operators, attributes, element types, and shape forms must be
-  rejected. Runtime-dimension generation accepts each operator from the oldest opset whose
-  definition it implements, through opset 20; see
+  rejected. Both paths accept each operator from the oldest opset whose
+  definition it implements through its ceiling, opset 27 at most
+  ([opsets 21 to 27](#opsets-21-to-27--september-24-2026)); see
   [control flow and sequences](#control-flow-and-sequences--september-16-2026).
   No accepted form is currently known to compute a wrong answer; see
   [node-test coverage](#node-test-coverage--september-16-2026).

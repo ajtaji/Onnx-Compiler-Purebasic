@@ -54,6 +54,7 @@ All of these live under `src/compiler/`.
 | [onnx_pack.pbi](../src/compiler/onnx_pack.pbi) | Deterministic checked PMONNXW weight-pack construction, identity, CRC, and alignment. |
 | [onnx_targets.pbi](../src/compiler/onnx_targets.pbi) | Five target profiles: dialect, suffix, launch contract, kernels, and capacity defaults. |
 | [onnx_compile.pbi](../src/compiler/onnx_compile.pbi) | Generation coordinator: options, validation, routing, capacity checks, packing, and manifests. |
+| [onnx_opsets.pbi](../src/compiler/onnx_opsets.pbi) | The highest ai.onnx opset accepted (27) and the operators whose definition changed above 20 (their ceilings), used by both paths; the private opset_ceiling_check.py holds it to onnx's schema history. |
 | [onnx_emit_random.pbi](../src/compiler/onnx_emit_random.pbi) | The random operators (RandomNormal, RandomUniform and their Like forms, Bernoulli, Multinomial) in both paths: validation sentences, emitted calls, the seed procedure, the manifest entry and the `--random-inputs` comparison mode. |
 | [onnx_emit.pbi](../src/compiler/onnx_emit.pbi) | Fixed-shape source generation and the `PmOnnx...` caller-owned-memory API. |
 | [onnx_emit_norm_small.pbi](../src/compiler/onnx_emit_norm_small.pbi) | Fixed-shape forms of InstanceNormalization, TopK, ScatterElements (and Scatter-9, read as it), ReduceMax, ReduceProd, Not and Pad: refusal sentences, the per-node call into the kernels, and the opset floors of these operators. |
