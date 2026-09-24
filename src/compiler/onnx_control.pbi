@@ -5,7 +5,8 @@
 ; Operator semantics are taken from the ONNX operator specification
 ; (https://onnx.ai/onnx/operators/): If-11/13/16/19, Loop-11/13/16/19,
 ; SequenceEmpty-11, SequenceConstruct-11, SequenceInsert-11, SequenceAt-11,
-; SequenceLength-11, SplitToSequence-11 and ConcatFromSequence-11.
+; SequenceLength-11, SequenceErase-11, SplitToSequence-11 and
+; ConcatFromSequence-11.
 ;
 ; Three stages, all on the runtime-dimension path:
 ;
@@ -81,7 +82,7 @@ Procedure.i PmcIsControl(Operation.s)
 EndProcedure
 
 Procedure.i PmcIsSequenceOp(Operation.s)
-  ProcedureReturn Bool(FindString("|SequenceEmpty|SequenceConstruct|SequenceInsert|SequenceAt|SequenceLength|SplitToSequence|ConcatFromSequence|", "|" + Operation + "|"))
+  ProcedureReturn Bool(FindString("|SequenceEmpty|SequenceConstruct|SequenceInsert|SequenceAt|SequenceLength|SequenceErase|SplitToSequence|ConcatFromSequence|", "|" + Operation + "|"))
 EndProcedure
 
 ; Control flow and sequences always run in the request stage: their result
@@ -143,7 +144,7 @@ Procedure.i PmcOperatorFloor(Operation.s)
     Case "Slice" : ProcedureReturn 10
     Case "Gather", "Concat", "Range", "Round", "CumSum", "ScatterND", "Squeeze", "Unsqueeze", "Clip", "Resize", "Gemm",
          "ReduceMean", "ReduceSum", "If", "Loop", "SequenceEmpty", "SequenceConstruct", "SequenceInsert", "SequenceAt",
-         "SequenceLength", "SplitToSequence", "ConcatFromSequence" : ProcedureReturn 11
+         "SequenceLength", "SequenceErase", "SplitToSequence", "ConcatFromSequence" : ProcedureReturn 11
     Case "GreaterOrEqual" : ProcedureReturn 12
     Case "Softmax" : ProcedureReturn 13
     Case "LayerNormalization", "STFT" : ProcedureReturn 17
@@ -502,6 +503,8 @@ Procedure.i PmcValidateNode(*Node.PmoOnnxNode)
       If PmcAllowedAttributes(*Node, "|") = 0 Or PmcCountRange(*Node, 2, 3, 1) = 0 : ProcedureReturn #False : EndIf
     Case "SequenceAt"
       If PmcAllowedAttributes(*Node, "|") = 0 Or PmcCountRange(*Node, 2, 2, 1) = 0 : ProcedureReturn #False : EndIf
+    Case "SequenceErase"
+      If PmcAllowedAttributes(*Node, "|") = 0 Or PmcCountRange(*Node, 1, 2, 1) = 0 : ProcedureReturn #False : EndIf
     Case "SequenceLength"
       If PmcAllowedAttributes(*Node, "|") = 0 Or PmcCountRange(*Node, 1, 1, 1) = 0 : ProcedureReturn #False : EndIf
     Case "SplitToSequence"
@@ -579,6 +582,11 @@ Procedure.i PmcInferNode(*Node.PmoOnnxNode, Depth.i)
     Case "SequenceAt"
       If PmcRequireKind(*Node, 0, #PMC_KIND_SEQUENCE) = 0 Or PmcRequireKind(*Node, 1, #PMC_KIND_TENSOR) = 0 : ProcedureReturn #False : EndIf
       PmcSetKind(PmcOutput(*Node, 0), #PMC_KIND_TENSOR)
+    Case "SequenceErase"
+      If PmcRequireKind(*Node, 0, #PMC_KIND_SEQUENCE) = 0 Or PmcRequireKind(*Node, 1, #PMC_KIND_TENSOR) = 0 : ProcedureReturn #False : EndIf
+      Element = 0
+      If FindMapElement(PmcSequenceElement(), PmcInput(*Node, 0)) : Element = PmcSequenceElement() : EndIf
+      PmcSetKind(PmcOutput(*Node, 0), #PMC_KIND_SEQUENCE, Element)
     Case "SequenceLength", "ConcatFromSequence"
       If PmcRequireKind(*Node, 0, #PMC_KIND_SEQUENCE) = 0 : ProcedureReturn #False : EndIf
       PmcSetKind(PmcOutput(*Node, 0), #PMC_KIND_TENSOR)

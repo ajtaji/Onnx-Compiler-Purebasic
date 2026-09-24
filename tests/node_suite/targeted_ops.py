@@ -809,6 +809,79 @@ def cases() -> list[Case]:
     c.append(Case("refuse_deformconv_3d", [N("DeformConv", ["x", "w", "o"], ["y"])],
                   [("x", F, [1, 1, 3, 3, 3]), ("w", F, [1, 1, 2, 2, 2]), ("o", F, [1, 24, 2, 2, 2])], [("y", F, [1, 1, 2, 2, 2])],
                   {"x": f32(1, 1, 3, 3, 3), "w": f32(1, 1, 2, 2, 2), "o": f32(1, 24, 2, 2, 2)}, opset=19, refuse="two spatial axes"))
+    # Unique: its output extents depend on the values, so both builds take
+    # the runtime-dimension path
+    def uq(x, axis, srt):
+        if axis is None:
+            slices = [(v,) for v in x.reshape(-1)]
+        else:
+            m = np.moveaxis(x, axis, 0)
+            slices = [tuple(m[i].reshape(-1)) for i in range(m.shape[0])]
+        keys = [tuple((1, 0.0) if isinstance(v, np.floating) and np.isnan(v) else (0, v) for v in s) for s in slices]
+        first, grp = [], []
+        for i, k in enumerate(keys):
+            g = next((g for g, f in enumerate(first) if keys[f] == k), None)
+            if g is None:
+                g = len(first)
+                first.append(i)
+            grp.append(g)
+        order = sorted(range(len(first)), key=lambda g: keys[first[g]]) if srt else list(range(len(first)))
+        idx = np.array([first[g] for g in order], np.int64)
+        rank = {g: k for k, g in enumerate(order)}
+        y = x.reshape(-1)[idx] if axis is None else np.take(x, idx, axis=axis)
+        return [y, idx, np.array([rank[g] for g in grp], np.int64), np.array([grp.count(g) for g in order], np.int64)]
+
+    def uq_oracle(axis, srt, keep=(0, 1, 2, 3)):
+        return lambda feeds: [uq(feeds["x"], axis, srt)[k] for k in keep]
+
+    def uq_case(name, x, elem, axis=None, srt=None, keep=(0, 1, 2, 3), oracle=None, then=False):
+        attrs = {}
+        if axis is not None:
+            attrs["axis"] = axis
+        if srt is not None:
+            attrs["sorted"] = srt
+        names = ["y", "i", "v", "c"]
+        outs = [names[k] if k in keep else "" for k in range(4)]
+        while outs[-1] == "":
+            outs.pop()
+        ax = None if axis is None else axis % x.ndim
+        yshape = [None] if ax is None else [None if d == ax else e for d, e in enumerate(x.shape)]
+        shapes = {"y": yshape, "i": [None], "v": [x.size if ax is None else x.shape[ax]], "c": [None]}
+        nodes = [N("Unique", ["x"], outs, **attrs)]
+        gouts = [(names[k], elem if k == 0 else I64, shapes[names[k]]) for k in keep]
+        orc = oracle or uq_oracle(ax, 1 if srt is None else srt, keep)
+        if then:
+            nodes.append(N("Mul", ["y", "y"], ["z"]))
+            gouts = [("z", elem, yshape)] + gouts[1:]
+            base = orc
+            orc = oracle or (lambda feeds: [o * o if k == 0 else o for k, o in enumerate(base(feeds))])
+        c.append(Case("unique_" + name, nodes, [("x", elem, list(x.shape))], gouts, {"x": x}, opset=11, oracle=orc))
+    uqf = np.array([2.5, -1.0, 3.0, 1.0, 0.0, 2.5, -3.0, 1.0, -1.0], np.float32)
+    uqn = np.array([2.5, -0.0, np.nan, 1.0, 0.0, 2.5, -3.0, np.nan, 1.0, -0.0], np.float32)
+    uqa = RNG.integers(-2, 3, (2, 5, 3)).astype(np.float32)
+    uqa[:, 3] = uqa[:, 1]
+    uqa[:, 4] = uqa[:, 0]
+    uqa[1, :, 2] = uqa[1, :, 0]
+    uq_case("flat_sorted", uqf, F)
+    uq_case("flat_unsorted", uqf, F, srt=0)
+    uq_case("nan_negative_zero_sorted", uqn, F, oracle="ref")
+    uq_case("nan_negative_zero_unsorted", uqn, F, srt=0, oracle="ref")
+    uq_case("axis1_unsorted", uqa, F, axis=1, srt=0)
+    uq_case("axis1_sorted", uqa, F, axis=1)
+    uq_case("axis_negative_sorted", uqa, F, axis=-1)
+    uq_case("int64_axis0", np.array([[5, -7], [3, 3], [5, -7], [-9, 0], [3, 3]], np.int64), I64, axis=0)
+    uq_case("int8_unsorted", np.array([-3, 100, -128, 5, -3, 127, 5], np.int8), S8, srt=0)
+    uq_case("int32_sorted", RNG.integers(-4, 4, 12).astype(np.int32), I32)
+    uq_case("y_and_counts", uqf, F, keep=(0, 3))
+    uq_case("y_and_inverse", uqf, F, keep=(0, 2))
+    uq_case("then_mul", uqa, F, axis=1, srt=0, then=True)
+    # SequenceErase between tensors, so every target runs it
+    c.append(Case("sequenceerase_split_concat", [N("SplitToSequence", ["x", "l"], ["s"], axis=0), N("SequenceErase", ["s", "p"], ["t"]),
+                                                 N("SequenceErase", ["t"], ["u"]), N("ConcatFromSequence", ["u"], ["y"], axis=0)],
+                  [("x", F, [6, 3])], [("y", F, [None, 3])], {"x": f32(6, 3)},
+                  [init("l", np.array([1, 2, 2, 1], np.int64)), init("p", np.array(-3, np.int64))], opset=11))
+    c.append(Case("refuse_unique_int16", [N("Unique", ["x"], ["y"])], [("x", TensorProto.INT16, [5])], [("y", TensorProto.INT16, [None])],
+                  {"x": np.array([3, 1, 3, 2, 1], np.int16)}, opset=11, refuse="implements Unique for FLOAT, UINT8, INT8, INT32, INT64 and BOOL"))
     return c
 
 

@@ -480,6 +480,9 @@ Procedure.s PmcNodeText(*Node.PmoOnnxNode, *Context.PmcGraphInfo, IsTop.i, Index
       ProcedureReturn "DSeqInsert(" + y + "," + a + "," + b + "," + c + "," + Str(Move) + ")"
     Case "SequenceAt"
       ProcedureReturn "DSeqAt(" + y + "," + a + "," + b + ")"
+    Case "SequenceErase"
+      Move = Bool(a <> b And PmcMovable(*Context, IsTop, a, Index, Known(), Persistent(), Last()))
+      ProcedureReturn "DSeqErase(" + y + "," + a + "," + b + "," + Str(Move) + ")"
     Case "SequenceLength"
       ProcedureReturn "DSeqLength(" + y + "," + a + ")"
     Case "SplitToSequence"

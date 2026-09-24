@@ -2770,3 +2770,115 @@ Procedure DOpDeformConv(Y.i, X.i, W.i, Off.i, B.i, Mk.i)
   PmOpI(10) = ow
   PmOpDeformConv(Dt(X)\Data, Dt(W)\Data, Dt(Off)\Data, bA, mA, Dt(Y)\Data)
 EndProcedure
+
+; ----------------------------------------------------------------------
+; Unique-11: the outputs Y, I (indices), V (inverse_indices), C (counts),
+; each 0 when the node leaves it out. HasAxis 0 flattens the input.
+; ----------------------------------------------------------------------
+Procedure DOpUnique(Y.i, I.i, V.i, C.i, X.i, Axis.i, HasAxis.i, Sorted.i)
+  Protected Dim dims.i(8)
+  Protected r.i
+  Protected n.i
+  Protected sl.i
+  Protected inner.i
+  Protected d.i
+  Protected kind.i
+  Protected count.i
+  Protected scratch.i
+  Protected bytes.i
+  Protected yA.i
+  Protected iA.i
+  Protected vA.i
+  Protected cA.i
+  If X = 0
+    DFail("Unique requires an input.")
+    ProcedureReturn
+  EndIf
+  kind = Dt(X)\Kind
+  If kind <> 1 And kind <> 2 And kind <> 3 And kind <> 6 And kind <> 7 And kind <> 9
+    DFail("Unique takes FLOAT, UINT8, INT8, INT32, INT64 or BOOL input.")
+    ProcedureReturn
+  EndIf
+  r = Dt(X)\Rank
+  If HasAxis <> 0
+    If Axis < 0
+      Axis = Axis + r
+    EndIf
+    If Axis < 0 Or Axis >= r
+      DFail("Unique's axis is outside the input rank.")
+      ProcedureReturn
+    EndIf
+    n = DOpDim(X, Axis)
+    inner = 1
+    d = Axis + 1
+    While d < r
+      inner = inner * DOpDim(X, d)
+      d = d + 1
+    Wend
+    sl = 1
+    If n > 0
+      sl = Dt(X)\Count / n
+    EndIf
+  Else
+    n = Dt(X)\Count
+    inner = 1
+    sl = 1
+  EndIf
+  bytes = n * 12
+  scratch = DNsScratch(bytes)
+  If scratch = 0
+    ProcedureReturn
+  EndIf
+  count = PmOpUniqueGroups(Dt(X)\Data, n, sl, inner, kind, Sorted, scratch, scratch + n * 4, scratch + n * 8)
+  yA = 0
+  If Y <> 0
+    If HasAxis <> 0
+      d = 0
+      While d < r
+        dims(d) = DOpDim(X, d)
+        d = d + 1
+      Wend
+      dims(Axis) = count
+      If DAlloc(Y, kind, r, @dims(0)) = 0
+        DNsScratchFree(scratch, bytes)
+        ProcedureReturn
+      EndIf
+    Else
+      dims(0) = count
+      If DAlloc(Y, kind, 1, @dims(0)) = 0
+        DNsScratchFree(scratch, bytes)
+        ProcedureReturn
+      EndIf
+    EndIf
+    yA = Dt(Y)\Data
+  EndIf
+  iA = 0
+  If I <> 0
+    dims(0) = count
+    If DAlloc(I, 7, 1, @dims(0)) = 0
+      DNsScratchFree(scratch, bytes)
+      ProcedureReturn
+    EndIf
+    iA = Dt(I)\Data
+  EndIf
+  vA = 0
+  If V <> 0
+    dims(0) = n
+    If DAlloc(V, 7, 1, @dims(0)) = 0
+      DNsScratchFree(scratch, bytes)
+      ProcedureReturn
+    EndIf
+    vA = Dt(V)\Data
+  EndIf
+  cA = 0
+  If C <> 0
+    dims(0) = count
+    If DAlloc(C, 7, 1, @dims(0)) = 0
+      DNsScratchFree(scratch, bytes)
+      ProcedureReturn
+    EndIf
+    cA = Dt(C)\Data
+  EndIf
+  PmOpUniqueWrite(Dt(X)\Data, n, sl, inner, DSize(kind), count, scratch, scratch + n * 4, scratch + n * 8, yA, iA, vA, cA)
+  DNsScratchFree(scratch, bytes)
+EndProcedure

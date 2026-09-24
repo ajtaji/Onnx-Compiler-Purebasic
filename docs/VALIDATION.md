@@ -643,6 +643,45 @@ disagree with the attributes; an index outside the unpooled shape or a
 batch index outside the input at run time.
 
 
+## Group C, third batch: Unique and SequenceErase — September 24, 2026
+
+Unique (opset 11: with and without an axis, sorted or in order of first
+occurrence, any of its four outputs) on FLOAT, UINT8, INT8, INT32, INT64
+and BOOL, and SequenceErase (opset 11, a position or the default last
+element) for every target. Both take the runtime-dimension path even when
+every extent is declared: Unique's output extents depend on the input's
+values, and a sequence decides its length while the program runs. Unique's
+kernel joins `runtime/tensor_ops.pmi` under the same rules;
+SequenceErase is one procedure appended to each sequence runtime.
+
+Unique follows the reference, which follows numpy: two FLOAT values are
+equal when both are NaN or when they compare equal, so -0 and +0 are one
+value (the first occurrence's bits are kept), and a NaN sorts after every
+number. ONNX Runtime keeps every NaN apart, so the targeted cases with a NaN
+are held to the reference alone. For an axis other than 0 with `sorted = 0`
+the onnx 1.22.0 reference fails (it reorders along axis 0); those cases are
+held to a definition written into the harness, which ONNX Runtime agrees
+with.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 525 cases - the 499 before; Unique flat and along an axis, sorted and not, a NaN and -0, INT64 values outside the signed 32-bit range, INT32, INT8 and UINT8 order, BOOL, and outputs left out | Windows, Pi 4, Pico and Pico 2: 525 of 525 bit-identical to the definition (the INT64 values outside the signed 32-bit range refused through the INT64 range check on the Pico and Pico 2, as the contract says); `--mutants` 54 of 54 caught (three new: the NaN order, INT8's sign, the stride of an axis slice) |
+| `tests/node_suite/targeted_ops.py`: 795 cases - the 765 before; 26 Unique builds (flat, axes 1 and -1, INT64, INT8, INT32, NaN and -0, outputs left out, a Mul after it), an INT16 input refused, and SequenceErase between two tensors | 795 of 795 as expected |
+| `tests/node_suite/targeted_control.py`: 32 cases - the 29 before; SequenceErase at a position, at the default, at a negative position, down to an empty sequence, and a position outside the sequence refused at run time | 32 of 32 as expected |
+| Official node tests at opset 20 or lower, this change against the previous compiler | PASS 553 of 964 before, 559 after: the six Unique cases; no case that passed fails |
+| `ops_targets_gate.py`: the new builds on the Pi 4, Pico and Pico 2 in unicorn | 28 builds, 84 runs: 84 of 84 bit-identical to the Windows program |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `29d2b42` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
+| Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
+
+A model that uses a sequence operator exports the sequence runtime, which
+now carries one more procedure (`DSeqErase`); nothing else in it changed.
+
+**Refused, with a sentence:** Unique on an element type other than those
+six; Unique on the fixed-shape path when that path is forced; a
+SequenceErase position outside the sequence, or an empty sequence, at run
+time. SequenceErase, refused in the section on control flow and sequences,
+now compiles.
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

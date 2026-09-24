@@ -80,6 +80,7 @@ Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
     Case "MaxUnpool" : ProcedureReturn "|kernel_shape|pads|strides|"
     Case "AffineGrid" : ProcedureReturn "|align_corners|"
     Case "MaxRoiPool" : ProcedureReturn "|pooled_shape|spatial_scale|"
+    Case "Unique" : ProcedureReturn "|axis|sorted|"
     Case "DeformConv" : ProcedureReturn "|dilations|group|kernel_shape|offset_group|pads|strides|"
     Case "RoiAlign"
       If Opset >= 16 : ProcedureReturn "|coordinate_transformation_mode|mode|output_height|output_width|sampling_ratio|spatial_scale|" : EndIf
@@ -262,6 +263,8 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         If Reason = "" And (PmoEmitAttrListI(*Node, "pooled_shape", 0, 0) < 1 Or PmoEmitAttrListI(*Node, "pooled_shape", 1, 0) < 1) : Reason = "pooled_shape must be positive." : EndIf
       Case "CenterCropPad"
         Reason = PmdNsTypeReason(*Node, 0, "input", "|1|2|3|6|7|9|")
+      Case "Unique"
+        Reason = PmdNsTypeReason(*Node, 0, "X", "|1|2|3|6|7|9|")
       Case "QuantizeLinear"
         Reason = PmdNsTypeReason(*Node, 0, "x", "|1|")
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "y_scale", "|1|") : EndIf
@@ -371,6 +374,10 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         If ListSize(*Node\Outputs()) <> 3 Or PmdNsNamedOutputs(*Node) <> 3
           Reason = "it declares " + Str(PmdNsNamedOutputs(*Node)) + " named outputs; DynamicQuantizeLinear has three (y, y_scale, y_zero_point)."
         EndIf
+      Case "Unique"
+        If ListSize(*Node\Outputs()) < 1 Or ListSize(*Node\Outputs()) > 4 Or PmdNsNamedOutputs(*Node) < 1
+          Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; Unique has one to four (Y, indices, inverse_indices, counts)."
+        EndIf
       Case "MaxPool", "Dropout", "RNN", "GRU", "SoftmaxCrossEntropyLoss"
         If ListSize(*Node\Outputs()) < 1 Or ListSize(*Node\Outputs()) > 2
           Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; " + Op + " has one or two."
@@ -475,6 +482,10 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
       Call = Pre + "DOpMaxUnpool(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + ")"
     Case "AffineGrid"
       Call = "DOpAffineGrid(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + Str(Bool(PmoEmitAttrI(*Node, "align_corners", 0) <> 0)) + ")"
+    Case "Unique"
+      Call = "DOpUnique(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 1)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 2)) + "," +
+             PmdNsId(Ids(), PmoEmitOutput(*Node, 3)) + "," + a(0) + "," + Str(PmoEmitAttrI(*Node, "axis", 0)) + "," + Str(PmoEmitNsAttributePresent(*Node, "axis")) + "," +
+             Str(Bool(PmoEmitAttrI(*Node, "sorted", 1) <> 0)) + ")"
     Case "MaxRoiPool"
       Pre = "PmOpI(5)=" + Str(PmoEmitAttrListI(*Node, "pooled_shape", 0, 1)) + " : PmOpI(6)=" + Str(PmoEmitAttrListI(*Node, "pooled_shape", 1, 1)) + " : "
       Pre + "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "spatial_scale", 1.0)) + ") : "

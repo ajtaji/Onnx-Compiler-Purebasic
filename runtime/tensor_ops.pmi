@@ -6252,3 +6252,200 @@ Procedure PmOpDeformConv(x.i, w.i, offset.i, bias.i, mask.i, y.i)
     n = n + 1
   Wend
 EndProcedure
+
+; ----------------------------------------------------------------------
+; Unique-11. The input is n slices of slen elements (no axis: n elements of
+; one; with an axis: slice i is x.take(i, axis) in C order, element j of
+; it at ((j / inner) * n + i) * inner + j % inner). Kind 1 FLOAT, 2 UINT8,
+; 3 INT8, 6 INT32, 7 INT64, 9 BOOL. Two FLOATs are equal when both are NaN
+; or when they compare equal (so -0 equals +0); a NaN orders after every
+; number. The groups are numbered in order of first occurrence; sorted
+; orders them by their first slice, lexicographically, keeping
+; first-occurrence order between equal values.
+; ----------------------------------------------------------------------
+Procedure.i PmOpUqAt(i.i, j.i, n.i, inner.i)
+  ProcedureReturn ((j / inner) * n + i) * inner + j % inner
+EndProcedure
+
+; -1, 0 or 1: element a against element b (flat indices) of kind.
+Procedure.i PmOpUqCmp(x.i, a.i, b.i, kind.i)
+  Protected fa.f
+  Protected fb.f
+  Protected na.i
+  Protected nb.i
+  Protected ia.i
+  Protected ib.i
+  If kind = 1
+    fa = PmTensorGet(x, a)
+    fb = PmTensorGet(x, b)
+    na = PmOpIsNan(fa)
+    nb = PmOpIsNan(fb)
+    If na <> 0 Or nb <> 0
+      ProcedureReturn na - nb
+    EndIf
+    If fa < fb
+      ProcedureReturn -1
+    EndIf
+    If fa > fb
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If kind = 7
+    ia = PmTensorGetI64(x, a)
+    ib = PmTensorGetI64(x, b)
+  ElseIf kind = 6
+    ia = PeekL(x + a * 4)
+    ib = PeekL(x + b * 4)
+  Else
+    ia = PeekA(x + a) & 255
+    ib = PeekA(x + b) & 255
+    If kind = 3
+      If ia > 127
+        ia = ia - 256
+      EndIf
+      If ib > 127
+        ib = ib - 256
+      EndIf
+    EndIf
+  EndIf
+  If ia < ib
+    ProcedureReturn -1
+  EndIf
+  If ia > ib
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Slice p against slice q, lexicographically.
+Procedure.i PmOpUqSliceCmp(x.i, p.i, q.i, n.i, slen.i, inner.i, kind.i)
+  Protected j.i
+  Protected c.i
+  j = 0
+  While j < slen
+    c = PmOpUqCmp(x, PmOpUqAt(p, j, n, inner), PmOpUqAt(q, j, n, inner), kind)
+    If c <> 0
+      ProcedureReturn c
+    EndIf
+    j = j + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; The groups: grp(i) (INT32 at grp) the group of slice i, first(g) the first
+; slice of group g, order(k) the group in output position k. Returns the
+; number of groups.
+Procedure.i PmOpUniqueGroups(x.i, n.i, slen.i, inner.i, kind.i, sorted.i, grp.i, first.i, order.i)
+  Protected i.i
+  Protected g.i
+  Protected k.i
+  Protected count.i
+  Protected found.i
+  Protected t.i
+  PmOpInit()
+  count = 0
+  i = 0
+  While i < n
+    found = -1
+    g = 0
+    While g < count
+      If found < 0
+        If PmOpUqSliceCmp(x, i, PeekL(first + g * 4), n, slen, inner, kind) = 0
+          found = g
+        EndIf
+      EndIf
+      g = g + 1
+    Wend
+    If found < 0
+      PokeL(first + count * 4, i)
+      found = count
+      count = count + 1
+    EndIf
+    PokeL(grp + i * 4, found)
+    i = i + 1
+  Wend
+  k = 0
+  While k < count
+    PokeL(order + k * 4, k)
+    k = k + 1
+  Wend
+  If sorted <> 0
+    ; insertion sort, stable
+    k = 1
+    While k < count
+      t = PeekL(order + k * 4)
+      g = k - 1
+      found = 0
+      While g >= 0 And found = 0
+        If PmOpUqSliceCmp(x, PeekL(first + PeekL(order + g * 4) * 4), PeekL(first + t * 4), n, slen, inner, kind) > 0
+          PokeL(order + (g + 1) * 4, PeekL(order + g * 4))
+          g = g - 1
+        Else
+          found = 1
+        EndIf
+      Wend
+      PokeL(order + (g + 1) * 4, t)
+      k = k + 1
+    Wend
+  EndIf
+  ProcedureReturn count
+EndProcedure
+
+; The outputs, any of y, indices, inverse_indices, counts (0 when absent),
+; after PmOpUniqueGroups returned count; bytes the element width of x.
+Procedure PmOpUniqueWrite(x.i, n.i, slen.i, inner.i, bytes.i, count.i, grp.i, first.i, order.i, y.i, idx.i, inv.i, cnt.i)
+  Protected k.i
+  Protected j.i
+  Protected i.i
+  Protected s.i
+  Protected b.i
+  Protected src.i
+  Protected dst.i
+  Protected c.i
+  k = 0
+  While k < count
+    s = PeekL(first + PeekL(order + k * 4) * 4)
+    If y <> 0
+      j = 0
+      While j < slen
+        src = PmOpUqAt(s, j, n, inner)
+        dst = PmOpUqAt(k, j, count, inner)
+        b = 0
+        While b < bytes
+          PokeA(y + dst * bytes + b, PeekA(x + src * bytes + b))
+          b = b + 1
+        Wend
+        j = j + 1
+      Wend
+    EndIf
+    If idx <> 0
+      PmTensorPutI64(idx, k, s)
+    EndIf
+    If cnt <> 0
+      c = 0
+      i = 0
+      While i < n
+        If PeekL(grp + i * 4) = PeekL(order + k * 4)
+          c = c + 1
+        EndIf
+        i = i + 1
+      Wend
+      PmTensorPutI64(cnt, k, c)
+    EndIf
+    k = k + 1
+  Wend
+  If inv <> 0
+    i = 0
+    While i < n
+      k = 0
+      While k < count
+        If PeekL(order + k * 4) = PeekL(grp + i * 4)
+          PmTensorPutI64(inv, i, k)
+        EndIf
+        k = k + 1
+      Wend
+      i = i + 1
+    Wend
+  EndIf
+EndProcedure

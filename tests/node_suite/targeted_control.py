@@ -373,6 +373,33 @@ def cases() -> list[Case]:
                   [N("SplitToSequence", ["x"], ["s"], axis=0), N("SequenceAt", ["s", "pos"], ["y"])],
                   [tv("x", F, ["n", 2]), tv("pos", I64, [])], [tv("y", F, [1, 2])],
                   {"x": f32(3, 2), "pos": np.array(3, np.int64)}, run_refuse="SequenceAt position 3 is outside"))
+    # SequenceErase: a position, the default last element, a negative
+    # position, an INT32 position, erasing down to an empty sequence
+    x, y, z = f32(2, 3), f32(4, 3), f32(1, 3)
+    c.append(Case("seq_erase_positions",
+                  [N("SequenceConstruct", ["x", "y", "z"], ["s"]),
+                   N("SequenceErase", ["s", "one"], ["s1"]),
+                   N("SequenceErase", ["s1"], ["s2"]),
+                   N("SequenceErase", ["s", "minus3"], ["s3"]),
+                   N("ConcatFromSequence", ["s2"], ["joined"], axis=0),
+                   N("SequenceLength", ["s3"], ["n3"]),
+                   N("SequenceAt", ["s3", "zero"], ["first3"])],
+                  [tv("x", F, ["a", 3]), tv("y", F, ["b", 3]), tv("z", F, ["c", 3])],
+                  [sv("s1", F, None), tv("joined", F, ["t", 3]), tv("n3", I64, []), tv("first3", F, ["p", 3])],
+                  {"x": x, "y": y, "z": z}, [scalar("one", 1, I64), scalar("minus3", -3, I64), scalar("zero", 0, I32)]))
+    x = f32(5, 2)
+    c.append(Case("seq_erase_to_empty",
+                  [N("SplitToSequence", ["x", "lengths"], ["s"], axis=0),
+                   N("SequenceErase", ["s", "first"], ["s1"]),
+                   N("SequenceErase", ["s1"], ["s2"]),
+                   N("SequenceLength", ["s2"], ["n"]),
+                   N("SequenceLength", ["s"], ["n0"])],
+                  [tv("x", F, ["a", 2])], [tv("n", I64, []), tv("n0", I64, []), sv("s1", F, None)],
+                  {"x": x}, [const("lengths", np.array([2, 3], np.int64)), scalar("first", 0, I32)]))
+    c.append(Case("run_refuse_sequence_erase_out_of_range",
+                  [N("SplitToSequence", ["x"], ["s"], axis=0), N("SequenceErase", ["s", "pos"], ["t"]), N("SequenceLength", ["t"], ["y"])],
+                  [tv("x", F, ["n", 2]), tv("pos", I64, [])], [tv("y", I64, [])],
+                  {"x": f32(3, 2), "pos": np.array(3, np.int64)}, run_refuse="SequenceErase position 3 is outside"))
     return c
 
 

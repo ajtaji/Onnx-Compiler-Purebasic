@@ -940,3 +940,43 @@ Procedure.i DSeqAppendShape(Id.i,Kind.i,Rank.i,DimsAddress.i)
   EndIf
   ProcedureReturn DSeqPlace(Id,DSeqCount(Id),Rank,DimsAddress,count,count*size)
 EndProcedure
+
+; SequenceErase: a new sequence without the element at Pos (default: the
+; last). Move=1 takes S's block over, as SequenceInsert does. The erased
+; element's data stays in the block until the sequence is released.
+Procedure DSeqErase(Y.i,S.i,Pos.i,Move.i)
+  Protected n.i=0
+  Protected p.i=0
+  Protected block.i=0
+  If DSeqRequire(S)=0
+    ProcedureReturn
+  EndIf
+  n=DSeqCount(S)
+  p=n-1
+  If Pos<>0
+    If DSeqPositionOk(Pos)=0
+      ProcedureReturn
+    EndIf
+    p=DInt(Pos,0)
+    If p<0
+      p=p+n
+    EndIf
+    If p<0 Or p>=n
+      DFail("SequenceErase position is outside [-n, n-1] for the sequence it erases from.")
+      ProcedureReturn
+    EndIf
+  ElseIf n=0
+    DFail("SequenceErase was given an empty sequence; there is no element to erase.")
+    ProcedureReturn
+  EndIf
+  DValueTake(Y,S,Move)
+  If DError<>0 Or DCancel<>0
+    ProcedureReturn
+  EndIf
+  block=Dt(Y)\Data
+  If p<n-1
+    DSeqMoveBytes(block+#PMD_SEQ_HEADER+(p+1)*#PMD_SEQ_RECORD,block+#PMD_SEQ_HEADER+p*#PMD_SEQ_RECORD,(n-1-p)*#PMD_SEQ_RECORD)
+  EndIf
+  PokeL(block+8,n-1)
+  Dt(Y)\Count=n-1
+EndProcedure

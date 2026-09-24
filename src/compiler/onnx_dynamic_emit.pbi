@@ -411,7 +411,7 @@ Procedure.s PmdCall(*Node.PmoOnnxNode, Map Ids.i())
       EndIf
     Case "InstanceNormalization","TopK","ScatterElements","Scatter","ReduceMax","ReduceProd","Not","Identity","Pad"
       call=PmdNsCall(*Node,Ids())
-    Case "If","Loop","SequenceEmpty","SequenceConstruct","SequenceInsert","SequenceAt","SequenceLength","SplitToSequence","ConcatFromSequence"
+    Case "If","Loop","SequenceEmpty","SequenceConstruct","SequenceInsert","SequenceAt","SequenceLength","SequenceErase","SplitToSequence","ConcatFromSequence"
       call=PmcCall(*Node)
     Case "MatMul"
       call="DMatMul("+y(0)+","+a(0)+","+a(1)+")"

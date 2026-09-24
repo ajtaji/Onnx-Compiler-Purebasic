@@ -25,7 +25,7 @@ Procedure.i PmoOpsOwns(Operation.s)
                                   "RNN|GRU|NonMaxSuppression|RoiAlign|GridSample|QuantizeLinear|DequantizeLinear|" +
                                   "DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|HannWindow|HammingWindow|" +
                                   "BlackmanWindow|DFT|MelWeightMatrix|NegativeLogLikelihoodLoss|SoftmaxCrossEntropyLoss|Col2Im|" +
-                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|", "|" + Operation + "|"))
+                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|Unique|", "|" + Operation + "|"))
 EndProcedure
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
@@ -56,6 +56,7 @@ Procedure.i PmoOpsFloor(Operation.s)
     Case "Col2Im", "CenterCropPad" : ProcedureReturn 18
     Case "DeformConv" : ProcedureReturn 19
     Case "AffineGrid" : ProcedureReturn 20
+    Case "Unique" : ProcedureReturn 11
     Case "QuantizeLinear", "DequantizeLinear", "MatMulInteger", "QLinearMatMul", "ConvInteger", "QLinearConv" : ProcedureReturn 10
     Case "DynamicQuantizeLinear" : ProcedureReturn 11
     Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss" : ProcedureReturn 12
@@ -2345,6 +2346,7 @@ Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
     Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss" : Done = PmoEmitOpsLoss(File, *Ir, *Node, ProcName, Opset)
     Case "MelWeightMatrix" : ProcedureReturn PmoEmitNsFail(*Node, PmoOpsMelSentence())
     Case "NonMaxSuppression" : ProcedureReturn PmoEmitNsFail(*Node, "its output size depends on the scores, which the fixed-shape path cannot plan.")
+    Case "Unique" : ProcedureReturn PmoEmitNsFail(*Node, "its output size depends on the input values, which the fixed-shape path cannot plan.")
     Case "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp"
       Done = PmoEmitOpsReduce(File, *Ir, *Node, ProcName, Opset)
     Case "ArgMax", "ArgMin" : Done = PmoEmitOpsArg(File, *Ir, *Node, ProcName, Opset)

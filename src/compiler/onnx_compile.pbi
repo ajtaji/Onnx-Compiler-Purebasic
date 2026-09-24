@@ -29,10 +29,11 @@ Procedure.s PmoCompileRuntimeDimensions(*Model.PmoOnnxModel)
     Op = *Model\Graph\Nodes()\Operation : Known = 1
     ; A branch, a trip count or a sequence decides shapes and even the set of
     ; values while the program runs; the fixed-shape planner cannot hold that.
-    If FindString("|If|Loop|SequenceEmpty|SequenceConstruct|SequenceInsert|SequenceAt|SequenceLength|SplitToSequence|ConcatFromSequence|", "|" + Op + "|")
+    If FindString("|If|Loop|SequenceEmpty|SequenceConstruct|SequenceInsert|SequenceAt|SequenceLength|SequenceErase|SplitToSequence|ConcatFromSequence|", "|" + Op + "|")
       ProcedureReturn Op + " is control flow or a sequence operator, so its values are decided at run time"
     EndIf
     If Op = "NonMaxSuppression" : ProcedureReturn "NonMaxSuppression output size depends on the scores" : EndIf
+    If Op = "Unique" : ProcedureReturn "Unique output size depends on input values" : EndIf
     ForEach *Model\Graph\Nodes()\Inputs()
       If *Model\Graph\Nodes()\Inputs() <> "" And Constants(*Model\Graph\Nodes()\Inputs()) = 0 : Known = 0 : EndIf
     Next

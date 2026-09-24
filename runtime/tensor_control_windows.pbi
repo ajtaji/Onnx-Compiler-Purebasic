@@ -537,3 +537,30 @@ Procedure.i DSeqAppendShape(Id.i, Kind.i, Rank.i, *Dims)
   If count > DLimit / size : ProcedureReturn DFail("An appended element exceeds the working-memory limit.") : EndIf
   ProcedureReturn DSeqPlace(Id, DSeqCount(Id), Rank, *Dims, count, count * size)
 EndProcedure
+
+; SequenceErase: a new sequence without the element at Pos (default: the
+; last). Move=1 takes S's block over, as SequenceInsert does. The erased
+; element's data stays in the block until the sequence is released.
+Procedure DSeqErase(Y.i, S.i, Pos.i, Move.i)
+  Protected n.i, p.i, raw.Integer, *block
+  If DSeqRequire(S) = 0 : ProcedureReturn : EndIf
+  n = DSeqCount(S) : p = n - 1
+  If Pos
+    If DSeqPosition(Pos, @raw) = 0 : ProcedureReturn : EndIf
+    p = raw\i
+    If p < 0 : p + n : EndIf
+    If p < 0 Or p >= n
+      DFail("SequenceErase position " + Str(raw\i) + " is outside [-" + Str(n) + ", " + Str(n - 1) + "] for a sequence of " + Str(n) + " elements.") : ProcedureReturn
+    EndIf
+  ElseIf n = 0
+    DFail("SequenceErase was given an empty sequence; there is no element to erase.") : ProcedureReturn
+  EndIf
+  DValueTake(Y, S, Move)
+  If DError <> "" Or DCancel : ProcedureReturn : EndIf
+  *block = Dt(Y)\Data
+  If p < n - 1
+    MoveMemory(*block + #PMD_SEQ_HEADER + (p + 1) * #PMD_SEQ_RECORD, *block + #PMD_SEQ_HEADER + p * #PMD_SEQ_RECORD, (n - 1 - p) * #PMD_SEQ_RECORD)
+  EndIf
+  PokeL(*block + 8, n - 1)
+  Dt(Y)\Count = n - 1
+EndProcedure
