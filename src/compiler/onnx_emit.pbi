@@ -934,7 +934,7 @@ Procedure.i PmoEmitGeneratedHelpers(File.i, *Ir.PmoIrModel, *Profile.PmoTargetPr
         If PmoEmitSliceHelper(File, *Ir, @*Ir\Nodes(), Calls()) = 0 : ProcedureReturn #False : EndIf
       Case "Expand"
         If PmoEmitExpandHelper(File, *Ir, @*Ir\Nodes(), Calls()) = 0 : ProcedureReturn #False : EndIf
-      Case "InstanceNormalization", "TopK", "ScatterElements", "ReduceMax", "ReduceProd", "Not", "Pad"
+      Case "InstanceNormalization", "TopK", "ScatterElements", "Scatter", "ReduceMax", "ReduceProd", "Not", "Pad"
         If PmoEmitNormSmallHelper(File, *Ir, @*Ir\Nodes(), Calls()) = 0 : ProcedureReturn #False : EndIf
       Case "NonZero"
         If PmoEmitNonZeroHelper(File, *Ir, @*Ir\Nodes(), Calls()) = 0 : ProcedureReturn #False : EndIf

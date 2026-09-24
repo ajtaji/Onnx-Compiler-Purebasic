@@ -409,7 +409,7 @@ Procedure.s PmdCall(*Node.PmoOnnxNode, Map Ids.i())
       Else
         call="DScatterReduce("+y(0)+","+a(0)+","+a(1)+","+a(2)+","+Str(i)+")"
       EndIf
-    Case "InstanceNormalization","TopK","ScatterElements","ReduceMax","ReduceProd","Not","Identity","Pad"
+    Case "InstanceNormalization","TopK","ScatterElements","Scatter","ReduceMax","ReduceProd","Not","Identity","Pad"
       call=PmdNsCall(*Node,Ids())
     Case "If","Loop","SequenceEmpty","SequenceConstruct","SequenceInsert","SequenceAt","SequenceLength","SplitToSequence","ConcatFromSequence"
       call=PmcCall(*Node)

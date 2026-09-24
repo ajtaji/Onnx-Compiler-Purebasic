@@ -59,11 +59,11 @@ Pooling         MaxPool  AveragePool  LpPool  GlobalMaxPool  GlobalAveragePool
 Reductions      ReduceMean  ReduceSum  ReduceMax  ReduceMin  ReduceProd  ReduceL1
                 ReduceL2  ReduceSumSquare  ReduceLogSum  ReduceLogSumExp
                 ArgMax  ArgMin  CumSum
-Signal          STFT  Resize  Upsample
+Signal          STFT  Resize  Upsample  GridSample
 Comparison      Equal  Greater  GreaterOrEqual  Less  LessOrEqual  And  Or  Xor
                 Not  Where
 Indexing        Gather  GatherElements  GatherND  Slice  Expand  Pad  NonZero
-                ScatterND  ScatterElements  TopK  Range  OneHot  Trilu
+                ScatterND  ScatterElements  Scatter  TopK  Range  OneHot  Trilu
                 Compress  ReverseSequence
 Shape           Reshape  Flatten  Squeeze  Unsqueeze  Transpose  Concat  Split
                 Tile  DepthToSpace  SpaceToDepth  Size  EyeLike
@@ -78,14 +78,14 @@ Sequences       SequenceEmpty  SequenceConstruct  SequenceInsert  SequenceAt
 Anything else is turned down by node number and by name:
 
 @FRAG
-ONNX COMPILER ERROR: node 0 uses unsupported operator GridSample
+ONNX COMPILER ERROR: node 0 uses unsupported operator TfIdfVectorizer
 @ENDFRAG
 
 The operators added in September 2026 - from Mod to Dropout in the list,
 and in a second group the trigonometric and hyperbolic functions from Tan,
 the bitwise operators, Hardmax, RNN, GRU, Det, the normalizations after
 InstanceNormalization, NonMaxSuppression, RoiAlign, Upsample, Compress,
-ReverseSequence and EyeLike - share one kernel source for every target (`runtime/tensor_ops.pmi`), so
+ReverseSequence and EyeLike, and after them GridSample - share one kernel source for every target (`runtime/tensor_ops.pmi`), so
 they give the same bits on Windows, the Pi 4, the UNO Q, the Pico and the
 Pico 2; chapter 8 says how that is checked.
 
@@ -219,12 +219,14 @@ and Pad from 11, InstanceNormalization from 6, the rest from 1 - and a form
 that belongs to another opset, such as Pad's wrap mode at opset 18, is
 refused by name. The operators added in September 2026 each start at the
 opset whose definition they compute (Mish at 18, Gelu at 20, Trilu and
-HardSwish at 14, the bitwise operators and GroupNormalization at 18, most
-of the rest at 11 or earlier), and LogSoftmax and Hardmax before 13 are
+HardSwish at 14, GridSample at 16, the bitwise operators and
+GroupNormalization at 18, most of the rest at 11 or earlier), and LogSoftmax and Hardmax before 13 are
 accepted only on the last axis, where the old flattening definition and the
 new one agree. Two have a ceiling as well: GroupNormalization up to 20
 (from 21 its scale is per channel, not per group), and Upsample up to 9,
-where it was deprecated for Resize - and only with fixed shapes. The fixed-shape path admits 7 through 23. The two paths
+where it was deprecated for Resize - and only with fixed shapes; Scatter,
+the same, is read at opsets 9 and 10 as ScatterElements without a
+reduction. The fixed-shape path admits 7 through 23. The two paths
 are not equally broad, and the message tells you which one you are on.
 
 @SECTION Fixed shapes and runtime dimensions

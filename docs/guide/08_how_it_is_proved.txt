@@ -492,20 +492,20 @@ invalid operation such as infinity times zero.
 
 **A definition to be held to.** `ops_scheme.py` in the compiler
 repository's `tools/onnx/tests/Diagnostics` writes every kernel out in numpy
-one binary32 operation per line. `ops_kernel_check.py` runs 268 cases -
+one binary32 operation per line. `ops_kernel_check.py` runs 310 cases -
 the math functions over tables of special values and branch boundaries,
 every operator's kernel, and the awkward cases - on Windows and, in the
 unicorn instruction emulator, on the Pi 4, Pico and Pico 2 builds, and
 requires every output to equal the definition bit for bit; with
-`--mutants` it plants 28 defects and requires each to be caught:
+`--mutants` it plants 32 defects and requires each to be caught:
 
 @FRAG
 py -3.12 ops_kernel_check.py --pbcompiler <pbcompiler.exe> --compiler PureMetalForge.exe --runtime <ONNX repository>\runtime --mutants
-windows 268 of 268 cases as the definition
-pi4     268 of 268 cases as the definition
-pico    268 of 268 cases as the definition
-pico2   268 of 268 cases as the definition
-mutants: 28 of 28 killed
+windows 310 of 310 cases as the definition
+pi4     310 of 310 cases as the definition
+pico    310 of 310 cases as the definition
+pico2   310 of 310 cases as the definition
+mutants: 32 of 32 killed
 @ENDFRAG
 
 That says the kernels compute what they were written to compute. Whether
@@ -515,7 +515,10 @@ operators have above opset 20 at opset 20, adds its own forms for both
 emitters, and scores everything against the ONNX reference evaluator,
 cross-checked with ONNX Runtime. Where the reference evaluator cannot run a
 form (RNN and GRU with sequence lengths or both directions, NonMaxSuppression
-without its thresholds) ONNX Runtime decides alone; where it lacks one
+without its thresholds) ONNX Runtime decides alone, and so it does for
+GridSample's cubic mode with border padding, where the reference evaluator
+clamps the coordinate as well as each tap and ONNX Runtime and PyTorch
+clamp only the taps; where it lacks one
 (GroupNormalization-18, Upsample-7) or answers otherwise than the
 operator's definition (LpNormalization, LRN, bilinear Upsample) a numpy
 definition decides, still cross-checked with ONNX Runtime wherever ONNX

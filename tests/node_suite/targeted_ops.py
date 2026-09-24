@@ -62,7 +62,9 @@ OPS = ("erf", "reciprocal", "ceil", "sign", "softplus", "softsign", "elu", "selu
        # GroupNormalization-21, whose per-channel scale differs from 18's)
        "tan", "asin", "acos", "sinh", "cosh", "asinh", "acosh", "atanh", "bitwise_not", "bitwise_and", "bitwise_or",
        "bitwise_xor", "hardmax", "lpnormalization", "l1normalization", "l2normalization", "mvn", "lrn", "eyelike", "det",
-       "compress", "reversesequence", "upsample", "rnn", "simple_rnn", "gru", "nonmaxsuppression", "roialign")
+       "compress", "reversesequence", "upsample", "rnn", "simple_rnn", "gru", "nonmaxsuppression", "roialign",
+       # after the second group
+       "gridsample")
 
 # re-imported official cases of a form that is refused, and the sentence that
 # must refuse them
@@ -519,6 +521,69 @@ def cases() -> list[Case]:
     c.append(Case("roialign_output_half_pixel_adaptive", [N("RoiAlign", ["x", "r", "i"], ["y"], output_height=2, output_width=2, spatial_scale=0.5)],
                   [("x", F, [2, 3, 6, 7]), ("r", F, [3, 4]), ("i", I64, [3])], [("y", F, [3, 3, 2, 2])], {"x": rx, "r": rois * 2, "i": ri2},
                   opset=10, dynamic=False, oracle=roialign_legacy))
+
+    # ---- GridSample ---------------------------------------------------------
+    def gs_case(name, r, mode, pad, align, opset=20, oracle=None, refuse=None, fixed=True):
+        dims = [3, 4, 5][:r] if r <= 3 else [2, 3, 4, 3][:r]
+        outd = [[7], [3, 4], [2, 3, 2], [2, 2, 2, 2]][r - 1]
+        x = f32(2, 3, *dims)
+        g = RNG.uniform(-1.4, 1.4, (2, *outd, r)).astype(np.float32)
+        attrs = {"mode": mode, "padding_mode": pad, "align_corners": align}
+        full = "refuse_gridsample_" + name[7:] if name.startswith("refuse_") else "gridsample_" + name
+        c.append(Case(full, [N("GridSample", ["x", "g"], ["y"], **attrs)],
+                      [("x", F, [2, 3, *dims]), ("g", F, [2, *outd, r])], [("y", F, [2, 3, *outd])], {"x": x, "g": g},
+                      opset=opset, oracle=oracle, refuse=refuse, fixed=fixed))
+
+    for mode in ("nearest", "linear", "cubic"):
+        for pad in ("zeros", "border", "reflection"):
+            for align in (0, 1):
+                # cubic with border padding: ONNX Runtime and PyTorch clamp each
+                # tap; the reference evaluator clamps the coordinate as well
+                gs_case("%s_%s_align%d" % (mode, pad, align), 2, mode, pad, align,
+                        oracle="ort" if (mode, pad) == ("cubic", "border") else None)
+    for mode, pad, align in (("linear", "zeros", 0), ("linear", "reflection", 1), ("nearest", "border", 0), ("nearest", "zeros", 1)):
+        gs_case("volumetric_%s_%s_align%d" % (mode, pad, align), 3, mode, pad, align)
+    gs_case("1d_linear_zeros", 1, "linear", "zeros", 0)
+    gs_case("1d_nearest_reflection", 1, "nearest", "reflection", 1)
+
+    def gs16(mode20, pad, align):
+        def run(feeds):
+            node = helper.make_node("GridSample", ["x", "g"], ["y"], mode=mode20, padding_mode=pad, align_corners=align)
+            g = helper.make_graph([node], "g", [helper.make_tensor_value_info("x", TensorProto.FLOAT, None),
+                                                helper.make_tensor_value_info("g", TensorProto.FLOAT, None)],
+                                  [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)])
+            return ReferenceEvaluator(helper.make_model(g, opset_imports=[helper.make_opsetid("", 20)])).run(None, feeds)
+        return run
+    # GridSample-16 names its modes bilinear and bicubic; the reference
+    # evaluator implements only -20's names, so it runs the -20 node
+    for mode16, mode20, pad, align in (("bilinear", "linear", "zeros", 0), ("bilinear", "linear", "border", 1),
+                                       ("nearest", "nearest", "reflection", 0), ("bicubic", "cubic", "zeros", 1)):
+        gs_case("opset16_%s_%s_align%d" % (mode16, pad, align), 2, mode16, pad, align, opset=16, oracle=gs16(mode20, pad, align))
+    gs_case("opset16_default_modes", 2, "bilinear", "zeros", 0, opset=16, oracle=gs16("linear", "zeros", 0))
+    gs_case("refuse_opset16_linear", 2, "linear", "zeros", 0, opset=16, refuse="is not a GridSample-16 mode")
+    gs_case("refuse_cubic_volumetric", 3, "cubic", "zeros", 0, refuse="cubic interpolation is implemented for a 4-D input")
+    gs_case("refuse_four_spatial_axes", 4, "linear", "zeros", 0, refuse="one to three spatial axes")
+
+    # ---- Scatter (opset 9 and 10): ScatterElements without reduction ---------
+    def scatter_oracle(axis):
+        def run(feeds):
+            y = feeds["d"].copy()
+            for pos in np.ndindex(*feeds["i"].shape):
+                at = list(pos)
+                at[axis] = int(feeds["i"][pos])
+                y[tuple(at)] = feeds["u"][pos]
+            return [y]
+        return run
+    sd = f32(4, 5)
+    si = np.array([[1, 0, 3], [3, 2, 0]], np.int64)
+    c.append(Case("scatter_axis1_opset10", [N("Scatter", ["d", "i", "u"], ["y"], axis=1)],
+                  [("d", F, [4, 5]), ("i", I64, [2, 3]), ("u", F, [2, 3])], [("y", F, [4, 5])],
+                  {"d": sd, "i": si, "u": f32(2, 3)}, opset=10, oracle=scatter_oracle(1)))
+    sdi = RNG.integers(-50, 50, (3, 4)).astype(np.int64)
+    si2 = np.array([[2, 0, 1, 1]], np.int32)
+    c.append(Case("scatter_default_axis_int64_opset9", [N("Scatter", ["d", "i", "u"], ["y"])],
+                  [("d", I64, [3, 4]), ("i", I32, [1, 4]), ("u", I64, [1, 4])], [("y", I64, [3, 4])],
+                  {"d": sdi, "i": si2, "u": RNG.integers(-9, 9, (1, 4)).astype(np.int64)}, opset=9, oracle=scatter_oracle(0)))
     return c
 
 

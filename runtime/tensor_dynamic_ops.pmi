@@ -1563,3 +1563,62 @@ Procedure DOpRoiAlign(Y.i, X.i, Rois.i, Idx.i)
     DFail("RoiAlign batch index is outside the input's batch.")
   EndIf
 EndProcedure
+
+; ----------------------------------------------------------------------
+; GridSample-16 and -20: Mode and Pad as PmOpGridSample takes them; NDim is
+; 1 for GridSample-20 (one to three spatial axes), 0 for -16 (two).
+; ----------------------------------------------------------------------
+Procedure DOpGridSample(Y.i, X.i, G.i, Mode.i, Pad.i, Align.i, NDim.i)
+  Protected Dim dims.i(8)
+  Protected r.i
+  Protected k.i
+  If X = 0 Or G = 0
+    DFail("GridSample requires X and grid.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(G)\Kind <> 1
+    DFail("GridSample computes FLOAT X and grid only.")
+    ProcedureReturn
+  EndIf
+  r = Dt(X)\Rank - 2
+  k = 0
+  If r < 1 Or r > 3
+    k = 1
+  EndIf
+  If r <> 2
+    If NDim = 0 Or Mode = 2
+      k = 1
+    EndIf
+  EndIf
+  If k <> 0
+    DFail("GridSample takes X [N, C, H, W] (GridSample-20 also [N, C, W] and [N, C, D, H, W], not with cubic mode).")
+    ProcedureReturn
+  EndIf
+  If Dt(G)\Rank <> r + 2
+    DFail("GridSample grid must be [N, output extents ..., spatial rank].")
+    ProcedureReturn
+  EndIf
+  If DOpDim(G, 0) <> DOpDim(X, 0) Or DOpDim(G, r + 1) <> r
+    DFail("GridSample grid must be [N, output extents ..., spatial rank].")
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = DOpDim(X, 0)
+  PmOpI(1) = DOpDim(X, 1)
+  PmOpI(2) = r
+  dims(0) = PmOpI(0)
+  dims(1) = PmOpI(1)
+  k = 0
+  While k < r
+    PmOpI(3 + k) = DOpDim(X, 2 + k)
+    PmOpI(6 + k) = DOpDim(G, 1 + k)
+    dims(2 + k) = PmOpI(6 + k)
+    k = k + 1
+  Wend
+  PmOpI(9) = Mode
+  PmOpI(10) = Pad
+  PmOpI(11) = Align
+  If DAlloc(Y, 1, r + 2, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpGridSample(Dt(X)\Data, Dt(G)\Data, Dt(Y)\Data)
+EndProcedure

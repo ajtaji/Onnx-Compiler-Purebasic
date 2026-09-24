@@ -4112,3 +4112,381 @@ Procedure PmOpUpsample(src.i, dst.i, rank.i, linear.i, bytes.i)
     i = i + 1
   Wend
 EndProcedure
+
+; ----------------------------------------------------------------------
+; GridSample-16 and GridSample-20. X is [N, C, D1 .. Dr], grid [N, O1 .. Or,
+; r] with the LAST spatial axis's coordinate first (x, y, z), Y [N, C, O1 ..
+; Or], r = 1 to 3. PmOpI(0) N, (1) C, (2) r, (3 ..) the input extents,
+; (6 ..) the output extents, (9) mode (0 nearest, 1 linear, 2 cubic),
+; (10) padding (0 zeros, 1 border, 2 reflection), (11) align_corners.
+;   coordinate  align: (n + 1) / 2 * (D - 1); else ((n + 1) * D - 1) / 2
+;   nearest     round half to even, then the padding rule, one tap
+;   outside     [0, D-1] (align) or [-0.5, D-0.5]: border clamps, reflection
+;               reflects; cubic with border clamps each tap instead, as ONNX
+;               Runtime does (the reference evaluator clamps the coordinate)
+;   taps        linear floor and floor + 1 with weights 1 - t and t; cubic
+;               floor - 1 .. floor + 2 with Keys' coefficients, A = -0.75
+;   sum         innermost axis first, each level w0*v0 + w1*v1 + ... in tap
+;               order; an out-of-range tap (zeros) is +0
+; A NaN coordinate is out of range under zeros padding and 0 under the
+; others; a reflected infinity is the low border. Coordinates beyond 2^22
+; are 2^22, where every tap is already outside (zeros) or on the border.
+; ----------------------------------------------------------------------
+Global Dim PmOpGsIdx.i(12)
+Global Dim PmOpGsW.f(12)
+Global Dim PmOpGsCnt.i(3)
+Global PmOpGsA.f
+Global PmOpGsA5.f
+Global PmOpGsA8.f
+Global PmOpGsA4.f
+Global PmOpGsA2.f
+Global PmOpGsA3.f
+Global PmOpGsFar.f
+Global PmOpGsTwo24.f
+
+Procedure.f PmOpFloorF(x.f)
+  ProcedureReturn PmOpNeg(PmOpCeil(PmOpNeg(x)))
+EndProcedure
+
+; Round half to even (numpy rint) of a non-NaN value.
+Procedure.f PmOpRint(x.f)
+  Protected r.f
+  Protected d.f
+  If (PmOpBits(x) & $7FFFFFFF) >= $4B000000
+    ProcedureReturn x
+  EndIf
+  r = PmOpFloorF(x)
+  d = x - r
+  If d > PmOpHalf
+    r = r + PmOpOne
+  ElseIf d = PmOpHalf
+    If (PmOpTruncInt(r) & 1) <> 0
+      r = r + PmOpOne
+    EndIf
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+Procedure.f PmOpGsReflect(x.f, lo.f, hi.f)
+  Protected rng.f
+  Protected dx.f
+  Protected q.f
+  Protected nf.f
+  Protected r.f
+  Protected t.f
+  Protected odd.i
+  rng = hi - lo
+  If (PmOpBits(rng) & $7FFFFFFF) = 0 Or (PmOpBits(x) & $7FFFFFFF) >= $7F800000
+    ProcedureReturn lo
+  EndIf
+  If x < lo
+    dx = lo - x
+  Else
+    dx = x - hi
+  EndIf
+  q = dx / rng
+  nf = PmOpFloorF(q)
+  t = nf * rng
+  r = dx - t
+  If r < 0.0
+    r = 0.0
+  EndIf
+  If r > rng
+    r = rng
+  EndIf
+  odd = 0
+  If nf < PmOpGsTwo24
+    odd = PmOpTruncInt(nf) & 1
+  EndIf
+  If x < lo
+    If odd <> 0
+      ProcedureReturn hi - r
+    EndIf
+    ProcedureReturn lo + r
+  EndIf
+  If odd <> 0
+    ProcedureReturn lo + r
+  EndIf
+  ProcedureReturn hi - r
+EndProcedure
+
+; The input index of tap i on an axis of extent d under the padding rule,
+; -1 for a tap that reads zero.
+Procedure.i PmOpGsIndex(i.i, d.i, pad.i, lo.f, hi.f)
+  Protected fi.f
+  If pad = 0
+    If i >= 0 And i < d
+      ProcedureReturn i
+    EndIf
+    ProcedureReturn -1
+  EndIf
+  If pad = 1
+    If i < 0
+      ProcedureReturn 0
+    EndIf
+    If i > d - 1
+      ProcedureReturn d - 1
+    EndIf
+    ProcedureReturn i
+  EndIf
+  fi = i
+  If fi < lo Or fi > hi
+    ProcedureReturn PmOpTruncInt(PmOpGsReflect(fi, lo, hi))
+  EndIf
+  ProcedureReturn i
+EndProcedure
+
+; Keys' cubic coefficient for the tap at distance s (s = t + 1 or 2 - t for
+; the outer taps, t or 1 - t for the inner ones).
+Procedure.f PmOpGsOuter(s.f)
+  Protected v.f
+  v = PmOpGsA * s
+  v = v - PmOpGsA5
+  v = v * s
+  v = v + PmOpGsA8
+  v = v * s
+  v = v - PmOpGsA4
+  ProcedureReturn v
+EndProcedure
+
+Procedure.f PmOpGsInner(s.f)
+  Protected v.f
+  v = PmOpGsA2 * s
+  v = v - PmOpGsA3
+  v = v * s
+  v = v * s
+  v = v + PmOpOne
+  ProcedureReturn v
+EndProcedure
+
+; The taps of spatial axis k (extent d) for normalized coordinate n.
+Procedure PmOpGsTaps(k.i, n.f, d.i, mode.i, pad.i, align.i)
+  Protected fd.f
+  Protected x.f
+  Protected lo.f
+  Protected hi.f
+  Protected t.f
+  Protected s.f
+  Protected x0f.f
+  Protected x0.i
+  Protected j.i
+  fd = d
+  x = n + PmOpOne
+  If align <> 0
+    x = x * PmOpHalf
+    t = fd - PmOpOne
+    x = x * t
+    lo = 0.0
+    hi = fd - PmOpOne
+  Else
+    x = x * fd
+    x = x - PmOpOne
+    x = x * PmOpHalf
+    lo = PmOpNeg(PmOpHalf)
+    hi = fd - PmOpHalf
+  EndIf
+  If PmOpIsNan(x) <> 0
+    If pad = 0
+      x = PmOpGsFar
+    Else
+      x = 0.0
+    EndIf
+  EndIf
+  If mode = 0
+    x = PmOpRint(x)
+  EndIf
+  If x < lo Or x > hi
+    If pad = 1 And mode <> 2
+      If x < 0.0
+        x = 0.0
+      EndIf
+      t = fd - PmOpOne
+      If x > t
+        x = t
+      EndIf
+    ElseIf pad = 2
+      x = PmOpGsReflect(x, lo, hi)
+    EndIf
+  EndIf
+  If x < PmOpNeg(PmOpGsFar)
+    x = PmOpNeg(PmOpGsFar)
+  EndIf
+  If x > PmOpGsFar
+    x = PmOpGsFar
+  EndIf
+  j = k * 4
+  If mode = 0
+    PmOpGsCnt(k) = 1
+    PmOpGsIdx(j) = PmOpGsIndex(PmOpTruncInt(x), d, pad, lo, hi)
+    PmOpGsW(j) = PmOpOne
+    ProcedureReturn
+  EndIf
+  x0f = PmOpFloorF(x)
+  t = x - x0f
+  x0 = PmOpTruncInt(x0f)
+  If mode = 1
+    PmOpGsCnt(k) = 2
+    PmOpGsIdx(j) = PmOpGsIndex(x0, d, pad, lo, hi)
+    PmOpGsW(j) = PmOpOne - t
+    PmOpGsIdx(j + 1) = PmOpGsIndex(x0 + 1, d, pad, lo, hi)
+    PmOpGsW(j + 1) = t
+    ProcedureReturn
+  EndIf
+  PmOpGsCnt(k) = 4
+  PmOpGsIdx(j) = PmOpGsIndex(x0 - 1, d, pad, lo, hi)
+  s = t + PmOpOne
+  PmOpGsW(j) = PmOpGsOuter(s)
+  PmOpGsIdx(j + 1) = PmOpGsIndex(x0, d, pad, lo, hi)
+  PmOpGsW(j + 1) = PmOpGsInner(t)
+  PmOpGsIdx(j + 2) = PmOpGsIndex(x0 + 1, d, pad, lo, hi)
+  s = PmOpOne - t
+  PmOpGsW(j + 2) = PmOpGsInner(s)
+  PmOpGsIdx(j + 3) = PmOpGsIndex(x0 + 2, d, pad, lo, hi)
+  s = PmOpTwo - t
+  PmOpGsW(j + 3) = PmOpGsOuter(s)
+EndProcedure
+
+; The weighted sum over the taps of axis k of the elements at plane + (base +
+; index) * 4.
+Procedure.f PmOpGsLine(plane.i, base.i, k.i)
+  Protected j.i
+  Protected v.f
+  Protected t.f
+  Protected acc.f
+  j = 0
+  While j < PmOpGsCnt(k)
+    If PmOpGsIdx(k * 4 + j) < 0
+      v = 0.0
+    Else
+      v = PmTensorGet(plane, base + PmOpGsIdx(k * 4 + j))
+    EndIf
+    t = PmOpGsW(k * 4 + j) * v
+    If j = 0
+      acc = t
+    Else
+      acc = PmOpAddF(acc, t)
+    EndIf
+    j = j + 1
+  Wend
+  ProcedureReturn acc
+EndProcedure
+
+; The same one level out: axis k's taps over lines of axis k + 1 (stride).
+Procedure.f PmOpGsPlane(plane.i, base.i, k.i, stride.i)
+  Protected j.i
+  Protected v.f
+  Protected t.f
+  Protected acc.f
+  j = 0
+  While j < PmOpGsCnt(k)
+    If PmOpGsIdx(k * 4 + j) < 0
+      v = 0.0
+    Else
+      v = PmOpGsLine(plane, base + PmOpGsIdx(k * 4 + j) * stride, k + 1)
+    EndIf
+    t = PmOpGsW(k * 4 + j) * v
+    If j = 0
+      acc = t
+    Else
+      acc = PmOpAddF(acc, t)
+    EndIf
+    j = j + 1
+  Wend
+  ProcedureReturn acc
+EndProcedure
+
+Procedure PmOpGridSample(x.i, grid.i, y.i)
+  Protected r.i
+  Protected n.i
+  Protected c.i
+  Protected o.i
+  Protected outCount.i
+  Protected inCount.i
+  Protected k.i
+  Protected plane.i
+  Protected at.i
+  Protected j.i
+  Protected t.f
+  Protected v.f
+  Protected acc.f
+  Protected ok.i
+  PmOpInit()
+  PmOpSetBits(@PmOpGsA, $BF400000)
+  PmOpSetBits(@PmOpGsA5, $C0700000)
+  PmOpSetBits(@PmOpGsA8, $C0C00000)
+  PmOpSetBits(@PmOpGsA4, $C0400000)
+  PmOpSetBits(@PmOpGsA2, $3FA00000)
+  PmOpSetBits(@PmOpGsA3, $40100000)
+  PmOpSetBits(@PmOpGsFar, $4A800000)
+  PmOpSetBits(@PmOpGsTwo24, $4B800000)
+  r = PmOpI(2)
+  outCount = 1
+  inCount = 1
+  k = 0
+  While k < r
+    outCount = outCount * PmOpI(6 + k)
+    inCount = inCount * PmOpI(3 + k)
+    k = k + 1
+  Wend
+  n = 0
+  While n < PmOpI(0)
+    o = 0
+    While o < outCount
+      k = 0
+      While k < r
+        t = PmTensorGet(grid, (n * outCount + o) * r + r - 1 - k)
+        PmOpGsTaps(k, t, PmOpI(3 + k), PmOpI(9), PmOpI(10), PmOpI(11))
+        k = k + 1
+      Wend
+      c = 0
+      While c < PmOpI(1)
+        plane = x + (n * PmOpI(1) + c) * inCount * 4
+        at = (n * PmOpI(1) + c) * outCount + o
+        If PmOpI(9) = 0
+          ok = 1
+          j = 0
+          k = 0
+          While k < r
+            If PmOpGsIdx(k * 4) < 0
+              ok = 0
+            Else
+              j = j * PmOpI(3 + k) + PmOpGsIdx(k * 4)
+            EndIf
+            k = k + 1
+          Wend
+          If ok = 0
+            PmTensorPut(y, at, 0.0)
+          Else
+            PmOpStoreF(y, at, PmTensorGet(plane, j))
+          EndIf
+        Else
+          If r = 1
+            v = PmOpGsLine(plane, 0, 0)
+          ElseIf r = 2
+            v = PmOpGsPlane(plane, 0, 0, PmOpI(4))
+          Else
+            j = 0
+            While j < PmOpGsCnt(0)
+              If PmOpGsIdx(j) < 0
+                acc = 0.0
+              Else
+                acc = PmOpGsPlane(plane, PmOpGsIdx(j) * PmOpI(4) * PmOpI(5), 1, PmOpI(5))
+              EndIf
+              t = PmOpGsW(j) * acc
+              If j = 0
+                v = t
+              Else
+                v = PmOpAddF(v, t)
+              EndIf
+              j = j + 1
+            Wend
+          EndIf
+          PmOpStoreF(y, at, v)
+        EndIf
+        c = c + 1
+      Wend
+      o = o + 1
+    Wend
+    n = n + 1
+  Wend
+EndProcedure

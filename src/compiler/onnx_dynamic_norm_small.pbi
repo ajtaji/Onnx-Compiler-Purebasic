@@ -177,6 +177,9 @@ Procedure.i PmdNsValidate(*Node.PmoOnnxNode)
       If PmdNsInputPresent(*Node, 1) = 0
         Reason = "input K is required; the k attribute belongs to TopK before opset 10."
       EndIf
+    Case "Scatter"
+      Allowed = "|axis|"
+      If PmdNsOpset > 10 : Reason = "Scatter is deprecated from opset 11 (use ScatterElements), and the model imports opset " + Str(PmdNsOpset) + "." : EndIf
     Case "ScatterElements"
       Allowed = "|axis|reduction|"
       Mode = PmoEmitAttrS(*Node, "reduction", "none")
@@ -231,7 +234,7 @@ Procedure.i PmdNsValidate(*Node.PmoOnnxNode)
     Select Op
       Case "InstanceNormalization" : Reason = PmdNsTypeReason(*Node, 0, "input", "|1|")
       Case "TopK" : Reason = PmdNsTypeReason(*Node, 0, "X", "|1|6|7|")
-      Case "ScatterElements"
+      Case "ScatterElements", "Scatter"
         Reason = PmdNsTypeReason(*Node, 0, "data", "|1|6|7|9|")
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "indices", "|6|7|") : EndIf
       Case "ReduceMax" : Reason = PmdNsTypeReason(*Node, 0, "data", "|1|6|7|9|")
@@ -273,7 +276,7 @@ Procedure.s PmdNsCall(*Node.PmoOnnxNode, Map Ids.i())
     Case "TopK"
       Call = "DTopK(" + y0 + "," + y1 + "," + a(0) + "," + a(1) + "," + Str(PmoEmitAttrI(*Node, "axis", -1)) + "," +
              Str(Bool(PmoEmitAttrI(*Node, "largest", 1) <> 0)) + "," + Str(Bool(PmoEmitAttrI(*Node, "sorted", 1) <> 0)) + ")"
-    Case "ScatterElements"
+    Case "ScatterElements", "Scatter"
       Mode = PmoEmitAttrS(*Node, "reduction", "none")
       Code = 0
       If Mode = "add" : Code = 1 : ElseIf Mode = "mul" : Code = 2 : ElseIf Mode = "max" : Code = 3 : ElseIf Mode = "min" : Code = 4 : EndIf

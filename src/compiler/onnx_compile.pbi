@@ -300,7 +300,7 @@ EndProcedure
 
 Procedure.i PmoCompileSupportedOp(Operation.s)
   If PmoOpsOwns(Operation) : ProcedureReturn #True : EndIf
-  ProcedureReturn Bool(FindString("|Add|Sub|Mul|Div|Pow|Relu|LeakyRelu|Sigmoid|Tanh|Exp|Log|Sqrt|Abs|Neg|Sin|Cos|Atan|Floor|Round|MatMul|Gemm|Softmax|ReduceMean|ReduceSum|CumSum|LayerNormalization|BatchNormalization|Conv|ConvTranspose|Clip|Resize|STFT|LSTM|Gather|Cast|Range|Equal|Greater|GreaterOrEqual|Less|LessOrEqual|And|Where|Slice|Expand|Pad|NonZero|ScatterND|Identity|InstanceNormalization|TopK|ScatterElements|ReduceMax|ReduceProd|Not|Reshape|Flatten|Squeeze|Unsqueeze|Transpose|Concat|RandomNormal|RandomNormalLike|RandomUniform|RandomUniformLike|", "|" + Operation + "|"))
+  ProcedureReturn Bool(FindString("|Add|Sub|Mul|Div|Pow|Relu|LeakyRelu|Sigmoid|Tanh|Exp|Log|Sqrt|Abs|Neg|Sin|Cos|Atan|Floor|Round|MatMul|Gemm|Softmax|ReduceMean|ReduceSum|CumSum|LayerNormalization|BatchNormalization|Conv|ConvTranspose|Clip|Resize|STFT|LSTM|Gather|Cast|Range|Equal|Greater|GreaterOrEqual|Less|LessOrEqual|And|Where|Slice|Expand|Pad|NonZero|ScatterND|Identity|InstanceNormalization|TopK|ScatterElements|Scatter|ReduceMax|ReduceProd|Not|Reshape|Flatten|Squeeze|Unsqueeze|Transpose|Concat|RandomNormal|RandomNormalLike|RandomUniform|RandomUniformLike|", "|" + Operation + "|"))
 EndProcedure
 
 Procedure.i PmoCompileValidate(*Ir.PmoIrModel)

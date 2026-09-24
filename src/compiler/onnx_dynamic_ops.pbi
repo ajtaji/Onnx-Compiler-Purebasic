@@ -59,11 +59,25 @@ Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
     Case "GRU" : ProcedureReturn "|activation_alpha|activation_beta|activations|clip|direction|hidden_size|layout|linear_before_reset|"
     Case "NonMaxSuppression" : ProcedureReturn "|center_point_box|"
     Case "Upsample" : ProcedureReturn "|mode|scales|"  ; so its own refusal, not an attribute's, is the sentence
+    Case "GridSample" : ProcedureReturn "|align_corners|mode|padding_mode|"
     Case "RoiAlign"
       If Opset >= 16 : ProcedureReturn "|coordinate_transformation_mode|mode|output_height|output_width|sampling_ratio|spatial_scale|" : EndIf
       ProcedureReturn "|mode|output_height|output_width|sampling_ratio|spatial_scale|"
   EndSelect
   ProcedureReturn PmoOpsUnaryAllowed(Op)
+EndProcedure
+
+; The declared rank of a top-level graph input or value, -1 when the model
+; does not declare its shape.
+Procedure.i PmdOpsDeclaredRank(Name.s)
+  If *PmdNsModel = 0 Or Name = "" : ProcedureReturn -1 : EndIf
+  ForEach *PmdNsModel\Graph\Inputs()
+    If *PmdNsModel\Graph\Inputs()\Name = Name And *PmdNsModel\Graph\Inputs()\HasShape : ProcedureReturn ListSize(*PmdNsModel\Graph\Inputs()\Dims()) : EndIf
+  Next
+  ForEach *PmdNsModel\Graph\Values()
+    If *PmdNsModel\Graph\Values()\Name = Name And *PmdNsModel\Graph\Values()\HasShape : ProcedureReturn ListSize(*PmdNsModel\Graph\Values()\Dims()) : EndIf
+  Next
+  ProcedureReturn -1
 EndProcedure
 
 ; The first element of a top-level initializer as a number: 1 in *Found when
@@ -204,6 +218,15 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
           k = 1 + Bool(Text = "bidirectional")
           Reason = PmoOpsRecurrentActivations(*Node, k, Codes())
         EndIf
+      Case "GridSample"
+        Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "grid", "|1|") : EndIf
+        k = PmdOpsDeclaredRank(PmoEmitInput(*Node, 0)) - 2
+        If k < 1 : k = 0 : EndIf
+        If PmdOpsDeclaredRank(PmoEmitInput(*Node, 0)) >= 0 And PmdOpsDeclaredRank(PmoEmitInput(*Node, 0)) < 3
+          If Reason = "" : Reason = "the input has rank " + Str(PmdOpsDeclaredRank(PmoEmitInput(*Node, 0))) + "; GridSample takes [N, C, D1 ...]." : EndIf
+        EndIf
+        If Reason = "" : Reason = PmoOpsGridSampleForm(*Node, PmdNsOpset, k, @Labels, @Kept) : EndIf
       Case "NonMaxSuppression"
         Reason = PmdNsTypeReason(*Node, 0, "boxes", "|1|")
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "scores", "|1|") : EndIf
@@ -360,6 +383,10 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
             Str(PmoEmitAttrI(*Node, "sampling_ratio", 0)) + " : PmOpI(8)=" + Str(Bool(PmoEmitAttrS(*Node, "mode", "avg") = "max")) + " : PmOpI(9)=" +
             Str(Bool(Text = "half_pixel")) + " : PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "spatial_scale", 1.0)) + ") : "
       Call = Pre + "DOpRoiAlign(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + ")"
+    Case "GridSample"
+      PmoOpsGridSampleForm(*Node, PmdNsOpset, 0, @Labels, @Kept)
+      Call = "DOpGridSample(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + Str(Labels\i) + "," + Str(Kept\i) + "," +
+             Str(PmoEmitAttrI(*Node, "align_corners", 0)) + "," + Str(Bool(PmdNsOpset >= 20)) + ")"
     Case "Min", "Max", "Sum", "Mean", "Mod", "PRelu", "Or", "Xor", "BitwiseAnd", "BitwiseOr", "BitwiseXor"
       n = ListSize(*Node\Inputs())
       For k = 0 To n - 1

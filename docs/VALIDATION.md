@@ -482,6 +482,40 @@ request by the contract's check (on the fixed-shape path and for the
 two-input operators; BitwiseNot on the runtime-dimension path carries all
 64 bits).
 
+## GridSample and Scatter — September 24, 2026
+
+GridSample-16 and GridSample-20 on both paths and every target: the modes
+nearest, linear and cubic (bilinear and bicubic at opset 16), the paddings
+zeros, border and reflection, align_corners, over one to three spatial axes
+(opset 20; two at opset 16), cubic over two. Its kernel joins
+`runtime/tensor_ops.pmi` under the same rules: the coordinate arithmetic is
+single binary32 operations, nearest rounds half to even as the reference
+does, and the taps are summed innermost axis first. Where the reference
+evaluator and ONNX Runtime disagree - cubic with border padding, where the
+reference evaluator clamps the sampling coordinate as well as each tap -
+the kernel follows ONNX Runtime and PyTorch, which clamp only the taps. A
+NaN grid coordinate is out of range under zeros padding and the first
+element's position on its axis under the others, and an infinite one is
+treated as 2^22 (reflection: the low border); the reference evaluator
+raises on both, so these are the kernel's own rules.
+
+Scatter, the deprecated operator of opsets 9 and 10, is read as
+ScatterElements without a reduction on both paths.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 310 cases - the 268 before, and 42 GridSample forms (one, two and three spatial axes; every mode, padding and align_corners; NaN and infinite grid coordinates, coordinates beyond 2^22, a NaN in X) | Windows, Pi 4, Pico and Pico 2: 310 of 310 bit-identical to the definition; `--mutants` 32 of 32 caught (four new: the cubic coefficient, reflection's parity, the align_corners extent, round half to even) |
+| `tests/node_suite/targeted_ops.py`: 598 cases - the 512 before; the 18 official GridSample cases, published at opset 22, re-imported at opset 20; 64 new GridSample builds and 4 Scatter builds with declared extents and a symbolic extent. Expected outputs from the ONNX reference evaluator cross-checked against ONNX Runtime; ONNX Runtime alone for cubic with border padding; the opset-16 modes through the reference evaluator's opset-20 node | 598 of 598 as expected; re-imported official cases 127 PASS (109 before), every GridSample case among them |
+| Official node tests at opset 20 or lower, this change against the previous compiler | PASS 468 of 964 before, 470 after (test_scatter_with_axis and test_scatter_without_axis); no case that passed fails |
+| `ops_targets_gate.py` on the 62 new builds that must pass, compiled for the Pi 4, Pico and Pico 2 and run in unicorn | 186 of 186: within the node-suite tolerance and bit-identical to the Windows program's |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `d6aa9d7` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical |
+| Kokoro-82M FP32 for Windows | source and pack byte-identical to the previous compiler's; the reference request's waveform byte-identical |
+
+**Refused, with a sentence:** GridSample-16's modes under their GridSample-20
+names and the reverse; a GridSample-16 input that is not 4-D; four or more
+spatial axes; cubic over other than two; element types other than FLOAT;
+Scatter from opset 11, where it is deprecated for ScatterElements.
+
 
 ## Explicit limitations
 

@@ -13,7 +13,7 @@
 ; ============================================================================
 
 Procedure.i PmoNsOwns(Operation.s)
-  ProcedureReturn Bool(FindString("|InstanceNormalization|TopK|ScatterElements|ReduceMax|ReduceProd|Not|Identity|Pad|", "|" + Operation + "|"))
+  ProcedureReturn Bool(FindString("|InstanceNormalization|TopK|ScatterElements|Scatter|ReduceMax|ReduceProd|Not|Identity|Pad|", "|" + Operation + "|"))
 EndProcedure
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
@@ -33,6 +33,7 @@ Procedure.i PmoNsFloor(Operation.s, FixedShape.i)
     Case "InstanceNormalization" : ProcedureReturn 6
     Case "TopK" : If FixedShape : ProcedureReturn 1 : EndIf : ProcedureReturn 10
     Case "ScatterElements" : ProcedureReturn 11
+    Case "Scatter" : ProcedureReturn 9
     Case "Pad" : If FixedShape : ProcedureReturn 2 : EndIf : ProcedureReturn 11
     Case "ReduceMax", "ReduceProd", "Not", "Identity" : ProcedureReturn 1
   EndSelect
@@ -210,7 +211,12 @@ Procedure.i PmoEmitNsScatterElements(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, 
   Protected *Indices.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
   Protected *Updates.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
   Protected Mode.s = PmoEmitAttrS(*Node, "reduction", "none"), Code.i, Rank.i, Axis.i, D.i
-  If Opset < 11 : ProcedureReturn PmoEmitNsFail(*Node, "ScatterElements does not exist before opset 11, and the model imports opset " + Str(Opset) + ".") : EndIf
+  If *Node\Operation = "Scatter"
+    ; Scatter-9 is ScatterElements without reduction, deprecated for it from opset 11
+    If Opset > 10 : ProcedureReturn PmoEmitNsFail(*Node, "Scatter is deprecated from opset 11 (use ScatterElements), and the model imports opset " + Str(Opset) + ".") : EndIf
+  ElseIf Opset < 11
+    ProcedureReturn PmoEmitNsFail(*Node, "ScatterElements does not exist before opset 11, and the model imports opset " + Str(Opset) + ".")
+  EndIf
   If Opset < 16
     If PmoEmitNsAttributesAllowed(*Node, "|axis|", Opset) = 0 : ProcedureReturn #False : EndIf
   ElseIf PmoEmitNsAttributesAllowed(*Node, "|axis|reduction|", Opset) = 0
@@ -434,7 +440,7 @@ Procedure.i PmoEmitNormSmallHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Ma
     Case "InstanceNormalization" : Done = PmoEmitNsInstanceNorm(File, *Ir, *Ref, ProcName, Opset)
     Case "Not" : Done = PmoEmitNsNot(File, *Ir, *Ref, ProcName, Opset)
     Case "TopK" : Done = PmoEmitNsTopK(File, *Ir, *Ref, ProcName, Opset)
-    Case "ScatterElements" : Done = PmoEmitNsScatterElements(File, *Ir, *Ref, ProcName, Opset)
+    Case "ScatterElements", "Scatter" : Done = PmoEmitNsScatterElements(File, *Ir, *Ref, ProcName, Opset)
     Case "ReduceMax", "ReduceProd" : Done = PmoEmitNsReduce(File, *Ir, *Ref, ProcName, Opset)
     Case "Pad" : Done = PmoEmitNsPad(File, *Ir, *Ref, ProcName, Opset)
   EndSelect

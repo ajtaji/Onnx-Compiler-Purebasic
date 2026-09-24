@@ -22,7 +22,7 @@ Procedure.i PmoOpsOwns(Operation.s)
                                   "GatherElements|GatherND|OneHot|Einsum|Dropout|CastLike|Size|Tan|Asin|Acos|Sinh|Cosh|Asinh|" +
                                   "Acosh|Atanh|BitwiseNot|BitwiseAnd|BitwiseOr|BitwiseXor|Hardmax|LpNormalization|" +
                                   "MeanVarianceNormalization|LRN|GroupNormalization|EyeLike|Det|Compress|ReverseSequence|Upsample|" +
-                                  "RNN|GRU|NonMaxSuppression|RoiAlign|", "|" + Operation + "|"))
+                                  "RNN|GRU|NonMaxSuppression|RoiAlign|GridSample|", "|" + Operation + "|"))
 EndProcedure
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
@@ -47,6 +47,7 @@ Procedure.i PmoOpsFloor(Operation.s)
     Case "Celu", "Einsum" : ProcedureReturn 12
     Case "HardSwish", "Trilu" : ProcedureReturn 14
     Case "CastLike" : ProcedureReturn 15
+    Case "GridSample" : ProcedureReturn 16
     Case "Mish", "BitwiseNot", "BitwiseAnd", "BitwiseOr", "BitwiseXor", "GroupNormalization" : ProcedureReturn 18
     Case "Gelu" : ProcedureReturn 20
   EndSelect
@@ -1526,6 +1527,84 @@ Procedure.i PmoEmitOpsRoiAlign(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcNa
   ProcedureReturn #True
 EndProcedure
 
+; GridSample's mode and padding codes (PmOpGridSample) for a node, or the
+; sentence that refuses it; Spatial is the input rank less two, 0 when the
+; rank is not yet known (the runtime-dimension wrapper checks it then).
+Procedure.s PmoOpsGridSampleForm(*Node.PmoOnnxNode, Opset.i, Spatial.i, *Mode.Integer, *Pad.Integer)
+  Protected Mode.s, Pad.s
+  If Opset >= 20
+    Mode = PmoEmitAttrS(*Node, "mode", "linear")
+    Select Mode
+      Case "nearest" : *Mode\i = 0
+      Case "linear" : *Mode\i = 1
+      Case "cubic" : *Mode\i = 2
+      Default : ProcedureReturn "attribute mode = " + Mode + " is not a GridSample-20 mode; nearest, linear and cubic are."
+    EndSelect
+  Else
+    Mode = PmoEmitAttrS(*Node, "mode", "bilinear")
+    Select Mode
+      Case "nearest" : *Mode\i = 0
+      Case "bilinear" : *Mode\i = 1
+      Case "bicubic" : *Mode\i = 2
+      Default : ProcedureReturn "attribute mode = " + Mode + " is not a GridSample-16 mode; nearest, bilinear and bicubic are."
+    EndSelect
+  EndIf
+  Pad = PmoEmitAttrS(*Node, "padding_mode", "zeros")
+  Select Pad
+    Case "zeros" : *Pad\i = 0
+    Case "border" : *Pad\i = 1
+    Case "reflection" : *Pad\i = 2
+    Default : ProcedureReturn "attribute padding_mode = " + Pad + "; zeros, border and reflection are."
+  EndSelect
+  If PmoEmitAttrI(*Node, "align_corners", 0) <> 0 And PmoEmitAttrI(*Node, "align_corners", 0) <> 1
+    ProcedureReturn "attribute align_corners = " + Str(PmoEmitAttrI(*Node, "align_corners", 0)) + "; 0 and 1 are."
+  EndIf
+  If Spatial <> 0
+    If Opset < 20 And Spatial <> 2 : ProcedureReturn "GridSample-16 takes a 4-D input [N, C, H, W]; this one has rank " + Str(Spatial + 2) + "." : EndIf
+    If Spatial < 1 Or Spatial > 3 : ProcedureReturn "the input has rank " + Str(Spatial + 2) + "; one to three spatial axes (rank 3 to 5) are implemented." : EndIf
+    If *Mode\i = 2 And Spatial <> 2 : ProcedureReturn "cubic interpolation is implemented for a 4-D input [N, C, H, W]; this one has rank " + Str(Spatial + 2) + "." : EndIf
+  EndIf
+  ProcedureReturn ""
+EndProcedure
+
+Procedure.i PmoEmitOpsGridSample(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *G.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Reason.s, Mode.Integer, Pad.Integer, R.i, k.i
+  If PmoEmitNsAttributesAllowed(*Node, "|align_corners|mode|padding_mode|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "X", 1) = 0 Or PmoOpsTypeOk(*Node, *G, "grid", 1) = 0 : ProcedureReturn #False : EndIf
+  R = PmoEmitRank(*X) - 2
+  If R < 1 : ProcedureReturn PmoEmitNsFail(*Node, "the input has rank " + Str(PmoEmitRank(*X)) + "; GridSample takes [N, C, D1 ...].") : EndIf
+  Reason = PmoOpsGridSampleForm(*Node, Opset, R, @Mode, @Pad)
+  If Reason <> "" : ProcedureReturn PmoEmitNsFail(*Node, Reason) : EndIf
+  If PmoEmitRank(*G) <> R + 2 Or PmoEmitDim(*G, 0) <> PmoEmitDim(*X, 0) Or PmoEmitDim(*G, R + 1) <> R
+    ProcedureReturn PmoEmitNsFail(*Node, "grid must be [N, output extents ..., " + Str(R) + "] for an input with " + Str(R) + " spatial axes.")
+  EndIf
+  If *Y = 0 Or *Y\ElementType <> 1 Or PmoEmitRank(*Y) <> R + 2 Or PmoEmitDim(*Y, 0) <> PmoEmitDim(*X, 0) Or PmoEmitDim(*Y, 1) <> PmoEmitDim(*X, 1)
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [N, C, the grid's output extents].")
+  EndIf
+  For k = 1 To R
+    If PmoEmitDim(*Y, k + 1) <> PmoEmitDim(*G, k) : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [N, C, the grid's output extents].") : EndIf
+  Next
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(PmoEmitDim(*X, 0)))
+  PmoEmitLine(File, "  PmOpI(1) = " + Str(PmoEmitDim(*X, 1)))
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(R))
+  For k = 0 To 2
+    If k < R
+      PmoEmitLine(File, "  PmOpI(" + Str(3 + k) + ") = " + Str(PmoEmitDim(*X, k + 2)))
+      PmoEmitLine(File, "  PmOpI(" + Str(6 + k) + ") = " + Str(PmoEmitDim(*G, k + 1)))
+    EndIf
+  Next
+  PmoEmitLine(File, "  PmOpI(9) = " + Str(Mode\i))
+  PmoEmitLine(File, "  PmOpI(10) = " + Str(Pad\i))
+  PmoEmitLine(File, "  PmOpI(11) = " + Str(PmoEmitAttrI(*Node, "align_corners", 0)))
+  PmoEmitLine(File, "  PmOpGridSample(*i0, *i1, *o0)")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
 ; One generated procedure for a node of these operators, registered in Calls.
 Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Calls.s())
   Protected ProcName.s = "PmOnnxNode" + Str(*Ref\Index), Opset.i = PmoEmitNsOpset(*Ir), Done.i, *Node.PmoOnnxNode = *Ref\Node
@@ -1547,6 +1626,7 @@ Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
     Case "Upsample" : Done = PmoEmitOpsUpsample(File, *Ir, *Node, ProcName, Opset)
     Case "RNN", "GRU" : Done = PmoEmitOpsRecurrent(File, *Ir, *Node, ProcName, Opset)
     Case "RoiAlign" : Done = PmoEmitOpsRoiAlign(File, *Ir, *Node, ProcName, Opset)
+    Case "GridSample" : Done = PmoEmitOpsGridSample(File, *Ir, *Node, ProcName, Opset)
     Case "NonMaxSuppression" : ProcedureReturn PmoEmitNsFail(*Node, "its output size depends on the scores, which the fixed-shape path cannot plan.")
     Case "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp"
       Done = PmoEmitOpsReduce(File, *Ir, *Node, ProcName, Opset)
