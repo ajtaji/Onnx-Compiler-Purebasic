@@ -1008,6 +1008,12 @@ Procedure.i PmoEmitNode(File.i, *Ir.PmoIrModel, *Profile.PmoTargetProfile,
   Protected Directions.q
   Protected Hidden.q
   If *Node = 0 : ProcedureReturn PmoEmitFail("source node is null") : EndIf
+  ; Every position a node does not list - an optional output such as LSTM's
+  ; Y_h and Y_c or BatchNormalization's running statistics, or an optional
+  ; trailing input - is the null address "0", exactly as a listed position
+  ; with an empty name is (forum 988: an absent Y_h was written as nothing,
+  ; source that did not build).
+  For Index = 0 To 31 : In(Index) = "0" : Out(Index) = "0" : Next
   For Index = 0 To InputCount - 1
     Name = PmoEmitInput(*Node, Index)
     If Name <> "" And PmoIrCompileTimeInput(Op, Index) = 0 : In(Index) = PmoEmitAddress(*Ir, Name) : Else : In(Index) = "0" : EndIf

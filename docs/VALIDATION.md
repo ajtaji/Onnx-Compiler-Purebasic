@@ -361,6 +361,24 @@ definition; [chapter 8](guide/08_how_it_is_proved.txt) how it is checked.
 **Not established:** any board run. The Pi 4 speed and audio of this scheme
 are to be measured on the board; the Pico cannot hold the speech model.
 
+## Absent optional outputs — September 23, 2026
+
+Forum topic 988: an LSTM whose only output is Y was accepted by the
+fixed-shape path and emitted as `PmOnnxLstm\YH = ` with nothing after it, so
+the generated program did not build; the runtime-dimension path refused the
+same node. LSTM's kernels keep the running hidden and cell state in Y_h and
+Y_c and build Y_h from Y, so a left-out LSTM output now gets a name no model
+can spell (`__pmo_absent_<node>_<position>`) and, on the fixed-shape path, its
+declared shape, before either path plans memory; nothing reads it and the
+model's own outputs are unchanged. Every other left-out position is the null
+address `0` on the fixed-shape path, as an empty name already was.
+
+| Check | Result |
+|---|---|
+| `tests/node_suite/targeted_optional_outputs.py`: LSTM with Y only (with and without B), Y_h only, Y and Y_c, Y and Y_h; LayerNormalization with Y only and with InvStdDev only; BatchNormalization-15 in training mode with Y only; each fixed-shape and, where that path has the form, runtime-dimension (14 builds). Expected outputs from the ONNX reference evaluator cross-checked against ONNX Runtime, ONNX Runtime alone for Y_c (the reference evaluator's LSTM has no Y_c) | 14 of 14 as expected; the BatchNormalization case is refused with its sentence (the operator's own shape inference and ONNX Runtime require all three outputs in training mode). The released compiler (`e9df233`): 4 of 14 (three fixed-shape programs that did not build, one that crashed with Y_h named empty, one runtime-dimension run that failed, five refusals) |
+| The same gate with `--mutants`: the correction taken out of each path in turn and the compiler rebuilt | 2 of 2 caught (5 of 7 fixed-shape and 5 of 6 runtime-dimension cases fail) |
+| Models with no left-out output (four models, fp32/fp16/bf16/int4/int8, five targets), this change against the previous compiler | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape PureMetal images byte-identical |
+
 
 ## Explicit limitations
 

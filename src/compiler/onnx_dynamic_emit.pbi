@@ -502,6 +502,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
     PmoDynamicError="The speech adapter requires the documented full Kokoro-82M model. Check its SHA-256 identity." : ProcedureReturn 0
   EndIf
   If PmoOnnxLoad(ModelPath,@model)=0 : PmoDynamicError=PmoWireError : ProcedureReturn 0 : EndIf
+  PmoCompileNameAbsentOutputs(@model,#False)
   PmoDynamicError=PmoRandomValidateModel(@model)
   If PmoDynamicError<>"" : Goto Failed : EndIf
   ForEach shapes()

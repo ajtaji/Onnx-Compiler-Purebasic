@@ -122,6 +122,7 @@ The checked external assets they consume are described in [Kokoro](KOKORO.md).
 | [targeted_control.py](../tests/node_suite/targeted_control.py) | Targeted If, Loop and sequence cases, the SplitToSequence node tests re-imported at opset 20, and Kitten TTS nano's own control-flow nodes. |
 | [pi4_control_gate.py](../tests/node_suite/pi4_control_gate.py) | Runs node-suite case folders on the Pi 4 target in an independent A64 instruction interpreter. |
 | [targeted_defaults.py](../tests/node_suite/targeted_defaults.py) | Opset-20 cases for attribute forms the node tests do not reach: defaults written out, auto_pad, Shape slices, ScatterND reductions, and the forms that must be refused; each built for both emitters and checked against the ONNX reference and ONNX Runtime. |
+| [targeted_optional_outputs.py](../tests/node_suite/targeted_optional_outputs.py) | Nodes with optional outputs left out (LSTM, LayerNormalization, BatchNormalization), for both emitters; `--mutants` rebuilds the compiler without the forum 988 correction and requires the cases to fail. |
 | [results/](../tests/node_suite/results/) | Published scores: one `.md` summary and one `.json` record per case for each measured run. |
 
 The rest of `tests/` is not part of this export; see [validation](VALIDATION.md).

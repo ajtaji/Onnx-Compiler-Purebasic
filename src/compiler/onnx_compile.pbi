@@ -64,6 +64,95 @@ Procedure.s PmoCompileRuntimeDimensions(*Model.PmoOnnxModel)
   ProcedureReturn ""
 EndProcedure
 
+; ABSENT OPTIONAL OUTPUTS THE KERNEL STILL WRITES (forum 988). LSTM's Y, Y_h
+; and Y_c are all optional, but its kernels keep the running hidden and cell
+; state in Y_h and Y_c and build Y_h from Y, so each needs memory whether or
+; not the model reads it. A left-out position (fewer outputs listed, or an
+; empty name) gets a name no model can spell, "__pmo_absent_<node>_<position>",
+; before either path plans anything; nothing reads it, and the graph's own
+; outputs are unchanged. With WithShapes the fixed-shape path also gets its
+; declared shape (Y [T, D, B, H], Y_h and Y_c [D, B, H], layout 0) when X and
+; W have fixed shapes; otherwise the missing shape is refused later with the
+; usual sentence. A model with nothing left out is not touched.
+Procedure.i PmoCompileFindDims(*Model.PmoOnnxModel, Name.s, List Dims.q())
+  ClearList(Dims())
+  ForEach *Model\Graph\Initializers()
+    If *Model\Graph\Initializers()\Name = Name
+      ForEach *Model\Graph\Initializers()\Dims() : AddElement(Dims()) : Dims() = *Model\Graph\Initializers()\Dims() : Next
+      ProcedureReturn #True
+    EndIf
+  Next
+  ForEach *Model\Graph\Inputs()
+    If *Model\Graph\Inputs()\Name = Name And *Model\Graph\Inputs()\HasShape
+      ForEach *Model\Graph\Inputs()\Dims()
+        If *Model\Graph\Inputs()\Dims()\HasValue = 0 : ProcedureReturn #False : EndIf
+        AddElement(Dims()) : Dims() = *Model\Graph\Inputs()\Dims()\Value
+      Next
+      ProcedureReturn #True
+    EndIf
+  Next
+  ForEach *Model\Graph\Values()
+    If *Model\Graph\Values()\Name = Name And *Model\Graph\Values()\HasShape
+      ForEach *Model\Graph\Values()\Dims()
+        If *Model\Graph\Values()\Dims()\HasValue = 0 : ProcedureReturn #False : EndIf
+        AddElement(Dims()) : Dims() = *Model\Graph\Values()\Dims()\Value
+      Next
+      ProcedureReturn #True
+    EndIf
+  Next
+  ProcedureReturn #False
+EndProcedure
+
+Procedure PmoCompileNameAbsentOutputs(*Model.PmoOnnxModel, WithShapes.i)
+  Protected NodeIndex.i, Position.i, Name.s, Hidden.q, Directions.q, Steps.q, Batch.q, Ok.i, Extent.i
+  NewList XDims.q()
+  NewList WDims.q()
+  ForEach *Model\Graph\Nodes()
+    If *Model\Graph\Nodes()\Operation = "LSTM" And (*Model\Graph\Nodes()\Domain = "" Or *Model\Graph\Nodes()\Domain = "ai.onnx")
+      While ListSize(*Model\Graph\Nodes()\Outputs()) < 3
+        LastElement(*Model\Graph\Nodes()\Outputs()) : AddElement(*Model\Graph\Nodes()\Outputs()) : *Model\Graph\Nodes()\Outputs() = ""
+      Wend
+      Ok = #False
+      If WithShapes And SelectElement(*Model\Graph\Nodes()\Inputs(), 1)
+        Name = *Model\Graph\Nodes()\Inputs()
+        FirstElement(*Model\Graph\Nodes()\Inputs())
+        If PmoCompileFindDims(*Model, *Model\Graph\Nodes()\Inputs(), XDims()) And ListSize(XDims()) = 3 And
+           PmoCompileFindDims(*Model, Name, WDims()) And ListSize(WDims()) = 3
+          SelectElement(XDims(), 0) : Steps = XDims() : SelectElement(XDims(), 1) : Batch = XDims()
+          SelectElement(WDims(), 0) : Directions = WDims() : SelectElement(WDims(), 1)
+          Hidden = PmoEmitAttrI(@*Model\Graph\Nodes(), "hidden_size", WDims() / 4)
+          Ok = #True
+        EndIf
+      EndIf
+      Position = 0
+      ForEach *Model\Graph\Nodes()\Outputs()
+        If Position < 3 And *Model\Graph\Nodes()\Outputs() = ""
+          Name = "__pmo_absent_" + Str(NodeIndex) + "_" + Str(Position)
+          *Model\Graph\Nodes()\Outputs() = Name
+          If Ok
+            LastElement(*Model\Graph\Values()) : AddElement(*Model\Graph\Values())
+            *Model\Graph\Values()\Name = Name : *Model\Graph\Values()\ElementType = 1
+            *Model\Graph\Values()\HasTensorType = #True : *Model\Graph\Values()\HasShape = #True
+            If Position = 0
+              AddElement(*Model\Graph\Values()\Dims()) : *Model\Graph\Values()\Dims()\HasValue = #True : *Model\Graph\Values()\Dims()\Value = Steps
+            EndIf
+            For Extent = 0 To 2
+              AddElement(*Model\Graph\Values()\Dims()) : *Model\Graph\Values()\Dims()\HasValue = #True
+              Select Extent
+                Case 0 : *Model\Graph\Values()\Dims()\Value = Directions
+                Case 1 : *Model\Graph\Values()\Dims()\Value = Batch
+                Default : *Model\Graph\Values()\Dims()\Value = Hidden
+              EndSelect
+            Next
+          EndIf
+        EndIf
+        Position + 1
+      Next
+    EndIf
+    NodeIndex + 1
+  Next
+EndProcedure
+
 Procedure.i PmoCompileFail(Message.s)
   If PmoCompileError = "" : PmoCompileError = Message : EndIf
   ProcedureReturn #False
@@ -697,6 +786,7 @@ Procedure.i PmoCompileCommand(ModelPath.s)
     If PmoDynamicCommand(ModelPath) = 0 : ProcedureReturn PmoCompileFail(PmoDynamicError) : EndIf
     ProcedureReturn #True
   EndIf
+  PmoCompileNameAbsentOutputs(@Model, #True)
   ; The attribute forms both paths share (onnx_forms.pbi): an attribute value
   ; this path does not compute is refused here, before anything is planned,
   ; instead of being ignored by the emitter (forum 859).
