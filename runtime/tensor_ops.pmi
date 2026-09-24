@@ -5290,6 +5290,7 @@ Global PmOpHamA.f
 Global PmOpHamB.f
 Global PmOpBlkA.f
 Global PmOpBlkC.f
+Global PmOpPio2F.f
 
 Procedure.f PmOpSinF(x.f)
   Protected r.f
@@ -5334,6 +5335,7 @@ Procedure PmOpSignalInit()
   PmOpSetBits(@PmOpHamB, $3EE9BD38)
   PmOpSetBits(@PmOpBlkA, $3ED70A3D)
   PmOpSetBits(@PmOpBlkC, $3DA3D70A)
+  PmOpSetBits(@PmOpPio2F, $3FC90FDB)
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -5383,18 +5385,40 @@ Procedure PmOpWindow(dst.i, size.i, kind.i, periodic.i)
   Wend
 EndProcedure
 
-; cos and sin of 2 pi r / n into PmOpDftC and PmOpDftS, r < n.
+; cos and sin of 2 pi r / n into PmOpDftC and PmOpDftS, r < n: the quarter
+; turn from the integers (4r = q n + rem), the angle within it pi/2 * rem / n,
+; so a multiple of a quarter turn gives exact 0 and 1.
 Global PmOpDftC.f
 Global PmOpDftS.f
 Procedure PmOpTwiddle(r.i, n.i)
   Protected a.f
   Protected fn.f
-  a = r
+  Protected c0.f
+  Protected s0.f
+  Protected q.i
+  Protected rem.i
+  q = (4 * r) / n
+  rem = 4 * r - q * n
+  a = rem
   fn = n
   a = a / fn
-  a = a * PmOpTwoPiF
-  PmOpDftC = PmOpCosF(a)
-  PmOpDftS = PmOpSinF(a)
+  a = a * PmOpPio2F
+  c0 = PmOpCosF(a)
+  s0 = PmOpSinF(a)
+  Select q
+    Case 0
+      PmOpDftC = c0
+      PmOpDftS = s0
+    Case 1
+      PmOpDftC = PmOpNeg(s0)
+      PmOpDftS = c0
+    Case 2
+      PmOpDftC = PmOpNeg(c0)
+      PmOpDftS = PmOpNeg(s0)
+    Case 3
+      PmOpDftC = s0
+      PmOpDftS = PmOpNeg(c0)
+  EndSelect
 EndProcedure
 
 ; ----------------------------------------------------------------------

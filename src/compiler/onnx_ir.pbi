@@ -128,6 +128,10 @@ Procedure.i PmoIrCompileTimeInput(Operation.s, Position.i)
       ProcedureReturn Bool(Position = 1)
     Case "Dropout"
       ProcedureReturn Bool(Position = 1 Or Position = 2)
+    Case "HannWindow", "HammingWindow", "BlackmanWindow"
+      ProcedureReturn Bool(Position = 0)
+    Case "DFT"
+      ProcedureReturn Bool(Position = 1 Or Position = 2)
   EndSelect
   ProcedureReturn #False
 EndProcedure

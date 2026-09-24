@@ -52,6 +52,8 @@ Procedure.s PmoCompileRuntimeDimensions(*Model.PmoOnnxModel)
                "Compress", "Upsample"
             Control = Bool(Position = 1)
           Case "Dropout" : Control = Bool(Position = 2)
+          Case "HannWindow", "HammingWindow", "BlackmanWindow" : Control = Bool(Position = 0)
+          Case "DFT" : Control = Bool(Position = 1 Or Position = 2)
         EndSelect
         Name = *Model\Graph\Nodes()\Inputs()
         If Control And Name <> "" And Constants(Name) = 0
@@ -106,6 +108,105 @@ Procedure.i PmoCompileFindDims(*Model.PmoOnnxModel, Name.s, List Dims.q())
     EndIf
   Next
   ProcedureReturn #False
+EndProcedure
+
+; The value of a one-element FLOAT, INT32 or INT64 initializer.
+Procedure.i PmoCompileInitScalar(*Model.PmoOnnxModel, Name.s, *Value.Double)
+  If Name = "" : ProcedureReturn #False : EndIf
+  ForEach *Model\Graph\Initializers()
+    If *Model\Graph\Initializers()\Name <> Name : Continue : EndIf
+    With *Model\Graph\Initializers()
+      If \DataLocation <> 0 : ProcedureReturn #False : EndIf
+      If \Raw\Bytes > 0
+        Select \DataType
+          Case 1 : If \Raw\Bytes <> 4 : ProcedureReturn #False : EndIf : *Value\d = PeekF(\Raw\Data)
+          Case 6 : If \Raw\Bytes <> 4 : ProcedureReturn #False : EndIf : *Value\d = PeekL(\Raw\Data)
+          Case 7 : If \Raw\Bytes <> 8 : ProcedureReturn #False : EndIf : *Value\d = PeekQ(\Raw\Data)
+          Default : ProcedureReturn #False
+        EndSelect
+        ProcedureReturn #True
+      EndIf
+      Select \DataType
+        Case 1 : If ListSize(\FloatData()) <> 1 : ProcedureReturn #False : EndIf : FirstElement(\FloatData()) : *Value\d = \FloatData()
+        Case 6 : If ListSize(\Int32Data()) <> 1 : ProcedureReturn #False : EndIf : FirstElement(\Int32Data()) : *Value\d = \Int32Data()
+        Case 7 : If ListSize(\Int64Data()) <> 1 : ProcedureReturn #False : EndIf : FirstElement(\Int64Data()) : *Value\d = \Int64Data()
+        Default : ProcedureReturn #False
+      EndSelect
+      ProcedureReturn #True
+    EndWith
+  Next
+  ProcedureReturn #False
+EndProcedure
+
+; MelWeightMatrix-17 whose five inputs are initializers becomes an
+; initializer before either path runs, computed as the ONNX reference computes
+; it: the mel edges in binary32 (2595 log10(1 + f / 700)), the bins
+; floor((dft_length + 1) f / sample_rate) and the triangles in binary64, then
+; rounded to binary32. "" when done or left for the emitters to refuse; a
+; sentence for parameters the definition cannot draw.
+Procedure.s PmoCompileFoldMel(*Model.PmoOnnxModel)
+  Protected Nb.Double, Dl.Double, Sr.Double, Lo.Double, Hi.Double, Name.s, Out.s, i.i, j.i, K.i, Bins.i, Count.i
+  Protected LoMel.f, HiMel.f, T.f, MelStep.f, Fb.d, Num.d, Den.d, Lf.i, Cf.i, Hf.i
+  Protected Dim Edge.i(0)
+  Protected Dim W.f(0)
+  Protected Dim In.s(4)
+  ForEach *Model\Graph\Nodes()
+    If *Model\Graph\Nodes()\Operation <> "MelWeightMatrix" Or ListSize(*Model\Graph\Nodes()\Inputs()) <> 5 : Continue : EndIf
+    If *Model\Graph\Nodes()\Domain <> "" And *Model\Graph\Nodes()\Domain <> "ai.onnx" : Continue : EndIf
+    If PmoEmitAttrI(@*Model\Graph\Nodes(), "output_datatype", 1) <> 1 : Continue : EndIf
+    i = 0
+    ForEach *Model\Graph\Nodes()\Inputs() : In(i) = *Model\Graph\Nodes()\Inputs() : i + 1 : Next
+    If FirstElement(*Model\Graph\Nodes()\Outputs()) = 0 : Continue : EndIf
+    Out = *Model\Graph\Nodes()\Outputs()
+    PushListPosition(*Model\Graph\Nodes())
+    If PmoCompileInitScalar(*Model, In(0), @Nb) = 0 Or PmoCompileInitScalar(*Model, In(1), @Dl) = 0 Or PmoCompileInitScalar(*Model, In(2), @Sr) = 0 Or
+       PmoCompileInitScalar(*Model, In(3), @Lo) = 0 Or PmoCompileInitScalar(*Model, In(4), @Hi) = 0
+      PopListPosition(*Model\Graph\Nodes())
+      Continue
+    EndIf
+    PopListPosition(*Model\Graph\Nodes())
+    Bins = Nb\d : K = Int(Dl\d) / 2 + 1
+    If Bins < 1 Or Dl\d < 1 Or Sr\d < 1 Or Lo\d < 0 Or Hi\d < Lo\d Or Bins > 4096 Or Dl\d > 65536
+      ProcedureReturn "MelWeightMatrix node " + *Model\Graph\Nodes()\Name + ": num_mel_bins = " + StrD(Nb\d) + ", dft_length = " + StrD(Dl\d) + ", sample_rate = " + StrD(Sr\d) +
+                      ", lower_edge_hertz = " + StrD(Lo\d) + " and upper_edge_hertz = " + StrD(Hi\d) + " do not describe a filter bank (positive counts, 0 <= lower <= upper)."
+    EndIf
+    ; the edges in binary32, as numpy computes them from binary32 inputs
+    T = Lo\d : T = T / 700.0 : T = 1.0 + T : T = Log10(T) : LoMel = 2595.0 * T
+    T = Hi\d : T = T / 700.0 : T = 1.0 + T : T = Log10(T) : HiMel = 2595.0 * T
+    MelStep = HiMel - LoMel : MelStep = MelStep / (Bins + 2)
+    Dim Edge(Bins + 1)
+    For i = 0 To Bins + 1
+      Fb = i : Num = MelStep : Fb = Fb * Num : Num = LoMel : Fb = Fb + Num
+      Fb = 700.0 * (Pow(10.0, Fb / 2595.0) - 1.0)
+      Edge(i) = Round(((Dl\d + 1.0) * Fb) / Sr\d, #PB_Round_Down)
+    Next
+    Dim W.f(K * Bins)
+    For i = 0 To Bins - 1
+      Lf = Edge(i) : Cf = Edge(i + 1) : Hf = Edge(i + 2)
+      If Lf < 0 Or Cf >= K Or Hf > K
+        ProcedureReturn "MelWeightMatrix node " + *Model\Graph\Nodes()\Name + ": band " + Str(i) + " reaches bin " + Str(Hf) + " of a " + Str(K) + "-bin spectrum; upper_edge_hertz must not pass half of sample_rate."
+      EndIf
+      If Cf = Lf
+        W(Cf * Bins + i) = 1.0
+      Else
+        For j = Lf To Cf : Num = j - Lf : Den = Cf - Lf : W(j * Bins + i) = Num / Den : Next
+      EndIf
+      If Hf > Cf
+        For j = Cf To Hf - 1 : Num = Hf - j : Den = Hf - Cf : W(j * Bins + i) = Num / Den : Next
+      EndIf
+    Next
+    ; the node becomes an initializer holding the matrix
+    DeleteElement(*Model\Graph\Nodes())
+    LastElement(*Model\Graph\Initializers()) : AddElement(*Model\Graph\Initializers())
+    With *Model\Graph\Initializers()
+      \Name = Out : \DataType = 1
+      AddElement(\Dims()) : \Dims() = K
+      AddElement(\Dims()) : \Dims() = Bins
+      For i = 0 To K * Bins - 1 : AddElement(\FloatData()) : \FloatData() = W(i) : Next
+    EndWith
+    Count + 1
+  Next
+  ProcedureReturn ""
 EndProcedure
 
 Procedure PmoCompileNameAbsentOutputs(*Model.PmoOnnxModel, WithShapes.i)
@@ -812,6 +913,8 @@ Procedure.i PmoCompileCommand(ModelPath.s)
     ProcedureReturn PmoCompileFail("--kokoro-text requires pi4 or unoq; Windows uses --speech-ui. Full Kokoro cannot fit Pico RAM.")
   EndIf
   If PmoOnnxLoad(ModelPath, @Model) = 0 : ProcedureReturn PmoCompileFail(PmoWireError) : EndIf
+  RandomReason = PmoCompileFoldMel(@Model)
+  If RandomReason <> "" : PmoCompileFail(RandomReason) : Goto PmoCompileCommandFailed : EndIf
   ForEach Shapes()
     If PmoCompileApplyShape(@Model, Shapes()) = 0 : Goto PmoCompileCommandFailed : EndIf
   Next

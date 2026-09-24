@@ -69,6 +69,12 @@ Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
       ProcedureReturn "|"
     Case "DynamicQuantizeLinear", "MatMulInteger", "QLinearMatMul" : ProcedureReturn "|"
     Case "ConvInteger", "QLinearConv" : ProcedureReturn "|auto_pad|dilations|group|kernel_shape|pads|strides|"
+    Case "HannWindow", "HammingWindow", "BlackmanWindow" : ProcedureReturn "|output_datatype|periodic|"
+    Case "DFT"
+      If Opset >= 20 : ProcedureReturn "|inverse|onesided|" : EndIf
+      ProcedureReturn "|axis|inverse|onesided|"
+    Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss" : ProcedureReturn "|ignore_index|reduction|"
+    Case "MelWeightMatrix" : ProcedureReturn "|output_datatype|"
     Case "RoiAlign"
       If Opset >= 16 : ProcedureReturn "|coordinate_transformation_mode|mode|output_height|output_width|sampling_ratio|spatial_scale|" : EndIf
       ProcedureReturn "|mode|output_height|output_width|sampling_ratio|spatial_scale|"
@@ -227,6 +233,17 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
           k = 1 + Bool(Text = "bidirectional")
           Reason = PmoOpsRecurrentActivations(*Node, k, Codes())
         EndIf
+      Case "HannWindow", "HammingWindow", "BlackmanWindow"
+        If PmoEmitAttrI(*Node, "output_datatype", 1) <> 1 : Reason = "output_datatype " + PmdNsTypeName(PmoEmitAttrI(*Node, "output_datatype", 1)) + " is not implemented; FLOAT is." : EndIf
+      Case "DFT"
+        Reason = PmdNsTypeReason(*Node, 0, "input", "|1|")
+      Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss"
+        Reason = PmdNsTypeReason(*Node, 0, "the scores", "|1|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "the target", "|6|7|") : EndIf
+        Text = PmoEmitAttrS(*Node, "reduction", "mean")
+        If Reason = "" And Text <> "none" And Text <> "sum" And Text <> "mean" : Reason = "attribute reduction = " + Text + "; none, sum and mean are." : EndIf
+      Case "MelWeightMatrix"
+        Reason = PmoOpsMelSentence()
       Case "QuantizeLinear"
         Reason = PmdNsTypeReason(*Node, 0, "x", "|1|")
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "y_scale", "|1|") : EndIf
@@ -336,7 +353,7 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         If ListSize(*Node\Outputs()) <> 3 Or PmdNsNamedOutputs(*Node) <> 3
           Reason = "it declares " + Str(PmdNsNamedOutputs(*Node)) + " named outputs; DynamicQuantizeLinear has three (y, y_scale, y_zero_point)."
         EndIf
-      Case "MaxPool", "Dropout", "RNN", "GRU"
+      Case "MaxPool", "Dropout", "RNN", "GRU", "SoftmaxCrossEntropyLoss"
         If ListSize(*Node\Outputs()) < 1 Or ListSize(*Node\Outputs()) > 2
           Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; " + Op + " has one or two."
         EndIf
@@ -415,6 +432,24 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
             Str(PmoEmitAttrI(*Node, "sampling_ratio", 0)) + " : PmOpI(8)=" + Str(Bool(PmoEmitAttrS(*Node, "mode", "avg") = "max")) + " : PmOpI(9)=" +
             Str(Bool(Text = "half_pixel")) + " : PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "spatial_scale", 1.0)) + ") : "
       Call = Pre + "DOpRoiAlign(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + ")"
+    Case "HannWindow", "HammingWindow", "BlackmanWindow"
+      Code = 2
+      If Op = "HannWindow" : Code = 0 : ElseIf Op = "HammingWindow" : Code = 1 : EndIf
+      Call = "DOpWindow(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + Str(Code) + "," + Str(Bool(PmoEmitAttrI(*Node, "periodic", 1) <> 0)) + ")"
+    Case "DFT"
+      d = -2
+      If PmdNsOpset < 20 : d = PmoEmitAttrI(*Node, "axis", 1) : EndIf
+      Text = "0"
+      If PmdNsOpset >= 20 : Text = a(2) : EndIf
+      Call = "DOpDft(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + Text + "," + Str(d) + "," +
+             Str(Bool(PmoEmitAttrI(*Node, "inverse", 0) <> 0)) + "," + Str(Bool(PmoEmitAttrI(*Node, "onesided", 0) <> 0)) + ")"
+    Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss"
+      Text = PmoEmitAttrS(*Node, "reduction", "mean")
+      Code = 2
+      If Text = "none" : Code = 0 : ElseIf Text = "sum" : Code = 1 : EndIf
+      Call = "DOpLoss(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 1)) + "," + a(0) + "," + a(1) + "," + a(2) + "," +
+             Str(Code) + "," + Str(PmoEmitNsAttributePresent(*Node, "ignore_index")) + "," + Str(PmoEmitAttrI(*Node, "ignore_index", 0)) + "," +
+             Str(Bool(Op = "SoftmaxCrossEntropyLoss")) + ")"
     Case "QuantizeLinear", "DequantizeLinear"
       Call = "DOpQuantize(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + "," + Str(PmoEmitAttrI(*Node, "axis", 1)) + "," +
              Str(Bool(Op = "QuantizeLinear")) + "," + Str(Bool(PmdNsOpset >= 13)) + ")"

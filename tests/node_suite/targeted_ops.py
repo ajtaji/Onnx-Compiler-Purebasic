@@ -91,6 +91,9 @@ def model_for(case: Case, symbolic: bool) -> onnx.ModelProto:
     g = helper.make_graph(case.nodes, case.name, ins, outs, case.initializers)
     m = helper.make_model(g, opset_imports=[helper.make_opsetid("", case.opset)])
     m.ir_version = 8
+    if len(case.nodes) > 1 and not symbolic:
+        # the intermediate values' shapes, as an exporter writes them
+        m = onnx.shape_inference.infer_shapes(m)
     return m
 
 
@@ -115,7 +118,11 @@ def expected(case: Case, m: onnx.ModelProto):
             other = []
         for i, (a, b) in enumerate(zip(got, other)):
             b = np.asarray(b)
-            if a.shape != b.shape or not np.allclose(a.astype(np.float64), b.astype(np.float64), rtol=1e-3, atol=1e-6, equal_nan=True):
+            # two independent computations agree to a relative 1e-3, and near
+            # zero to 1e-5 of the output's largest magnitude (an FFT's zeros)
+            scale = float(np.nanmax(np.abs(a.astype(np.float64)))) if a.size and np.issubdtype(a.dtype, np.floating) else 0.0
+            if a.shape != b.shape or not np.allclose(a.astype(np.float64), b.astype(np.float64), rtol=1e-3,
+                                                      atol=max(1e-6, 1e-5 * (scale if np.isfinite(scale) else 0.0)), equal_nan=True):
                 raise SystemExit("%s output %d: onnxruntime and the reference evaluator disagree\n  ref %r\n  ort %r"
                                  % (case.name, i, a.ravel()[:12], b.ravel()[:12]))
     return got
@@ -684,6 +691,73 @@ def cases() -> list[Case]:
                   [("a", U8, [3, 4]), ("b", U8, [4, 5])], [("y", I32, [3, 5])], {"a": ma[0], "b": mb},
                   [init("az", np.array([1, 2, 3], np.uint8))], opset=10, symbolic_axes=(), dynamic=False,
                   refuse="per-row zero point is not implemented"))
+
+    # ---- group C: windows, DFT, MelWeightMatrix and the losses ---------------
+    # a window's size is an initializer; a FLOAT input x is added to the result
+    # so the program has an input to bind
+    for op in ("HannWindow", "HammingWindow", "BlackmanWindow"):
+        for periodic in (0, 1):
+            c.append(Case("%s_periodic%d" % (op.lower(), periodic), [N(op, ["n"], ["w"], periodic=periodic), N("Add", ["w", "x"], ["y"])],
+                          [("x", F, [10])], [("y", F, [10])], {"x": np.zeros(10, np.float32)}, [init("n", np.array(10, np.int64))],
+                          opset=17))
+    for fixed_path, text in ((True, "uses unsupported runtime type 11"), (False, "output_datatype DOUBLE is not implemented")):
+        c.append(Case("refuse_hannwindow_double" + ("" if fixed_path else "_runtime"),
+                      [N("HannWindow", ["n"], ["w"], output_datatype=11), N("Cast", ["w"], ["w32"], to=F), N("Add", ["w32", "x"], ["y"])],
+                      [("x", F, [10])], [("y", F, [10])], {"x": np.zeros(10, np.float32)}, [init("n", np.array(10, np.int64))], opset=17,
+                      fixed=fixed_path, dynamic=not fixed_path, refuse=text))
+    dx1 = f32(2, 6, 3, 1)
+    dx2 = f32(2, 6, 3, 2)
+    for name, x, n, inv, ones, oshape in (("real", dx1, 6, 0, 0, [2, 6, 3, 2]), ("real_onesided", dx1, 6, 0, 1, [2, 4, 3, 2]),
+                                          ("complex_padded", dx2, 8, 0, 0, [2, 8, 3, 2]), ("complex_cropped", dx2, 4, 0, 0, [2, 4, 3, 2]),
+                                          ("inverse", dx2, 6, 1, 0, [2, 6, 3, 2]), ("inverse_onesided", dx2, 10, 1, 1, [2, 10, 3, 1])):
+        c.append(Case("dft_opset17_" + name, [N("DFT", ["x", "n"], ["y"], axis=1, inverse=inv, onesided=ones)],
+                      [("x", F, list(x.shape))], [("y", F, oshape)], {"x": x}, [init("n", np.array(n, np.int64))], opset=17))
+    c.append(Case("dft_opset20_axis_input", [N("DFT", ["x", "", "a"], ["y"])], [("x", F, [2, 6, 3, 2])], [("y", F, [2, 6, 3, 2])],
+                  {"x": dx2}, [init("a", np.array(1, np.int64))], opset=20))
+    c.append(Case("dft_opset20_default_axis", [N("DFT", ["x"], ["y"], onesided=1)], [("x", F, [2, 5, 7, 1])], [("y", F, [2, 5, 4, 2])],
+                  {"x": f32(2, 5, 7, 1)}, opset=20))
+
+    def mel_oracle(nb, dl, sr, lo, hi, then=None):
+        def run(feeds):
+            node = helper.make_node("MelWeightMatrix", ["a", "b", "c", "d", "e"], ["m"])
+            g = helper.make_graph([node], "g", [], [helper.make_tensor_value_info("m", TensorProto.FLOAT, None)],
+                                  [init("a", np.array(nb, np.int64)), init("b", np.array(dl, np.int64)), init("c", np.array(sr, np.int64)),
+                                   init("d", np.array(lo, np.float32)), init("e", np.array(hi, np.float32))])
+            m = ReferenceEvaluator(helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])).run(None, {})[0]
+            return [m * feeds["x"]] if then else [m + feeds["x"]]
+        return run
+    mel_inits = [init("a", np.array(8, np.int64)), init("b", np.array(64, np.int64)), init("c", np.array(16000, np.int64)),
+                 init("d", np.array(20.0, np.float32)), init("e", np.array(8000.0, np.float32))]
+    # (a product with Mul: MatMul's Windows kernel sums in another order than
+    # the bare-metal one, which the target gate's bit identity would flag)
+    c.append(Case("melweightmatrix_mul", [N("MelWeightMatrix", ["a", "b", "c", "d", "e"], ["m"]), N("Mul", ["m", "x"], ["y"])],
+                  [("x", F, [1, 8])], [("y", F, [33, 8])], {"x": np.abs(f32(1, 8)) + 1}, mel_inits, opset=17,
+                  oracle=mel_oracle(8, 64, 16000, 20.0, 8000.0, then=True)))
+    c.append(Case("melweightmatrix_add", [N("MelWeightMatrix", ["a", "b", "c", "d", "e"], ["m"]), N("Add", ["m", "x"], ["y"])],
+                  [("x", F, [33, 8])], [("y", F, [33, 8])], {"x": np.zeros((33, 8), np.float32)}, mel_inits, opset=17,
+                  oracle=mel_oracle(8, 64, 16000, 20.0, 8000.0)))
+    c.append(Case("refuse_melweightmatrix_runtime_input", [N("MelWeightMatrix", ["a", "b", "c", "d", "hi"], ["m"]), N("Add", ["m", "x"], ["y"])],
+                  [("hi", F, []), ("x", F, [33, 8])], [("y", F, [33, 8])], {"hi": np.array(8000.0, np.float32), "x": np.zeros((33, 8), np.float32)},
+                  mel_inits[:4], opset=17, symbolic_axes=(1,), refuse="MelWeightMatrix is implemented for five initializer inputs"))
+    lx = f32(3, 5, 4, scale=2.0)
+    lt = RNG.integers(0, 5, (3, 4)).astype(np.int64)
+    lt[0, 0] = 2
+    lw = RNG.uniform(0.5, 2.0, 5).astype(np.float32)
+    for red in ("none", "sum", "mean"):
+        for weighted in (0, 1):
+            ins = ["x", "t"] + (["w"] if weighted else [])
+            inits = [init("w", lw)] if weighted else []
+            oshape = [3, 4] if red == "none" else []
+            c.append(Case("nllloss_%s_w%d" % (red, weighted), [N("NegativeLogLikelihoodLoss", ins, ["y"], reduction=red, ignore_index=2)],
+                          [("x", F, [3, 5, 4]), ("t", I64, [3, 4])], [("y", F, oshape)], {"x": lx, "t": lt}, inits, opset=13))
+            c.append(Case("sce_%s_w%d" % (red, weighted), [N("SoftmaxCrossEntropyLoss", ins, ["y", "lp"], reduction=red)],
+                          [("x", F, [3, 5, 4]), ("t", I64, [3, 4])], [("y", F, oshape), ("lp", F, [3, 5, 4])], {"x": lx, "t": lt}, inits,
+                          opset=13))
+    c.append(Case("sce_2d_int32_target_no_log_prob", [N("SoftmaxCrossEntropyLoss", ["x", "t"], ["y"])],
+                  [("x", F, [6, 5]), ("t", I32, [6])], [("y", F, [])], {"x": f32(6, 5), "t": RNG.integers(0, 5, 6).astype(np.int32)}, opset=13))
+    c.append(Case("nllloss_4d", [N("NegativeLogLikelihoodLoss", ["x", "t"], ["y"], reduction="sum")],
+                  [("x", F, [2, 3, 2, 2]), ("t", I64, [2, 2, 2])], [("y", F, [])],
+                  {"x": f32(2, 3, 2, 2), "t": RNG.integers(0, 3, (2, 2, 2)).astype(np.int64)}, opset=13))
     return c
 
 

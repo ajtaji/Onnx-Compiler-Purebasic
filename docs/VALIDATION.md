@@ -567,6 +567,45 @@ of other than UINT8, INT8 and INT32; the float8, 4-bit, 2-bit and 16-bit
 quantized types; blocked quantization (opset 21); a scale of more than one
 value before opset 13; FLOAT16 scales.
 
+## Group C, first batch: windows, DFT, MelWeightMatrix and the losses — September 24, 2026
+
+HannWindow, HammingWindow and BlackmanWindow (opset 17), DFT (opset 17 and
+20: forward, inverse, one-sided, and the real inverse of a one-sided
+spectrum, over any axis before the last), NegativeLogLikelihoodLoss and
+SoftmaxCrossEntropyLoss (opset 12 on; none, sum and mean, weights,
+ignore_index, the optional log_prob) on both paths and every target, and
+MelWeightMatrix (opset 17) from initializers.
+
+The kernels join `runtime/tensor_ops.pmi`. sin and cos over the binary32
+range are Tan's integer reduction by pi/2 followed by its kernels. DFT is
+computed by its definition, each output a sum in index order of binary32
+products; its twiddle factors take their quarter turn from the integers
+(4r = q n + rem, the angle within it pi/2 * rem / n), so a multiple of a
+quarter turn gives exact 0 and 1. MelWeightMatrix is not a kernel: a
+binary32 computation of its band edges disagreed with the reference on one
+of 980 parameter sets tried, because a band edge that falls within 1e-8 of
+a bin boundary decides a whole column. When its five inputs are
+initializers the compiler computes the matrix before either path runs, the
+edges as the reference computes them (the mel endpoints in binary32, the
+bins in binary64), and the node becomes an initializer; otherwise it is
+refused with a sentence.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 476 cases - the 386 before; the three windows, periodic and symmetric, sizes 1 to 400; DFT real and complex, lengths 1 to 31 against a signal of 6, both directions, one-sided, a NaN; NegativeLogLikelihoodLoss with INT32 and INT64 targets, each reduction, weights and ignore_index, and a target outside the classes | Windows, Pi 4, Pico and Pico 2: 476 of 476 bit-identical to the definition; `--mutants` 45 of 45 caught (five new: a Hamming coefficient, a twiddle quadrant, the inverse's sign, the one-sided inverse's doubling, the weighted mean's divisor) |
+| `tests/node_suite/targeted_ops.py`: 729 cases - the 665 before and 64 new builds of these operators (MelWeightMatrix before a Mul and before an Add, both paths) | 729 of 729 as expected. Multi-node cases now carry their intermediate shapes, as an exporter writes them |
+| Official node tests at opset 20 or lower, this change against the previous compiler | PASS 490 of 964 before, 538 after; no case that passed fails. The 48 new passes are the window, DFT and loss cases. Two new FAIL_NUMERIC cases, test_dft_inverse and its opset-19 twin, are the reference's round-off: an imaginary part the reference gives as 1.9e-7 is exactly 0 here, and the corpus's absolute tolerance is 1e-7. test_melweightmatrix is refused: its parameters are graph inputs. The function-expanded SoftmaxCrossEntropyLoss cases stay refused (their intermediate values carry no shape) |
+| `ops_targets_gate.py`: every targeted build that must pass, compiled for the Pi 4, Pico and Pico 2 and run in unicorn | 492 builds, 1,476 runs: 1,473 bit-identical to the Windows program; the three others were a MelWeightMatrix case followed by a MatMul, whose Windows kernel sums in another order than the bare-metal one - the case now multiplies instead, and the 60 builds of this batch then pass 180 of 180 |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `c995378` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
+| Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
+
+**Refused, with a sentence:** a window's output_datatype other than FLOAT;
+MelWeightMatrix whose inputs are not all initializers, whose parameters do
+not describe a filter bank, or whose bands pass the Nyquist bin; DFT with a
+last axis other than 1 or 2, a signal on the last axis, or (fixed shapes) a
+length or axis that is not a constant; a loss reduction other than none,
+sum and mean; a target outside the classes at run time.
+
 
 ## Explicit limitations
 

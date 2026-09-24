@@ -2152,3 +2152,227 @@ Procedure DOpQConv(Y.i, X.i, W.i, XZ.i, WZ.i, Bias.i, XS.i, WS.i, YS.i, YZ.i, Mo
     PmOpQConv(Dt(X)\Data, Dt(W)\Data, xzA, wzA, 0, Dt(Y)\Data, 0, 0, 0, 0)
   EndIf
 EndProcedure
+
+; ----------------------------------------------------------------------
+; HannWindow, HammingWindow, BlackmanWindow (Kind 0, 1, 2), opset 17.
+; ----------------------------------------------------------------------
+Procedure DOpWindow(Y.i, S.i, Kind.i, Periodic.i)
+  Protected Dim dims.i(8)
+  Protected size.i
+  If S = 0
+    DFail("A window operator requires its size.")
+    ProcedureReturn
+  EndIf
+  If (Dt(S)\Kind <> 6 And Dt(S)\Kind <> 7) Or Dt(S)\Count <> 1
+    DFail("A window's size must be one INT32 or INT64 value.")
+    ProcedureReturn
+  EndIf
+  size = DInt(S, 0)
+  If size < 1
+    DFail("A window's size must be positive.")
+    ProcedureReturn
+  EndIf
+  dims(0) = size
+  If DAlloc(Y, 1, 1, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpWindow(Dt(Y)\Data, size, Kind, Periodic)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DFT-17 and -20. Len and AxisT are the optional dft_length and (DFT-20)
+; axis tensors, 0 when absent; Axis is the attribute's axis or -2.
+; ----------------------------------------------------------------------
+Procedure DOpDft(Y.i, X.i, Len.i, AxisT.i, Axis.i, Inv.i, Ones.i)
+  Protected Dim dims.i(8)
+  Protected rank.i
+  Protected comp.i
+  Protected n.i
+  Protected L.i
+  Protected d.i
+  Protected outer.i
+  Protected inner.i
+  If X = 0
+    DFail("DFT requires an input.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(X)\Rank < 2
+    DFail("DFT takes a FLOAT input of rank two or more.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(X)\Rank
+  comp = DOpDim(X, rank - 1)
+  If comp <> 1 And comp <> 2
+    DFail("DFT's last axis must be 1 (real) or 2 (complex).")
+    ProcedureReturn
+  EndIf
+  If AxisT <> 0
+    If (Dt(AxisT)\Kind <> 6 And Dt(AxisT)\Kind <> 7) Or Dt(AxisT)\Count <> 1
+      DFail("DFT's axis must be one INT32 or INT64 value.")
+      ProcedureReturn
+    EndIf
+    Axis = DInt(AxisT, 0)
+  EndIf
+  If Axis < 0
+    Axis = Axis + rank
+  EndIf
+  If Axis < 0 Or Axis >= rank - 1
+    DFail("DFT's signal axis must be one of the axes before the last.")
+    ProcedureReturn
+  EndIf
+  L = DOpDim(X, Axis)
+  If Inv <> 0 And Ones <> 0 And comp <> 2
+    DFail("An inverse one-sided DFT takes a complex spectrum.")
+    ProcedureReturn
+  EndIf
+  If Len <> 0
+    If (Dt(Len)\Kind <> 6 And Dt(Len)\Kind <> 7) Or Dt(Len)\Count <> 1
+      DFail("DFT's dft_length must be one INT32 or INT64 value.")
+      ProcedureReturn
+    EndIf
+    n = DInt(Len, 0)
+  ElseIf Inv <> 0 And Ones <> 0
+    n = 2 * (L - 1)
+  Else
+    n = L
+  EndIf
+  If n < 1
+    DFail("DFT's length must be positive.")
+    ProcedureReturn
+  EndIf
+  outer = 1
+  inner = 1
+  d = 0
+  While d < rank
+    dims(d) = DOpDim(X, d)
+    If d < Axis
+      outer = outer * dims(d)
+    ElseIf d > Axis And d < rank - 1
+      inner = inner * dims(d)
+    EndIf
+    d = d + 1
+  Wend
+  dims(Axis) = n
+  If Ones <> 0 And Inv = 0
+    dims(Axis) = n / 2 + 1
+  EndIf
+  dims(rank - 1) = 2
+  If Ones <> 0 And Inv <> 0
+    dims(rank - 1) = 1
+  EndIf
+  If DAlloc(Y, 1, rank, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = outer
+  PmOpI(1) = L
+  PmOpI(2) = inner
+  PmOpI(3) = comp
+  PmOpI(4) = n
+  PmOpI(5) = Inv
+  PmOpI(6) = Ones
+  PmOpDft(Dt(X)\Data, Dt(Y)\Data)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; NegativeLogLikelihoodLoss (Sce 0) and SoftmaxCrossEntropyLoss (1), opsets
+; 12 to 20. Code: 0 none, 1 sum, 2 mean. LP the optional log_prob output.
+; ----------------------------------------------------------------------
+Procedure DOpLoss(Y.i, LP.i, X.i, T.i, W.i, Code.i, HasIgnore.i, Ignore.i, Sce.i)
+  Protected Dim dims.i(8)
+  Protected rank.i
+  Protected n.i
+  Protected c.i
+  Protected dd.i
+  Protected d.i
+  Protected lpA.i
+  Protected scratch.i
+  Protected bytes.i
+  If X = 0 Or T = 0
+    DFail("A loss operator requires the scores and the target.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(X)\Rank < 2
+    DFail("A loss operator takes FLOAT scores [N, C, D1 ...].")
+    ProcedureReturn
+  EndIf
+  If Dt(T)\Kind <> 6 And Dt(T)\Kind <> 7
+    DFail("A loss operator's target must be INT32 or INT64.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(X)\Rank
+  n = DOpDim(X, 0)
+  c = DOpDim(X, 1)
+  dd = 1
+  d = 2
+  While d < rank
+    dd = dd * DOpDim(X, d)
+    d = d + 1
+  Wend
+  If Dt(T)\Rank <> rank - 1 Or Dt(T)\Count <> n * dd
+    DFail("A loss operator's target must be [N, D1 ...].")
+    ProcedureReturn
+  EndIf
+  If W <> 0
+    If Dt(W)\Kind <> 1 Or Dt(W)\Count <> c Or Dt(W)\Rank <> 1
+      DFail("A loss operator's weight must be FLOAT [C].")
+      ProcedureReturn
+    EndIf
+  EndIf
+  scratch = 0
+  bytes = 0
+  lpA = Dt(X)\Data
+  If Sce <> 0
+    If LP <> 0
+      If DLike(LP, X, 0) = 0
+        ProcedureReturn
+      EndIf
+      lpA = Dt(LP)\Data
+    Else
+      bytes = Dt(X)\Count * 4
+      scratch = DNsScratch(bytes)
+      If scratch = 0
+        ProcedureReturn
+      EndIf
+      lpA = scratch
+    EndIf
+    PmOpLogSoftmax(Dt(X)\Data, lpA, n, c, dd)
+  EndIf
+  If Code = 0
+    d = 0
+    While d < rank - 1
+      dims(d) = DOpDim(T, d)
+      d = d + 1
+    Wend
+    If DAlloc(Y, 1, rank - 1, @dims(0)) = 0
+      If scratch <> 0
+        DNsScratchFree(scratch, bytes)
+      EndIf
+      ProcedureReturn
+    EndIf
+  ElseIf DAlloc(Y, 1, 0, @dims(0)) = 0
+    If scratch <> 0
+      DNsScratchFree(scratch, bytes)
+    EndIf
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = n
+  PmOpI(1) = c
+  PmOpI(2) = dd
+  PmOpI(3) = Dt(T)\Kind
+  PmOpI(4) = Code
+  PmOpI(5) = HasIgnore
+  PmOpI(6) = Ignore
+  PmOpI(7) = 0
+  If W <> 0
+    PmOpI(7) = 1
+    d = PmOpNllLoss(lpA, Dt(T)\Data, Dt(W)\Data, Dt(Y)\Data)
+  Else
+    d = PmOpNllLoss(lpA, Dt(T)\Data, 0, Dt(Y)\Data)
+  EndIf
+  If scratch <> 0
+    DNsScratchFree(scratch, bytes)
+  EndIf
+  If d <> 0
+    DFail("A loss target is outside the classes and is not ignore_index.")
+  EndIf
+EndProcedure
