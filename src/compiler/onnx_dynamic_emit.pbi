@@ -385,7 +385,7 @@ Procedure.s PmdCall(*Node.PmoOnnxNode, Map Ids.i())
       call="DWhere("+y(0)+","+a(0)+","+a(1)+","+a(2)+")"
     Case "NonZero"
       call="DNonZero("+y(0)+","+a(0)+")"
-    Case "RandomNormal","RandomNormalLike","RandomUniform","RandomUniformLike"
+    Case "RandomNormal","RandomNormalLike","RandomUniform","RandomUniformLike","Bernoulli","Multinomial"
       If *Node<>*PmdTopNode Or PmdNodeIndex<0
         attr=op+" inside an If or Loop body is not implemented: its stream is keyed by a graph node index, and a node in a body would draw the same values on every pass. Move the node out of the body."
       Else

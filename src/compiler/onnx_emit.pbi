@@ -1338,6 +1338,19 @@ Procedure.i PmoEmitNode(File.i, *Ir.PmoIrModel, *Profile.PmoTargetProfile,
     If *Quant : PmoEmitLine(File, "  PmOnnxLstm\WScales = " + PmoEmitAddress(*Ir, *Quant\ScaleName)) : Else : PmoEmitLine(File, "  PmOnnxLstm\WScales = 0") : EndIf
     If *QuantR : PmoEmitLine(File, "  PmOnnxLstm\RScales = " + PmoEmitAddress(*Ir, *QuantR\ScaleName)) : Else : PmoEmitLine(File, "  PmOnnxLstm\RScales = 0") : EndIf
     PmoEmitLine(File, "  PmTensorLstm(@PmOnnxLstm)")
+  ElseIf PmoRandomIsDraw(Op)
+    If Count > #PMO_RANDOM_ELEMENT_LIMIT
+      ProcedureReturn PmoEmitFail(PmoRandomLabel(*Node, *Ref\Index) + " output has " + Str(Count) + " elements; the generator numbers elements with 32 bits, so at most 4294967295.")
+    EndIf
+    *A = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+    If Op = "Multinomial"
+      If PmoEmitRank(*A) <> 2 Or PmoEmitDim(*A, 1) < 1
+        ProcedureReturn PmoEmitFail(PmoRandomLabel(*Node, *Ref\Index) + " input has rank " + Str(PmoEmitRank(*A)) + "; Multinomial takes [batch_size, class_size] with at least one class.")
+      EndIf
+      PmoEmitLine(File, "  " + PmoRandomDrawFixedCall(*Node, *Ref\Index, Out(0), In(0), Count, PmoEmitDim(*A, 0), PmoEmitDim(*A, 1)))
+    Else
+      PmoEmitLine(File, "  " + PmoRandomDrawFixedCall(*Node, *Ref\Index, Out(0), In(0), Count, 0, 0))
+    EndIf
   ElseIf PmoRandomIsOp(Op)
     If Count > #PMO_RANDOM_ELEMENT_LIMIT
       ProcedureReturn PmoEmitFail(PmoRandomLabel(*Node, *Ref\Index) + " output has " + Str(Count) + " elements; the generator numbers elements with 32 bits, so at most 4294967295.")
@@ -1526,7 +1539,7 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
   ; The operator-set kernels, one source for every target, only where a node
   ; uses them, so every other model's source is unchanged by them.
   ForEach *Ir\Nodes()
-    If PmoOpsOwns(*Ir\Nodes()\Node\Operation)
+    If PmoOpsOwns(*Ir\Nodes()\Node\Operation) Or *Ir\Nodes()\Node\Operation = "Multinomial"
       RandomInclude = RuntimeInclude : If RandomInclude = "" : RandomInclude = *Profile\TensorInclude : EndIf
       PmoEmitLine(File, "#PMO_OPS_INT32 = " + Str(Bool(*Profile\NativeIntegerBytes = 4)))
       PmoEmitLine(File, "XIncludeFile " + Chr(34) + GetPathPart(RandomInclude) + "tensor_ops.pmi" + Chr(34))

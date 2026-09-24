@@ -2,7 +2,7 @@
 ; onnx_emit_random.pbi - the ONNX random operators in both lowering paths
 ; ----------------------------------------------------------------------------
 ; RandomUniform, RandomUniformLike, RandomNormal and RandomNormalLike
-; (ai.onnx since version 1). The specification leaves the generator open;
+; (ai.onnx since version 1), Bernoulli (15) and Multinomial (7). The specification leaves the generator open;
 ; this compiler specifies it (runtime/tensor_random.pmi) so one seed gives
 ; the same FLOAT values on every target. Here: the validator's sentences,
 ; the emitted calls for the fixed-shape and runtime-dimension paths, the
@@ -23,7 +23,8 @@ EndProcedure
 
 Procedure.i PmoRandomIsOp(Operation.s)
   ProcedureReturn Bool(Operation = "RandomUniform" Or Operation = "RandomUniformLike" Or
-                       Operation = "RandomNormal" Or Operation = "RandomNormalLike")
+                       Operation = "RandomNormal" Or Operation = "RandomNormalLike" Or
+                       Operation = "Bernoulli" Or Operation = "Multinomial")
 EndProcedure
 
 Procedure.i PmoRandomIsLike(Operation.s)
@@ -67,6 +68,77 @@ Procedure.s PmoRandomLabel(*Node.PmoOnnxNode, NodeIndex.i)
   ProcedureReturn "node " + Str(NodeIndex) + " (" + *Node\Operation + ")"
 EndProcedure
 
+; Bernoulli-15 and Multinomial-7 draw from the same streams: element i's
+; uniform u = (w0 >> 8) * 2^-24 of the node's key. Bernoulli writes 1 where
+; u < p (the operator's text: P(1) = p; its ONNX function body compares the
+; other way), Multinomial turns u into a class index (tensor_ops.pmi).
+Procedure.i PmoRandomIsDraw(Operation.s)
+  ProcedureReturn Bool(Operation = "Bernoulli" Or Operation = "Multinomial")
+EndProcedure
+
+; The output element type of a Bernoulli or Multinomial node.
+Procedure.i PmoRandomDrawKind(*Node.PmoOnnxNode)
+  Protected *Attr.PmoOnnxAttribute = PmoRandomAttr(*Node, "dtype")
+  If *Attr : ProcedureReturn *Attr\IntegerValue : EndIf
+  If *Node\Operation = "Multinomial" : ProcedureReturn 6 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmoRandomDrawSamples(*Node.PmoOnnxNode)
+  Protected *Attr.PmoOnnxAttribute
+  If *Node\Operation <> "Multinomial" : ProcedureReturn 0 : EndIf
+  *Attr = PmoRandomAttr(*Node, "sample_size")
+  If *Attr : ProcedureReturn *Attr\IntegerValue : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.s PmoRandomValidateDraw(*Node.PmoOnnxNode, NodeIndex.i, InputType.i)
+  Protected Op.s = *Node\Operation
+  Protected Label.s = PmoRandomLabel(*Node, NodeIndex)
+  Protected Allowed.s = "|seed|dtype|"
+  Protected Name.s
+  Protected Kind.i
+  Protected InputCount.i
+  If Op = "Multinomial" : Allowed = "|sample_size|seed|dtype|" : EndIf
+  ForEach *Node\Attributes()
+    Name = *Node\Attributes()\Name
+    If FindString(Allowed, "|" + Name + "|") = 0
+      ProcedureReturn Label + " has attribute " + Name + ", which the ONNX specification does not define for " + Op + "; nothing was emitted."
+    EndIf
+    If Name = "seed"
+      If *Node\Attributes()\AttributeType <> 0 And *Node\Attributes()\AttributeType <> 1
+        ProcedureReturn Label + " attribute seed is stored as attribute type " + Str(*Node\Attributes()\AttributeType) + "; the ONNX specification defines it as FLOAT."
+      EndIf
+    ElseIf *Node\Attributes()\AttributeType <> 0 And *Node\Attributes()\AttributeType <> 2
+      ProcedureReturn Label + " attribute " + Name + " is stored as attribute type " + Str(*Node\Attributes()\AttributeType) + "; the ONNX specification defines it as INT."
+    EndIf
+  Next
+  Kind = PmoRandomDrawKind(*Node)
+  If Op = "Multinomial"
+    If Kind <> 6 And Kind <> 7
+      ProcedureReturn Label + " attribute dtype = " + Str(Kind) + " (" + PmoRandomTypeName(Kind) + ") is not an output type of Multinomial; INT32 (6) and INT64 (7) are."
+    EndIf
+    If PmoRandomDrawSamples(*Node) < 1
+      ProcedureReturn Label + " attribute sample_size = " + Str(PmoRandomDrawSamples(*Node)) + "; Multinomial draws at least one sample per row."
+    EndIf
+  ElseIf Kind <> 1 And Kind <> 2 And Kind <> 3 And Kind <> 6 And Kind <> 7 And Kind <> 9
+    ProcedureReturn Label + " attribute dtype = " + Str(Kind) + " (" + PmoRandomTypeName(Kind) + ") is not implemented: Bernoulli writes FLOAT (1), UINT8 (2), INT8 (3), INT32 (6), INT64 (7) or BOOL (9)."
+  EndIf
+  If InputType <> 0 And InputType <> 1
+    ProcedureReturn Label + " input has element type " + PmoRandomTypeName(InputType) + " (" + Str(InputType) + "); " + Op + " is implemented for FLOAT input."
+  EndIf
+  ForEach *Node\Inputs()
+    If *Node\Inputs() <> "" : InputCount + 1 : EndIf
+  Next
+  If InputCount <> 1 Or ListSize(*Node\Inputs()) <> 1
+    ProcedureReturn Label + " has " + Str(ListSize(*Node\Inputs())) + " inputs; " + Op + " takes exactly one."
+  EndIf
+  If ListSize(*Node\Outputs()) <> 1 Or PmoRandomOutputName(*Node) = ""
+    ProcedureReturn Label + " has " + Str(ListSize(*Node\Outputs())) + " outputs; " + Op + " has exactly one."
+  EndIf
+  ProcedureReturn ""
+EndProcedure
+
 ; The claimed forms, and a sentence naming the operator, the attribute and
 ; the value for every form that is not. InputType is the element type of a
 ; Like node's input when the caller knows it, 0 when it does not.
@@ -81,6 +153,7 @@ Procedure.s PmoRandomValidate(*Node.PmoOnnxNode, NodeIndex.i, InputType.i)
   Protected Axis.i
   Protected InputCount.i
   Protected *Attr.PmoOnnxAttribute
+  If PmoRandomIsDraw(Op) : ProcedureReturn PmoRandomValidateDraw(*Node, NodeIndex, InputType) : EndIf
   If PmoRandomIsNormal(Op)
     Allowed = "|mean|scale|seed|dtype|"
   Else
@@ -191,7 +264,7 @@ Procedure.s PmoRandomValidateModel(*Model.PmoOnnxModel)
   ForEach *Model\Graph\Nodes()
     If PmoRandomIsOp(*Model\Graph\Nodes()\Operation) And (*Model\Graph\Nodes()\Domain = "" Or *Model\Graph\Nodes()\Domain = "ai.onnx")
       InputType = 0
-      If PmoRandomIsLike(*Model\Graph\Nodes()\Operation) And FirstElement(*Model\Graph\Nodes()\Inputs())
+      If (PmoRandomIsLike(*Model\Graph\Nodes()\Operation) Or PmoRandomIsDraw(*Model\Graph\Nodes()\Operation)) And FirstElement(*Model\Graph\Nodes()\Inputs())
         InputType = PmoRandomDeclaredType(*Model, *Model\Graph\Nodes()\Inputs())
       EndIf
       Message = PmoRandomValidate(@*Model\Graph\Nodes(), Index, InputType)
@@ -199,7 +272,11 @@ Procedure.s PmoRandomValidateModel(*Model.PmoOnnxModel)
       ; A declared output type other than FLOAT contradicts the node.
       FirstElement(*Model\Graph\Nodes()\Outputs())
       Declared = PmoRandomDeclaredType(*Model, *Model\Graph\Nodes()\Outputs())
-      If Declared <> 0 And Declared <> 1
+      If PmoRandomIsDraw(*Model\Graph\Nodes()\Operation)
+        If Declared <> 0 And Declared <> PmoRandomDrawKind(@*Model\Graph\Nodes())
+          ProcedureReturn PmoRandomLabel(@*Model\Graph\Nodes(), Index) + " output " + *Model\Graph\Nodes()\Outputs() + " is declared " + PmoRandomTypeName(Declared) + " (" + Str(Declared) + "); the node produces " + PmoRandomTypeName(PmoRandomDrawKind(@*Model\Graph\Nodes())) + " (" + Str(PmoRandomDrawKind(@*Model\Graph\Nodes())) + ")."
+        EndIf
+      ElseIf Declared <> 0 And Declared <> 1
         ProcedureReturn PmoRandomLabel(@*Model\Graph\Nodes(), Index) + " output " + *Model\Graph\Nodes()\Outputs() + " is declared " + PmoRandomTypeName(Declared) + " (" + Str(Declared) + "); this compiler generates FLOAT (1) random tensors only."
       EndIf
     EndIf
@@ -248,6 +325,16 @@ Procedure.s PmoRandomDynamicCall(*Node.PmoOnnxNode, NodeIndex.i, OutputId.s, Inp
   Protected Text.s
   Protected Axis.i
   Protected *Attr.PmoOnnxAttribute
+  If PmoRandomIsDraw(*Node\Operation)
+    If AsInput : ProcedureReturn "DRandomFedKind(" + OutputId + "," + InputId + "," + Str(PmoRandomDrawSamples(*Node)) + "," + Str(PmoRandomDrawKind(*Node)) + ")" : EndIf
+    Text = PmoRandomArguments(*Node, NodeIndex)
+    Text = StringField(Text, 1, ",") + "," + StringField(Text, 2, ",") + "," + StringField(Text, 3, ",")
+    If *Node\Operation = "Bernoulli"
+      ProcedureReturn "DRandomBernoulli(" + OutputId + "," + InputId + "," + Text + "," + Str(PmoRandomDrawKind(*Node)) + ")"
+    EndIf
+    ProcedureReturn "If DRandomMultinomial(" + OutputId + "," + InputId + "," + Text + "," + Str(PmoRandomDrawSamples(*Node)) + "," + Str(PmoRandomDrawKind(*Node)) + ") : DOpMultinomialPick(" +
+                    OutputId + "," + InputId + "," + Str(PmoRandomDrawSamples(*Node)) + "," + Str(PmoRandomDrawKind(*Node)) + ") : EndIf"
+  EndIf
   If PmoRandomIsLike(*Node\Operation)
     If AsInput : ProcedureReturn "DRandomFed(" + OutputId + "," + InputId + ",0)" : EndIf
     ProcedureReturn "DRandomLike(" + OutputId + "," + InputId + "," + PmoRandomArguments(*Node, NodeIndex) + ")"
@@ -272,6 +359,18 @@ Procedure.s PmoRandomFixedCall(*Node.PmoOnnxNode, NodeIndex.i, Destination.s, Co
   Arguments = StringField(Arguments, 1, ",") + "," + StringField(Arguments, 2, ",") + "," + StringField(Arguments, 3, ",") + "," +
               Str(Val(Kind) & 1) + "," + StringField(Arguments, 5, ",") + "," + StringField(Arguments, 6, ",")
   ProcedureReturn "If PmRandomNodeBits(" + Destination + ", " + Str(Count) + ", " + ReplaceString(Arguments, ",", ", ") + ") = 0 : PmOnnxRuntimeOk = 0 : EndIf"
+EndProcedure
+
+; Fixed-shape call text for Bernoulli and Multinomial: Source is the input
+; address; Batch and Classes are the Multinomial input's extents.
+Procedure.s PmoRandomDrawFixedCall(*Node.PmoOnnxNode, NodeIndex.i, Destination.s, Source.s, Count.q, Batch.q, Classes.q)
+  Protected Arguments.s = PmoRandomArguments(*Node, NodeIndex)
+  Protected Key.s = StringField(Arguments, 1, ",") + ", " + StringField(Arguments, 2, ",") + ", " + StringField(Arguments, 3, ",")
+  If *Node\Operation = "Bernoulli"
+    ProcedureReturn "If PmRandomBernoulli(" + Source + ", " + Destination + ", " + Str(Count) + ", " + Key + ", " + Str(PmoRandomDrawKind(*Node)) + ") = 0 : PmOnnxRuntimeOk = 0 : EndIf"
+  EndIf
+  ProcedureReturn "If PmRandomUniformDraws(" + Destination + ", " + Str(Count) + ", " + Key + ") = 0 : PmOnnxRuntimeOk = 0 : Else : PmOpMultinomial(" + Source + ", " + Destination + ", " +
+                  Str(Batch) + ", " + Str(Classes) + ", " + Str(PmoRandomDrawSamples(*Node)) + ", " + Str(PmoRandomDrawKind(*Node)) + ") : EndIf"
 EndProcedure
 
 ; Comparison mode on the fixed-shape path: each random node leaves the
@@ -331,7 +430,30 @@ Procedure.s PmoRandomManifestText(*Model.PmoOnnxModel, AsInputs.i, FirstInput.i,
   Text + PmoRandomJsonText("normal_transform") + ":" + PmoRandomJsonText("Box-Muller cosine branch in basic binary32 operations; |z| <= 5.77") + ","
   Text + PmoRandomJsonText("contract") + ":" + PmoRandomJsonText("the same FLOAT values for one seed, request number and shape on every target") + ","
   ForEach *Model\Graph\Nodes()
-    If PmoRandomIsOp(*Model\Graph\Nodes()\Operation)
+    If PmoRandomIsDraw(*Model\Graph\Nodes()\Operation)
+      If Nodes <> "" : Nodes + "," : EndIf
+      Nodes + "{" + PmoRandomJsonText("index") + ":" + Str(Index) + ","
+      Nodes + PmoRandomJsonText("name") + ":" + PmoRandomJsonText(*Model\Graph\Nodes()\Name) + ","
+      Nodes + PmoRandomJsonText("op") + ":" + PmoRandomJsonText(*Model\Graph\Nodes()\Operation) + ","
+      Nodes + PmoRandomJsonText("output") + ":" + PmoRandomJsonText(PmoRandomOutputName(@*Model\Graph\Nodes())) + ","
+      If *Model\Graph\Nodes()\Operation = "Bernoulli"
+        Nodes + PmoRandomJsonText("transform") + ":" + PmoRandomJsonText("1 where (w0 >> 8) * 2^-24 < p, else 0") + ","
+      Else
+        Nodes + PmoRandomJsonText("transform") + ":" + PmoRandomJsonText("the first class whose running sum of exp(x - max) exceeds (w0 >> 8) * 2^-24 times the total") + ","
+        Nodes + PmoRandomJsonText("sample_size") + ":" + Str(PmoRandomDrawSamples(@*Model\Graph\Nodes())) + ","
+      EndIf
+      *Attr = PmoRandomAttr(@*Model\Graph\Nodes(), "seed")
+      If *Attr
+        Nodes + PmoRandomJsonText("seed") + ":" + PmoRandomJsonText("attribute") + "," + PmoRandomJsonText("seed_bits") + ":" + PmoRandomJsonText(PmoRandomHex(PmoRandomBits(*Attr\FloatValue))) + ","
+      Else
+        Nodes + PmoRandomJsonText("seed") + ":" + PmoRandomJsonText("model") + ","
+      EndIf
+      If AsInputs
+        Nodes + PmoRandomJsonText("input_index") + ":" + Str(InputIndex) + ","
+        InputIndex + 1
+      EndIf
+      Nodes + PmoRandomJsonText("dtype") + ":" + Str(PmoRandomDrawKind(@*Model\Graph\Nodes())) + "}"
+    ElseIf PmoRandomIsOp(*Model\Graph\Nodes()\Operation)
       P1 = 0.0 : P2 = 1.0
       If PmoRandomIsNormal(*Model\Graph\Nodes()\Operation)
         First = "mean" : Second = "scale"

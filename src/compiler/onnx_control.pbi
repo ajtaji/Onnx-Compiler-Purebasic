@@ -140,6 +140,7 @@ Procedure.i PmcOperatorFloor(Operation.s)
     Case "Exp", "Log", "Sqrt", "Abs", "Neg", "Floor", "Sigmoid", "Tanh", "LeakyRelu", "Cast" : ProcedureReturn 6
     Case "Add", "Sub", "Mul", "Div", "Pow", "Equal", "Greater", "Less", "And", "Sin", "Cos", "Atan", "LSTM" : ProcedureReturn 7
     Case "Expand" : ProcedureReturn 8
+    Case "Multinomial" : ProcedureReturn 7
     Case "ConstantOfShape", "Where", "NonZero" : ProcedureReturn 9
     Case "Slice" : ProcedureReturn 10
     Case "Gather", "Concat", "Range", "Round", "CumSum", "ScatterND", "Squeeze", "Unsqueeze", "Clip", "Resize", "Gemm",
@@ -147,6 +148,7 @@ Procedure.i PmcOperatorFloor(Operation.s)
          "SequenceLength", "SequenceErase", "SplitToSequence", "ConcatFromSequence" : ProcedureReturn 11
     Case "GreaterOrEqual" : ProcedureReturn 12
     Case "Softmax" : ProcedureReturn 13
+    Case "Bernoulli" : ProcedureReturn 15
     Case "LayerNormalization", "STFT" : ProcedureReturn 17
   EndSelect
   ProcedureReturn 20

@@ -6449,3 +6449,91 @@ Procedure PmOpUniqueWrite(x.i, n.i, slen.i, inner.i, bytes.i, count.i, grp.i, fi
     Wend
   EndIf
 EndProcedure
+
+; ----------------------------------------------------------------------
+; Multinomial-7. x holds batch rows of classes unnormalized
+; log-probabilities. On entry y holds batch * samples uniform draws in
+; [0, 1) as FLOAT (the node's RandomUniform stream, written there by
+; tensor_random.pmi); they are replaced, last first, by class indices
+; (kind 6 INT32, 7 INT64), so an INT64 index never overwrites a draw still
+; to be read. Row b's weights are w(k) = exp(x(k) - max), summed in class
+; order; draw i of row b picks the first class k whose running sum exceeds
+; t = u(i) * total. When none does (t rounded up to the total, or weights
+; that are not finite) it picks the last class with a positive weight, else
+; class 0.
+; ----------------------------------------------------------------------
+Procedure.f PmOpMnMax(x.i, b.i, classes.i)
+  Protected k.i
+  Protected mx.f
+  Protected v.f
+  mx = PmTensorGet(x, b * classes)
+  k = 1
+  While k < classes
+    v = PmTensorGet(x, b * classes + k)
+    If v > mx
+      mx = v
+    EndIf
+    k = k + 1
+  Wend
+  ProcedureReturn mx
+EndProcedure
+
+Procedure PmOpMultinomial(x.i, y.i, batch.i, classes.i, samples.i, kind.i)
+  Protected i.i
+  Protected b.i
+  Protected k.i
+  Protected pick.i
+  Protected last.i
+  Protected mx.f
+  Protected v.f
+  Protected w.f
+  Protected run.f
+  Protected total.f
+  Protected t.f
+  PmOpInit()
+  i = batch * samples - 1
+  While i >= 0
+    b = i / samples
+    mx = PmOpMnMax(x, b, classes)
+    total = 0.0
+    last = -1
+    k = 0
+    While k < classes
+      v = PmTensorGet(x, b * classes + k)
+      v = v - mx
+      w = PmOpExp(v)
+      If w > 0.0
+        last = k
+      EndIf
+      total = total + w
+      k = k + 1
+    Wend
+    If last < 0
+      last = 0
+    EndIf
+    t = PmTensorGet(y, i)
+    t = t * total
+    run = 0.0
+    pick = -1
+    k = 0
+    While k < classes And pick < 0
+      v = PmTensorGet(x, b * classes + k)
+      v = v - mx
+      w = PmOpExp(v)
+      run = run + w
+      If t < run
+        pick = k
+      EndIf
+      k = k + 1
+    Wend
+    If pick < 0
+      pick = last
+    EndIf
+    If kind = 7
+      PmTensorPutI64(y, i, pick)
+    Else
+      PokeL(y + i * 4, pick)
+    EndIf
+    i = i - 1
+  Wend
+EndProcedure

@@ -682,6 +682,39 @@ SequenceErase position outside the sequence, or an empty sequence, at run
 time. SequenceErase, refused in the section on control flow and sequences,
 now compiles.
 
+## Group C, third batch (second half): Bernoulli and Multinomial — September 24, 2026
+
+Bernoulli (opset 15) and Multinomial (opset 7) join the random operators
+on both paths and every target, under the contract of the
+[random operators](#random-operators--september-16-2026): the same node
+key, the same element counter, the same uniform `u = (w0 >> 8) * 2^-24`.
+
+| Part | Contract |
+|---|---|
+| Bernoulli | FLOAT probabilities in; `1` where `u < p`, else `0`, as FLOAT, UINT8, INT8, INT32, INT64 or BOOL (`dtype`; FLOAT without one). So `P(1) = p` for `p` in [0, 1], `p = 1` always gives 1, `p = 0` and a NaN give 0. This is the operator's text and the reference's; the ONNX function body of Bernoulli (`Greater(RandomUniformLike(x), x)`) gives 1 with probability `1 - p`, and is not followed. |
+| Multinomial | FLOAT `[batch_size, class_size]` of unnormalized log-probabilities in; `[batch_size, sample_size]` INT32 or INT64 class indices out. Draw `i` of row `b` is element `b * sample_size + s` of the stream. Row weights `exp(x - max)` (the binary32 `exp` of `runtime/tensor_ops.pmi`) are summed in class order; the draw picks the first class whose running sum exceeds `u * total`, else the last class with a positive weight, else class 0 (a row whose weights are not finite). The draws are written into the output buffer first and replaced by indices last to first, so no scratch is needed. |
+| Comparison | `--random-inputs` turns these nodes into model inputs too; the manifest gives each node's `dtype`, and a supplied tensor of another element type or shape fails the request with a sentence. |
+| Claimed forms | Bernoulli on FLOAT input; Multinomial on FLOAT input of rank 2 with at least one class, `sample_size` of at least 1. Every other `dtype`, a non-FLOAT input and an unknown attribute are refused with a sentence naming the node, the attribute and the value. |
+
+The onnx 1.22.0 corpus has no case for either operator at opset 20 or lower
+(its Bernoulli cases are opset 22), so the checks are these:
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 537 cases - the 525 before; Multinomial over random rows, logits 100 apart (an overflowing `exp` without the shift), equal logits, `-inf` and `+inf` and NaN in a row, 40 classes, a draw of `1 - 2^-24`, INT32 and INT64 in place | Windows, Pi 4, Pico and Pico 2: 537 of 537 bit-identical to the definition; `--mutants` 57 of 57 caught (three new: the max shift, the running sum, the draw's scale) |
+| `tests/node_suite/targeted_ops.py`: 813 cases - the 795 before; Bernoulli with a seed, with the model seed, after another node (index 1), as FLOAT, BOOL, INT64 and UINT8; Multinomial with one and nine samples, INT32 and INT64, seeded and not; FLOAT16 Bernoulli and FLOAT Multinomial refused. Expected values from the contract written out in the harness (Threefry checked against two published answers there) | 813 of 813 as expected |
+| `ops_targets_gate.py`: the new builds on the Pi 4, Pico and Pico 2 in unicorn | 14 builds, 42 runs: 42 of 42 bit-identical to the Windows program |
+| `random_operator_gate.py` (private tree), all parts, with a new part for these two in comparison mode | 235 checks PASS: node-test forms, refusals, seed and request sequences, comparison mode for all six operators, Kitten, the Pi 4 fixed-shape and runtime-dimension sources in the A64 interpreter, and the Pico, Pico 2 and UNO Q sources built |
+| Statistics from the contract over 400,000 draws (seed 3) and 20,000 draws of a five-class row | Bernoulli frequency within 2.4 standard errors of p for p = 0.01, 0.1, 0.5, 0.9; Multinomial chi-square 2.15 on 4 degrees of freedom |
+| Official node tests at opset 20 or lower, this change against the previous compiler | PASS 559 of 964 before and after; no case changes (the corpus has none for these operators) |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `43a461e` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
+| Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
+
+A model that uses a random operator exports the generator and its
+wrappers, which now carry the appended procedures (`PmRandomBernoulli`,
+`PmRandomUniformDraws`; `DRandomBernoulli`, `DRandomMultinomial`,
+`DRandomFedKind`); a model with Multinomial also carries `tensor_ops.pmi`.
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

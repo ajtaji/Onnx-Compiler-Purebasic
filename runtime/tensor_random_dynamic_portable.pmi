@@ -74,3 +74,69 @@ Procedure DRandomFed(Y.i,A.i,Rank.i)
     EndIf
   Next
 EndProcedure
+
+; Bernoulli: Y takes X's shape and Kind (the dtype attribute, or FLOAT when
+; the node has none); X must be FLOAT.
+Procedure DRandomBernoulli(Y.i,X.i,Node.i,HasSeed.i,SeedBits.i,Kind.i)
+  If Dt(X)\Kind<>1
+    DFail("Bernoulli takes FLOAT probabilities; its input has another element type.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y,X,Kind)=0
+    ProcedureReturn
+  EndIf
+  If PmRandomBernoulli(Dt(X)\Data,Dt(Y)\Data,Dt(Y)\Count,Node,HasSeed,SeedBits,Kind)=0
+    DFail("A random tensor has more than 4294967295 elements; the generator numbers elements with 32 bits. Check the shape feeding this node.")
+  EndIf
+EndProcedure
+
+; Multinomial, first half: Y shaped [batch, Samples] of Kind and filled with
+; the node's uniform draws as FLOAT; DOpMultinomialPick (tensor_dynamic_ops.pmi)
+; turns them into class indices. Returns 0 after a refusal.
+Procedure.i DRandomMultinomial(Y.i,X.i,Node.i,HasSeed.i,SeedBits.i,Samples.i,Kind.i)
+  If Dt(X)\Kind<>1 Or Dt(X)\Rank<>2
+    ProcedureReturn DFail("Multinomial takes a FLOAT input of shape [batch_size, class_size].")
+  EndIf
+  If DDims(X*8+1)<1
+    ProcedureReturn DFail("Multinomial's input has no classes (class_size 0).")
+  EndIf
+  PmRandomDims(0)=DDims(X*8)
+  PmRandomDims(1)=Samples
+  If DAlloc(Y,Kind,2,@PmRandomDims(0))=0
+    ProcedureReturn 0
+  EndIf
+  If PmRandomUniformDraws(Dt(Y)\Data,Dt(Y)\Count,Node,HasSeed,SeedBits)=0
+    ProcedureReturn DFail("A random tensor has more than 4294967295 elements; the generator numbers elements with 32 bits. Check the shape feeding this node.")
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Comparison mode for Bernoulli and Multinomial: the caller supplied the
+; node's tensor. It must have the node's element type Kind and, for
+; Bernoulli (Samples 0), X's shape; for Multinomial [X's first extent, Samples].
+Procedure DRandomFedKind(Y.i,X.i,Samples.i,Kind.i)
+  Protected i.i=0
+  Protected ok.i=1
+  If Dt(Y)\Kind<>Kind
+    DFail("A random node compiled as a model input (--random-inputs) was supplied with an element type other than the one the node produces. Supply the tensor with the node's element type.")
+    ProcedureReturn
+  EndIf
+  If Samples=0
+    If Dt(Y)\Rank<>Dt(X)\Rank
+      ok=0
+    Else
+      For i=0 To Dt(X)\Rank-1
+        If DDims(Y*8+i)<>DDims(X*8+i)
+          ok=0
+        EndIf
+      Next
+    EndIf
+  ElseIf Dt(Y)\Rank<>2 Or Dt(X)\Rank<>2
+    ok=0
+  ElseIf DDims(Y*8)<>DDims(X*8) Or DDims(Y*8+1)<>Samples
+    ok=0
+  EndIf
+  If ok=0
+    DFail("A random node compiled as a model input (--random-inputs) was supplied with a shape other than the one the node produces. Supply the tensor with the node's shape.")
+  EndIf
+EndProcedure

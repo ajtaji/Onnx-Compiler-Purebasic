@@ -2,7 +2,9 @@
 ; tensor_random.pmi - the specified generator behind the ONNX random operators
 ; ----------------------------------------------------------------------
 ; Operators: RandomUniform, RandomUniformLike, RandomNormal, RandomNormalLike
-; (ai.onnx, since version 1; the definitions opset 20 uses).
+; (ai.onnx, since version 1; the definitions opset 20 uses); Bernoulli (15)
+; and Multinomial (7) draw from the same uniform (PmRandomBernoulli,
+; PmRandomUniformDraws, at the end of this file).
 ;   https://onnx.ai/onnx/operators/onnx__RandomUniform.html
 ;   https://onnx.ai/onnx/operators/onnx__RandomUniformLike.html
 ;   https://onnx.ai/onnx/operators/onnx__RandomNormal.html
@@ -416,4 +418,71 @@ Procedure.i PmRandomNodeBits(dst.i, count.i, node.i, hasSeed.i, seedBits.i, kind
   PokeL(@p1, p1Bits)
   PokeL(@p2, p2Bits)
   ProcedureReturn PmRandomNode(dst, count, node, hasSeed, seedBits, kind, p1, p2)
+EndProcedure
+
+; Bernoulli-15: element i of the output is 1 when u < x(i), where u is the
+; uniform draw RandomUniform makes for element i of this node (low 0, high
+; 1: u = (w0 >> 8) * 2^-24 in [0, 1)), and 0 otherwise; so P(1) = x(i) for
+; x(i) in [0, 1], and a NaN gives 0. kind is the output element type: 1
+; FLOAT, 2 UINT8, 3 INT8, 6 INT32, 7 INT64, 9 BOOL. Returns 0 for another
+; kind or an element count beyond 2^32, and writes nothing; 1 otherwise.
+Procedure.i PmRandomBernoulli(src.i, dst.i, count.i, node.i, hasSeed.i, seedBits.i, kind.i)
+  Protected n0.i
+  Protected n1.i
+  Protected i.i
+  Protected m.i
+  Protected b.i
+  Protected u.f
+  Protected p.f
+  If kind <> 1 And kind <> 2 And kind <> 3 And kind <> 6 And kind <> 7 And kind <> 9
+    ProcedureReturn 0
+  EndIf
+  If count < 0
+    ProcedureReturn 0
+  EndIf
+  If ((count >> 16) >> 16) <> 0
+    ProcedureReturn 0
+  EndIf
+  PmRandomInit()
+  If hasSeed <> 0
+    PmRandomThreefry(seedBits, 0, node, 1)
+  Else
+    PmRandomThreefry(PmRandomModelSeed, 0, node, 0)
+  EndIf
+  n0 = PmRandomW0
+  n1 = PmRandomW1
+  i = 0
+  While i < count
+    PmRandomThreefry(n0, n1, i, PmRandomRequest)
+    m = (PmRandomW0 >> 8) & $FFFFFF
+    u = m
+    u = u * PmRandomTwoM24
+    p = PmTensorGet(src, i)
+    b = 0
+    If u < p
+      b = 1
+    EndIf
+    If kind = 1
+      If b <> 0
+        PmTensorPut(dst, i, 1.0)
+      Else
+        PmTensorPut(dst, i, 0.0)
+      EndIf
+    ElseIf kind = 6
+      PokeL(dst + i * 4, b)
+    ElseIf kind = 7
+      PokeL(dst + i * 8, b)
+      PokeL(dst + i * 8 + 4, 0)
+    Else
+      PokeA(dst + i, b)
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; The uniform draws [0, 1) of a node's first count elements, as FLOAT at dst
+; (Multinomial's draws: tensor_ops.pmi turns them into class indices).
+Procedure.i PmRandomUniformDraws(dst.i, count.i, node.i, hasSeed.i, seedBits.i)
+  ProcedureReturn PmRandomNodeBits(dst, count, node, hasSeed, seedBits, 0, 0, $3F800000)
 EndProcedure

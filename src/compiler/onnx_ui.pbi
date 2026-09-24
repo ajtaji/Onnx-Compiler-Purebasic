@@ -416,7 +416,7 @@ Procedure PmoRunUi()
   SetGadgetState(#PMO_UI_PRECISION, 0)
   CheckBoxGadget(#PMO_UI_SIMPLIFY, 636, 171, 118, 26, "Simplify")
   CheckBoxGadget(#PMO_UI_RANDOM_INPUTS, 636, 204, 380, 24, "Random nodes as model inputs (comparison)")
-  GadgetToolTip(#PMO_UI_RANDOM_INPUTS, "Compile every RandomNormal, RandomNormalLike, RandomUniform and RandomUniformLike node as an extra model input that the caller fills, so a run can be compared sample for sample with a reference's noise. This changes the model's inputs; leave it off for deployment.")
+  GadgetToolTip(#PMO_UI_RANDOM_INPUTS, "Compile every RandomNormal, RandomNormalLike, RandomUniform, RandomUniformLike, Bernoulli and Multinomial node as an extra model input that the caller fills, so a run can be compared sample for sample with a reference's noise. This changes the model's inputs; leave it off for deployment.")
   TextGadget(#PB_Any, 770, 174, 242, 24, "Resident model (always)")
 
   TextGadget(#PB_Any, 24, 208, 280, 24, "ONNX Runtime library (fixed-extent tracing only)")

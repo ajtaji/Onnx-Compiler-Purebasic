@@ -2882,3 +2882,12 @@ Procedure DOpUnique(Y.i, I.i, V.i, C.i, X.i, Axis.i, HasAxis.i, Sorted.i)
   PmOpUniqueWrite(Dt(X)\Data, n, sl, inner, DSize(kind), count, scratch, scratch + n * 4, scratch + n * 8, yA, iA, vA, cA)
   DNsScratchFree(scratch, bytes)
 EndProcedure
+
+; ----------------------------------------------------------------------
+; Multinomial-7, after DRandomMultinomial (tensor_random_dynamic_*) has
+; shaped Y as [batch, samples] and filled it with the node's draws: the
+; draws become class indices.
+; ----------------------------------------------------------------------
+Procedure DOpMultinomialPick(Y.i, X.i, Samples.i, Kind.i)
+  PmOpMultinomial(Dt(X)\Data, Dt(Y)\Data, DOpDim(X, 0), DOpDim(X, 1), Samples, Kind)
+EndProcedure

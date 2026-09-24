@@ -73,7 +73,8 @@ Procedure.i PmoOpsGraphUses(*Graph.PmoOnnxGraph)
   Protected *Sub.PmoOnnxGraph
   If *Graph = 0 : ProcedureReturn #False : EndIf
   ForEach *Graph\Nodes()
-    If PmoOpsOwns(*Graph\Nodes()\Operation) And *Graph\Nodes()\Operation <> "CastLike"
+    ; Multinomial is a random operator whose class choice is a kernel here.
+    If (PmoOpsOwns(*Graph\Nodes()\Operation) And *Graph\Nodes()\Operation <> "CastLike") Or *Graph\Nodes()\Operation = "Multinomial"
       ProcedureReturn #True
     EndIf
     ForEach *Graph\Nodes()\Attributes()

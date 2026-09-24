@@ -106,6 +106,10 @@ def expected(case: Case, m: onnx.ModelProto):
         options = ort.SessionOptions()
         options.log_severity_level = 4
         return [np.asarray(v) for v in ort.InferenceSession(m.SerializeToString(), options, providers=["CPUExecutionProvider"]).run(None, case.feeds)]
+    if isinstance(case.oracle, tuple) and case.oracle[0] == "own":
+        # a random operator: its values are this compiler's specified
+        # generator, which neither ONNX Runtime nor the reference reproduces
+        return [np.asarray(v) for v in case.oracle[1](case.feeds)]
     if case.oracle == "ref":
         # a form ONNX Runtime computes otherwise than the reference and the
         # official test data (MaxUnpool with output_shape): the reference alone
@@ -147,6 +151,62 @@ def f32(*shape, scale=1.0):
 
 def init(name, array):
     return numpy_helper.from_array(np.asarray(array), name)
+
+
+# ---------------------------------------------------------------------------
+# The random operators' generator, as runtime/tensor_random.pmi specifies it
+# (docs/VALIDATION.md, "Random operators"): Threefry-2x32-20, the node key
+# from the seed attribute or the model seed, element i of request 0, and
+# the uniform u = (w0 >> 8) * 2^-24. Bernoulli and Multinomial draw from it.
+# ---------------------------------------------------------------------------
+def _threefry(k0, k1, c0, c1):
+    m = 0xFFFFFFFF
+    rot = (13, 15, 26, 6, 17, 29, 16, 24)
+    ks = (k0 & m, k1 & m, (0x1BD11BDA ^ k0 ^ k1) & m)
+    x0, x1 = (c0 + ks[0]) & m, (c1 + ks[1]) & m
+    for block in range(5):
+        for step in range(4):
+            x0 = (x0 + x1) & m
+            r = rot[(block % 2) * 4 + step]
+            x1 = (((x1 << r) | (x1 >> (32 - r))) & m) ^ x0
+        s = block + 1
+        x0 = (x0 + ks[s % 3]) & m
+        x1 = (x1 + ks[(s + 1) % 3] + s) & m
+    return x0, x1
+
+
+assert _threefry(0, 0, 0, 0) == (0x6B200159, 0x99BA4EFE)
+assert _threefry(0x13198A2E, 0x03707344, 0x243F6A88, 0x85A308D3) == (0xC4923A9C, 0x483DF7A0)
+
+
+def uniform_draws(count, node, seed=None):
+    if seed is None:
+        n0, n1 = _threefry(0, 0, node, 0)
+    else:
+        n0, n1 = _threefry(int(np.array([seed], np.float32).view(np.uint32)[0]), 0, node, 1)
+    return np.array([((_threefry(n0, n1, i, 0)[0] >> 8) & 0xFFFFFF) for i in range(count)], np.float32) * np.float32(2.0 ** -24)
+
+
+def bernoulli_oracle(node, seed, dtype):
+    def run(feeds):
+        p = next(iter(feeds.values())) if node == 0 else np.abs(next(iter(feeds.values())))
+        u = uniform_draws(p.size, node, seed).reshape(p.shape)
+        return [(u < p).astype(dtype)]
+    return ("own", run)
+
+
+def multinomial_oracle(node, seed, samples, dtype):
+    def run(feeds):
+        x = next(iter(feeds.values())).astype(np.float64)
+        u = uniform_draws(x.shape[0] * samples, node, seed).reshape(x.shape[0], samples).astype(np.float64)
+        w = np.exp(x - x.max(axis=1, keepdims=True))
+        c = np.cumsum(w, axis=1)
+        t = u * c[:, -1:]
+        # the kernel works in binary32: keep every draw well away from a class boundary
+        gap = np.min(np.abs(t[:, :, None] - c[:, None, :]) / c[:, -1:, None])
+        assert gap > 1e-4, "a draw lies within %g of a class boundary; choose other data" % gap
+        return [np.array([[int(np.searchsorted(c[b], t[b, s], side="right")) for s in range(samples)] for b in range(x.shape[0])], dtype)]
+    return ("own", run)
 
 
 def cases() -> list[Case]:
@@ -882,6 +942,29 @@ def cases() -> list[Case]:
                   [init("l", np.array([1, 2, 2, 1], np.int64)), init("p", np.array(-3, np.int64))], opset=11))
     c.append(Case("refuse_unique_int16", [N("Unique", ["x"], ["y"])], [("x", TensorProto.INT16, [5])], [("y", TensorProto.INT16, [None])],
                   {"x": np.array([3, 1, 3, 2, 1], np.int16)}, opset=11, refuse="implements Unique for FLOAT, UINT8, INT8, INT32, INT64 and BOOL"))
+    # Bernoulli and Multinomial: this compiler's specified generator
+    bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
+    bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]
+    c.append(Case("bernoulli_seed", [N("Bernoulli", ["x"], ["y"], seed=3.0)], [("x", F, [3, 4, 5])], [("y", F, [3, 4, 5])],
+                  {"x": bp}, opset=15, oracle=bernoulli_oracle(0, 3.0, np.float32)))
+    c.append(Case("bernoulli_model_seed_bool", [N("Bernoulli", ["x"], ["y"], dtype=B)], [("x", F, [3, 4, 5])], [("y", B, [3, 4, 5])],
+                  {"x": bp}, opset=15, oracle=bernoulli_oracle(0, None, np.bool_)))
+    c.append(Case("bernoulli_int64_after_abs", [N("Abs", ["x"], ["a"]), N("Bernoulli", ["a"], ["y"], dtype=I64, seed=-1.5)],
+                  [("x", F, [3, 4, 5])], [("y", I64, [3, 4, 5])], {"x": (bp - 0.5).astype(np.float32)}, opset=15,
+                  oracle=bernoulli_oracle(1, -1.5, np.int64)))
+    c.append(Case("bernoulli_uint8", [N("Bernoulli", ["x"], ["y"], dtype=TensorProto.UINT8, seed=11.0)], [("x", F, [7])],
+                  [("y", TensorProto.UINT8, [7])], {"x": bp.ravel()[:7].copy()}, opset=15, oracle=bernoulli_oracle(0, 11.0, np.uint8)))
+    ml = np.array([[0.0, 1.0, -1.0, 2.0, 0.5], [3.0, -20.0, 3.0, 0.0, 1.0], [-5.0, -5.0, -5.0, -5.0, -5.0]], np.float32)
+    c.append(Case("multinomial_default", [N("Multinomial", ["x"], ["y"], seed=2.0)], [("x", F, [3, 5])], [("y", I32, [3, 1])],
+                  {"x": ml}, opset=7, oracle=multinomial_oracle(0, 2.0, 1, np.int32)))
+    c.append(Case("multinomial_samples_int64", [N("Multinomial", ["x"], ["y"], seed=5.0, sample_size=9, dtype=I64)], [("x", F, [3, 5])],
+                  [("y", I64, [3, 9])], {"x": ml}, opset=7, oracle=multinomial_oracle(0, 5.0, 9, np.int64)))
+    c.append(Case("multinomial_model_seed", [N("Multinomial", ["x"], ["y"], sample_size=4)], [("x", F, [3, 5])], [("y", I32, [3, 4])],
+                  {"x": ml}, opset=15, oracle=multinomial_oracle(0, None, 4, np.int32)))
+    c.append(Case("refuse_bernoulli_float16_dtype", [N("Bernoulli", ["x"], ["y"], dtype=TensorProto.FLOAT16)], [("x", F, [4])],
+                  [("y", TensorProto.FLOAT16, [4])], {"x": bp.ravel()[:4].copy()}, opset=15, refuse="is not implemented: Bernoulli writes"))
+    c.append(Case("refuse_multinomial_float_dtype", [N("Multinomial", ["x"], ["y"], dtype=F)], [("x", F, [2, 3])],
+                  [("y", F, [2, 1])], {"x": ml[:2, :3].copy()}, opset=7, refuse="is not an output type of Multinomial"))
     return c
 
 

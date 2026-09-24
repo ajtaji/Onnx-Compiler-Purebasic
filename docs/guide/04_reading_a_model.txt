@@ -75,6 +75,7 @@ Shape           Reshape  Flatten  Squeeze  Unsqueeze  Transpose  Concat  Split
                 CenterCropPad
 Other           Cast  CastLike  Identity  Dropout (inference)
 Random          RandomNormal  RandomNormalLike  RandomUniform  RandomUniformLike
+                Bernoulli  Multinomial
 Control flow    If  Loop                              (runtime dimensions)
 Sequences       SequenceEmpty  SequenceConstruct  SequenceInsert  SequenceAt
                 SequenceErase  SequenceLength  SplitToSequence
@@ -364,8 +365,9 @@ followed by those extents.
 
 @SECTION Random operators, and checking a model that has them
 
-`RandomNormal`, `RandomNormalLike`, `RandomUniform` and `RandomUniformLike`
-are compiled on both paths and for every target. They are the one family
+`RandomNormal`, `RandomNormalLike`, `RandomUniform`, `RandomUniformLike`,
+`Bernoulli` and `Multinomial` are compiled on both paths and for every
+target. They are the one family
 where the ONNX specification leaves something open that a compiler must not:
 it fixes the distribution, the element type and the shape, and says nothing
 about the generator. Two runtimes that both follow the specification can
@@ -379,6 +381,12 @@ input is FLOAT); `mean` and `scale`, or `low` and `high`, with their
 specification defaults; the `seed` attribute; `shape` of up to eight axes; up
 to 4,294,967,295 elements per tensor. A random node is never folded and never
 scheduled with the bind-time constant work: every execution draws again.
+`Bernoulli` (opset 15) takes FLOAT probabilities and writes FLOAT, UINT8,
+INT8, INT32, INT64 or BOOL; it writes 1 where the node's uniform draw is
+below the probability, as the operator's text says (its ONNX function
+body compares the other way round). `Multinomial` (opset 7) takes FLOAT
+rows of unnormalized log-probabilities and writes INT32 or INT64 class
+indices, `sample_size` per row.
 Every other form is refused with the node, the operator, the attribute and
 the value:
 
@@ -409,18 +417,19 @@ extra model input that you fill, so you can feed the reference's own noise
 once, and pass those tensors in) and get a sample-exact comparison:
 
 @FRAG
---random-inputs makes every RandomNormal/RandomUniform(-Like) node an extra model input the caller fills.
+--random-inputs makes every RandomNormal/RandomUniform(-Like), Bernoulli and Multinomial node an extra model input the caller fills.
 @ENDFRAG
 
 The window has the same switch, "Random nodes as model inputs (comparison)".
 The extra inputs follow the graph's own inputs in node order, and the
 manifest's `random.nodes[].input_index` says which is which. Each supplied
-tensor must be FLOAT with the shape the node would have produced, and a
-wrong shape fails the request with a sentence rather than flowing on. The
+tensor must have the element type (`random.nodes[].dtype`) and the shape the
+node would have produced, and anything else fails the request with a
+sentence rather than flowing on. The
 option is refused for a model with no random node:
 
 @FRAG
-ONNX COMPILER ERROR: --random-inputs was given, but the model has no RandomNormal, RandomNormalLike, RandomUniform or RandomUniformLike node to turn into an input. Remove the option.
+ONNX COMPILER ERROR: --random-inputs was given, but the model has no RandomNormal, RandomNormalLike, RandomUniform, RandomUniformLike, Bernoulli or Multinomial node to turn into an input. Remove the option.
 @ENDFRAG
 
 @TRAP `--random-inputs` CHANGES THE MODEL'S INPUTS. A program built for the
