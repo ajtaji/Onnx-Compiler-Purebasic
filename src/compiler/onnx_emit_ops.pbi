@@ -24,7 +24,8 @@ Procedure.i PmoOpsOwns(Operation.s)
                                   "MeanVarianceNormalization|LRN|GroupNormalization|EyeLike|Det|Compress|ReverseSequence|Upsample|" +
                                   "RNN|GRU|NonMaxSuppression|RoiAlign|GridSample|QuantizeLinear|DequantizeLinear|" +
                                   "DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|HannWindow|HammingWindow|" +
-                                  "BlackmanWindow|DFT|MelWeightMatrix|NegativeLogLikelihoodLoss|SoftmaxCrossEntropyLoss|", "|" + Operation + "|"))
+                                  "BlackmanWindow|DFT|MelWeightMatrix|NegativeLogLikelihoodLoss|SoftmaxCrossEntropyLoss|Col2Im|" +
+                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|", "|" + Operation + "|"))
 EndProcedure
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
@@ -50,6 +51,11 @@ Procedure.i PmoOpsFloor(Operation.s)
     Case "HardSwish", "Trilu" : ProcedureReturn 14
     Case "CastLike" : ProcedureReturn 15
     Case "GridSample" : ProcedureReturn 16
+    Case "MaxRoiPool" : ProcedureReturn 1
+    Case "MaxUnpool" : ProcedureReturn 9
+    Case "Col2Im", "CenterCropPad" : ProcedureReturn 18
+    Case "DeformConv" : ProcedureReturn 19
+    Case "AffineGrid" : ProcedureReturn 20
     Case "QuantizeLinear", "DequantizeLinear", "MatMulInteger", "QLinearMatMul", "ConvInteger", "QLinearConv" : ProcedureReturn 10
     Case "DynamicQuantizeLinear" : ProcedureReturn 11
     Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss" : ProcedureReturn 12
@@ -1676,6 +1682,267 @@ Procedure.i PmoEmitOpsLoss(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s
   ProcedureReturn #True
 EndProcedure
 
+; ---- Col2Im, CenterCropPad, MaxUnpool, AffineGrid, MaxRoiPool, DeformConv ----
+Procedure.i PmoEmitOpsCol2Im(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected *Img.PmoIrConstant = PmoEmitConstant(*Ir, PmoEmitInput(*Node, 1))
+  Protected *Blk.PmoIrConstant = PmoEmitConstant(*Ir, PmoEmitInput(*Node, 2))
+  Protected s.i, d.i, Ok.Integer, Bl.q = 1, L.q = 1, C.q, ImgE.q, BlkE.q, Dil.q, PadB.q, PadE.q, Strd.q, Col.q
+  Protected Dim Im.q(3)
+  If PmoEmitNsAttributesAllowed(*Node, "|dilations|pads|strides|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "input", 1) = 0 : ProcedureReturn #False : EndIf
+  If *Img = 0 Or *Blk = 0 : ProcedureReturn PmoEmitNsFail(*Node, "inputs image_shape and block_shape must be constants for fixed-shape emission.") : EndIf
+  s = *Img\Elements
+  If s < 1 Or s > 3 Or *Blk\Elements <> s : ProcedureReturn PmoEmitNsFail(*Node, "image_shape and block_shape must hold one to three extents each, as many as each other.") : EndIf
+  If PmoEmitRank(*X) <> 3 : ProcedureReturn PmoEmitNsFail(*Node, "the input must be [N, C * prod(block_shape), L].") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(s))
+  For d = 0 To s - 1
+    ImgE = PmoEmitConstI(*Ir, PmoEmitInput(*Node, 1), d, @Ok)
+    BlkE = PmoEmitConstI(*Ir, PmoEmitInput(*Node, 2), d, @Ok)
+    Dil = PmoEmitAttrListI(*Node, "dilations", d, 1)
+    PadB = PmoEmitAttrListI(*Node, "pads", d, 0)
+    PadE = PmoEmitAttrListI(*Node, "pads", d + s, 0)
+    Strd = PmoEmitAttrListI(*Node, "strides", d, 1)
+    If ImgE < 1 Or BlkE < 1 Or Dil < 1 Or Strd < 1 Or PadB < 0 Or PadE < 0
+      ProcedureReturn PmoEmitNsFail(*Node, "extents, dilations and strides must be positive and pads not negative on axis " + Str(d) + ".")
+    EndIf
+    Col = (ImgE + PadB + PadE - (Dil * (BlkE - 1) + 1)) / Strd + 1
+    If Col < 1 : ProcedureReturn PmoEmitNsFail(*Node, "the block does not fit the padded image on axis " + Str(d) + ".") : EndIf
+    Bl * BlkE : L * Col : Im(d) = ImgE
+    PmoEmitLine(File, "  PmOpI(" + Str(8 + d) + ") = " + Str(ImgE))
+    PmoEmitLine(File, "  PmOpI(" + Str(12 + d) + ") = " + Str(BlkE))
+    PmoEmitLine(File, "  PmOpI(" + Str(16 + d) + ") = " + Str(Dil))
+    PmoEmitLine(File, "  PmOpI(" + Str(20 + d) + ") = " + Str(PadB))
+    PmoEmitLine(File, "  PmOpI(" + Str(24 + d) + ") = " + Str(Strd))
+    PmoEmitLine(File, "  PmOpI(" + Str(28 + d) + ") = " + Str(Col))
+  Next
+  If PmoEmitDim(*X, 1) % Bl <> 0 Or PmoEmitDim(*X, 2) <> L
+    ProcedureReturn PmoEmitNsFail(*Node, "the input must be [N, C * " + Str(Bl) + ", " + Str(L) + "] for these blocks.")
+  EndIf
+  C = PmoEmitDim(*X, 1) / Bl
+  If *Y = 0 Or *Y\ElementType <> 1 Or PmoEmitRank(*Y) <> s + 2 Or PmoEmitDim(*Y, 0) <> PmoEmitDim(*X, 0) Or PmoEmitDim(*Y, 1) <> C
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [N, " + Str(C) + ", image_shape ...].")
+  EndIf
+  For d = 0 To s - 1
+    If PmoEmitDim(*Y, 2 + d) <> Im(d) : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [N, " + Str(C) + ", image_shape ...].") : EndIf
+  Next
+  PmoEmitLine(File, "  PmOpI(1) = " + Str(PmoEmitDim(*X, 0)))
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(C))
+  PmoEmitLine(File, "  PmOpCol2Im(*i0, *o0)")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsCenterCropPad(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected *Sh.PmoIrConstant = PmoEmitConstant(*Ir, PmoEmitInput(*Node, 1))
+  Protected Rank.i, n.i, k.i, Axis.q, ShE.q, Ok.Integer, d.i
+  Protected Dim Target.q(8)
+  Protected Dim Seen.i(8)
+  If PmoEmitNsAttributesAllowed(*Node, "|axes|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "input", 1 | 2 | 4 | 8 | 16 | 32) = 0 : ProcedureReturn #False : EndIf
+  If *Sh = 0 : ProcedureReturn PmoEmitNsFail(*Node, "input shape must be a constant for fixed-shape emission.") : EndIf
+  Rank = PmoEmitRank(*X)
+  If Rank < 1 Or Rank > 8 : ProcedureReturn PmoEmitNsFail(*Node, "the input rank must be one to eight.") : EndIf
+  For d = 0 To Rank - 1 : Target(d) = PmoEmitDim(*X, d) : Next
+  n = PmoEmitAttrListCount(*Node, "axes")
+  If n = 0 : n = Rank : EndIf
+  If *Sh\Elements <> n : ProcedureReturn PmoEmitNsFail(*Node, "input shape holds " + Str(*Sh\Elements) + " extents for " + Str(n) + " axes.") : EndIf
+  For k = 0 To n - 1
+    Axis = k
+    If PmoEmitAttrListCount(*Node, "axes") > 0 : Axis = PmoEmitAttrListI(*Node, "axes", k, 0) : EndIf
+    If Axis < 0 : Axis + Rank : EndIf
+    If Axis < 0 Or Axis >= Rank Or Seen(Axis) : ProcedureReturn PmoEmitNsFail(*Node, "attribute axes names an axis outside the rank or twice.") : EndIf
+    Seen(Axis) = 1
+    ShE = PmoEmitConstI(*Ir, PmoEmitInput(*Node, 1), k, @Ok)
+    If Ok\i = 0 Or ShE < 0 : ProcedureReturn PmoEmitNsFail(*Node, "input shape must hold extents that are not negative.") : EndIf
+    Target(Axis) = ShE
+  Next
+  If *Y = 0 Or *Y\ElementType <> *X\ElementType Or PmoEmitRank(*Y) <> Rank : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must have the input's element type and rank.") : EndIf
+  For d = 0 To Rank - 1
+    If PmoEmitDim(*Y, d) <> Target(d) : ProcedureReturn PmoEmitNsFail(*Node, "the declared output extent on axis " + Str(d) + " is " + Str(PmoEmitDim(*Y, d)) + "; shape gives " + Str(Target(d)) + ".") : EndIf
+  Next
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(Rank))
+  For d = 0 To Rank - 1
+    PmoEmitLine(File, "  PmOpDA(" + Str(d) + ") = " + Str(PmoEmitDim(*X, d)))
+    PmoEmitLine(File, "  PmOpDY(" + Str(d) + ") = " + Str(Target(d)))
+    If Target(d) < PmoEmitDim(*X, d)
+      PmoEmitLine(File, "  PmOpI(" + Str(8 + d) + ") = " + Str((PmoEmitDim(*X, d) - Target(d)) / 2))
+      PmoEmitLine(File, "  PmOpI(" + Str(16 + d) + ") = 0")
+    Else
+      PmoEmitLine(File, "  PmOpI(" + Str(8 + d) + ") = 0")
+      PmoEmitLine(File, "  PmOpI(" + Str(16 + d) + ") = " + Str((Target(d) - PmoEmitDim(*X, d)) / 2))
+    EndIf
+  Next
+  PmoEmitLine(File, "  PmOpCenterCropPad(*i0, *o0, " + Str(PmoEmitElementBytes(*X\ElementType)) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsMaxUnpool(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *I.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected s.i, d.i, Rank.i, Inf.q, Ok.Integer, K.q, Strd.q, PadB.q, PadE.q, O.q
+  If PmoEmitNsAttributesAllowed(*Node, "|kernel_shape|pads|strides|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "X", 1) = 0 Or PmoOpsTypeOk(*Node, *I, "I", 4) = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*X) : s = Rank - 2
+  If s < 1 Or s > 3 : ProcedureReturn PmoEmitNsFail(*Node, "X must be N x C x D1 ... Ds with one to three spatial axes.") : EndIf
+  If PmoEmitShapeEqual(*X, *I) = 0 : ProcedureReturn PmoEmitNsFail(*Node, "I must have X's shape.") : EndIf
+  If PmoEmitAttrListCount(*Node, "kernel_shape") <> s : ProcedureReturn PmoEmitNsFail(*Node, "attribute kernel_shape must hold " + Str(s) + " extents.") : EndIf
+  If PmoEmitInput(*Node, 2) <> "" And PmoEmitConstant(*Ir, PmoEmitInput(*Node, 2)) = 0
+    ProcedureReturn PmoEmitNsFail(*Node, "input output_shape must be a constant for fixed-shape emission.")
+  EndIf
+  If *Y = 0 Or *Y\ElementType <> 1 Or PmoEmitRank(*Y) <> Rank : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT with X's rank.") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(Rank))
+  PmoEmitLine(File, "  PmOpI(1) = 7")
+  For d = 0 To Rank - 1
+    If d < 2
+      Inf = PmoEmitDim(*X, d)
+    Else
+      K = PmoEmitAttrListI(*Node, "kernel_shape", d - 2, 1)
+      Strd = PmoEmitAttrListI(*Node, "strides", d - 2, 1)
+      PadB = PmoEmitAttrListI(*Node, "pads", d - 2, 0)
+      PadE = PmoEmitAttrListI(*Node, "pads", d - 2 + s, 0)
+      Inf = (PmoEmitDim(*X, d) - 1) * Strd - (PadB + PadE) + K
+    EndIf
+    O = Inf
+    If PmoEmitInput(*Node, 2) <> "" : O = PmoEmitConstI(*Ir, PmoEmitInput(*Node, 2), d, @Ok) : EndIf
+    If Inf < 1 Or O < Inf Or (d < 2 And O <> Inf)
+      ProcedureReturn PmoEmitNsFail(*Node, "output_shape must hold X's first two extents and at least the inferred extent on each spatial axis (" + Str(Inf) + " on axis " + Str(d) + ").")
+    EndIf
+    If PmoEmitDim(*Y, d) <> O : ProcedureReturn PmoEmitNsFail(*Node, "the declared output extent on axis " + Str(d) + " is " + Str(PmoEmitDim(*Y, d)) + "; it is " + Str(O) + ".") : EndIf
+    PmoEmitLine(File, "  PmOpDA(" + Str(d) + ") = " + Str(PmoEmitDim(*X, d)))
+    PmoEmitLine(File, "  PmOpDB(" + Str(d) + ") = " + Str(Inf))
+    PmoEmitLine(File, "  PmOpDY(" + Str(d) + ") = " + Str(O))
+  Next
+  PmoEmitLine(File, "  If PmOpMaxUnpool(*i0, *i1, *o0) <> 0 : PmOnnxRuntimeOk = 0 : EndIf")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsAffineGrid(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *T.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected *Sz.PmoIrConstant = PmoEmitConstant(*Ir, PmoEmitInput(*Node, 1))
+  Protected r.i, d.i, Ok.Integer, E.q
+  If PmoEmitNsAttributesAllowed(*Node, "|align_corners|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *T, "theta", 1) = 0 : ProcedureReturn #False : EndIf
+  If *Sz = 0 : ProcedureReturn PmoEmitNsFail(*Node, "input size must be a constant for fixed-shape emission.") : EndIf
+  r = *Sz\Elements - 2
+  If r < 2 Or r > 3 : ProcedureReturn PmoEmitNsFail(*Node, "size must be [N, C, H, W] or [N, C, D, H, W].") : EndIf
+  If PmoEmitRank(*T) <> 3 Or PmoEmitDim(*T, 1) <> r Or PmoEmitDim(*T, 2) <> r + 1 Or PmoEmitDim(*T, 0) <> PmoEmitConstI(*Ir, PmoEmitInput(*Node, 1), 0, @Ok)
+    ProcedureReturn PmoEmitNsFail(*Node, "theta must be [N, " + Str(r) + ", " + Str(r + 1) + "] with size's N.")
+  EndIf
+  If *Y = 0 Or *Y\ElementType <> 1 Or PmoEmitRank(*Y) <> r + 2 Or PmoEmitDim(*Y, 0) <> PmoEmitDim(*T, 0) Or PmoEmitDim(*Y, r + 1) <> r
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [N, spatial ..., " + Str(r) + "].")
+  EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(PmoEmitDim(*T, 0)))
+  PmoEmitLine(File, "  PmOpI(1) = " + Str(r))
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(Bool(PmoEmitAttrI(*Node, "align_corners", 0) <> 0)))
+  For d = 0 To r - 1
+    E = PmoEmitConstI(*Ir, PmoEmitInput(*Node, 1), d + 2, @Ok)
+    If E < 1 Or PmoEmitDim(*Y, d + 1) <> E : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [N, spatial ..., " + Str(r) + "] with size's extents.") : EndIf
+    PmoEmitLine(File, "  PmOpI(" + Str(8 + d) + ") = " + Str(E))
+  Next
+  PmoEmitLine(File, "  PmOpAffineGrid(*i0, *o0)")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsMaxRoiPool(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *R.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Ph.q, Pw.q
+  If PmoEmitNsAttributesAllowed(*Node, "|pooled_shape|spatial_scale|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "X", 1) = 0 Or PmoOpsTypeOk(*Node, *R, "rois", 1) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitAttrListCount(*Node, "pooled_shape") <> 2 : ProcedureReturn PmoEmitNsFail(*Node, "attribute pooled_shape is required, two extents.") : EndIf
+  Ph = PmoEmitAttrListI(*Node, "pooled_shape", 0, 0) : Pw = PmoEmitAttrListI(*Node, "pooled_shape", 1, 0)
+  If Ph < 1 Or Pw < 1 : ProcedureReturn PmoEmitNsFail(*Node, "pooled_shape must be positive.") : EndIf
+  If PmoEmitRank(*X) <> 4 Or PmoEmitRank(*R) <> 2 Or PmoEmitDim(*R, 1) <> 5 : ProcedureReturn PmoEmitNsFail(*Node, "X must be N x C x H x W and rois [num_rois, 5].") : EndIf
+  If *Y = 0 Or *Y\ElementType <> 1 Or *Y\Elements <> PmoEmitDim(*R, 0) * PmoEmitDim(*X, 1) * Ph * Pw
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [num_rois, C, " + Str(Ph) + ", " + Str(Pw) + "].")
+  EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(PmoEmitDim(*X, 0)))
+  PmoEmitLine(File, "  PmOpI(1) = " + Str(PmoEmitDim(*X, 1)))
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(PmoEmitDim(*X, 2)))
+  PmoEmitLine(File, "  PmOpI(3) = " + Str(PmoEmitDim(*X, 3)))
+  PmoEmitLine(File, "  PmOpI(4) = " + Str(PmoEmitDim(*R, 0)))
+  PmoEmitLine(File, "  PmOpI(5) = " + Str(Ph))
+  PmoEmitLine(File, "  PmOpI(6) = " + Str(Pw))
+  PmoEmitLine(File, "  PmOpSetBits(@PmOpF(0), " + PmoOpsBits(PmoEmitAttrF(*Node, "spatial_scale", 1.0)) + ")")
+  PmoEmitLine(File, "  If PmOpMaxRoiPool(*i0, *i1, *o0) <> 0 : PmOnnxRuntimeOk = 0 : EndIf")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsDeformConv(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *W.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *Off.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+  Protected *B.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 3))
+  Protected *M.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 4))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected G.q, OG.q, C.q, Mo.q, Kh.q, Kw.q, Oh.q, Ow.q, d.i
+  Protected Dim St.q(1)
+  Protected Dim Dl.q(1)
+  Protected Dim Pd.q(3)
+  If PmoEmitNsAttributesAllowed(*Node, "|dilations|group|kernel_shape|offset_group|pads|strides|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "X", 1) = 0 Or PmoOpsTypeOk(*Node, *W, "W", 1) = 0 Or PmoOpsTypeOk(*Node, *Off, "offset", 1) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitRank(*X) <> 4 : ProcedureReturn PmoEmitNsFail(*Node, "X has rank " + Str(PmoEmitRank(*X)) + "; two spatial axes (N x C x H x W) are implemented, as in the reference.") : EndIf
+  G = PmoEmitAttrI(*Node, "group", 1) : OG = PmoEmitAttrI(*Node, "offset_group", 1)
+  C = PmoEmitDim(*X, 1) : Mo = PmoEmitDim(*W, 0) : Kh = PmoEmitDim(*W, 2) : Kw = PmoEmitDim(*W, 3)
+  If PmoEmitRank(*W) <> 4 Or G < 1 Or OG < 1 Or C <> G * PmoEmitDim(*W, 1) Or Mo % G <> 0 Or C % OG <> 0
+    ProcedureReturn PmoEmitNsFail(*Node, "group and offset_group do not divide the channels as W's shape requires.")
+  EndIf
+  If PmoEmitAttrListCount(*Node, "kernel_shape") > 0 And (PmoEmitAttrListI(*Node, "kernel_shape", 0, 0) <> Kh Or PmoEmitAttrListI(*Node, "kernel_shape", 1, 0) <> Kw)
+    ProcedureReturn PmoEmitNsFail(*Node, "attribute kernel_shape does not match W.")
+  EndIf
+  For d = 0 To 1
+    St(d) = PmoEmitAttrListI(*Node, "strides", d, 1) : Dl(d) = PmoEmitAttrListI(*Node, "dilations", d, 1)
+    Pd(d) = PmoEmitAttrListI(*Node, "pads", d, 0) : Pd(d + 2) = PmoEmitAttrListI(*Node, "pads", d + 2, 0)
+    If St(d) < 1 Or Dl(d) < 1 Or Pd(d) < 0 Or Pd(d + 2) < 0 : ProcedureReturn PmoEmitNsFail(*Node, "strides and dilations must be positive and pads not negative.") : EndIf
+  Next
+  Oh = (PmoEmitDim(*X, 2) + Pd(0) + Pd(2) - (Dl(0) * (Kh - 1) + 1)) / St(0) + 1
+  Ow = (PmoEmitDim(*X, 3) + Pd(1) + Pd(3) - (Dl(1) * (Kw - 1) + 1)) / St(1) + 1
+  If Oh < 1 Or Ow < 1 : ProcedureReturn PmoEmitNsFail(*Node, "the kernel is larger than the padded input.") : EndIf
+  If PmoEmitRank(*Off) <> 4 Or PmoEmitDim(*Off, 0) <> PmoEmitDim(*X, 0) Or PmoEmitDim(*Off, 1) <> OG * Kh * Kw * 2 Or PmoEmitDim(*Off, 2) <> Oh Or PmoEmitDim(*Off, 3) <> Ow
+    ProcedureReturn PmoEmitNsFail(*Node, "offset must be [N, " + Str(OG * Kh * Kw * 2) + ", " + Str(Oh) + ", " + Str(Ow) + "].")
+  EndIf
+  If *B And (*B\ElementType <> 1 Or *B\Elements <> Mo) : ProcedureReturn PmoEmitNsFail(*Node, "B must be FLOAT [" + Str(Mo) + "].") : EndIf
+  If *M And (*M\ElementType <> 1 Or *M\Elements <> PmoEmitDim(*X, 0) * OG * Kh * Kw * Oh * Ow) : ProcedureReturn PmoEmitNsFail(*Node, "mask must be FLOAT [N, " + Str(OG * Kh * Kw) + ", " + Str(Oh) + ", " + Str(Ow) + "].") : EndIf
+  If *Y = 0 Or *Y\ElementType <> 1 Or *Y\Elements <> PmoEmitDim(*X, 0) * Mo * Oh * Ow : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [N, " + Str(Mo) + ", " + Str(Oh) + ", " + Str(Ow) + "].") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(PmoEmitDim(*X, 0)))
+  PmoEmitLine(File, "  PmOpI(1) = " + Str(C))
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(PmoEmitDim(*X, 2)))
+  PmoEmitLine(File, "  PmOpI(3) = " + Str(PmoEmitDim(*X, 3)))
+  PmoEmitLine(File, "  PmOpI(4) = " + Str(Mo))
+  PmoEmitLine(File, "  PmOpI(5) = " + Str(G))
+  PmoEmitLine(File, "  PmOpI(6) = " + Str(OG))
+  PmoEmitLine(File, "  PmOpI(7) = " + Str(Kh))
+  PmoEmitLine(File, "  PmOpI(8) = " + Str(Kw))
+  PmoEmitLine(File, "  PmOpI(9) = " + Str(Oh))
+  PmoEmitLine(File, "  PmOpI(10) = " + Str(Ow))
+  PmoEmitLine(File, "  PmOpI(11) = " + Str(St(0)))
+  PmoEmitLine(File, "  PmOpI(12) = " + Str(St(1)))
+  PmoEmitLine(File, "  PmOpI(13) = " + Str(Dl(0)))
+  PmoEmitLine(File, "  PmOpI(14) = " + Str(Dl(1)))
+  PmoEmitLine(File, "  PmOpI(15) = " + Str(Pd(0)))
+  PmoEmitLine(File, "  PmOpI(16) = " + Str(Pd(1)))
+  PmoEmitLine(File, "  PmOpDeformConv(*i0, *i1, *i2, " + PmoOpsIn(*Node, 3) + ", " + PmoOpsIn(*Node, 4) + ", *o0)")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
 ; ---- the quantized operators ------------------------------------------------
 ; One value (a scalar or a one-element tensor) or one per element of Extent.
 Procedure.i PmoOpsQCount(*V.PmoIrValue, Extent.q)
@@ -2069,6 +2336,12 @@ Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
     Case "ConvInteger", "QLinearConv" : Done = PmoEmitOpsQConv(File, *Ir, *Node, ProcName, Opset)
     Case "HannWindow", "HammingWindow", "BlackmanWindow" : Done = PmoEmitOpsWindow(File, *Ir, *Node, ProcName, Opset)
     Case "DFT" : Done = PmoEmitOpsDft(File, *Ir, *Node, ProcName, Opset)
+    Case "Col2Im" : Done = PmoEmitOpsCol2Im(File, *Ir, *Node, ProcName, Opset)
+    Case "CenterCropPad" : Done = PmoEmitOpsCenterCropPad(File, *Ir, *Node, ProcName, Opset)
+    Case "MaxUnpool" : Done = PmoEmitOpsMaxUnpool(File, *Ir, *Node, ProcName, Opset)
+    Case "AffineGrid" : Done = PmoEmitOpsAffineGrid(File, *Ir, *Node, ProcName, Opset)
+    Case "MaxRoiPool" : Done = PmoEmitOpsMaxRoiPool(File, *Ir, *Node, ProcName, Opset)
+    Case "DeformConv" : Done = PmoEmitOpsDeformConv(File, *Ir, *Node, ProcName, Opset)
     Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss" : Done = PmoEmitOpsLoss(File, *Ir, *Node, ProcName, Opset)
     Case "MelWeightMatrix" : ProcedureReturn PmoEmitNsFail(*Node, PmoOpsMelSentence())
     Case "NonMaxSuppression" : ProcedureReturn PmoEmitNsFail(*Node, "its output size depends on the scores, which the fixed-shape path cannot plan.")

@@ -606,6 +606,42 @@ last axis other than 1 or 2, a signal on the last axis, or (fixed shapes) a
 length or axis that is not a constant; a loss reduction other than none,
 sum and mean; a target outside the classes at run time.
 
+## Group C, second batch: Col2Im, CenterCropPad, MaxUnpool, AffineGrid, MaxRoiPool, DeformConv — September 24, 2026
+
+Col2Im (opset 18, one to three spatial axes), CenterCropPad (18, any
+element type the compiler carries), MaxUnpool (9 and 11, with and without
+output_shape), AffineGrid (20, two and three spatial axes), MaxRoiPool (1)
+and DeformConv (19, two spatial axes, groups, offset groups, mask and bias)
+on both paths and every target. Their kernels join
+`runtime/tensor_ops.pmi` under the same rules. Col2Im adds the block
+elements in the reference's order; DeformConv samples bilinearly with
+zeros outside, as the reference's GridSample does, and sums each input
+channel's kernel positions in order.
+
+Two operators follow one implementation where the others differ.
+MaxUnpool with output_shape: the indices address the inferred shape, whose
+block sits at the start of the larger output, as the reference and the
+official test data have it; ONNX Runtime reads them as indices into the
+output. MaxRoiPool has no reference implementation; it follows ONNX
+Runtime (the box corners scaled and rounded half away from zero, the bins
+the float extent divided by the pooled extent, an empty bin 0, a maximum
+that a NaN never wins).
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 499 cases - the 476 before; Col2Im over one to three axes with pads, strides and dilations and a NaN; CenterCropPad cropping, padding and both on FLOAT, INT64 and BOOL; MaxUnpool with output_shape, INT32 indices and an index outside; AffineGrid in two and three dimensions, both alignments, an extent of 1; MaxRoiPool with boxes outside the input, empty bins and a NaN; DeformConv with groups, offset groups, mask, bias, strides, dilations and an offset far outside | Windows, Pi 4, Pico and Pico 2: 499 of 499 bit-identical to the definition; `--mutants` 51 of 51 caught (six new) |
+| `tests/node_suite/targeted_ops.py`: 765 cases - the 729 before; the official Col2Im, CenterCropPad, MaxUnpool, AffineGrid and DeformConv cases published above opset 20, re-imported at 20; 32 new builds (MaxRoiPool against ONNX Runtime alone, MaxUnpool with output_shape against the reference alone) | 765 of 765 as expected; re-imported official cases 139 PASS (135 before) |
+| Official node tests at opset 20 or lower, this change against the previous compiler | PASS 538 of 964 before, 553 after: the Col2Im, CenterCropPad and AffineGrid cases; no case that passed fails |
+| `ops_targets_gate.py`: every targeted build that must pass, on the Pi 4, Pico and Pico 2 in unicorn | Running when this was committed; the result is in the commit that publishes the node-test results |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `41ff4a6` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
+| Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
+
+**Refused, with a sentence:** DeformConv over other than two spatial axes
+(the reference implements two); image_shape, block_shape, shape, size and
+output_shape that are not constants on the fixed-shape path; shapes that
+disagree with the attributes; an index outside the unpooled shape or a
+batch index outside the input at run time.
+
 
 ## Explicit limitations
 

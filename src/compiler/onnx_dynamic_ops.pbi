@@ -75,6 +75,12 @@ Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
       ProcedureReturn "|axis|inverse|onesided|"
     Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss" : ProcedureReturn "|ignore_index|reduction|"
     Case "MelWeightMatrix" : ProcedureReturn "|output_datatype|"
+    Case "Col2Im" : ProcedureReturn "|dilations|pads|strides|"
+    Case "CenterCropPad" : ProcedureReturn "|axes|"
+    Case "MaxUnpool" : ProcedureReturn "|kernel_shape|pads|strides|"
+    Case "AffineGrid" : ProcedureReturn "|align_corners|"
+    Case "MaxRoiPool" : ProcedureReturn "|pooled_shape|spatial_scale|"
+    Case "DeformConv" : ProcedureReturn "|dilations|group|kernel_shape|offset_group|pads|strides|"
     Case "RoiAlign"
       If Opset >= 16 : ProcedureReturn "|coordinate_transformation_mode|mode|output_height|output_width|sampling_ratio|spatial_scale|" : EndIf
       ProcedureReturn "|mode|output_height|output_width|sampling_ratio|spatial_scale|"
@@ -244,6 +250,18 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         If Reason = "" And Text <> "none" And Text <> "sum" And Text <> "mean" : Reason = "attribute reduction = " + Text + "; none, sum and mean are." : EndIf
       Case "MelWeightMatrix"
         Reason = PmoOpsMelSentence()
+      Case "Col2Im", "AffineGrid", "MaxUnpool", "DeformConv"
+        Reason = PmdNsTypeReason(*Node, 0, "the first input", "|1|")
+        If Reason = "" And Op = "DeformConv" And PmdOpsDeclaredRank(PmoEmitInput(*Node, 0)) >= 0 And PmdOpsDeclaredRank(PmoEmitInput(*Node, 0)) <> 4
+          Reason = "X has rank " + Str(PmdOpsDeclaredRank(PmoEmitInput(*Node, 0))) + "; two spatial axes (N x C x H x W) are implemented, as in the reference."
+        EndIf
+        If Reason = "" And Op = "MaxUnpool" And PmoEmitAttrListCount(*Node, "kernel_shape") < 1 : Reason = "attribute kernel_shape is required." : EndIf
+      Case "MaxRoiPool"
+        Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
+        If Reason = "" And PmoEmitAttrListCount(*Node, "pooled_shape") <> 2 : Reason = "attribute pooled_shape is required, two extents." : EndIf
+        If Reason = "" And (PmoEmitAttrListI(*Node, "pooled_shape", 0, 0) < 1 Or PmoEmitAttrListI(*Node, "pooled_shape", 1, 0) < 1) : Reason = "pooled_shape must be positive." : EndIf
+      Case "CenterCropPad"
+        Reason = PmdNsTypeReason(*Node, 0, "input", "|1|2|3|6|7|9|")
       Case "QuantizeLinear"
         Reason = PmdNsTypeReason(*Node, 0, "x", "|1|")
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "y_scale", "|1|") : EndIf
@@ -432,6 +450,42 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
             Str(PmoEmitAttrI(*Node, "sampling_ratio", 0)) + " : PmOpI(8)=" + Str(Bool(PmoEmitAttrS(*Node, "mode", "avg") = "max")) + " : PmOpI(9)=" +
             Str(Bool(Text = "half_pixel")) + " : PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "spatial_scale", 1.0)) + ") : "
       Call = Pre + "DOpRoiAlign(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + ")"
+    Case "Col2Im"
+      n = PmoEmitAttrListCount(*Node, "strides")
+      If PmoEmitAttrListCount(*Node, "dilations") > n : n = PmoEmitAttrListCount(*Node, "dilations") : EndIf
+      If PmoEmitAttrListCount(*Node, "pads") / 2 > n : n = PmoEmitAttrListCount(*Node, "pads") / 2 : EndIf
+      Pre = "PmOpT(0)=" + Str(n) + " : "
+      For d = 0 To n - 1
+        Pre + "PmOpT(" + Str(8 + d) + ")=" + Str(PmoEmitAttrListI(*Node, "dilations", d, 1)) + " : PmOpT(" + Str(24 + d) + ")=" + Str(PmoEmitAttrListI(*Node, "strides", d, 1)) + " : "
+        Pre + "PmOpT(" + Str(16 + d) + ")=" + Str(PmoEmitAttrListI(*Node, "pads", d, 0)) + " : PmOpT(" + Str(16 + n + d) + ")=" + Str(PmoEmitAttrListI(*Node, "pads", d + n, 0)) + " : "
+      Next
+      Call = Pre + "DOpCol2Im(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + ")"
+    Case "CenterCropPad"
+      n = PmoEmitAttrListCount(*Node, "axes")
+      Pre = "PmOpT(0)=" + Str(n) + " : "
+      For k = 0 To n - 1 : Pre + "PmOpT(" + Str(1 + k) + ")=" + Str(PmoEmitAttrListI(*Node, "axes", k, 0)) + " : " : Next
+      Call = Pre + "DOpCenterCropPad(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + ")"
+    Case "MaxUnpool"
+      n = PmoEmitAttrListCount(*Node, "kernel_shape")
+      Pre = "PmOpT(0)=" + Str(n) + " : "
+      For d = 0 To n - 1
+        Pre + "PmOpT(" + Str(8 + d) + ")=" + Str(PmoEmitAttrListI(*Node, "kernel_shape", d, 1)) + " : PmOpT(" + Str(12 + d) + ")=" + Str(PmoEmitAttrListI(*Node, "strides", d, 1)) + " : "
+        Pre + "PmOpT(" + Str(16 + d) + ")=" + Str(PmoEmitAttrListI(*Node, "pads", d, 0)) + " : PmOpT(" + Str(16 + n + d) + ")=" + Str(PmoEmitAttrListI(*Node, "pads", d + n, 0)) + " : "
+      Next
+      Call = Pre + "DOpMaxUnpool(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + ")"
+    Case "AffineGrid"
+      Call = "DOpAffineGrid(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + Str(Bool(PmoEmitAttrI(*Node, "align_corners", 0) <> 0)) + ")"
+    Case "MaxRoiPool"
+      Pre = "PmOpI(5)=" + Str(PmoEmitAttrListI(*Node, "pooled_shape", 0, 1)) + " : PmOpI(6)=" + Str(PmoEmitAttrListI(*Node, "pooled_shape", 1, 1)) + " : "
+      Pre + "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "spatial_scale", 1.0)) + ") : "
+      Call = Pre + "DOpMaxRoiPool(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + ")"
+    Case "DeformConv"
+      Pre = "PmOpI(5)=" + Str(PmoEmitAttrI(*Node, "group", 1)) + " : PmOpI(6)=" + Str(PmoEmitAttrI(*Node, "offset_group", 1)) + " : "
+      Pre + "PmOpI(11)=" + Str(PmoEmitAttrListI(*Node, "strides", 0, 1)) + " : PmOpI(12)=" + Str(PmoEmitAttrListI(*Node, "strides", 1, 1)) + " : "
+      Pre + "PmOpI(13)=" + Str(PmoEmitAttrListI(*Node, "dilations", 0, 1)) + " : PmOpI(14)=" + Str(PmoEmitAttrListI(*Node, "dilations", 1, 1)) + " : "
+      Pre + "PmOpI(15)=" + Str(PmoEmitAttrListI(*Node, "pads", 0, 0)) + " : PmOpI(16)=" + Str(PmoEmitAttrListI(*Node, "pads", 1, 0)) + " : "
+      Pre + "PmOpT(0)=" + Str(PmoEmitAttrListI(*Node, "pads", 2, 0)) + " : PmOpT(1)=" + Str(PmoEmitAttrListI(*Node, "pads", 3, 0)) + " : "
+      Call = Pre + "DOpDeformConv(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + "," + a(3) + "," + a(4) + ")"
     Case "HannWindow", "HammingWindow", "BlackmanWindow"
       Code = 2
       If Op = "HannWindow" : Code = 0 : ElseIf Op = "HammingWindow" : Code = 1 : EndIf

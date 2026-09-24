@@ -2376,3 +2376,397 @@ Procedure DOpLoss(Y.i, LP.i, X.i, T.i, W.i, Code.i, HasIgnore.i, Ignore.i, Sce.i
     DFail("A loss target is outside the classes and is not ignore_index.")
   EndIf
 EndProcedure
+
+; ----------------------------------------------------------------------
+; Col2Im-18. The call has set PmOpT(0) the count of dilations, pads and
+; strides given (0 or the spatial rank), PmOpT(8 + d) dilations, (16 ..)
+; pads, (24 + d) strides.
+; ----------------------------------------------------------------------
+Procedure DOpCol2Im(Y.i, X.i, Img.i, Blk.i)
+  Protected Dim dims.i(8)
+  Protected s.i
+  Protected d.i
+  Protected bl.i
+  Protected L.i
+  Protected ie.i
+  Protected be.i
+  Protected dl.i
+  Protected pb.i
+  Protected pe.i
+  Protected st.i
+  Protected col.i
+  If X = 0 Or Img = 0 Or Blk = 0
+    DFail("Col2Im requires the input, image_shape and block_shape.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(X)\Rank <> 3 Or Dt(Img)\Kind <> 7 Or Dt(Blk)\Kind <> 7
+    DFail("Col2Im takes FLOAT [N, C * prod(block_shape), L] and INT64 image_shape and block_shape.")
+    ProcedureReturn
+  EndIf
+  s = Dt(Img)\Count
+  If s < 1 Or s > 3 Or Dt(Blk)\Count <> s
+    DFail("Col2Im takes one to three spatial axes, as many in image_shape as in block_shape.")
+    ProcedureReturn
+  EndIf
+  If PmOpT(0) <> 0 And PmOpT(0) <> s
+    DFail("Col2Im's dilations, pads or strides do not match image_shape.")
+    ProcedureReturn
+  EndIf
+  bl = 1
+  L = 1
+  d = 0
+  While d < s
+    ie = DInt(Img, d)
+    be = DInt(Blk, d)
+    dl = 1
+    pb = 0
+    pe = 0
+    st = 1
+    If PmOpT(0) <> 0
+      dl = PmOpT(8 + d)
+      pb = PmOpT(16 + d)
+      pe = PmOpT(16 + s + d)
+      st = PmOpT(24 + d)
+    EndIf
+    If ie < 1 Or be < 1 Or dl < 1 Or st < 1 Or pb < 0 Or pe < 0
+      DFail("Col2Im extents, dilations and strides must be positive and pads not negative.")
+      ProcedureReturn
+    EndIf
+    col = (ie + pb + pe - (dl * (be - 1) + 1)) / st + 1
+    If col < 1
+      DFail("Col2Im's block does not fit the padded image.")
+      ProcedureReturn
+    EndIf
+    PmOpI(8 + d) = ie
+    PmOpI(12 + d) = be
+    PmOpI(16 + d) = dl
+    PmOpI(20 + d) = pb
+    PmOpI(24 + d) = st
+    PmOpI(28 + d) = col
+    dims(2 + d) = ie
+    bl = bl * be
+    L = L * col
+    d = d + 1
+  Wend
+  If DOpDim(X, 1) % bl <> 0 Or DOpDim(X, 2) <> L
+    DFail("Col2Im's input does not hold the blocks image_shape and block_shape describe.")
+    ProcedureReturn
+  EndIf
+  dims(0) = DOpDim(X, 0)
+  dims(1) = DOpDim(X, 1) / bl
+  If DAlloc(Y, 1, s + 2, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = s
+  PmOpI(1) = dims(0)
+  PmOpI(2) = dims(1)
+  PmOpCol2Im(Dt(X)\Data, Dt(Y)\Data)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; CenterCropPad-18. The call has set PmOpT(0) the count of axes given (0 for
+; all), PmOpT(1 + k) the axes.
+; ----------------------------------------------------------------------
+Procedure DOpCenterCropPad(Y.i, X.i, Sh.i)
+  Protected Dim dims.i(8)
+  Protected Dim seen.i(8)
+  Protected r.i
+  Protected n.i
+  Protected k.i
+  Protected a.i
+  Protected e.i
+  Protected d.i
+  If X = 0 Or Sh = 0
+    DFail("CenterCropPad requires the input and shape.")
+    ProcedureReturn
+  EndIf
+  If Dt(Sh)\Kind <> 7 And Dt(Sh)\Kind <> 6
+    DFail("CenterCropPad's shape must be INT32 or INT64.")
+    ProcedureReturn
+  EndIf
+  r = Dt(X)\Rank
+  If r < 1
+    DFail("CenterCropPad takes an input of rank one or more.")
+    ProcedureReturn
+  EndIf
+  d = 0
+  While d < r
+    dims(d) = DOpDim(X, d)
+    d = d + 1
+  Wend
+  n = PmOpT(0)
+  If n = 0
+    n = r
+  EndIf
+  If Dt(Sh)\Count <> n
+    DFail("CenterCropPad's shape must hold one extent per axis.")
+    ProcedureReturn
+  EndIf
+  k = 0
+  While k < n
+    a = k
+    If PmOpT(0) <> 0
+      a = PmOpT(1 + k)
+    EndIf
+    If a < 0
+      a = a + r
+    EndIf
+    If a < 0 Or a >= r
+      DFail("CenterCropPad's axes name an axis outside the rank.")
+      ProcedureReturn
+    EndIf
+    If seen(a) <> 0
+      DFail("CenterCropPad's axes name an axis twice.")
+      ProcedureReturn
+    EndIf
+    seen(a) = 1
+    e = DInt(Sh, k)
+    If e < 0
+      DFail("CenterCropPad's shape must not be negative.")
+      ProcedureReturn
+    EndIf
+    dims(a) = e
+    k = k + 1
+  Wend
+  If DAlloc(Y, Dt(X)\Kind, r, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = r
+  d = 0
+  While d < r
+    PmOpDA(d) = DOpDim(X, d)
+    PmOpDY(d) = dims(d)
+    PmOpI(8 + d) = 0
+    PmOpI(16 + d) = 0
+    If dims(d) < PmOpDA(d)
+      PmOpI(8 + d) = (PmOpDA(d) - dims(d)) / 2
+    Else
+      PmOpI(16 + d) = (dims(d) - PmOpDA(d)) / 2
+    EndIf
+    d = d + 1
+  Wend
+  PmOpCenterCropPad(Dt(X)\Data, Dt(Y)\Data, DSize(Dt(X)\Kind))
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MaxUnpool-9/11. The call has set PmOpT(0) the spatial count s of
+; kernel_shape, (8 + d) kernel, (12 + d) strides, (16 ..) pads.
+; ----------------------------------------------------------------------
+Procedure DOpMaxUnpool(Y.i, X.i, Ix.i, OutS.i)
+  Protected Dim dims.i(8)
+  Protected r.i
+  Protected s.i
+  Protected d.i
+  Protected inf.i
+  Protected o.i
+  If X = 0 Or Ix = 0
+    DFail("MaxUnpool requires X and I.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or (Dt(Ix)\Kind <> 7 And Dt(Ix)\Kind <> 6)
+    DFail("MaxUnpool takes FLOAT X and INT64 I.")
+    ProcedureReturn
+  EndIf
+  r = Dt(X)\Rank
+  s = r - 2
+  If s < 1 Or s > 3 Or PmOpT(0) <> s Or Dt(Ix)\Count <> Dt(X)\Count
+    DFail("MaxUnpool takes N x C x D1 ... Ds with one to three spatial axes, I of X's shape and one kernel extent per spatial axis.")
+    ProcedureReturn
+  EndIf
+  If OutS <> 0
+    If Dt(OutS)\Count <> r
+      DFail("MaxUnpool's output_shape must hold one extent per axis.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  d = 0
+  While d < r
+    If d < 2
+      inf = DOpDim(X, d)
+    Else
+      inf = (DOpDim(X, d) - 1) * PmOpT(12 + d - 2) - (PmOpT(16 + d - 2) + PmOpT(16 + s + d - 2)) + PmOpT(8 + d - 2)
+    EndIf
+    o = inf
+    If OutS <> 0
+      o = DInt(OutS, d)
+    EndIf
+    If inf < 1 Or o < inf
+      DFail("MaxUnpool's output_shape must be at least the inferred shape on every axis.")
+      ProcedureReturn
+    EndIf
+    If d < 2 And o <> inf
+      DFail("MaxUnpool's output_shape must keep X's first two extents.")
+      ProcedureReturn
+    EndIf
+    PmOpDA(d) = DOpDim(X, d)
+    PmOpDB(d) = inf
+    PmOpDY(d) = o
+    dims(d) = o
+    d = d + 1
+  Wend
+  If DAlloc(Y, 1, r, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = r
+  PmOpI(1) = Dt(Ix)\Kind
+  If PmOpMaxUnpool(Dt(X)\Data, Dt(Ix)\Data, Dt(Y)\Data) <> 0
+    DFail("A MaxUnpool index is outside the unpooled shape.")
+  EndIf
+EndProcedure
+
+; AffineGrid-20.
+Procedure DOpAffineGrid(Y.i, T.i, Sz.i, Align.i)
+  Protected Dim dims.i(8)
+  Protected r.i
+  Protected d.i
+  Protected e.i
+  If T = 0 Or Sz = 0
+    DFail("AffineGrid requires theta and size.")
+    ProcedureReturn
+  EndIf
+  If Dt(T)\Kind <> 1 Or Dt(Sz)\Kind <> 7
+    DFail("AffineGrid takes FLOAT theta and INT64 size.")
+    ProcedureReturn
+  EndIf
+  r = Dt(Sz)\Count - 2
+  If r < 2 Or r > 3
+    DFail("AffineGrid's size must be [N, C, H, W] or [N, C, D, H, W].")
+    ProcedureReturn
+  EndIf
+  If Dt(T)\Rank <> 3 Or DOpDim(T, 1) <> r Or DOpDim(T, 2) <> r + 1 Or DOpDim(T, 0) <> DInt(Sz, 0)
+    DFail("AffineGrid's theta must be [N, r, r + 1] with size's N.")
+    ProcedureReturn
+  EndIf
+  dims(0) = DOpDim(T, 0)
+  d = 0
+  While d < r
+    e = DInt(Sz, 2 + d)
+    If e < 1
+      DFail("AffineGrid's size must be positive.")
+      ProcedureReturn
+    EndIf
+    PmOpI(8 + d) = e
+    dims(1 + d) = e
+    d = d + 1
+  Wend
+  dims(r + 1) = r
+  If DAlloc(Y, 1, r + 2, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = dims(0)
+  PmOpI(1) = r
+  PmOpI(2) = Align
+  PmOpAffineGrid(Dt(T)\Data, Dt(Y)\Data)
+EndProcedure
+
+; MaxRoiPool-1. The call has set PmOpI(5 6) and PmOpF(0).
+Procedure DOpMaxRoiPool(Y.i, X.i, Rs.i)
+  Protected Dim dims.i(8)
+  If X = 0 Or Rs = 0
+    DFail("MaxRoiPool requires X and rois.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(X)\Rank <> 4 Or Dt(Rs)\Kind <> 1 Or Dt(Rs)\Rank <> 2
+    DFail("MaxRoiPool takes FLOAT X [N, C, H, W] and rois [num_rois, 5].")
+    ProcedureReturn
+  EndIf
+  If DOpDim(Rs, 1) <> 5
+    DFail("MaxRoiPool takes FLOAT X [N, C, H, W] and rois [num_rois, 5].")
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = DOpDim(X, 0)
+  PmOpI(1) = DOpDim(X, 1)
+  PmOpI(2) = DOpDim(X, 2)
+  PmOpI(3) = DOpDim(X, 3)
+  PmOpI(4) = DOpDim(Rs, 0)
+  dims(0) = PmOpI(4)
+  dims(1) = PmOpI(1)
+  dims(2) = PmOpI(5)
+  dims(3) = PmOpI(6)
+  If DAlloc(Y, 1, 4, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  If PmOpMaxRoiPool(Dt(X)\Data, Dt(Rs)\Data, Dt(Y)\Data) <> 0
+    DFail("A MaxRoiPool batch index is outside the input's batch.")
+  EndIf
+EndProcedure
+
+; DeformConv-19, two spatial axes. The call has set PmOpI(5) group, (6)
+; offset_group, (11 12) strides, (13 14) dilations, (15 16) leading pads,
+; PmOpT(0 1) the trailing pads.
+Procedure DOpDeformConv(Y.i, X.i, W.i, Off.i, B.i, Mk.i)
+  Protected Dim dims.i(8)
+  Protected c.i
+  Protected m.i
+  Protected kh.i
+  Protected kw.i
+  Protected oh.i
+  Protected ow.i
+  Protected og.i
+  Protected bA.i
+  Protected mA.i
+  If X = 0 Or W = 0 Or Off = 0
+    DFail("DeformConv requires X, W and offset.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(W)\Kind <> 1 Or Dt(Off)\Kind <> 1 Or Dt(X)\Rank <> 4 Or Dt(W)\Rank <> 4 Or Dt(Off)\Rank <> 4
+    DFail("DeformConv takes FLOAT X [N, C, H, W], W [M, C / group, kh, kw] and offset [N, *, oh, ow].")
+    ProcedureReturn
+  EndIf
+  c = DOpDim(X, 1)
+  m = DOpDim(W, 0)
+  kh = DOpDim(W, 2)
+  kw = DOpDim(W, 3)
+  og = PmOpI(6)
+  If PmOpI(5) < 1 Or og < 1
+    DFail("DeformConv's group and offset_group must be positive.")
+    ProcedureReturn
+  EndIf
+  If c <> PmOpI(5) * DOpDim(W, 1) Or m % PmOpI(5) <> 0 Or c % og <> 0
+    DFail("DeformConv's group and offset_group do not divide the channels as W's shape requires.")
+    ProcedureReturn
+  EndIf
+  oh = (DOpDim(X, 2) + PmOpI(15) + PmOpT(0) - (PmOpI(13) * (kh - 1) + 1)) / PmOpI(11) + 1
+  ow = (DOpDim(X, 3) + PmOpI(16) + PmOpT(1) - (PmOpI(14) * (kw - 1) + 1)) / PmOpI(12) + 1
+  If oh < 1 Or ow < 1
+    DFail("DeformConv's kernel is larger than the padded input.")
+    ProcedureReturn
+  EndIf
+  If DOpDim(Off, 0) <> DOpDim(X, 0) Or DOpDim(Off, 1) <> og * kh * kw * 2 Or DOpDim(Off, 2) <> oh Or DOpDim(Off, 3) <> ow
+    DFail("DeformConv's offset must be [N, offset_group * kh * kw * 2, oh, ow].")
+    ProcedureReturn
+  EndIf
+  bA = 0
+  If B <> 0
+    If Dt(B)\Kind <> 1 Or Dt(B)\Count <> m
+      DFail("DeformConv's B must be FLOAT [M].")
+      ProcedureReturn
+    EndIf
+    bA = Dt(B)\Data
+  EndIf
+  mA = 0
+  If Mk <> 0
+    If Dt(Mk)\Kind <> 1 Or Dt(Mk)\Count <> DOpDim(X, 0) * og * kh * kw * oh * ow
+      DFail("DeformConv's mask must be FLOAT [N, offset_group * kh * kw, oh, ow].")
+      ProcedureReturn
+    EndIf
+    mA = Dt(Mk)\Data
+  EndIf
+  dims(0) = DOpDim(X, 0)
+  dims(1) = m
+  dims(2) = oh
+  dims(3) = ow
+  If DAlloc(Y, 1, 4, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = DOpDim(X, 0)
+  PmOpI(1) = c
+  PmOpI(2) = DOpDim(X, 2)
+  PmOpI(3) = DOpDim(X, 3)
+  PmOpI(4) = m
+  PmOpI(7) = kh
+  PmOpI(8) = kw
+  PmOpI(9) = oh
+  PmOpI(10) = ow
+  PmOpDeformConv(Dt(X)\Data, Dt(W)\Data, Dt(Off)\Data, bA, mA, Dt(Y)\Data)
+EndProcedure

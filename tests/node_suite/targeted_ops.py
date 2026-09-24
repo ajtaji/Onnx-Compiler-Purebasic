@@ -64,7 +64,8 @@ OPS = ("erf", "reciprocal", "ceil", "sign", "softplus", "softsign", "elu", "selu
        "bitwise_xor", "hardmax", "lpnormalization", "l1normalization", "l2normalization", "mvn", "lrn", "eyelike", "det",
        "compress", "reversesequence", "upsample", "rnn", "simple_rnn", "gru", "nonmaxsuppression", "roialign",
        # after the second group
-       "gridsample", "quantizelinear", "dequantizelinear", "qlinearmatmul")
+       "gridsample", "quantizelinear", "dequantizelinear", "qlinearmatmul",
+       "col2im", "center_crop_pad", "maxunpool", "affine_grid", "deform_conv")
 
 # re-imported official cases of a form that is refused, and the sentence that
 # must refuse them
@@ -105,6 +106,10 @@ def expected(case: Case, m: onnx.ModelProto):
         options = ort.SessionOptions()
         options.log_severity_level = 4
         return [np.asarray(v) for v in ort.InferenceSession(m.SerializeToString(), options, providers=["CPUExecutionProvider"]).run(None, case.feeds)]
+    if case.oracle == "ref":
+        # a form ONNX Runtime computes otherwise than the reference and the
+        # official test data (MaxUnpool with output_shape): the reference alone
+        return [np.asarray(x) for x in ReferenceEvaluator(m).run(None, case.feeds)]
     source = case.oracle(case.feeds) if case.oracle else ReferenceEvaluator(m).run(None, case.feeds)
     got = [np.asarray(x) for x in source]
     if ort is not None:
@@ -758,6 +763,52 @@ def cases() -> list[Case]:
     c.append(Case("nllloss_4d", [N("NegativeLogLikelihoodLoss", ["x", "t"], ["y"], reduction="sum")],
                   [("x", F, [2, 3, 2, 2]), ("t", I64, [2, 2, 2])], [("y", F, [])],
                   {"x": f32(2, 3, 2, 2), "t": RNG.integers(0, 3, (2, 2, 2)).astype(np.int64)}, opset=13))
+
+    # ---- group C, second batch -----------------------------------------------
+    for name, image, block, attrs, L in (("2d", [5, 6], [2, 3], {"pads": [1, 0, 0, 1], "strides": [1, 2], "dilations": [2, 1]}, 12),
+                                         ("1d", [9], [3], {"pads": [1, 0], "strides": [2]}, 4),
+                                         ("3d_default", [3, 4, 2], [2, 2, 2], {}, 6)):
+        cb = int(np.prod(block))
+        c.append(Case("col2im_" + name, [N("Col2Im", ["x", "i", "b"], ["y"], **attrs)], [("x", F, [2, 2 * cb, L])],
+                      [("y", F, [2, 2] + image)], {"x": f32(2, 2 * cb, L)},
+                      [init("i", np.array(image, np.int64)), init("b", np.array(block, np.int64))], opset=18))
+    ccx = f32(4, 7, 3)
+    c.append(Case("centercroppad_axes", [N("CenterCropPad", ["x", "s"], ["y"], axes=[0, 1])], [("x", F, [4, 7, 3])], [("y", F, [6, 4, 3])],
+                  {"x": ccx}, [init("s", np.array([6, 4], np.int64))], opset=18))
+    c.append(Case("centercroppad_all_int64", [N("CenterCropPad", ["x", "s"], ["y"])], [("x", I64, [5, 4])], [("y", I64, [2, 7])],
+                  {"x": RNG.integers(0, 100, (5, 4)).astype(np.int64)}, [init("s", np.array([2, 7], np.int64))], opset=18))
+    c.append(Case("centercroppad_negative_axis", [N("CenterCropPad", ["x", "s"], ["y"], axes=[-1])], [("x", F, [4, 7, 3])], [("y", F, [4, 7, 8])],
+                  {"x": ccx}, [init("s", np.array([8], np.int64))], opset=18))
+    upx = f32(1, 2, 2, 2)
+    upi = np.array([[[[0, 3], [9, 14]], [[16, 19], [25, 30]]]], np.int64)
+    c.append(Case("maxunpool_2d", [N("MaxUnpool", ["x", "i"], ["y"], kernel_shape=[2, 2], strides=[2, 2])],
+                  [("x", F, [1, 2, 2, 2]), ("i", I64, [1, 2, 2, 2])], [("y", F, [1, 2, 4, 4])], {"x": upx, "i": upi}, opset=11))
+    c.append(Case("maxunpool_output_shape", [N("MaxUnpool", ["x", "i", "s"], ["y"], kernel_shape=[2, 2], strides=[2, 2])],
+                  [("x", F, [1, 2, 2, 2]), ("i", I64, [1, 2, 2, 2])], [("y", F, [1, 2, 5, 5])], {"x": upx, "i": upi},
+                  [init("s", np.array([1, 2, 5, 5], np.int64))], opset=11, oracle="ref"))
+    for r, align in ((2, 0), (2, 1), (3, 0), (3, 1)):
+        size = [2, 3, 4, 5] if r == 2 else [2, 3, 3, 4, 5]
+        c.append(Case("affinegrid_%dd_align%d" % (r, align), [N("AffineGrid", ["t", "s"], ["y"], align_corners=align)],
+                      [("t", F, [2, r, r + 1])], [("y", F, [2] + size[2:] + [r])], {"t": f32(2, r, r + 1)},
+                      [init("s", np.array(size, np.int64))], opset=20))
+    rx = f32(2, 3, 8, 9)
+    rrois = np.array([[0, 1.2, 0.4, 6.6, 5.5], [1, -2, -1, 3, 2], [1, 4, 4, 4, 4], [0, 0, 0, 17, 15]], np.float32)
+    c.append(Case("maxroipool", [N("MaxRoiPool", ["x", "r"], ["y"], pooled_shape=[3, 4], spatial_scale=0.5)],
+                  [("x", F, [2, 3, 8, 9]), ("r", F, [4, 5])], [("y", F, [4, 3, 3, 4])], {"x": rx, "r": rrois}, opset=7, oracle="ort"))
+    dx = f32(1, 4, 6, 7)
+    dw = f32(6, 2, 3, 3)
+    doff = f32(1, 36, 6, 4, scale=1.5)
+    dmask = RNG.uniform(0, 1, (1, 18, 6, 4)).astype(np.float32)
+    c.append(Case("deformconv_groups_mask_bias", [N("DeformConv", ["x", "w", "o", "b", "m"], ["y"], group=2, offset_group=2, pads=[1, 1, 1, 1],
+                                                     strides=[1, 2])],
+                  [("x", F, [1, 4, 6, 7]), ("w", F, [6, 2, 3, 3]), ("o", F, [1, 36, 6, 4]), ("b", F, [6]), ("m", F, [1, 18, 6, 4])],
+                  [("y", F, [1, 6, 6, 4])], {"x": dx, "w": dw, "o": doff, "b": f32(6), "m": dmask}, opset=19))
+    c.append(Case("deformconv_plain", [N("DeformConv", ["x", "w", "o"], ["y"])],
+                  [("x", F, [1, 2, 5, 5]), ("w", F, [3, 2, 2, 2]), ("o", F, [1, 8, 4, 4])], [("y", F, [1, 3, 4, 4])],
+                  {"x": f32(1, 2, 5, 5), "w": f32(3, 2, 2, 2), "o": f32(1, 8, 4, 4, scale=0.7)}, opset=19))
+    c.append(Case("refuse_deformconv_3d", [N("DeformConv", ["x", "w", "o"], ["y"])],
+                  [("x", F, [1, 1, 3, 3, 3]), ("w", F, [1, 1, 2, 2, 2]), ("o", F, [1, 24, 2, 2, 2])], [("y", F, [1, 1, 2, 2, 2])],
+                  {"x": f32(1, 1, 3, 3, 3), "w": f32(1, 1, 2, 2, 2), "o": f32(1, 24, 2, 2, 2)}, opset=19, refuse="two spatial axes"))
     return c
 
 

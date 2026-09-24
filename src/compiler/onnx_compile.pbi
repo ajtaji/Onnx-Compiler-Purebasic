@@ -54,6 +54,9 @@ Procedure.s PmoCompileRuntimeDimensions(*Model.PmoOnnxModel)
           Case "Dropout" : Control = Bool(Position = 2)
           Case "HannWindow", "HammingWindow", "BlackmanWindow" : Control = Bool(Position = 0)
           Case "DFT" : Control = Bool(Position = 1 Or Position = 2)
+          Case "Col2Im" : Control = Bool(Position = 1 Or Position = 2)
+          Case "CenterCropPad", "AffineGrid" : Control = Bool(Position = 1)
+          Case "MaxUnpool" : Control = Bool(Position = 2)
         EndSelect
         Name = *Model\Graph\Nodes()\Inputs()
         If Control And Name <> "" And Constants(Name) = 0

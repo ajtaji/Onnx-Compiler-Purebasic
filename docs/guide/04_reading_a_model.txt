@@ -49,7 +49,8 @@ Elementwise     Exp  Log  Sqrt  Abs  Neg  Sin  Cos  Tan  Asin  Acos  Atan
                 Sinh  Cosh  Asinh  Acosh  Atanh  Floor  Round  Ceil
                 Sign  Erf  IsNaN  IsInf
 Bitwise         BitwiseNot  BitwiseAnd  BitwiseOr  BitwiseXor
-Linear algebra  MatMul  Gemm  Conv  ConvTranspose  LSTM  RNN  GRU  Einsum  Det
+Linear algebra  MatMul  Gemm  Conv  ConvTranspose  DeformConv  LSTM  RNN  GRU
+                Einsum  Det
 Normalization   Softmax  LogSoftmax  LayerNormalization  BatchNormalization
                 InstanceNormalization  GroupNormalization  LpNormalization
                 MeanVarianceNormalization  LRN
@@ -58,19 +59,20 @@ Losses          NegativeLogLikelihoodLoss  SoftmaxCrossEntropyLoss
 Quantized       QuantizeLinear  DequantizeLinear  DynamicQuantizeLinear
                 MatMulInteger  QLinearMatMul  ConvInteger  QLinearConv
 Pooling         MaxPool  AveragePool  LpPool  GlobalMaxPool  GlobalAveragePool
-                GlobalLpPool
+                GlobalLpPool  MaxUnpool  MaxRoiPool
 Reductions      ReduceMean  ReduceSum  ReduceMax  ReduceMin  ReduceProd  ReduceL1
                 ReduceL2  ReduceSumSquare  ReduceLogSum  ReduceLogSumExp
                 ArgMax  ArgMin  CumSum
 Signal          STFT  DFT  HannWindow  HammingWindow  BlackmanWindow
-                MelWeightMatrix  Resize  Upsample  GridSample
+                MelWeightMatrix  Resize  Upsample  GridSample  AffineGrid
 Comparison      Equal  Greater  GreaterOrEqual  Less  LessOrEqual  And  Or  Xor
                 Not  Where
 Indexing        Gather  GatherElements  GatherND  Slice  Expand  Pad  NonZero
                 ScatterND  ScatterElements  Scatter  TopK  Range  OneHot  Trilu
                 Compress  ReverseSequence
 Shape           Reshape  Flatten  Squeeze  Unsqueeze  Transpose  Concat  Split
-                Tile  DepthToSpace  SpaceToDepth  Size  EyeLike
+                Tile  DepthToSpace  SpaceToDepth  Size  EyeLike  Col2Im
+                CenterCropPad
 Other           Cast  CastLike  Identity  Dropout (inference)
 Random          RandomNormal  RandomNormalLike  RandomUniform  RandomUniformLike
 Control flow    If  Loop                              (runtime dimensions)
@@ -231,7 +233,8 @@ that belongs to another opset, such as Pad's wrap mode at opset 18, is
 refused by name. The operators added in September 2026 each start at the
 opset whose definition they compute (Mish at 18, Gelu at 20, Trilu and
 HardSwish at 14, GridSample at 16, DFT and the windows at 17, the bitwise
-operators and GroupNormalization at 18, most of the rest at 11 or earlier), and LogSoftmax and Hardmax before 13 are
+operators, GroupNormalization, Col2Im and CenterCropPad at 18, DeformConv at
+19, AffineGrid at 20, most of the rest at 11 or earlier), and LogSoftmax and Hardmax before 13 are
 accepted only on the last axis, where the old flattening definition and the
 new one agree. Two have a ceiling as well: GroupNormalization up to 20
 (from 21 its scale is per channel, not per group), and Upsample up to 9,

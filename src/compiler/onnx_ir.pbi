@@ -132,6 +132,12 @@ Procedure.i PmoIrCompileTimeInput(Operation.s, Position.i)
       ProcedureReturn Bool(Position = 0)
     Case "DFT"
       ProcedureReturn Bool(Position = 1 Or Position = 2)
+    Case "Col2Im"
+      ProcedureReturn Bool(Position = 1 Or Position = 2)
+    Case "CenterCropPad", "AffineGrid"
+      ProcedureReturn Bool(Position = 1)
+    Case "MaxUnpool"
+      ProcedureReturn Bool(Position = 2)
   EndSelect
   ProcedureReturn #False
 EndProcedure

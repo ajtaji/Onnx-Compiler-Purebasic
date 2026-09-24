@@ -5629,3 +5629,626 @@ Procedure.i PmOpNllLoss(lp.i, target.i, weight.i, y.i)
   EndIf
   ProcedureReturn 0
 EndProcedure
+
+; ----------------------------------------------------------------------
+; Col2Im-18: data [N, C * B, L] (B = the block's element count) to
+; [N, C, image ...], s = PmOpI(0) spatial axes. PmOpI(1) N, (2) C,
+; (8 + d) image extents, (12 + d) block, (16 + d) dilations, (20 + d)
+; leading pads, (24 + d) strides, (28 + d) blocks per axis. Each block
+; element is added in kernel-position order, then block order, as the
+; reference adds them.
+; ----------------------------------------------------------------------
+Procedure PmOpCol2Im(src.i, dst.i)
+  Protected s.i
+  Protected n.i
+  Protected c.i
+  Protected d.i
+  Protected bl.i
+  Protected L.i
+  Protected img.i
+  Protected k.i
+  Protected li.i
+  Protected rest.i
+  Protected pos.i
+  Protected inside.i
+  Protected at.i
+  Protected v.f
+  PmOpInit()
+  s = PmOpI(0)
+  bl = 1
+  L = 1
+  img = 1
+  d = 0
+  While d < s
+    bl = bl * PmOpI(12 + d)
+    L = L * PmOpI(28 + d)
+    img = img * PmOpI(8 + d)
+    d = d + 1
+  Wend
+  n = 0
+  While n < PmOpI(1) * PmOpI(2) * img
+    PmTensorPut(dst, n, 0.0)
+    n = n + 1
+  Wend
+  n = 0
+  While n < PmOpI(1)
+    c = 0
+    While c < PmOpI(2)
+      k = 0
+      While k < bl
+        rest = k
+        d = s - 1
+        While d >= 0
+          PmOpOffset(d) = rest % PmOpI(12 + d)
+          rest = rest / PmOpI(12 + d)
+          d = d - 1
+        Wend
+        li = 0
+        While li < L
+          rest = li
+          d = s - 1
+          While d >= 0
+            PmOpCoord(d) = rest % PmOpI(28 + d)
+            rest = rest / PmOpI(28 + d)
+            d = d - 1
+          Wend
+          inside = 1
+          at = 0
+          d = 0
+          While d < s
+            pos = PmOpCoord(d) * PmOpI(24 + d) - PmOpI(20 + d) + PmOpOffset(d) * PmOpI(16 + d)
+            If pos < 0 Or pos >= PmOpI(8 + d)
+              inside = 0
+            EndIf
+            at = at * PmOpI(8 + d) + pos
+            d = d + 1
+          Wend
+          If inside <> 0
+            at = (n * PmOpI(2) + c) * img + at
+            v = PmTensorGet(src, ((n * PmOpI(2) + c) * bl + k) * L + li)
+            PmOpStoreF(dst, at, PmOpAddF(PmTensorGet(dst, at), v))
+          EndIf
+          li = li + 1
+        Wend
+        k = k + 1
+      Wend
+      c = c + 1
+    Wend
+    n = n + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; CenterCropPad-18 over rank r = PmOpI(0), elements Bytes wide: PmOpDA the
+; input extents, PmOpDY the output's, PmOpI(8 + d) the input's leading crop
+; and PmOpI(16 + d) the output's leading pad on axis d. Outside the input,
+; zero bytes.
+; ----------------------------------------------------------------------
+Procedure PmOpCenterCropPad(src.i, dst.i, bytes.i)
+  Protected r.i
+  Protected count.i
+  Protected o.i
+  Protected d.i
+  Protected rest.i
+  Protected pos.i
+  Protected inside.i
+  Protected at.i
+  Protected b.i
+  r = PmOpI(0)
+  count = 1
+  d = 0
+  While d < r
+    count = count * PmOpDY(d)
+    d = d + 1
+  Wend
+  o = 0
+  While o < count
+    rest = o
+    inside = 1
+    at = 0
+    d = r - 1
+    While d >= 0
+      PmOpCoord(d) = rest % PmOpDY(d)
+      rest = rest / PmOpDY(d)
+      d = d - 1
+    Wend
+    d = 0
+    While d < r
+      pos = PmOpCoord(d) - PmOpI(16 + d) + PmOpI(8 + d)
+      If pos < 0 Or pos >= PmOpDA(d)
+        inside = 0
+      EndIf
+      at = at * PmOpDA(d) + pos
+      d = d + 1
+    Wend
+    b = 0
+    While b < bytes
+      If inside <> 0
+        PokeA(dst + o * bytes + b, PeekA(src + at * bytes + b))
+      Else
+        PokeA(dst + o * bytes + b, 0)
+      EndIf
+      b = b + 1
+    Wend
+    o = o + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MaxUnpool-11: rank r = PmOpI(0); PmOpDA the input extents, PmOpDB the
+; extents the indices address (the inferred output), PmOpDY the output's
+; (the inferred shape, or output_shape, which may be larger; the inferred
+; block sits at its start). Indices INT64 (PmOpI(1) = 7) or INT32. Returns
+; 1 for an index outside the inferred shape.
+; ----------------------------------------------------------------------
+Procedure.i PmOpMaxUnpool(src.i, idx.i, dst.i)
+  Protected r.i
+  Protected count.i
+  Protected total.i
+  Protected outCount.i
+  Protected i.i
+  Protected k.i
+  Protected d.i
+  Protected rest.i
+  Protected at.i
+  Protected inside.i
+  PmOpInit()
+  r = PmOpI(0)
+  count = 1
+  total = 1
+  outCount = 1
+  d = 0
+  While d < r
+    count = count * PmOpDA(d)
+    total = total * PmOpDB(d)
+    outCount = outCount * PmOpDY(d)
+    d = d + 1
+  Wend
+  i = 0
+  While i < outCount
+    PmTensorPut(dst, i, 0.0)
+    i = i + 1
+  Wend
+  i = 0
+  While i < count
+    If PmOpI(1) = 7
+      k = PmTensorGetI64(idx, i)
+    Else
+      k = PeekL(idx + i * 4)
+    EndIf
+    If k < 0 Or k >= total
+      ProcedureReturn 1
+    EndIf
+    rest = k
+    d = r - 1
+    While d >= 0
+      PmOpCoord(d) = rest % PmOpDB(d)
+      rest = rest / PmOpDB(d)
+      d = d - 1
+    Wend
+    inside = 1
+    at = 0
+    d = 0
+    While d < r
+      If PmOpCoord(d) >= PmOpDY(d)
+        inside = 0
+      EndIf
+      at = at * PmOpDY(d) + PmOpCoord(d)
+      d = d + 1
+    Wend
+    If inside <> 0
+      PokeL(dst + at * 4, PeekL(src + i * 4))
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; AffineGrid-20: theta [N, r, r + 1], the grid [N, D1 .. Dr, r] with x
+; (the last axis) first. PmOpI(0) N, (1) r (2 or 3), (8 + d) the output
+; extents, (2) align_corners. The base coordinate of position k of n:
+; align (2k / (n - 1)) - 1 (-1 when n = 1), else ((2k + 1) / n) - 1; each
+; output theta[j, 0] * x + theta[j, 1] * y (+ theta[j, 2] * z) +
+; theta[j, r] in that order.
+; ----------------------------------------------------------------------
+Procedure.f PmOpAffineBase(k.i, n.i, align.i)
+  Protected a.f
+  Protected b.f
+  If align <> 0
+    If n < 2
+      ProcedureReturn PmOpNeg(PmOpOne)
+    EndIf
+    a = 2 * k
+    b = n - 1
+  Else
+    a = 2 * k + 1
+    b = n
+  EndIf
+  a = a / b
+  ProcedureReturn a - PmOpOne
+EndProcedure
+
+Procedure PmOpAffineGrid(theta.i, dst.i)
+  Protected N.i
+  Protected r.i
+  Protected count.i
+  Protected nn.i
+  Protected o.i
+  Protected d.i
+  Protected rest.i
+  Protected j.i
+  Protected k.i
+  Protected acc.f
+  Protected t.f
+  Protected Dim hom.f(3)
+  PmOpInit()
+  N = PmOpI(0)
+  r = PmOpI(1)
+  count = 1
+  d = 0
+  While d < r
+    count = count * PmOpI(8 + d)
+    d = d + 1
+  Wend
+  nn = 0
+  While nn < N
+    o = 0
+    While o < count
+      rest = o
+      d = r - 1
+      While d >= 0
+        PmOpCoord(d) = rest % PmOpI(8 + d)
+        rest = rest / PmOpI(8 + d)
+        d = d - 1
+      Wend
+      ; the homogeneous coordinate: x (last axis), y, z
+      k = 0
+      While k < r
+        hom(k) = PmOpAffineBase(PmOpCoord(r - 1 - k), PmOpI(8 + r - 1 - k), PmOpI(2))
+        k = k + 1
+      Wend
+      j = 0
+      While j < r
+        acc = PmTensorGet(theta, (nn * r + j) * (r + 1)) * hom(0)
+        k = 1
+        While k < r
+          t = PmTensorGet(theta, (nn * r + j) * (r + 1) + k) * hom(k)
+          acc = PmOpAddF(acc, t)
+          k = k + 1
+        Wend
+        acc = PmOpAddF(acc, PmTensorGet(theta, (nn * r + j) * (r + 1) + r))
+        PmOpStoreF(dst, (nn * count + o) * r + j, acc)
+        j = j + 1
+      Wend
+      o = o + 1
+    Wend
+    nn = nn + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MaxRoiPool-1 as ONNX Runtime computes it. X [N, C, H, W], rois [R, 5]
+; (batch index, x1, y1, x2, y2). PmOpI(0) N, (1) C, (2) H, (3) W, (4) R,
+; (5) pooled height, (6) pooled width; PmOpF(0) spatial_scale. The box
+; corners scaled and rounded half away from zero; the bins the float
+; extent / pooled, floor and ceil, clipped to the input; an empty bin 0;
+; the maximum from -FLT_MAX that a NaN never wins. Returns 1 for a batch
+; index outside the input.
+; ----------------------------------------------------------------------
+Procedure.i PmOpRoundAway(x.f)
+  Protected t.f
+  Protected v.i
+  t = PmOpAbs(x)
+  t = t + PmOpHalf
+  v = PmOpTruncInt(PmOpFloorF(t))
+  If (PmOpBits(x) & $80000000) <> 0
+    v = 0 - v
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+Procedure.i PmOpMaxRoiPool(x.i, rois.i, y.i)
+  Protected r.i
+  Protected b.i
+  Protected c.i
+  Protected ph.i
+  Protected pw.i
+  Protected sw.i
+  Protected sh.i
+  Protected ew.i
+  Protected eh.i
+  Protected rh.i
+  Protected rw.i
+  Protected hs.i
+  Protected he.i
+  Protected ws.i
+  Protected we.i
+  Protected i.i
+  Protected j.i
+  Protected plane.i
+  Protected bh.f
+  Protected bw.f
+  Protected t.f
+  Protected m.f
+  Protected v.f
+  PmOpInit()
+  r = 0
+  While r < PmOpI(4)
+    b = PmOpTruncInt(PmTensorGet(rois, r * 5))
+    If b < 0 Or b >= PmOpI(0)
+      ProcedureReturn 1
+    EndIf
+    t = PmTensorGet(rois, r * 5 + 1) * PmOpF(0)
+    sw = PmOpRoundAway(t)
+    t = PmTensorGet(rois, r * 5 + 2) * PmOpF(0)
+    sh = PmOpRoundAway(t)
+    t = PmTensorGet(rois, r * 5 + 3) * PmOpF(0)
+    ew = PmOpRoundAway(t)
+    t = PmTensorGet(rois, r * 5 + 4) * PmOpF(0)
+    eh = PmOpRoundAway(t)
+    rh = eh - sh + 1
+    If rh < 1
+      rh = 1
+    EndIf
+    rw = ew - sw + 1
+    If rw < 1
+      rw = 1
+    EndIf
+    bh = rh
+    t = PmOpI(5)
+    bh = bh / t
+    bw = rw
+    t = PmOpI(6)
+    bw = bw / t
+    c = 0
+    While c < PmOpI(1)
+      plane = (b * PmOpI(1) + c) * PmOpI(2) * PmOpI(3)
+      ph = 0
+      While ph < PmOpI(5)
+        pw = 0
+        While pw < PmOpI(6)
+          t = ph
+          t = t * bh
+          hs = PmOpTruncInt(PmOpFloorF(t)) + sh
+          t = ph + 1
+          t = t * bh
+          he = PmOpTruncInt(PmOpCeil(t)) + sh
+          t = pw
+          t = t * bw
+          ws = PmOpTruncInt(PmOpFloorF(t)) + sw
+          t = pw + 1
+          t = t * bw
+          we = PmOpTruncInt(PmOpCeil(t)) + sw
+          If hs < 0
+            hs = 0
+          EndIf
+          If hs > PmOpI(2)
+            hs = PmOpI(2)
+          EndIf
+          If he < 0
+            he = 0
+          EndIf
+          If he > PmOpI(2)
+            he = PmOpI(2)
+          EndIf
+          If ws < 0
+            ws = 0
+          EndIf
+          If ws > PmOpI(3)
+            ws = PmOpI(3)
+          EndIf
+          If we < 0
+            we = 0
+          EndIf
+          If we > PmOpI(3)
+            we = PmOpI(3)
+          EndIf
+          If he <= hs Or we <= ws
+            PmTensorPut(y, ((r * PmOpI(1) + c) * PmOpI(5) + ph) * PmOpI(6) + pw, 0.0)
+          Else
+            m = PmOpFromBits($FF7FFFFF)
+            i = hs
+            While i < he
+              j = ws
+              While j < we
+                v = PmTensorGet(x, plane + i * PmOpI(3) + j)
+                If PmOpIsNan(v) = 0
+                  If v > m
+                    m = v
+                  EndIf
+                EndIf
+                j = j + 1
+              Wend
+              i = i + 1
+            Wend
+            PmTensorPut(y, ((r * PmOpI(1) + c) * PmOpI(5) + ph) * PmOpI(6) + pw, m)
+          EndIf
+          pw = pw + 1
+        Wend
+        ph = ph + 1
+      Wend
+      c = c + 1
+    Wend
+    r = r + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DeformConv-19 in two dimensions. X [N, C, H, W], W [M, C / group, kh,
+; kw], offset [N, og * kh * kw * 2, oh, ow] (h then w per kernel position),
+; mask [N, og * kh * kw, oh, ow] or absent, B [M] or absent. PmOpI(0) N,
+; (1) C, (2) H, (3) W, (4) M, (5) group, (6) offset_group, (7) kh, (8) kw,
+; (9) oh, (10) ow, (11 12) strides, (13 14) dilations, (15 16) leading pads.
+; Each output: the bias, then per input channel of its group the sum over
+; kernel positions of sample * weight (* mask); a sample bilinear, taps
+; floor and floor + 1, zeros outside.
+; ----------------------------------------------------------------------
+Procedure.f PmOpBilinearZero(plane.i, ht.i, wd.i, yy.f, xx.f)
+  Protected h0f.f
+  Protected w0f.f
+  Protected th.f
+  Protected tw.f
+  Protected h0.i
+  Protected w0.i
+  Protected a.i
+  Protected b.i
+  Protected hi.i
+  Protected wi.i
+  Protected v.f
+  Protected t.f
+  Protected row.f
+  Protected acc.f
+  Protected wy.f
+  Protected wx.f
+  Protected lim.f
+  If PmOpIsNan(yy) <> 0 Or PmOpIsNan(xx) <> 0
+    ProcedureReturn 0.0
+  EndIf
+  lim = ht
+  If yy <= PmOpNeg(PmOpOne) Or yy >= lim
+    ProcedureReturn 0.0
+  EndIf
+  lim = wd
+  If xx <= PmOpNeg(PmOpOne) Or xx >= lim
+    ProcedureReturn 0.0
+  EndIf
+  h0f = PmOpFloorF(yy)
+  w0f = PmOpFloorF(xx)
+  th = yy - h0f
+  tw = xx - w0f
+  h0 = PmOpTruncInt(h0f)
+  w0 = PmOpTruncInt(w0f)
+  a = 0
+  While a < 2
+    hi = h0 + a
+    If hi >= 0 And hi < ht
+      b = 0
+      While b < 2
+        wi = w0 + b
+        v = 0.0
+        If wi >= 0 And wi < wd
+          v = PmTensorGet(plane, hi * wd + wi)
+        EndIf
+        If b = 0
+          wx = PmOpOne - tw
+        Else
+          wx = tw
+        EndIf
+        t = wx * v
+        If b = 0
+          row = t
+        Else
+          row = PmOpAddF(row, t)
+        EndIf
+        b = b + 1
+      Wend
+    Else
+      row = 0.0
+    EndIf
+    If a = 0
+      wy = PmOpOne - th
+    Else
+      wy = th
+    EndIf
+    t = wy * row
+    If a = 0
+      acc = t
+    Else
+      acc = PmOpAddF(acc, t)
+    EndIf
+    a = a + 1
+  Wend
+  ProcedureReturn acc
+EndProcedure
+
+Procedure PmOpDeformConv(x.i, w.i, offset.i, bias.i, mask.i, y.i)
+  Protected n.i
+  Protected m.i
+  Protected g.i
+  Protected cg.i
+  Protected mg.i
+  Protected cog.i
+  Protected i.i
+  Protected j.i
+  Protected ci.i
+  Protected c.i
+  Protected og.i
+  Protected a.i
+  Protected b.i
+  Protected ch.i
+  Protected first.i
+  Protected oh.i
+  Protected ow.i
+  Protected kh.i
+  Protected kw.i
+  Protected acc.f
+  Protected part.f
+  Protected hh.f
+  Protected ww.f
+  Protected v.f
+  Protected t.f
+  PmOpInit()
+  cg = PmOpI(1) / PmOpI(5)
+  mg = PmOpI(4) / PmOpI(5)
+  cog = PmOpI(1) / PmOpI(6)
+  kh = PmOpI(7)
+  kw = PmOpI(8)
+  oh = PmOpI(9)
+  ow = PmOpI(10)
+  n = 0
+  While n < PmOpI(0)
+    m = 0
+    While m < PmOpI(4)
+      g = m / mg
+      i = 0
+      While i < oh
+        j = 0
+        While j < ow
+          acc = 0.0
+          If bias <> 0
+            acc = PmTensorGet(bias, m)
+          EndIf
+          ci = 0
+          While ci < cg
+            c = g * cg + ci
+            og = c / cog
+            first = 1
+            a = 0
+            While a < kh
+              b = 0
+              While b < kw
+                ch = ((og * kh + a) * kw + b) * 2
+                hh = i * PmOpI(11) - PmOpI(15) + a * PmOpI(13)
+                hh = hh + PmTensorGet(offset, ((n * PmOpI(6) * kh * kw * 2 + ch) * oh + i) * ow + j)
+                ww = j * PmOpI(12) - PmOpI(16) + b * PmOpI(14)
+                ww = ww + PmTensorGet(offset, ((n * PmOpI(6) * kh * kw * 2 + ch + 1) * oh + i) * ow + j)
+                v = PmOpBilinearZero(x + (n * PmOpI(1) + c) * PmOpI(2) * PmOpI(3) * 4, PmOpI(2), PmOpI(3), hh, ww)
+                t = v * PmTensorGet(w, ((m * cg + ci) * kh + a) * kw + b)
+                If mask <> 0
+                  t = t * PmTensorGet(mask, ((n * PmOpI(6) * kh * kw + (og * kh + a) * kw + b) * oh + i) * ow + j)
+                EndIf
+                If first <> 0
+                  part = t
+                  first = 0
+                Else
+                  part = PmOpAddF(part, t)
+                EndIf
+                b = b + 1
+              Wend
+              a = a + 1
+            Wend
+            acc = PmOpAddF(acc, part)
+            ci = ci + 1
+          Wend
+          PmOpStoreF(y, ((n * PmOpI(4) + m) * oh + i) * ow + j, acc)
+          j = j + 1
+        Wend
+        i = i + 1
+      Wend
+      m = m + 1
+    Wend
+    n = n + 1
+  Wend
+EndProcedure
