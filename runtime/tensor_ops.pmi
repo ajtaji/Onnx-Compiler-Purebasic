@@ -1,0 +1,2187 @@
+; ======================================================================
+; tensor_ops.pmi - kernels for the operators added to complete the ONNX
+; operator set: elementwise functions, variadic and broadcasting binary
+; operators, pooling, reductions, index and data-movement operators.
+; ----------------------------------------------------------------------
+; ONE SOURCE FOR EVERY TARGET. This file is written in the subset both
+; dialects accept and is included, unchanged, by the Windows and the
+; portable model programs (Pi 4, UNO Q, Pico, Pico 2), on both the
+; fixed-shape and the runtime-dimension path. There is no second copy.
+;
+; THE NUMERICAL CONTRACT. Every floating-point step is ONE binary32
+; operation (+, -, *, / with a correctly rounded result), an exact
+; conversion of an integer below 2^24, an exact operation on the bits, or a
+; comparison. No library function is called: the targets' Exp, Log and Sqr
+; differ, and so would the answers. The functions a kernel needs (exp, log,
+; log1p, expm1, tanh, erf, sqrt) are defined below as fixed sequences of
+; those steps, so one input gives the same bits on every target. Accuracy
+; against the true function, measured over the binary32 range the kernels
+; use (docs/VALIDATION.md): exp 1.1, expm1 1.9, log 2.6, log1p 3.5, tanh
+; 1.9, erf 0.8 units in the last place; sqrt is correctly rounded.
+;
+; Each kernel names the ONNX operator section it implements
+; (https://onnx.ai/onnx/operators/). Kernels take byte addresses and do no
+; shape inference: the fixed-shape emitter (onnx_emit_ops.pbi) and the
+; runtime-dimension wrappers (tensor_dynamic_ops.pmi) have checked shapes,
+; element types and attributes and filled the parameter arrays below.
+;
+; Element kinds are ONNX TensorProto codes: 1 FLOAT (4 bytes), 6 INT32 (4),
+; 7 INT64 (8), 9 BOOL (1). INT64 goes through PmTensorGetI64 and
+; PmTensorPutI64, so a 32-bit target clears PmTensorInt64Ok for a value
+; outside its checked range instead of computing a different number.
+;
+; The program defines #PMO_OPS_INT32 before including this file: 1 where
+; the native integer is 32 bits (Pico, Pico 2), 0 where it is 64.
+; ======================================================================
+
+; Parameter arrays, filled by the caller before a kernel runs. A kernel
+; reads them and leaves them as they were; the scratch arrays after them
+; belong to the kernels.
+Global Dim PmOpDY.i(8)
+Global Dim PmOpDA.i(8)
+Global Dim PmOpDB.i(8)
+Global Dim PmOpI.i(96)
+Global Dim PmOpF.f(8)
+Global Dim PmOpAddr.i(16)
+Global Dim PmOpDN.i(136)
+Global Dim PmOpN.i(16)
+Global Dim PmOpStride.i(136)
+Global Dim PmOpCoord.i(8)
+Global Dim PmOpOffset.i(16)
+Global PmOpStatus.i
+
+; Constants, loaded from their bit patterns once.
+Global PmOpReady.i
+Global PmOpScratchF.f
+Global PmOpOne.f
+Global PmOpHalf.f
+Global PmOpTwo.f
+Global PmOpInvLn2.f
+Global PmOpLn2Hi.f
+Global PmOpLn2Lo.f
+Global PmOpMagic.f
+Global PmOpSqrt2.f
+Global PmOpInfinity.f
+Global PmOpExpHi.f
+Global PmOpExpLo.f
+Global PmOpExpm1Edge.f
+Global PmOpNine.f
+Global PmOpSixth.f
+Global PmOpInvSqrt2.f
+Global PmOpSqrt2OverPi.f
+Global PmOpGeluCubic.f
+Global Dim PmOpInvFact.f(12)
+Global Dim PmOpLogC.f(8)
+Global Dim PmOpErfPP.f(5)
+Global Dim PmOpErfQQ.f(6)
+Global Dim PmOpErfPA.f(7)
+Global Dim PmOpErfQA.f(7)
+Global Dim PmOpErfRA.f(8)
+Global Dim PmOpErfSA.f(9)
+Global Dim PmOpErfRB.f(7)
+Global Dim PmOpErfSB.f(8)
+Global PmOpErx.f
+Global PmOpEfx.f
+Global PmOpErfTiny.f
+Global PmOpErfSmall.f
+Global PmOpErfMid.f
+Global PmOpErfBig.f
+Global PmOpErfSplit.f
+Global PmOpErfBias.f
+
+Procedure PmOpSetBits(address.i, bits.i)
+  PokeL(address, bits)
+EndProcedure
+
+Procedure PmOpInit()
+  If PmOpReady <> 0
+    ProcedureReturn
+  EndIf
+  PmOpSetBits(@PmOpOne, $3F800000)
+  PmOpSetBits(@PmOpHalf, $3F000000)
+  PmOpSetBits(@PmOpTwo, $40000000)
+  PmOpSetBits(@PmOpInvLn2, $3FB8AA3B)
+  PmOpSetBits(@PmOpLn2Hi, $3F317200)
+  PmOpSetBits(@PmOpLn2Lo, $35BFBE8E)
+  PmOpSetBits(@PmOpMagic, $4B400000)
+  PmOpSetBits(@PmOpSqrt2, $3FB504F3)
+  PmOpSetBits(@PmOpInfinity, $7F800000)
+  PmOpSetBits(@PmOpExpHi, $42B17218)
+  PmOpSetBits(@PmOpExpLo, $C2CFF1B5)
+  PmOpSetBits(@PmOpExpm1Edge, $3F317218)
+  PmOpSetBits(@PmOpNine, $41100000)
+  PmOpSetBits(@PmOpSixth, $3E2AAAAB)
+  PmOpSetBits(@PmOpInvSqrt2, $3F3504F3)
+  PmOpSetBits(@PmOpSqrt2OverPi, $3F4C422A)
+  PmOpSetBits(@PmOpGeluCubic, $3D372713)
+  ; 1/k! for k = 0..11
+  PmOpSetBits(@PmOpInvFact(0), $3F800000)
+  PmOpSetBits(@PmOpInvFact(1), $3F800000)
+  PmOpSetBits(@PmOpInvFact(2), $3F000000)
+  PmOpSetBits(@PmOpInvFact(3), $3E2AAAAB)
+  PmOpSetBits(@PmOpInvFact(4), $3D2AAAAB)
+  PmOpSetBits(@PmOpInvFact(5), $3C088889)
+  PmOpSetBits(@PmOpInvFact(6), $3AB60B61)
+  PmOpSetBits(@PmOpInvFact(7), $39500D01)
+  PmOpSetBits(@PmOpInvFact(8), $37D00D01)
+  PmOpSetBits(@PmOpInvFact(9), $3638EF1D)
+  PmOpSetBits(@PmOpInvFact(10), $3493F27E)
+  PmOpSetBits(@PmOpInvFact(11), $32D7322B)
+  ; 2/(2k+1) for k = 0..7, the atanh series of log
+  PmOpSetBits(@PmOpLogC(0), $40000000)
+  PmOpSetBits(@PmOpLogC(1), $3F2AAAAB)
+  PmOpSetBits(@PmOpLogC(2), $3ECCCCCD)
+  PmOpSetBits(@PmOpLogC(3), $3E924925)
+  PmOpSetBits(@PmOpLogC(4), $3E638E39)
+  PmOpSetBits(@PmOpLogC(5), $3E3A2E8C)
+  PmOpSetBits(@PmOpLogC(6), $3E1D89D9)
+  PmOpSetBits(@PmOpLogC(7), $3E088889)
+  ; erf: the coefficients of fdlibm's s_erff.c (Sun Microsystems), in binary32
+  PmOpSetBits(@PmOpErx, $3F58560B)
+  PmOpSetBits(@PmOpEfx, $3E0375D4)
+  PmOpSetBits(@PmOpErfPP(0), $3E0375D4)
+  PmOpSetBits(@PmOpErfPP(1), $BEA66BEB)
+  PmOpSetBits(@PmOpErfPP(2), $BCE9528F)
+  PmOpSetBits(@PmOpErfPP(3), $BBBD1489)
+  PmOpSetBits(@PmOpErfPP(4), $B7C756B1)
+  PmOpSetBits(@PmOpErfQQ(0), $3F800000)
+  PmOpSetBits(@PmOpErfQQ(1), $3ECBBBCE)
+  PmOpSetBits(@PmOpErfQQ(2), $3D852A63)
+  PmOpSetBits(@PmOpErfQQ(3), $3BA68116)
+  PmOpSetBits(@PmOpErfQQ(4), $390AEE49)
+  PmOpSetBits(@PmOpErfQQ(5), $B684E21A)
+  PmOpSetBits(@PmOpErfPA(0), $BB1ACDC6)
+  PmOpSetBits(@PmOpErfPA(1), $3ED46805)
+  PmOpSetBits(@PmOpErfPA(2), $BEBE9208)
+  PmOpSetBits(@PmOpErfPA(3), $3EA2FE54)
+  PmOpSetBits(@PmOpErfPA(4), $BDE31CC2)
+  PmOpSetBits(@PmOpErfPA(5), $3D1151B3)
+  PmOpSetBits(@PmOpErfPA(6), $BB0DF9C0)
+  PmOpSetBits(@PmOpErfQA(0), $3F800000)
+  PmOpSetBits(@PmOpErfQA(1), $3DD9F331)
+  PmOpSetBits(@PmOpErfQA(2), $3F0A5785)
+  PmOpSetBits(@PmOpErfQA(3), $3D931AE7)
+  PmOpSetBits(@PmOpErfQA(4), $3E013307)
+  PmOpSetBits(@PmOpErfQA(5), $3C5F6E13)
+  PmOpSetBits(@PmOpErfQA(6), $3C445AA3)
+  PmOpSetBits(@PmOpErfRA(0), $BC21A093)
+  PmOpSetBits(@PmOpErfRA(1), $BF31A0B7)
+  PmOpSetBits(@PmOpErfRA(2), $C128F022)
+  PmOpSetBits(@PmOpErfRA(3), $C2798057)
+  PmOpSetBits(@PmOpErfRA(4), $C322658C)
+  PmOpSetBits(@PmOpErfRA(5), $C3389AE7)
+  PmOpSetBits(@PmOpErfRA(6), $C2A2932B)
+  PmOpSetBits(@PmOpErfRA(7), $C11D077E)
+  PmOpSetBits(@PmOpErfSA(0), $3F800000)
+  PmOpSetBits(@PmOpErfSA(1), $419D35CE)
+  PmOpSetBits(@PmOpErfSA(2), $4309A863)
+  PmOpSetBits(@PmOpErfSA(3), $43D9486F)
+  PmOpSetBits(@PmOpErfSA(4), $442158C9)
+  PmOpSetBits(@PmOpErfSA(5), $43D6810B)
+  PmOpSetBits(@PmOpErfSA(6), $42D9451F)
+  PmOpSetBits(@PmOpErfSA(7), $40D23F7C)
+  PmOpSetBits(@PmOpErfSA(8), $BD777F97)
+  PmOpSetBits(@PmOpErfRB(0), $BC21A092)
+  PmOpSetBits(@PmOpErfRB(1), $BF4C9DD4)
+  PmOpSetBits(@PmOpErfRB(2), $C18E104B)
+  PmOpSetBits(@PmOpErfRB(3), $C320A2EA)
+  PmOpSetBits(@PmOpErfRB(4), $C41F6441)
+  PmOpSetBits(@PmOpErfRB(5), $C480230B)
+  PmOpSetBits(@PmOpErfRB(6), $C3F1C275)
+  PmOpSetBits(@PmOpErfSB(0), $3F800000)
+  PmOpSetBits(@PmOpErfSB(1), $41F2B459)
+  PmOpSetBits(@PmOpErfSB(2), $43A2E571)
+  PmOpSetBits(@PmOpErfSB(3), $44C01759)
+  PmOpSetBits(@PmOpErfSB(4), $4547FDBB)
+  PmOpSetBits(@PmOpErfSB(5), $451F90CE)
+  PmOpSetBits(@PmOpErfSB(6), $43ED43A7)
+  PmOpSetBits(@PmOpErfSB(7), $C1B38712)
+  PmOpSetBits(@PmOpErfTiny, $31800000)
+  PmOpSetBits(@PmOpErfSmall, $3F580000)
+  PmOpSetBits(@PmOpErfMid, $3FA00000)
+  PmOpSetBits(@PmOpErfBig, $40C00000)
+  PmOpSetBits(@PmOpErfSplit, $4036DB6E)
+  PmOpSetBits(@PmOpErfBias, $3F100000)
+  PmOpReady = 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Bits and exact helpers. PmOpBits returns the 32 bits of a binary32 value
+; masked to 32 bits; only masked fields and the sign bit (b & $80000000)
+; are ever compared, so the width of the native integer does not matter.
+; ----------------------------------------------------------------------
+Procedure.i PmOpBits(x.f)
+  PmOpScratchF = x
+  ProcedureReturn PeekL(@PmOpScratchF) & $FFFFFFFF
+EndProcedure
+
+Procedure.f PmOpFromBits(b.i)
+  PokeL(@PmOpScratchF, b)
+  ProcedureReturn PmOpScratchF
+EndProcedure
+
+Procedure.i PmOpIsNan(x.f)
+  If (PmOpBits(x) & $7FFFFFFF) > $7F800000
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.f PmOpNaN()
+  ProcedureReturn PmOpFromBits($7FC00000)
+EndProcedure
+
+; -x by flipping the sign bit, so -(+0) is -0 and a NaN keeps its payload.
+Procedure.f PmOpNeg(x.f)
+  ProcedureReturn PmOpFromBits(PmOpBits(x) ! $80000000)
+EndProcedure
+
+Procedure.f PmOpAbs(x.f)
+  ProcedureReturn PmOpFromBits(PmOpBits(x) & $7FFFFFFF)
+EndProcedure
+
+; y * 2^n, exactly where the result is normal; a subnormal result is
+; rounded once (the first step is exact, the second rounds).
+Procedure.f PmOpLdexp(y.f, n.i)
+  Protected p.f
+  If n > 127
+    p = PmOpFromBits(n << 23)
+    y = y * p
+    p = PmOpFromBits($7F000000)
+    y = y * p
+    ProcedureReturn y
+  EndIf
+  If n < -126
+    p = PmOpFromBits((n + 253) << 23)
+    y = y * p
+    p = PmOpFromBits($00800000)
+    y = y * p
+    ProcedureReturn y
+  EndIf
+  p = PmOpFromBits((n + 127) << 23)
+  y = y * p
+  ProcedureReturn y
+EndProcedure
+
+; The integer toward zero of x, for |x| < 2^31; PmOpStatus = 3 outside
+; (and for a NaN or an infinity).
+Procedure.i PmOpTruncInt(x.f)
+  Protected b.i
+  Protected e.i
+  Protected m.i
+  Protected v.i
+  b = PmOpBits(x)
+  e = ((b >> 23) & $FF) - 127
+  If e < 0
+    ProcedureReturn 0
+  EndIf
+  If e > 30
+    PmOpStatus = 3
+    ProcedureReturn 0
+  EndIf
+  m = (b & $7FFFFF) | $800000
+  If e < 23
+    v = m >> (23 - e)
+  Else
+    v = m << (e - 23)
+  EndIf
+  If (b & $80000000) <> 0
+    v = 0 - v
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+; Ceil-13 on the bits: exact for every binary32 value.
+Procedure.f PmOpCeil(x.f)
+  Protected b.i
+  Protected e.i
+  Protected mask.i
+  b = PmOpBits(x)
+  e = ((b >> 23) & $FF) - 127
+  If e >= 23
+    ProcedureReturn x
+  EndIf
+  If e < 0
+    If (b & $7FFFFFFF) = 0
+      ProcedureReturn x
+    EndIf
+    If (b & $80000000) <> 0
+      ProcedureReturn PmOpFromBits($80000000)
+    EndIf
+    ProcedureReturn PmOpOne
+  EndIf
+  mask = $7FFFFF >> e
+  If (b & mask) = 0
+    ProcedureReturn x
+  EndIf
+  If (b & $80000000) = 0
+    b = b + ($800000 >> e)
+  EndIf
+  b = b - (b & mask)
+  ProcedureReturn PmOpFromBits(b)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; sqrt, correctly rounded: the integer square root of fdlibm's e_sqrtf.c
+; on the significand, in steps that fit 32-bit integers.
+; ----------------------------------------------------------------------
+Procedure.f PmOpSqrt(x.f)
+  Protected ix.i
+  Protected m.i
+  Protected i.i
+  Protected q.i
+  Protected s.i
+  Protected r.i
+  Protected t.i
+  ix = PmOpBits(x)
+  If (ix & $7F800000) = $7F800000
+    If (ix & $7FFFFF) <> 0
+      ProcedureReturn x
+    EndIf
+    If (ix & $80000000) = 0
+      ProcedureReturn x
+    EndIf
+    ProcedureReturn PmOpNaN()
+  EndIf
+  If (ix & $7FFFFFFF) = 0
+    ProcedureReturn x
+  EndIf
+  If (ix & $80000000) <> 0
+    ProcedureReturn PmOpNaN()
+  EndIf
+  m = (ix >> 23) & $FF
+  If m = 0
+    i = 0
+    While (ix & $800000) = 0
+      ix = ix << 1
+      i = i + 1
+    Wend
+    m = m - (i - 1)
+  EndIf
+  m = m - 127
+  ix = (ix & $7FFFFF) | $800000
+  If (m & 1) <> 0
+    ix = ix + ix
+  EndIf
+  m = m >> 1
+  ix = ix + ix
+  q = 0
+  s = 0
+  r = $1000000
+  While r <> 0
+    t = s + r
+    If t <= ix
+      s = t + r
+      ix = ix - t
+      q = q + r
+    EndIf
+    ix = ix + ix
+    r = r >> 1
+  Wend
+  If ix <> 0
+    q = q + (q & 1)
+  EndIf
+  ix = (q >> 1) + $3F000000
+  ix = ix + (m << 23)
+  ProcedureReturn PmOpFromBits(ix)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; exp: n = nearest integer to x/ln2 (added to 1.5*2^23 and read back from
+; the bits), r = x - n*ln2 in two steps (ln2's high part has 16 bits, so
+; n*ln2hi is exact), e^r by its Taylor polynomial of degree 7 in Horner
+; form, scaled by 2^n.
+; ----------------------------------------------------------------------
+Procedure.f PmOpExp(x.f)
+  Protected t.f
+  Protected u.f
+  Protected nf.f
+  Protected p.f
+  Protected r.f
+  Protected q.f
+  Protected y.f
+  Protected n.i
+  Protected k.i
+  If (PmOpBits(x) & $7FFFFFFF) > $7F800000
+    ProcedureReturn x
+  EndIf
+  If x > PmOpExpHi
+    ProcedureReturn PmOpInfinity
+  EndIf
+  If x < PmOpExpLo
+    ProcedureReturn 0.0
+  EndIf
+  t = x * PmOpInvLn2
+  u = t + PmOpMagic
+  n = (PmOpBits(u) & $7FFFFF) - $400000
+  nf = n
+  p = nf * PmOpLn2Hi
+  r = x - p
+  q = nf * PmOpLn2Lo
+  r = r - q
+  y = PmOpInvFact(7)
+  k = 6
+  While k >= 0
+    y = y * r
+    y = y + PmOpInvFact(k)
+    k = k - 1
+  Wend
+  ProcedureReturn PmOpLdexp(y, n)
+EndProcedure
+
+; expm1: the Taylor polynomial of degree 11 for |x| <= ln2, exp(x) - 1
+; outside it.
+Procedure.f PmOpExpm1(x.f)
+  Protected y.f
+  Protected k.i
+  If (PmOpBits(x) & $7FFFFFFF) > $7F800000
+    ProcedureReturn x
+  EndIf
+  If PmOpAbs(x) > PmOpExpm1Edge
+    y = PmOpExp(x)
+    y = y - PmOpOne
+    ProcedureReturn y
+  EndIf
+  y = PmOpInvFact(11)
+  k = 10
+  While k >= 2
+    y = y * x
+    y = y + PmOpInvFact(k)
+    k = k - 1
+  Wend
+  y = y * x
+  y = y * x
+  y = y + x
+  ProcedureReturn y
+EndProcedure
+
+; log: x = m * 2^e with m in [sqrt(1/2), sqrt(2)] (a subnormal is scaled
+; by 2^23 first), s = (m - 1)/(m + 1), ln m = 2 atanh(s) by eight terms of
+; its series in s^2, ln x = e*ln2hi + (e*ln2lo + ln m).
+Procedure.f PmOpLog(x.f)
+  Protected b.i
+  Protected e.i
+  Protected k.i
+  Protected m.f
+  Protected num.f
+  Protected den.f
+  Protected s.f
+  Protected z.f
+  Protected p.f
+  Protected ef.f
+  Protected a.f
+  Protected c.f
+  b = PmOpBits(x)
+  If (b & $7FFFFFFF) > $7F800000
+    ProcedureReturn x
+  EndIf
+  If (b & $7FFFFFFF) = 0
+    ProcedureReturn PmOpNeg(PmOpInfinity)
+  EndIf
+  If (b & $80000000) <> 0
+    ProcedureReturn PmOpNaN()
+  EndIf
+  If b = $7F800000
+    ProcedureReturn x
+  EndIf
+  e = (b >> 23) & $FF
+  If e = 0
+    m = PmOpFromBits($4B000000)
+    m = x * m
+    b = PmOpBits(m)
+    e = ((b >> 23) & $FF) - 23
+  EndIf
+  e = e - 127
+  m = PmOpFromBits((b & $7FFFFF) | $3F800000)
+  If m > PmOpSqrt2
+    m = PmOpFromBits((b & $7FFFFF) | $3F000000)
+    e = e + 1
+  EndIf
+  num = m - PmOpOne
+  den = m + PmOpOne
+  s = num / den
+  z = s * s
+  p = PmOpLogC(7)
+  k = 6
+  While k >= 0
+    p = p * z
+    p = p + PmOpLogC(k)
+    k = k - 1
+  Wend
+  p = s * p
+  ef = e
+  a = ef * PmOpLn2Lo
+  a = a + p
+  c = ef * PmOpLn2Hi
+  c = c + a
+  ProcedureReturn c
+EndProcedure
+
+; log1p(t) = log(u) * (t / (u - 1)) with u = 1 + t, which cancels the
+; rounding of u; t itself when u rounds to 1.
+Procedure.f PmOpLog1p(t.f)
+  Protected u.f
+  Protected d.f
+  Protected q.f
+  Protected l.f
+  If (PmOpBits(t) & $7FFFFFFF) > $7F800000
+    ProcedureReturn t
+  EndIf
+  u = PmOpOne + t
+  If u = PmOpOne
+    ProcedureReturn t
+  EndIf
+  If u = PmOpInfinity
+    ProcedureReturn u
+  EndIf
+  d = u - PmOpOne
+  q = t / d
+  l = PmOpLog(u)
+  l = l * q
+  ProcedureReturn l
+EndProcedure
+
+; tanh(|x|) = t / (t + 2) with t = expm1(2|x|), 1 above 9; the sign of x.
+Procedure.f PmOpTanh(x.f)
+  Protected a.f
+  Protected t.f
+  Protected d.f
+  Protected y.f
+  If (PmOpBits(x) & $7FFFFFFF) > $7F800000
+    ProcedureReturn x
+  EndIf
+  a = PmOpAbs(x)
+  If a > PmOpNine
+    y = PmOpOne
+  Else
+    a = a + a
+    t = PmOpExpm1(a)
+    d = t + PmOpTwo
+    y = t / d
+  EndIf
+  If (PmOpBits(x) & $80000000) <> 0
+    ProcedureReturn PmOpNeg(y)
+  EndIf
+  ProcedureReturn y
+EndProcedure
+
+; A polynomial with count coefficients at address (lowest order first), in
+; Horner form.
+Procedure.f PmOpPoly(address.i, count.i, z.f)
+  Protected y.f
+  Protected c.f
+  Protected k.i
+  k = count - 1
+  y = PmTensorGet(address, k)
+  k = k - 1
+  While k >= 0
+    c = PmTensorGet(address, k)
+    y = y * z
+    y = y + c
+    k = k - 1
+  Wend
+  ProcedureReturn y
+EndProcedure
+
+; erf: fdlibm's s_erff.c in binary32 steps. |x| < 0.84375: x + x*P/Q in
+; x^2; below 1.25: erx + P/Q in |x| - 1; up to 6: 1 - exp(-z*z - 0.5625) *
+; exp((z - |x|)(z + |x|) + R/S) / |x| with z = |x| cut to 12 significand
+; bits (so z*z is exact) and R/S in 1/x^2; 1 from 6. Odd in x.
+Procedure.f PmOpErf(x.f)
+  Protected b.i
+  Protected a.f
+  Protected z.f
+  Protected r.f
+  Protected s.f
+  Protected y.f
+  Protected t.f
+  Protected e1.f
+  Protected e2.f
+  Protected d.f
+  b = PmOpBits(x)
+  If (b & $7FFFFFFF) > $7F800000
+    ProcedureReturn x
+  EndIf
+  If (b & $7FFFFFFF) = 0
+    ProcedureReturn x
+  EndIf
+  a = PmOpAbs(x)
+  If a < PmOpErfSmall
+    If a < PmOpErfTiny
+      t = PmOpEfx * x
+      t = x + t
+      ProcedureReturn t
+    EndIf
+    z = x * x
+    r = PmOpPoly(@PmOpErfPP(0), 5, z)
+    s = PmOpPoly(@PmOpErfQQ(0), 6, z)
+    y = r / s
+    t = x * y
+    t = x + t
+    ProcedureReturn t
+  EndIf
+  If a < PmOpErfMid
+    s = a - PmOpOne
+    r = PmOpPoly(@PmOpErfPA(0), 7, s)
+    t = PmOpPoly(@PmOpErfQA(0), 7, s)
+    y = r / t
+    y = PmOpErx + y
+  ElseIf a >= PmOpErfBig
+    y = PmOpOne
+  Else
+    t = a * a
+    s = PmOpOne / t
+    If a < PmOpErfSplit
+      r = PmOpPoly(@PmOpErfRA(0), 8, s)
+      t = PmOpPoly(@PmOpErfSA(0), 9, s)
+    Else
+      r = PmOpPoly(@PmOpErfRB(0), 7, s)
+      t = PmOpPoly(@PmOpErfSB(0), 8, s)
+    EndIf
+    z = PmOpFromBits(PmOpBits(a) & $FFFFF000)
+    e1 = z * z
+    e1 = 0.0 - e1
+    e1 = e1 - PmOpErfBias
+    e1 = PmOpExp(e1)
+    d = z - a
+    y = z + a
+    d = d * y
+    y = r / t
+    d = d + y
+    e2 = PmOpExp(d)
+    e1 = e1 * e2
+    e1 = e1 / a
+    y = PmOpOne - e1
+  EndIf
+  If (b & $80000000) <> 0
+    ProcedureReturn PmOpNeg(y)
+  EndIf
+  ProcedureReturn y
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Integer arithmetic with the checked INT64 contract. On a 32-bit target an
+; INT64 result outside the signed 32-bit range clears PmTensorInt64Ok
+; instead of wrapping to a different number; INT32 keeps its low 32 bits
+; (the store is 32 bits wide); a 64-bit target wraps INT64 in 64 bits, as
+; the reference's numpy does.
+; ----------------------------------------------------------------------
+Procedure.i PmOpAddI(a.i, b.i, kind.i)
+  Protected r.i
+  r = a + b
+  CompilerIf #PMO_OPS_INT32 = 1
+    If kind = 7
+      If (a >= 0 And b >= 0 And r < 0) Or (a < 0 And b < 0 And r >= 0)
+        PmTensorInt64Ok = 0
+      EndIf
+    EndIf
+  CompilerEndIf
+  ProcedureReturn r
+EndProcedure
+
+Procedure.i PmOpMulI(a.i, b.i, kind.i)
+  CompilerIf #PMO_OPS_INT32 = 1
+    If kind = 7 And a <> 0 And b <> 0
+      If (a > 0 And b > 0 And a > 2147483647 / b) Or (a < 0 And b < 0 And a < 2147483647 / b) Or (a > 0 And b < 0 And b < -2147483648 / a) Or (a < 0 And b > 0 And a < -2147483648 / b)
+        PmTensorInt64Ok = 0
+      EndIf
+    EndIf
+  CompilerEndIf
+  ProcedureReturn a * b
+EndProcedure
+
+Procedure.i PmOpReadInt(address.i, index.i, kind.i)
+  If kind = 7
+    ProcedureReturn PmTensorGetI64(address, index)
+  EndIf
+  If kind = 6
+    ProcedureReturn PeekL(address + index * 4)
+  EndIf
+  ProcedureReturn PeekA(address + index) & 255
+EndProcedure
+
+Procedure PmOpWriteInt(address.i, index.i, kind.i, value.i)
+  If kind = 7
+    PmTensorPutI64(address, index, value)
+  ElseIf kind = 6
+    PokeL(address + index * 4, value)
+  ElseIf value <> 0
+    PokeA(address + index, 1)
+  Else
+    PokeA(address + index, 0)
+  EndIf
+EndProcedure
+
+Procedure.i PmOpKindBytes(kind.i)
+  If kind = 7
+    ProcedureReturn 8
+  EndIf
+  If kind = 9
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 4
+EndProcedure
+
+; Every FLOAT result an arithmetic kernel writes goes through here: a NaN is
+; written as the one quiet NaN $7FC00000. The targets' own rules for the NaN
+; an invalid operation makes (the host's x87 gives $FFC00000, the Arm cores
+; $7FC00000) and for which operand's payload survives differ, so the kernels
+; define it instead. Copies (Split, Tile, Gather...) move the bits unchanged.
+Procedure PmOpStoreF(dst.i, index.i, v.f)
+  If (PmOpBits(v) & $7FFFFFFF) > $7F800000
+    PokeL(dst + index * 4, $7FC00000)
+  Else
+    PmTensorPut(dst, index, v)
+  EndIf
+EndProcedure
+
+Procedure PmOpCopyBytes(src.i, dst.i, bytes.i)
+  Protected i.i
+  If src = dst
+    ProcedureReturn
+  EndIf
+  i = 0
+  While i + 4 <= bytes
+    PokeL(dst + i, PeekL(src + i))
+    i = i + 4
+  Wend
+  While i < bytes
+    PokeA(dst + i, PeekA(src + i))
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Elementwise functions of one tensor, Count elements. FLOAT unless noted;
+; PmOpF(0) and PmOpF(1) carry alpha/beta-style attributes, PmOpI(0) and
+; PmOpI(1) IsInf's detect_positive and detect_negative. Each op states the
+; ONNX definition and the order of its binary32 steps. A NaN element gives
+; the same NaN back (0 for ThresholdedRelu and Shrink, whose comparisons are
+; false for it), decided on the bits before any comparison: the host
+; compiler's float comparisons do not order a NaN the way IEEE 754 does.
+;   0 Erf-13                 erf(x)
+;   1 Reciprocal-13          1 / x
+;   2 Ceil-13                exact, on the bits
+;   3 Sign-13                1, -1, or x for zeros and NaN; also INT32/INT64
+;   4 Softplus-1             x > 0: x + log1p(exp(-x)), else log1p(exp(x))
+;                            (the overflow-free form ONNX Runtime uses)
+;   5 Softsign-1             x / (1 + |x|)
+;   6 Elu-6                  x >= 0: x, else alpha * (exp(x) - 1)
+;   7 Selu-6                 x > 0: gamma * x, else gamma*(alpha*exp(x) - alpha)
+;   8 Celu-12                max(0,x) + min(0, alpha*(exp(x/alpha) - 1))
+;   9 HardSigmoid-6          max(0, min(1, alpha*x + beta))
+;  10 HardSwish-14           x * HardSigmoid(x) with alpha 1/6, beta 0.5
+;  11 Mish-18                x * tanh(softplus(x))
+;  12 Gelu-20 "none"         (0.5 * x) * (1 + erf(x * (1/sqrt 2)))
+;  13 Gelu-20 "tanh"         (0.5 * x) * (1 + tanh(sqrt(2/pi) *
+;                            (x + 0.044715 * x*x*x)))
+;  14 ThresholdedRelu-10     x > alpha: x, else 0
+;  15 Shrink-9               x < -lambd: x + bias; x > lambd: x - bias; else 0
+;                            (F0 bias, F1 lambd)
+;  16 IsNaN-20               BOOL
+;  17 IsInf-20               BOOL
+;  18 x / F0                 (Mean's division by the number of inputs)
+; ----------------------------------------------------------------------
+Procedure.f PmOpSoftplus(x.f)
+  Protected e.f
+  Protected t.f
+  If x > 0.0
+    t = PmOpNeg(x)
+    e = PmOpExp(t)
+    e = PmOpLog1p(e)
+    e = x + e
+    ProcedureReturn e
+  EndIf
+  e = PmOpExp(x)
+  ProcedureReturn PmOpLog1p(e)
+EndProcedure
+
+Procedure.f PmOpClamp01(t.f)
+  If PmOpIsNan(t) <> 0
+    ProcedureReturn t
+  EndIf
+  If t < 0.0
+    ProcedureReturn 0.0
+  EndIf
+  If t > PmOpOne
+    ProcedureReturn PmOpOne
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+Procedure.f PmOpUnaryValue(x.f, op.i)
+  Protected t.f
+  Protected u.f
+  Protected h.f
+  If PmOpIsNan(x) <> 0
+    If op = 14 Or op = 15
+      ProcedureReturn 0.0
+    EndIf
+    ProcedureReturn x
+  EndIf
+  Select op
+    Case 0
+      ProcedureReturn PmOpErf(x)
+    Case 1
+      t = PmOpOne / x
+      ProcedureReturn t
+    Case 2
+      ProcedureReturn PmOpCeil(x)
+    Case 3
+      If x > 0.0
+        ProcedureReturn PmOpOne
+      EndIf
+      If x < 0.0
+        ProcedureReturn PmOpNeg(PmOpOne)
+      EndIf
+      ProcedureReturn x
+    Case 4
+      ProcedureReturn PmOpSoftplus(x)
+    Case 5
+      t = PmOpAbs(x)
+      t = PmOpOne + t
+      t = x / t
+      ProcedureReturn t
+    Case 6
+      If x >= 0.0
+        ProcedureReturn x
+      EndIf
+      t = PmOpExp(x)
+      t = t - PmOpOne
+      t = PmOpF(0) * t
+      ProcedureReturn t
+    Case 7
+      If x > 0.0
+        t = PmOpF(1) * x
+        ProcedureReturn t
+      EndIf
+      t = PmOpExp(x)
+      t = PmOpF(0) * t
+      t = t - PmOpF(0)
+      t = PmOpF(1) * t
+      ProcedureReturn t
+    Case 8
+      t = x / PmOpF(0)
+      t = PmOpExp(t)
+      t = t - PmOpOne
+      t = PmOpF(0) * t
+      If t > 0.0
+        t = 0.0
+      EndIf
+      u = x
+      If u < 0.0
+        u = 0.0
+      EndIf
+      t = u + t
+      ProcedureReturn t
+    Case 9
+      t = PmOpF(0) * x
+      t = t + PmOpF(1)
+      ProcedureReturn PmOpClamp01(t)
+    Case 10
+      t = PmOpSixth * x
+      t = t + PmOpHalf
+      t = PmOpClamp01(t)
+      t = x * t
+      ProcedureReturn t
+    Case 11
+      t = PmOpSoftplus(x)
+      t = PmOpTanh(t)
+      t = x * t
+      ProcedureReturn t
+    Case 12
+      t = x * PmOpInvSqrt2
+      t = PmOpErf(t)
+      t = PmOpOne + t
+      h = PmOpHalf * x
+      t = h * t
+      ProcedureReturn t
+    Case 13
+      t = x * x
+      t = t * x
+      t = PmOpGeluCubic * t
+      t = x + t
+      t = PmOpSqrt2OverPi * t
+      t = PmOpTanh(t)
+      t = PmOpOne + t
+      h = PmOpHalf * x
+      t = h * t
+      ProcedureReturn t
+    Case 14
+      If x > PmOpF(0)
+        ProcedureReturn x
+      EndIf
+      ProcedureReturn 0.0
+    Case 15
+      t = PmOpNeg(PmOpF(1))
+      If x < t
+        t = x + PmOpF(0)
+        ProcedureReturn t
+      EndIf
+      If x > PmOpF(1)
+        t = x - PmOpF(0)
+        ProcedureReturn t
+      EndIf
+      ProcedureReturn 0.0
+    Case 18
+      t = x / PmOpF(0)
+      ProcedureReturn t
+  EndSelect
+  PmOpStatus = 2
+  ProcedureReturn x
+EndProcedure
+
+Procedure PmOpUnary(src.i, dst.i, count.i, op.i, kind.i)
+  Protected i.i
+  Protected b.i
+  Protected v.i
+  Protected x.f
+  PmOpInit()
+  i = 0
+  If op = 16 Or op = 17
+    While i < count
+      b = PeekL(src + i * 4) & $7FFFFFFF
+      v = 0
+      If op = 16
+        If b > $7F800000
+          v = 1
+        EndIf
+      ElseIf b = $7F800000
+        If (PeekL(src + i * 4) & $80000000) = 0
+          v = Bool(PmOpI(0) <> 0)
+        Else
+          v = Bool(PmOpI(1) <> 0)
+        EndIf
+      EndIf
+      PokeA(dst + i, v)
+      i = i + 1
+    Wend
+    ProcedureReturn
+  EndIf
+  If kind <> 1
+    If op <> 3
+      PmOpStatus = 2
+      ProcedureReturn
+    EndIf
+    While i < count
+      v = PmOpReadInt(src, i, kind)
+      If v > 0
+        v = 1
+      ElseIf v < 0
+        v = -1
+      EndIf
+      PmOpWriteInt(dst, i, kind, v)
+      i = i + 1
+    Wend
+    ProcedureReturn
+  EndIf
+  While i < count
+    x = PmTensorGet(src, i)
+    x = PmOpUnaryValue(x, op)
+    PmOpStoreF(dst, i, x)
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; fmod(a, b) exactly (C's fmod: the sign of a). |b| is doubled to t with
+; t <= |a| < 2t, then halved back down to |b|, subtracting where it fits;
+; every subtraction has x in [t, 2t), so it is exact (Sterbenz), and so is
+; every doubling and halving of t. NaN for a NaN, an infinite a or a zero
+; b; a for an infinite b.
+; ----------------------------------------------------------------------
+Procedure.f PmOpFmod(a.f, b.f)
+  Protected x.f
+  Protected y.f
+  Protected t.f
+  Protected u.f
+  Protected ab.i
+  Protected bb.i
+  ab = PmOpBits(a)
+  bb = PmOpBits(b)
+  If (ab & $7FFFFFFF) > $7F800000 Or (bb & $7FFFFFFF) > $7F800000
+    ProcedureReturn PmOpNaN()
+  EndIf
+  If (ab & $7FFFFFFF) = $7F800000 Or (bb & $7FFFFFFF) = 0
+    ProcedureReturn PmOpNaN()
+  EndIf
+  If (bb & $7FFFFFFF) = $7F800000
+    ProcedureReturn a
+  EndIf
+  x = PmOpAbs(a)
+  y = PmOpAbs(b)
+  If x < y
+    ProcedureReturn a
+  EndIf
+  t = y
+  u = t + t
+  While u <= x
+    t = u
+    u = t + t
+  Wend
+  While t >= y
+    If x >= t
+      x = x - t
+    EndIf
+    If t = y
+      t = 0.0
+    Else
+      t = t * PmOpHalf
+    EndIf
+  Wend
+  If (ab & $80000000) <> 0
+    ProcedureReturn PmOpNeg(x)
+  EndIf
+  ProcedureReturn x
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Min-13, Max-13, Sum-13, Mean-13 (any number of inputs), Mod-13 and
+; PRelu-16 (two), Or-7 and Xor-7 (two), with numpy broadcasting. Inputs k
+; = 0..n-1 are at PmOpAddr(k) with their dims, right-aligned to Rank with
+; leading ones, in PmOpDN(k*8 + d); the output dims are in PmOpDY. Every
+; output element folds the inputs in order, ((in0 op in1) op in2) ...
+;   op 0 Min   FLOAT: a NaN from either side wins, as numpy.minimum
+;   op 1 Max   the same with the larger value
+;   op 2 Sum   FLOAT a + b; INT32/INT64 with the checked INT64 contract
+;   op 3 Mean  the FLOAT sum, then one division by n
+;   op 4 Mod   fmod=0, integers: the sign of the divisor (Python's %)
+;   op 5 Mod   fmod=1: C's fmod, the sign of the dividend; FLOAT exact
+;   op 6 Or    BOOL
+;   op 7 Xor   BOOL
+;   op 8 PRelu x > 0: x, else x * slope (ONNX Runtime's form); in0 is X
+; A zero divisor in an integer Mod sets PmOpStatus = 4.
+; ----------------------------------------------------------------------
+; a + b as IEEE 754 defines it where the host compiler does not: a NaN
+; operand is returned as it is (the first one), and -0 + -0 is -0.
+Procedure.f PmOpAddF(a.f, b.f)
+  Protected t.f
+  If PmOpIsNan(a) <> 0
+    ProcedureReturn a
+  EndIf
+  If PmOpIsNan(b) <> 0
+    ProcedureReturn b
+  EndIf
+  t = a + b
+  If (PmOpBits(t) & $7FFFFFFF) = 0
+    If (PmOpBits(a) & PmOpBits(b) & $80000000) <> 0
+      ProcedureReturn PmOpFromBits($80000000)
+    EndIf
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+Procedure.f PmOpFloatFold(a.f, b.f, op.i)
+  Protected t.f
+  Select op
+    Case 0
+      If PmOpIsNan(a) <> 0
+        ProcedureReturn a
+      EndIf
+      If PmOpIsNan(b) <> 0 Or b < a
+        ProcedureReturn b
+      EndIf
+      ProcedureReturn a
+    Case 1
+      If PmOpIsNan(a) <> 0
+        ProcedureReturn a
+      EndIf
+      If PmOpIsNan(b) <> 0 Or b > a
+        ProcedureReturn b
+      EndIf
+      ProcedureReturn a
+    Case 2
+      ProcedureReturn PmOpAddF(a, b)
+    Case 3
+      ProcedureReturn PmOpAddF(a, b)
+    Case 5
+      ProcedureReturn PmOpFmod(a, b)
+    Case 8
+      If PmOpIsNan(a) <> 0 Or a > 0.0
+        ProcedureReturn a
+      EndIf
+      t = a * b
+      ProcedureReturn t
+  EndSelect
+  PmOpStatus = 2
+  ProcedureReturn a
+EndProcedure
+
+Procedure.i PmOpIntFold(a.i, b.i, op.i, kind.i)
+  Protected r.i
+  Select op
+    Case 0
+      If b < a
+        ProcedureReturn b
+      EndIf
+      ProcedureReturn a
+    Case 1
+      If b > a
+        ProcedureReturn b
+      EndIf
+      ProcedureReturn a
+    Case 2
+      ProcedureReturn PmOpAddI(a, b, kind)
+    Case 4
+      If b = 0
+        PmOpStatus = 4
+        ProcedureReturn 0
+      EndIf
+      r = a % b
+      If r <> 0 And ((r < 0 And b > 0) Or (r > 0 And b < 0))
+        r = r + b
+      EndIf
+      ProcedureReturn r
+    Case 5
+      If b = 0
+        PmOpStatus = 4
+        ProcedureReturn 0
+      EndIf
+      ProcedureReturn a % b
+    Case 6
+      ProcedureReturn Bool(a <> 0 Or b <> 0)
+    Case 7
+      r = Bool(a <> 0)
+      If b <> 0
+        r = 1 - r
+      EndIf
+      ProcedureReturn r
+    Case 8
+      If a > 0
+        ProcedureReturn a
+      EndIf
+      ProcedureReturn PmOpMulI(a, b, kind)
+  EndSelect
+  PmOpStatus = 2
+  ProcedureReturn a
+EndProcedure
+
+; Strides of input k over the output's axes: 0 where the input's extent is
+; one and the output's is not.
+Procedure PmOpBroadcastStrides(k.i, rank.i)
+  Protected d.i
+  Protected s.i
+  s = 1
+  d = rank - 1
+  While d >= 0
+    If PmOpDN(k * 8 + d) = 1 And PmOpDY(d) <> 1
+      PmOpStride(k * 8 + d) = 0
+    Else
+      PmOpStride(k * 8 + d) = s
+    EndIf
+    s = s * PmOpDN(k * 8 + d)
+    d = d - 1
+  Wend
+EndProcedure
+
+Procedure PmOpVariadic(dst.i, n.i, rank.i, op.i, kind.i)
+  Protected count.i
+  Protected i.i
+  Protected k.i
+  Protected d.i
+  Protected fa.f
+  Protected fb.f
+  Protected ia.i
+  Protected ib.i
+  Protected nf.f
+  PmOpInit()
+  count = 1
+  d = 0
+  While d < rank
+    PmOpCoord(d) = 0
+    count = count * PmOpDY(d)
+    d = d + 1
+  Wend
+  k = 0
+  While k < n
+    PmOpBroadcastStrides(k, rank)
+    PmOpOffset(k) = 0
+    k = k + 1
+  Wend
+  nf = n
+  i = 0
+  While i < count
+    If kind = 1
+      fa = PmTensorGet(PmOpAddr(0), PmOpOffset(0))
+      k = 1
+      While k < n
+        fb = PmTensorGet(PmOpAddr(k), PmOpOffset(k))
+        fa = PmOpFloatFold(fa, fb, op)
+        k = k + 1
+      Wend
+      If op = 3
+        fa = fa / nf
+      EndIf
+      PmOpStoreF(dst, i, fa)
+    Else
+      ia = PmOpReadInt(PmOpAddr(0), PmOpOffset(0), kind)
+      k = 1
+      While k < n
+        ib = PmOpReadInt(PmOpAddr(k), PmOpOffset(k), kind)
+        ia = PmOpIntFold(ia, ib, op, kind)
+        k = k + 1
+      Wend
+      PmOpWriteInt(dst, i, kind, ia)
+    EndIf
+    ; advance the output coordinate and every input offset
+    d = rank - 1
+    While d >= 0
+      PmOpCoord(d) = PmOpCoord(d) + 1
+      k = 0
+      While k < n
+        PmOpOffset(k) = PmOpOffset(k) + PmOpStride(k * 8 + d)
+        k = k + 1
+      Wend
+      If PmOpCoord(d) < PmOpDY(d)
+        d = -1
+      Else
+        k = 0
+        While k < n
+          PmOpOffset(k) = PmOpOffset(k) - PmOpStride(k * 8 + d) * PmOpDY(d)
+          k = k + 1
+        Wend
+        PmOpCoord(d) = 0
+        d = d - 1
+      EndIf
+    Wend
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ReduceMin-20, ReduceL1-18, ReduceL2-18, ReduceSumSquare-18,
+; ReduceLogSum-18 and ReduceLogSumExp-18 (and their attribute forms before
+; opset 18, which reduce the same way). The input dims are in PmOpDA;
+; Mask has bit d set for every reduced axis. The output holds the kept
+; extents in row-major order, whether or not keepdims kept the reduced
+; axes as ones. Each output combines its input elements in row-major
+; order, the order the reference's numpy visits them:
+;   op 0 Min         +infinity (the type's maximum for integers) over the
+;                    empty set; a FLOAT NaN wins
+;   op 1 L1          sum of |x|, 0 over the empty set
+;   op 2 L2          sqrt of the sum of x*x (FLOAT)
+;   op 3 SumSquare   sum of x*x
+;   op 4 LogSum      log of the sum (FLOAT), -infinity over the empty set
+;   op 5 LogSumExp   m + log(sum exp(x - m)) with m the largest element, the
+;                    overflow-free form ONNX Runtime uses; -infinity over the
+;                    empty set
+; INT32 and INT64 for Min, L1 and SumSquare, with the checked INT64
+; contract.
+; ----------------------------------------------------------------------
+Procedure PmOpReduce(src.i, dst.i, rank.i, mask.i, op.i, kind.i)
+  Protected d.i
+  Protected s.i
+  Protected outCount.i
+  Protected inner.i
+  Protected o.i
+  Protected j.i
+  Protected n.i
+  Protected base.i
+  Protected at.i
+  Protected coord.i
+  Protected pass.i
+  Protected acc.f
+  Protected m.f
+  Protected x.f
+  Protected t.f
+  Protected ia.i
+  Protected iv.i
+  PmOpInit()
+  ; strides of the input, the kept and the reduced counts
+  s = 1
+  outCount = 1
+  inner = 1
+  d = rank - 1
+  While d >= 0
+    PmOpStride(d) = s
+    s = s * PmOpDA(d)
+    If ((mask >> d) & 1) <> 0
+      inner = inner * PmOpDA(d)
+    Else
+      outCount = outCount * PmOpDA(d)
+    EndIf
+    d = d - 1
+  Wend
+  o = 0
+  While o < outCount
+    ; the input offset of output o: its kept coordinates, reduced ones at 0
+    base = 0
+    n = o
+    d = rank - 1
+    While d >= 0
+      If ((mask >> d) & 1) = 0
+        coord = n % PmOpDA(d)
+        n = n / PmOpDA(d)
+        base = base + coord * PmOpStride(d)
+      EndIf
+      d = d - 1
+    Wend
+    If kind = 1
+      m = PmOpNeg(PmOpInfinity)
+      pass = 0
+      If op = 5
+        pass = 1
+      EndIf
+      While pass >= 0
+        If op = 0
+          acc = PmOpInfinity
+        ElseIf op = 4 Or (op = 5 And pass = 0)
+          acc = 0.0
+        Else
+          acc = 0.0
+        EndIf
+        j = 0
+        While j < inner
+          ; the offset of the j-th reduced element in row-major order
+          at = base
+          n = j
+          d = rank - 1
+          While d >= 0
+            If ((mask >> d) & 1) <> 0
+              coord = n % PmOpDA(d)
+              n = n / PmOpDA(d)
+              at = at + coord * PmOpStride(d)
+            EndIf
+            d = d - 1
+          Wend
+          x = PmTensorGet(src, at)
+          Select op
+            Case 0
+              If PmOpIsNan(acc) = 0
+                If PmOpIsNan(x) <> 0 Or x < acc
+                  acc = x
+                EndIf
+              EndIf
+            Case 1
+              t = PmOpAbs(x)
+              acc = acc + t
+            Case 2
+              t = x * x
+              acc = acc + t
+            Case 3
+              t = x * x
+              acc = acc + t
+            Case 4
+              acc = acc + x
+            Case 5
+              If pass = 1
+                If PmOpIsNan(m) = 0
+                  If PmOpIsNan(x) <> 0 Or x > m
+                    m = x
+                  EndIf
+                EndIf
+              Else
+                t = x - m
+                t = PmOpExp(t)
+                acc = acc + t
+              EndIf
+          EndSelect
+          j = j + 1
+        Wend
+        pass = pass - 1
+      Wend
+      Select op
+        Case 2
+          acc = PmOpSqrt(acc)
+        Case 4
+          acc = PmOpLog(acc)
+        Case 5
+          If inner = 0
+            acc = PmOpNeg(PmOpInfinity)
+          ElseIf PmOpIsNan(m) <> 0 Or (PmOpBits(m) & $7FFFFFFF) = $7F800000
+            acc = m
+          Else
+            acc = PmOpLog(acc)
+            acc = m + acc
+          EndIf
+      EndSelect
+      PmOpStoreF(dst, o, acc)
+    Else
+      If op = 0
+        If kind = 6
+          ia = 2147483647
+        Else
+          CompilerIf #PMO_OPS_INT32 = 1
+            ia = 2147483647
+          CompilerElse
+            ia = 9223372036854775807
+          CompilerEndIf
+        EndIf
+      Else
+        ia = 0
+      EndIf
+      j = 0
+      While j < inner
+        at = base
+        n = j
+        d = rank - 1
+        While d >= 0
+          If ((mask >> d) & 1) <> 0
+            coord = n % PmOpDA(d)
+            n = n / PmOpDA(d)
+            at = at + coord * PmOpStride(d)
+          EndIf
+          d = d - 1
+        Wend
+        iv = PmOpReadInt(src, at, kind)
+        Select op
+          Case 0
+            If iv < ia
+              ia = iv
+            EndIf
+          Case 1
+            If iv < 0
+              iv = 0 - iv
+            EndIf
+            ia = PmOpAddI(ia, iv, kind)
+          Default
+            iv = PmOpMulI(iv, iv, kind)
+            ia = PmOpAddI(ia, iv, kind)
+        EndSelect
+        j = j + 1
+      Wend
+      PmOpWriteInt(dst, o, kind, ia)
+    EndIf
+    o = o + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ArgMax-13 (op 0) and ArgMin-13 (op 1) along one axis of an
+; (Outer, Width, Inner) view; INT64 indices. Ties give the first index, or
+; the last with select_last_index = 1. FLOAT: the first NaN wins, as
+; numpy.argmax does. Width must be at least 1.
+; ----------------------------------------------------------------------
+Procedure PmOpArg(src.i, dst.i, outer.i, width.i, inner.i, op.i, lastIndex.i, kind.i)
+  Protected o.i
+  Protected i.i
+  Protected j.i
+  Protected best.i
+  Protected at.i
+  Protected take.i
+  Protected fb.f
+  Protected fx.f
+  Protected ib.i
+  Protected ix.i
+  PmOpInit()
+  o = 0
+  While o < outer
+    i = 0
+    While i < inner
+      at = o * width * inner + i
+      best = 0
+      If kind = 1
+        fb = PmTensorGet(src, at)
+      Else
+        ib = PmOpReadInt(src, at, kind)
+      EndIf
+      j = 1
+      While j < width
+        take = 0
+        If kind = 1
+          fx = PmTensorGet(src, at + j * inner)
+          If PmOpIsNan(fb) = 0
+            If PmOpIsNan(fx) <> 0
+              take = 1
+            ElseIf op = 0
+              If fx > fb Or (lastIndex <> 0 And fx = fb)
+                take = 1
+              EndIf
+            Else
+              If fx < fb Or (lastIndex <> 0 And fx = fb)
+                take = 1
+              EndIf
+            EndIf
+          EndIf
+          If take <> 0
+            fb = fx
+          EndIf
+        Else
+          ix = PmOpReadInt(src, at + j * inner, kind)
+          If op = 0
+            If ix > ib Or (lastIndex <> 0 And ix = ib)
+              take = 1
+            EndIf
+          Else
+            If ix < ib Or (lastIndex <> 0 And ix = ib)
+              take = 1
+            EndIf
+          EndIf
+          If take <> 0
+            ib = ix
+          EndIf
+        EndIf
+        If take <> 0
+          best = j
+        EndIf
+        j = j + 1
+      Wend
+      PmTensorPutI64(dst, o * inner + i, best)
+      i = i + 1
+    Wend
+    o = o + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; LogSoftmax-13 along one axis of an (Outer, Width, Inner) view:
+; y = (x - m) - log(sum exp(x - m)), m the largest element of the slice,
+; the sum in index order.
+; ----------------------------------------------------------------------
+Procedure PmOpLogSoftmax(src.i, dst.i, outer.i, width.i, inner.i)
+  Protected o.i
+  Protected i.i
+  Protected j.i
+  Protected at.i
+  Protected m.f
+  Protected x.f
+  Protected s.f
+  Protected t.f
+  Protected l.f
+  PmOpInit()
+  o = 0
+  While o < outer
+    i = 0
+    While i < inner
+      at = o * width * inner + i
+      m = PmOpNeg(PmOpInfinity)
+      j = 0
+      While j < width
+        x = PmTensorGet(src, at + j * inner)
+        If PmOpIsNan(m) = 0
+          If PmOpIsNan(x) <> 0 Or x > m
+            m = x
+          EndIf
+        EndIf
+        j = j + 1
+      Wend
+      s = 0.0
+      j = 0
+      While j < width
+        x = PmTensorGet(src, at + j * inner)
+        t = x - m
+        t = PmOpExp(t)
+        s = s + t
+        j = j + 1
+      Wend
+      l = PmOpLog(s)
+      j = 0
+      While j < width
+        x = PmTensorGet(src, at + j * inner)
+        t = x - m
+        t = t - l
+        PmOpStoreF(dst, at + j * inner, t)
+        j = j + 1
+      Wend
+      i = i + 1
+    Wend
+    o = o + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MaxPool-12, AveragePool-19, LpPool-18 and their global forms
+; (GlobalMaxPool-1, GlobalAveragePool-1, GlobalLpPool-2), over an
+; (N, C, D1 ... Ds) input with s = 1, 2 or 3 spatial axes. The caller has
+; resolved auto_pad and ceil_mode into explicit output extents and begin
+; and end pads, so the kernel only walks windows. Parameters in PmOpI:
+;   0 s        1 N        2 C
+;   3 mode: 0 max, 1 average, 2 Lp
+;   4 count_include_pad (average)   5 p (Lp: 1, 2 or larger)
+;   6 storage_order (MaxPool indices: 0 row-major, 1 column-major)
+;   8+d input extent   12+d output extent   16+d kernel   20+d stride
+;   24+d dilation      28+d begin pad       32+d end pad
+; For output position o and kernel offset k on axis d the input coordinate
+; is o*stride - begin + k*dilation. A window position outside the input is
+; skipped; for average it still counts when count_include_pad = 1 and it
+; lies inside the padded extent [-begin, input + end).
+;   max       the largest element, ONNX Runtime's rule: an element replaces
+;             the running maximum when it is greater, so the first of equal
+;             elements is kept, and the Indices output (INT64, optional)
+;             holds its offset in the flattened input, batch and channel
+;             included; column-major over the spatial axes with
+;             storage_order = 1. A window with no input element gives the
+;             lowest finite value and index -1
+;   average   the sum in window order, then one division by the count (NaN
+;             for a window that counts nothing)
+;   Lp        (sum |x|^p)^(1/p): p = 1 the sum of |x|, p = 2 the square
+;             root of the sum of squares, otherwise exp(log(sum)/p) with
+;             |x|^p = exp(p*log|x|)
+; ----------------------------------------------------------------------
+Procedure PmOpPool(src.i, dst.i, indices.i)
+  Protected s.i
+  Protected d.i
+  Protected planes.i
+  Protected plane.i
+  Protected inPlane.i
+  Protected outPlane.i
+  Protected o.i
+  Protected n.i
+  Protected windows.i
+  Protected w.i
+  Protected q.i
+  Protected valid.i
+  Protected inside.i
+  Protected counted.i
+  Protected at.i
+  Protected bestAt.i
+  Protected c.i
+  Protected colStride.i
+  Protected rowStride.i
+  Protected flat.i
+  Protected acc.f
+  Protected x.f
+  Protected t.f
+  Protected pf.f
+  Protected cf.f
+  PmOpInit()
+  s = PmOpI(0)
+  planes = PmOpI(1) * PmOpI(2)
+  inPlane = 1
+  outPlane = 1
+  windows = 1
+  d = 0
+  While d < s
+    inPlane = inPlane * PmOpI(8 + d)
+    outPlane = outPlane * PmOpI(12 + d)
+    windows = windows * PmOpI(16 + d)
+    d = d + 1
+  Wend
+  pf = PmOpI(5)
+  plane = 0
+  While plane < planes
+    o = 0
+    While o < outPlane
+      ; output coordinates of o, into PmOpCoord(0 .. s-1)
+      n = o
+      d = s - 1
+      While d >= 0
+        PmOpCoord(d) = n % PmOpI(12 + d)
+        n = n / PmOpI(12 + d)
+        d = d - 1
+      Wend
+      acc = 0.0
+      If PmOpI(3) = 0
+        acc = PmOpNeg(PmOpFromBits($7F7FFFFF))
+      EndIf
+      bestAt = -1
+      counted = 0
+      w = 0
+      While w < windows
+        ; window offset w into kernel coordinates, then input coordinates
+        n = w
+        valid = 1
+        inside = 1
+        at = 0
+        d = s - 1
+        While d >= 0
+          q = n % PmOpI(16 + d)
+          n = n / PmOpI(16 + d)
+          q = PmOpCoord(d) * PmOpI(20 + d) - PmOpI(28 + d) + q * PmOpI(24 + d)
+          If q < 0 Or q >= PmOpI(8 + d)
+            valid = 0
+            If q < 0 - PmOpI(28 + d) Or q >= PmOpI(8 + d) + PmOpI(32 + d)
+              inside = 0
+            EndIf
+          EndIf
+          PmOpOffset(d) = q
+          d = d - 1
+        Wend
+        If valid <> 0
+          ; row-major offset within the plane
+          at = 0
+          d = 0
+          While d < s
+            at = at * PmOpI(8 + d) + PmOpOffset(d)
+            d = d + 1
+          Wend
+          x = PmTensorGet(src, plane * inPlane + at)
+          Select PmOpI(3)
+            Case 0
+              If PmOpIsNan(x) = 0 And x > acc
+                acc = x
+                bestAt = at
+              EndIf
+            Case 1
+              acc = acc + x
+            Default
+              x = PmOpAbs(x)
+              If PmOpI(5) = 1
+                acc = acc + x
+              ElseIf PmOpI(5) = 2
+                t = x * x
+                acc = acc + t
+              ElseIf (PmOpBits(x) & $7FFFFFFF) <> 0
+                t = PmOpLog(x)
+                t = pf * t
+                t = PmOpExp(t)
+                acc = acc + t
+              EndIf
+          EndSelect
+          counted = counted + 1
+        ElseIf inside <> 0 And PmOpI(4) <> 0
+          counted = counted + 1
+        EndIf
+        w = w + 1
+      Wend
+      If PmOpI(3) = 1
+        If counted > 0
+          cf = counted
+          acc = acc / cf
+        Else
+          acc = PmOpNaN()
+        EndIf
+      ElseIf PmOpI(3) = 2
+        If PmOpI(5) = 2
+          acc = PmOpSqrt(acc)
+        ElseIf PmOpI(5) > 2 And (PmOpBits(acc) & $7FFFFFFF) <> 0
+          t = PmOpLog(acc)
+          t = t / pf
+          acc = PmOpExp(t)
+        EndIf
+      EndIf
+      PmOpStoreF(dst, plane * outPlane + o, acc)
+      If indices <> 0
+        flat = -1
+        If bestAt >= 0
+          If PmOpI(6) = 0
+            flat = plane * inPlane + bestAt
+          Else
+            ; column-major over the spatial axes: the first axis varies fastest
+            n = bestAt
+            d = s - 1
+            While d >= 0
+              PmOpOffset(d) = n % PmOpI(8 + d)
+              n = n / PmOpI(8 + d)
+              d = d - 1
+            Wend
+            flat = 0
+            d = s - 1
+            While d >= 0
+              flat = flat * PmOpI(8 + d) + PmOpOffset(d)
+              d = d - 1
+            Wend
+            flat = plane * inPlane + flat
+          EndIf
+        EndIf
+        PmTensorPutI64(indices, plane * outPlane + o, flat)
+      EndIf
+      o = o + 1
+    Wend
+    plane = plane + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Data movement. Elements are copied as bytes of the given width, so these
+; kernels serve every element type and change no value.
+; ----------------------------------------------------------------------
+
+; A copy of one element of Bytes (1, 4 or 8) from src to dst.
+Procedure PmOpCopyElement(src.i, dst.i, bytes.i)
+  If bytes = 4
+    PokeL(dst, PeekL(src))
+  ElseIf bytes = 8
+    PokeL(dst, PeekL(src))
+    PokeL(dst + 4, PeekL(src + 4))
+  Else
+    PokeA(dst, PeekA(src))
+  EndIf
+EndProcedure
+
+; Transpose-style permutation: output axis d is input axis PmOpI(40 + d).
+; Input dims in PmOpDA; the output dims follow. DepthToSpace-13 and
+; SpaceToDepth-13 are this permutation of a rank-6 view of the input.
+Procedure PmOpPermute(src.i, dst.i, rank.i, bytes.i)
+  Protected d.i
+  Protected s.i
+  Protected count.i
+  Protected i.i
+  Protected at.i
+  s = 1
+  d = rank - 1
+  While d >= 0
+    PmOpStride(d) = s
+    s = s * PmOpDA(d)
+    d = d - 1
+  Wend
+  count = s
+  d = 0
+  While d < rank
+    PmOpDY(d) = PmOpDA(PmOpI(40 + d))
+    PmOpStride(16 + d) = PmOpStride(PmOpI(40 + d))
+    PmOpCoord(d) = 0
+    d = d + 1
+  Wend
+  at = 0
+  i = 0
+  While i < count
+    PmOpCopyElement(src + at * bytes, dst + i * bytes, bytes)
+    d = rank - 1
+    While d >= 0
+      PmOpCoord(d) = PmOpCoord(d) + 1
+      at = at + PmOpStride(16 + d)
+      If PmOpCoord(d) < PmOpDY(d)
+        d = -1
+      Else
+        at = at - PmOpStride(16 + d) * PmOpDY(d)
+        PmOpCoord(d) = 0
+        d = d - 1
+      EndIf
+    Wend
+    i = i + 1
+  Wend
+EndProcedure
+
+; Tile-13: output dims in PmOpDY, input dims in PmOpDA; output coordinate
+; c reads input coordinate c mod extent on every axis.
+Procedure PmOpTile(src.i, dst.i, rank.i, bytes.i)
+  Protected d.i
+  Protected s.i
+  Protected count.i
+  Protected i.i
+  Protected n.i
+  Protected at.i
+  s = 1
+  count = 1
+  d = rank - 1
+  While d >= 0
+    PmOpStride(d) = s
+    s = s * PmOpDA(d)
+    count = count * PmOpDY(d)
+    d = d - 1
+  Wend
+  i = 0
+  While i < count
+    n = i
+    at = 0
+    d = rank - 1
+    While d >= 0
+      at = at + ((n % PmOpDY(d)) % PmOpDA(d)) * PmOpStride(d)
+      n = n / PmOpDY(d)
+      d = d - 1
+    Wend
+    PmOpCopyElement(src + at * bytes, dst + i * bytes, bytes)
+    i = i + 1
+  Wend
+EndProcedure
+
+; Split-18 (and -13, -11, -2): one output, the Width elements from Offset
+; along the axis of an (Outer, SrcWidth, Inner) view.
+Procedure PmOpSlab(src.i, dst.i, outer.i, srcWidth.i, offset.i, width.i, inner.i, bytes.i)
+  Protected o.i
+  Protected run.i
+  run = width * inner * bytes
+  o = 0
+  While o < outer
+    PmOpCopyBytes(src + ((o * srcWidth + offset) * inner) * bytes, dst + o * run, run)
+    o = o + 1
+  Wend
+EndProcedure
+
+; Trilu-14 over the last two axes of a (Batch, Rows, Cols) view: element
+; (i, j) is kept when j - i >= K (Upper = 1) or j - i <= K (Upper = 0), and
+; zero otherwise.
+Procedure PmOpTrilu(src.i, dst.i, batch.i, rows.i, cols.i, k.i, upper.i, bytes.i)
+  Protected b.i
+  Protected i.i
+  Protected j.i
+  Protected at.i
+  Protected keep.i
+  b = 0
+  While b < batch
+    i = 0
+    While i < rows
+      j = 0
+      While j < cols
+        at = ((b * rows + i) * cols + j) * bytes
+        If upper <> 0
+          keep = Bool(j - i >= k)
+        Else
+          keep = Bool(j - i <= k)
+        EndIf
+        If keep <> 0
+          PmOpCopyElement(src + at, dst + at, bytes)
+        ElseIf bytes = 1
+          PokeA(dst + at, 0)
+        ElseIf bytes = 4
+          PokeL(dst + at, 0)
+        Else
+          PokeL(dst + at, 0)
+          PokeL(dst + at + 4, 0)
+        EndIf
+        j = j + 1
+      Wend
+      i = i + 1
+    Wend
+    b = b + 1
+  Wend
+EndProcedure
+
+; GatherElements-13: data dims in PmOpDA, indices (and output) dims in
+; PmOpDB. Output element c reads data at c with its Axis coordinate
+; replaced by the index there (negative counts from the end). Returns 1 for
+; an index outside [-s, s-1], 0 otherwise.
+Procedure.i PmOpGatherElements(source.i, indices.i, dst.i, rank.i, axis.i, bytes.i, indexKind.i)
+  Protected d.i
+  Protected s.i
+  Protected count.i
+  Protected i.i
+  Protected n.i
+  Protected at.i
+  Protected coord.i
+  Protected v.i
+  s = 1
+  count = 1
+  d = rank - 1
+  While d >= 0
+    PmOpStride(d) = s
+    s = s * PmOpDA(d)
+    count = count * PmOpDB(d)
+    d = d - 1
+  Wend
+  i = 0
+  While i < count
+    n = i
+    at = 0
+    d = rank - 1
+    While d >= 0
+      coord = n % PmOpDB(d)
+      n = n / PmOpDB(d)
+      If d = axis
+        v = PmOpReadInt(indices, i, indexKind)
+        If v < 0
+          v = v + PmOpDA(d)
+        EndIf
+        If v < 0 Or v >= PmOpDA(d)
+          ProcedureReturn 1
+        EndIf
+        coord = v
+      EndIf
+      at = at + coord * PmOpStride(d)
+      d = d - 1
+    Wend
+    PmOpCopyElement(source + at * bytes, dst + i * bytes, bytes)
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; GatherND-13: PmOpI(0) batch_dims b, PmOpI(1) data rank r, PmOpI(2)
+; indices rank q; data dims in PmOpDA, indices dims in PmOpDB, k =
+; PmOpDB(q-1). Every index tuple picks a slice of the data's axes b+k .. r-1
+; within its batch. Returns 1 for an index outside [-s, s-1].
+Procedure.i PmOpGatherND(source.i, indices.i, dst.i, bytes.i, indexKind.i)
+  Protected b.i
+  Protected r.i
+  Protected q.i
+  Protected k.i
+  Protected d.i
+  Protected batches.i
+  Protected tuples.i
+  Protected slice.i
+  Protected perBatch.i
+  Protected bi.i
+  Protected t.i
+  Protected j.i
+  Protected v.i
+  Protected offset.i
+  Protected row.i
+  b = PmOpI(0)
+  r = PmOpI(1)
+  q = PmOpI(2)
+  k = PmOpDB(q - 1)
+  batches = 1
+  d = 0
+  While d < b
+    batches = batches * PmOpDB(d)
+    d = d + 1
+  Wend
+  tuples = 1
+  d = b
+  While d < q - 1
+    tuples = tuples * PmOpDB(d)
+    d = d + 1
+  Wend
+  slice = 1
+  d = b + k
+  While d < r
+    slice = slice * PmOpDA(d)
+    d = d + 1
+  Wend
+  perBatch = 1
+  d = b
+  While d < r
+    perBatch = perBatch * PmOpDA(d)
+    d = d + 1
+  Wend
+  bi = 0
+  While bi < batches
+    t = 0
+    While t < tuples
+      row = (bi * tuples + t) * k
+      offset = 0
+      j = 0
+      While j < k
+        v = PmOpReadInt(indices, row + j, indexKind)
+        If v < 0
+          v = v + PmOpDA(b + j)
+        EndIf
+        If v < 0 Or v >= PmOpDA(b + j)
+          ProcedureReturn 1
+        EndIf
+        offset = offset * PmOpDA(b + j) + v
+        j = j + 1
+      Wend
+      offset = offset * slice
+      PmOpCopyBytes(source + (bi * perBatch + offset) * bytes, dst + ((bi * tuples + t) * slice) * bytes, slice * bytes)
+      t = t + 1
+    Wend
+    bi = bi + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; OneHot-11 over an (Outer, Inner) view of the indices, the new axis of
+; extent Depth between them. An index is truncated toward zero (FLOAT
+; indices), a negative one counts from Depth; one outside [-depth,
+; depth-1] gives a row of off values. Values: PmOpF(0)/PmOpF(1) (off, on)
+; for FLOAT output, PmOpI(0)/PmOpI(1) for INT32/INT64/BOOL.
+Procedure PmOpOneHot(indices.i, dst.i, outer.i, depth.i, inner.i, indexKind.i, outKind.i)
+  Protected o.i
+  Protected i.i
+  Protected d.i
+  Protected v.i
+  Protected at.i
+  PmOpInit()
+  o = 0
+  While o < outer
+    i = 0
+    While i < inner
+      If indexKind = 1
+        v = PmOpTruncInt(PmTensorGet(indices, o * inner + i))
+      Else
+        v = PmOpReadInt(indices, o * inner + i, indexKind)
+      EndIf
+      If v < 0
+        v = v + depth
+      EndIf
+      d = 0
+      While d < depth
+        at = (o * depth + d) * inner + i
+        If outKind = 1
+          If d = v
+            PmTensorPut(dst, at, PmOpF(1))
+          Else
+            PmTensorPut(dst, at, PmOpF(0))
+          EndIf
+        ElseIf d = v
+          PmOpWriteInt(dst, at, outKind, PmOpI(1))
+        Else
+          PmOpWriteInt(dst, at, outKind, PmOpI(0))
+        EndIf
+        d = d + 1
+      Wend
+      i = i + 1
+    Wend
+    o = o + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Einsum-12, FLOAT, one to four operands. The caller has parsed the
+; equation into labels: PmOpI(0) operands n, PmOpI(1) labels L (at most
+; 16), PmOpI(2) output labels Lo. Labels 0 .. Lo-1 are the output's axes in
+; order; Lo .. L-1 are summed over. PmOpI(4 + l) is label l's extent and
+; PmOpI(20 + k*16 + l) operand k's element stride for it (the sum of the
+; strides of every axis of operand k carrying the label, so a repeated
+; label reads a diagonal; 0 when the operand lacks it). Operand k is at
+; PmOpAddr(k). Every output element is the sum, over the summed labels in
+; row-major order, of the product of the operands' elements in operand
+; order; 0 for an empty sum.
+; ----------------------------------------------------------------------
+Procedure PmOpEinsum(dst.i)
+  Protected n.i
+  Protected labels.i
+  Protected kept.i
+  Protected outCount.i
+  Protected sumCount.i
+  Protected o.i
+  Protected c.i
+  Protected l.i
+  Protected k.i
+  Protected v.i
+  Protected coord.i
+  Protected acc.f
+  Protected p.f
+  Protected x.f
+  PmOpInit()
+  n = PmOpI(0)
+  labels = PmOpI(1)
+  kept = PmOpI(2)
+  outCount = 1
+  l = 0
+  While l < kept
+    outCount = outCount * PmOpI(4 + l)
+    l = l + 1
+  Wend
+  sumCount = 1
+  l = kept
+  While l < labels
+    sumCount = sumCount * PmOpI(4 + l)
+    l = l + 1
+  Wend
+  o = 0
+  While o < outCount
+    ; operand offsets of the output labels' coordinates
+    k = 0
+    While k < n
+      PmOpOffset(k) = 0
+      k = k + 1
+    Wend
+    v = o
+    l = kept - 1
+    While l >= 0
+      coord = v % PmOpI(4 + l)
+      v = v / PmOpI(4 + l)
+      k = 0
+      While k < n
+        PmOpOffset(k) = PmOpOffset(k) + coord * PmOpI(20 + k * 16 + l)
+        k = k + 1
+      Wend
+      l = l - 1
+    Wend
+    acc = 0.0
+    c = 0
+    While c < sumCount
+      k = 0
+      While k < n
+        PmOpOffset(8 + k) = PmOpOffset(k)
+        k = k + 1
+      Wend
+      v = c
+      l = labels - 1
+      While l >= kept
+        coord = v % PmOpI(4 + l)
+        v = v / PmOpI(4 + l)
+        k = 0
+        While k < n
+          PmOpOffset(8 + k) = PmOpOffset(8 + k) + coord * PmOpI(20 + k * 16 + l)
+          k = k + 1
+        Wend
+        l = l - 1
+      Wend
+      p = PmTensorGet(PmOpAddr(0), PmOpOffset(8))
+      k = 1
+      While k < n
+        x = PmTensorGet(PmOpAddr(k), PmOpOffset(8 + k))
+        p = p * x
+        k = k + 1
+      Wend
+      acc = acc + p
+      c = c + 1
+    Wend
+    PmOpStoreF(dst, o, acc)
+    o = o + 1
+  Wend
+EndProcedure

@@ -123,6 +123,18 @@ DataSection
   PmdRandomPortableStart:
   IncludeBinary "../../runtime/tensor_random_dynamic_portable.pmi"
   PmdRandomPortableEnd:
+  PmdOpsStart:
+  IncludeBinary "../../runtime/tensor_ops.pmi"
+  PmdOpsEnd:
+  PmdOpsDynamicStart:
+  IncludeBinary "../../runtime/tensor_dynamic_ops.pmi"
+  PmdOpsDynamicEnd:
+  PmdOpsWindowsStart:
+  IncludeBinary "../../runtime/tensor_dynamic_ops_windows.pbi"
+  PmdOpsWindowsEnd:
+  PmdOpsPortableStart:
+  IncludeBinary "../../runtime/tensor_dynamic_ops_portable.pmi"
+  PmdOpsPortableEnd:
 EndDataSection
 
 Procedure.i PmdWriteSupport(Path.s,*Data,Bytes.i)
@@ -133,8 +145,18 @@ Procedure.i PmdWriteSupport(Path.s,*Data,Bytes.i)
   ProcedureReturn 1
 EndProcedure
 
-Procedure.i PmdExportRuntime(Folder.s,Speech.i,TargetIndex.i,Random.i=0)
+Procedure.i PmdExportRuntime(Folder.s,Speech.i,TargetIndex.i,Random.i=0,Ops.i=0)
   If FileSize(Folder)<>-2 And CreateDirectory(Folder)=0 : PmoDynamicError="Cannot create the generated runtime source folder." : ProcedureReturn 0 : EndIf
+  ; Only a model with an operator of onnx_emit_ops.pbi carries its kernels.
+  If Ops
+    If PmdWriteSupport(Folder+"tensor_ops.pmi",?PmdOpsStart,?PmdOpsEnd-?PmdOpsStart)=0 : ProcedureReturn 0 : EndIf
+    If PmdWriteSupport(Folder+"tensor_dynamic_ops.pmi",?PmdOpsDynamicStart,?PmdOpsDynamicEnd-?PmdOpsDynamicStart)=0 : ProcedureReturn 0 : EndIf
+    If PmdPortable
+      If PmdWriteSupport(Folder+"tensor_dynamic_ops_portable.pmi",?PmdOpsPortableStart,?PmdOpsPortableEnd-?PmdOpsPortableStart)=0 : ProcedureReturn 0 : EndIf
+    Else
+      If PmdWriteSupport(Folder+"tensor_dynamic_ops_windows.pbi",?PmdOpsWindowsStart,?PmdOpsWindowsEnd-?PmdOpsWindowsStart)=0 : ProcedureReturn 0 : EndIf
+    EndIf
+  EndIf
   ; Only a model with a random operator carries the generator, so every other
   ; model's source closure is unchanged by it.
   If Random
@@ -189,9 +211,9 @@ EndProcedure
 XIncludeFile "onnx_control.pbi"
 
 ; Reject attributes that this lowering does not implement; never silently
-Procedure.i PmdExportTargetRuntime(Folder.s,TargetIndex.i,Random.i=0)
+Procedure.i PmdExportTargetRuntime(Folder.s,TargetIndex.i,Random.i=0,Ops.i=0)
   PmdPortable=Bool(TargetIndex<>#PMO_TARGET_WINDOWS)
-  ProcedureReturn PmdExportRuntime(Folder,0,TargetIndex,Random)
+  ProcedureReturn PmdExportRuntime(Folder,0,TargetIndex,Random,Ops)
 EndProcedure
 
 ; Reject attributes whose value this lowering does not implement; never silently
@@ -204,6 +226,7 @@ EndProcedure
 ; jump out of a Select on a string: the selector stays on the stack for the
 ; block's lifetime, and leaving it by Goto crashed the compiler (forum 858).
 XIncludeFile "onnx_dynamic_norm_small.pbi"
+XIncludeFile "onnx_dynamic_ops.pbi"
 
 Procedure.i PmdValidate(*Node.PmoOnnxNode)
   ; If, Loop and the sequence operators (onnx_control.pbi).
@@ -216,6 +239,9 @@ Procedure.i PmdValidate(*Node.PmoOnnxNode)
   Protected allowed.s="|",op.s=*Node\Operation,mode.s,i.i,reason.s
   If PmdNsOwns(op)
     ProcedureReturn PmdNsValidate(*Node)
+  EndIf
+  If PmoOpsOwns(op)
+    ProcedureReturn PmdOpsValidate(*Node)
   EndIf
   If PmoFormOwns(op)
     reason=PmoFormRefusal(*Node,#False)
@@ -393,6 +419,9 @@ Procedure.s PmdCall(*Node.PmoOnnxNode, Map Ids.i())
       call="DGemm("+y(0)+","+a(0)+","+a(1)+","+a(2)+","+Str(PmoEmitAttrI(*Node,"transA",0))+","+Str(PmoEmitAttrI(*Node,"transB",0))+","+PmoEmitFloat(PmoEmitAttrF(*Node,"alpha",1))+","+PmoEmitFloat(PmoEmitAttrF(*Node,"beta",1))+")"
     Case "ReduceMean","ReduceSum"
       call="DReduce("+y(0)+","+a(0)+","+a(1)+","+Str(PmoEmitAttrI(*Node,"keepdims",1))+","+Str(Bool(op="ReduceMean"))+")"
+      ; noop_with_empty_axes (ReduceSum-13, ReduceMean-18): an empty axes
+      ; set leaves the data as it is instead of reducing every axis.
+      If PmoEmitAttrI(*Node,"noop_with_empty_axes",0)<>0 : call="DReduceNoopEmpty("+Mid(call,9) : EndIf
     Case "Softmax"
       call="DSoftmax("+y(0)+","+a(0)+","+Str(PmoEmitAttrI(*Node,"axis",-1))+")"
     Case "LayerNormalization"
@@ -425,7 +454,11 @@ Procedure.s PmdCall(*Node.PmoOnnxNode, Map Ids.i())
     Case "STFT"
       call="DStft("+y(0)+","+a(0)+","+a(1)+","+a(2)+","+a(3)+","+Str(PmoEmitAttrI(*Node,"onesided",1))+")"
     Default
-      PmoDynamicError="Reusable source emission does not yet support "+op+"."
+      If PmoOpsOwns(op)
+        call=PmdOpsCall(*Node,Ids())
+      Else
+        PmoDynamicError="Reusable source emission does not yet support "+op+"."
+      EndIf
   EndSelect
   ; Validated after the operator is known to be emitted at all, so a model
   ; using an operator this path lacks is told that, not about its attributes.
@@ -611,7 +644,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   If RenameFile(pending,prefix+".pmw")=0 : PmoDynamicError="Cannot publish packed weights." : Goto Failed : EndIf
   pending=""
   hash=LCase(FileFingerprint(prefix+".pmw",#PB_Cipher_SHA2,256))
-  If PmdExportRuntime(prefix+".runtime\",Bool(speech Or kokoroText),targetIndex,Bool(randomCount>0))=0 : Goto Failed : EndIf
+  If PmdExportRuntime(prefix+".runtime\",Bool(speech Or kokoroText),targetIndex,Bool(randomCount>0),PmoOpsGraphUses(@model\Graph))=0 : Goto Failed : EndIf
   If PmcExportRuntime(prefix+".runtime\")=0 : Goto Failed : EndIf
   sourcePath=prefix+PmoTargets(targetIndex)\SourceSuffix
   file=CreateFile(#PB_Any,sourcePath)
@@ -650,6 +683,17 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
       PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_random.pmi"+Chr(34))
       PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_random_dynamic_windows.pbi"+Chr(34))
     EndIf
+  EndIf
+  ; The operator-set kernels and their wrappers, only where a node uses them.
+  If PmoOpsGraphUses(@model\Graph)
+    PmdLine(file,"#PMO_OPS_INT32 = "+Str(Bool(PmdPortable And PmoTargets(targetIndex)\NativeIntegerBytes=4)))
+    PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_ops.pmi"+Chr(34))
+    If PmdPortable
+      PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_dynamic_ops_portable.pmi"+Chr(34))
+    Else
+      PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_dynamic_ops_windows.pbi"+Chr(34))
+    EndIf
+    PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_dynamic_ops.pmi"+Chr(34))
   EndIf
   If PmcUsed : PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\"+PmcRuntimeFile()+Chr(34)) : EndIf
   PmdLine(file,"Global PmModelWeights.i, PmModelReady.i")

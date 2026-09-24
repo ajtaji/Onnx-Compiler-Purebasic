@@ -379,6 +379,59 @@ address `0` on the fixed-shape path, as an empty name already was.
 | The same gate with `--mutants`: the correction taken out of each path in turn and the compiler rebuilt | 2 of 2 caught (5 of 7 fixed-shape and 5 of 6 runtime-dimension cases fail) |
 | Models with no left-out output (four models, fp32/fp16/bf16/int4/int8, five targets), this change against the previous compiler | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape PureMetal images byte-identical |
 
+## Operator set, first group — September 24, 2026
+
+Fifty-two operators are new on both paths and for every target: the
+elementwise functions Erf, Reciprocal, Ceil, Sign, Softplus, Softsign, Elu,
+Selu, Celu, HardSigmoid, HardSwish, Mish, Gelu, ThresholdedRelu, Shrink,
+IsNaN and IsInf; Min, Max, Sum and Mean over any number of inputs, Mod,
+PRelu, Or and Xor with numpy broadcasting; ReduceMin, ReduceL1, ReduceL2,
+ReduceSumSquare, ReduceLogSum and ReduceLogSumExp; ArgMax, ArgMin and
+LogSoftmax; MaxPool (with Indices), AveragePool, LpPool and the three
+global pools over one to three spatial axes; Split, Tile, DepthToSpace,
+SpaceToDepth, Trilu, GatherElements, GatherND and OneHot; Einsum; Dropout in
+inference; CastLike; and Size. ReduceSum and ReduceMean on the
+runtime-dimension path now reduce over any set of axes, the empty set with
+`noop_with_empty_axes` included, where they took one final axis.
+
+**One kernel source, the same bits everywhere.** The kernels are one file,
+`runtime/tensor_ops.pmi`, included unchanged by the Windows program and by
+the programs for the Pi 4, the UNO Q, the Pico and the Pico 2, on both
+paths. Every floating-point step is one binary32 operation, and the
+functions the kernels need - exp, expm1, log, log1p, tanh, erf and a
+correctly rounded sqrt - are written into the file as fixed sequences of
+such operations rather than taken from each target's library. Two
+properties of the host compiler had to be designed around: its float
+comparisons do not order a NaN the way IEEE 754 does (a NaN compares below
+and equal to everything), and it adds -0 and -0 to +0. So every kernel
+decides NaN on the bits before it compares, adds through a helper where a
+negative zero can arise, and writes every NaN it produces as the one quiet
+NaN `$7FC00000` (the x87 and the Arm cores make different NaNs for an
+invalid operation). The definition is `tools/onnx/tests/Diagnostics/ops_scheme.py`
+in the compiler repository, the kernels written out in numpy one binary32
+operation per line.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 189 kernel cases - every math function over tables with signed zeros, subnormals, infinities, NaN and every branch boundary; every elementwise operator; Min/Max/Sum/Mean with one to three broadcast inputs and NaNs; Mod both ways and by zero; every reduction, including empty axes; ArgMax/ArgMin ties and NaN; LogSoftmax on every axis; 17 pooling forms in 1, 2 and 3 dimensions; permutation, Tile, Split, Trilu, GatherElements, GatherND, OneHot, nine Einsum equations - against the numpy definition | Windows, Pi 4 (A64 in unicorn), Pico and Pico 2 (Thumb in unicorn): 189 of 189 bit-identical on every target |
+| The same with `--mutants`: 18 planted defects (a shorter Taylor series, the lost low part of ln 2, a missing rounding step, a NaN that stops winning, broadcasting, pooling, index and Einsum faults) | 18 of 18 caught |
+| Accuracy of the math functions against the true function, 80,000 arguments each | exp 1.1, expm1 1.9, log 2.6, log1p 3.8, tanh 1.9, erf 0.8 units in the last place at most; sqrt correctly rounded (50,000 of 50,000) |
+| `tests/node_suite/targeted_ops.py`: the official node tests of these operators published only above opset 20, re-imported at opset 20; and 119 targeted forms (every attribute, both opset forms of the reductions and of Split, broadcasting, ties, NaN, the pooling shape rules, all four Split forms, Einsum with a diagonal, implicit output and ellipsis), each built with declared extents and with a symbolic extent; expected outputs from the ONNX reference evaluator, cross-checked against ONNX Runtime | 375 of 375 as expected. Re-imported official cases: 75 PASS; 65 refused for their element type (FLOAT16, BFLOAT16, DOUBLE, the float8, 4-bit and 2-bit types, UINT8); 2 function-expanded cases whose intermediate values carry no shape. Every refusal case is refused with its sentence |
+| Official node tests at opset 20 or lower (the corpus and harness of the node-test coverage section), this change against the previous compiler | PASS 202 of 964 before, 442 after; no case that passed fails; 36 fewer cases stop while running (DReduce's any-axes form), none newly fails |
+| `ops_targets_gate.py` (compiler repository, beside the kernel check): the 224 targeted builds that must pass, compiled for the Pi 4, Pico and Pico 2 by the path the model selects, the generated programs run in unicorn (A64; Thumb) | 672 of 672 as expected: every output within the node-suite tolerance of the reference and bit-identical to the Windows program's; the INT64 forms the 32-bit targets' contract cannot prove in range (a CastLike to INT64, INT64 ReduceL1 and ReduceSumSquare) refused on the Pico and Pico 2 with the contract's sentence |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4/int8, five targets) | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape PureMetal images byte-identical; the kernels are included only where a node uses them |
+| Kokoro-82M FP32 for Windows, reference, 295-token and 69-token requests | source and pack byte-identical; all three waveforms byte-identical |
+
+**Refused, with a sentence naming operator, node and value:** element types
+outside FLOAT, INT32 (runtime-dimension path), INT64 and BOOL; Mod with
+fmod = 0 on FLOAT; Gelu approximations other than none and tanh; LogSoftmax
+before opset 13 on an axis other than the last (its older definition
+flattens); Dropout in training mode with a nonzero ratio (it draws random
+masks); an Einsum ellipsis on the runtime-dimension path (the operand ranks
+are not known when the source is written); pooling with explicit pads and
+an auto_pad; and on the Pico and Pico 2, an INT64 Sum, PRelu, ReduceL1 or
+ReduceSumSquare whose result the 32-bit INT64 contract cannot prove in range.
+
 
 ## Explicit limitations
 

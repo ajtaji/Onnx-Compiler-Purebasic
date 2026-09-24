@@ -896,6 +896,7 @@ Procedure.i PmoEmitSliceHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Ca
 EndProcedure
 
 XIncludeFile "onnx_emit_norm_small.pbi"
+XIncludeFile "onnx_emit_ops.pbi"
 
 Procedure.i PmoEmitGeneratedHelpers(File.i, *Ir.PmoIrModel, *Profile.PmoTargetProfile, Map Calls.s())
   Protected Op.s
@@ -939,6 +940,10 @@ Procedure.i PmoEmitGeneratedHelpers(File.i, *Ir.PmoIrModel, *Profile.PmoTargetPr
         If PmoEmitNonZeroHelper(File, *Ir, @*Ir\Nodes(), Calls()) = 0 : ProcedureReturn #False : EndIf
       Case "ScatterND"
         If PmoEmitScatterHelper(File, *Ir, @*Ir\Nodes(), Calls()) = 0 : ProcedureReturn #False : EndIf
+      Default
+        If PmoOpsOwns(Op)
+          If PmoEmitOpsHelper(File, *Ir, @*Ir\Nodes(), Calls()) = 0 : ProcedureReturn #False : EndIf
+        EndIf
     EndSelect
   Next
   ProcedureReturn Bool(PmoEmitError = "")
@@ -1510,6 +1515,16 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
     RandomInclude = RuntimeInclude : If RandomInclude = "" : RandomInclude = *Profile\TensorInclude : EndIf
     PmoEmitLine(File, "XIncludeFile " + Chr(34) + GetPathPart(RandomInclude) + "tensor_random.pmi" + Chr(34))
   EndIf
+  ; The operator-set kernels, one source for every target, only where a node
+  ; uses them, so every other model's source is unchanged by them.
+  ForEach *Ir\Nodes()
+    If PmoOpsOwns(*Ir\Nodes()\Node\Operation)
+      RandomInclude = RuntimeInclude : If RandomInclude = "" : RandomInclude = *Profile\TensorInclude : EndIf
+      PmoEmitLine(File, "#PMO_OPS_INT32 = " + Str(Bool(*Profile\NativeIntegerBytes = 4)))
+      PmoEmitLine(File, "XIncludeFile " + Chr(34) + GetPathPart(RandomInclude) + "tensor_ops.pmi" + Chr(34))
+      Break
+    EndIf
+  Next
   If *Ir\ReducedWeightCount : PmoStorageEmit(File,Bool(*Profile\NativeIntegerBytes=8 And *Profile\SourceDialect=#PMO_SOURCE_PUREMETAL)) : EndIf
   PmoEmitLine(File)
   PmoEmitLine(File, "#PMO_WEIGHT_FILE_BYTES = " + Str(*Ir\WeightBytes))

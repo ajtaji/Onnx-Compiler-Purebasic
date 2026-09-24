@@ -41,17 +41,28 @@ and no partial support hiding behind a flag - an operator is on this list
 or it is refused.
 
 @FRAG
-Arithmetic      Add  Sub  Mul  Div  Pow
-Activations     Relu  LeakyRelu  Sigmoid  Tanh  Clip
-Elementwise     Exp  Log  Sqrt  Abs  Neg  Sin  Cos  Atan  Floor  Round
-Linear algebra  MatMul  Gemm  Conv  ConvTranspose  LSTM
-Normalization   Softmax  LayerNormalization  BatchNormalization  InstanceNormalization
-Reductions      ReduceMean  ReduceSum  ReduceMax  ReduceProd  CumSum
+Arithmetic      Add  Sub  Mul  Div  Pow  Mod  Min  Max  Sum  Mean  Reciprocal
+Activations     Relu  LeakyRelu  PRelu  Sigmoid  Tanh  Clip  Elu  Selu  Celu
+                HardSigmoid  HardSwish  Softplus  Softsign  Mish  Gelu
+                ThresholdedRelu  Shrink
+Elementwise     Exp  Log  Sqrt  Abs  Neg  Sin  Cos  Atan  Floor  Round  Ceil
+                Sign  Erf  IsNaN  IsInf
+Linear algebra  MatMul  Gemm  Conv  ConvTranspose  LSTM  Einsum
+Normalization   Softmax  LogSoftmax  LayerNormalization  BatchNormalization
+                InstanceNormalization
+Pooling         MaxPool  AveragePool  LpPool  GlobalMaxPool  GlobalAveragePool
+                GlobalLpPool
+Reductions      ReduceMean  ReduceSum  ReduceMax  ReduceMin  ReduceProd  ReduceL1
+                ReduceL2  ReduceSumSquare  ReduceLogSum  ReduceLogSumExp
+                ArgMax  ArgMin  CumSum
 Signal          STFT  Resize
-Comparison      Equal  Greater  GreaterOrEqual  Less  LessOrEqual  And  Not  Where
-Indexing        Gather  Slice  Expand  Pad  NonZero  ScatterND  ScatterElements  TopK  Range
-Shape           Reshape  Flatten  Squeeze  Unsqueeze  Transpose  Concat
-Other           Cast  Identity
+Comparison      Equal  Greater  GreaterOrEqual  Less  LessOrEqual  And  Or  Xor
+                Not  Where
+Indexing        Gather  GatherElements  GatherND  Slice  Expand  Pad  NonZero
+                ScatterND  ScatterElements  TopK  Range  OneHot  Trilu
+Shape           Reshape  Flatten  Squeeze  Unsqueeze  Transpose  Concat  Split
+                Tile  DepthToSpace  SpaceToDepth  Size
+Other           Cast  CastLike  Identity  Dropout (inference)
 Random          RandomNormal  RandomNormalLike  RandomUniform  RandomUniformLike
 Control flow    If  Loop                              (runtime dimensions)
 Sequences       SequenceEmpty  SequenceConstruct  SequenceInsert  SequenceAt
@@ -62,8 +73,13 @@ Sequences       SequenceEmpty  SequenceConstruct  SequenceInsert  SequenceAt
 Anything else is turned down by node number and by name:
 
 @FRAG
-ONNX COMPILER ERROR: node 0 uses unsupported operator Einsum
+ONNX COMPILER ERROR: node 0 uses unsupported operator NonMaxSuppression
 @ENDFRAG
+
+The operators added in September 2026 - from Mod to Dropout in the list -
+share one kernel source for every target (`runtime/tensor_ops.pmi`), so
+they give the same bits on Windows, the Pi 4, the UNO Q, the Pico and the
+Pico 2; chapter 8 says how that is checked.
 
 @TRAP Being on the list is necessary, not sufficient. An operator is
 supported for the attribute combinations, ranks and element types that
@@ -193,7 +209,11 @@ InstanceNormalization, TopK, ScatterElements, ReduceMax, ReduceProd, Not,
 Identity and Pad have floors of their own - TopK from 10, ScatterElements
 and Pad from 11, InstanceNormalization from 6, the rest from 1 - and a form
 that belongs to another opset, such as Pad's wrap mode at opset 18, is
-refused by name. The fixed-shape path admits 7 through 23. The two paths
+refused by name. The operators added in September 2026 each start at the
+opset whose definition they compute (Mish at 18, Gelu at 20, Trilu and
+HardSwish at 14, most of the rest at 11 or earlier), and LogSoftmax before
+13 is accepted only on the last axis, where the old flattening definition
+and the new one agree. The fixed-shape path admits 7 through 23. The two paths
 are not equally broad, and the message tells you which one you are on.
 
 @SECTION Fixed shapes and runtime dimensions

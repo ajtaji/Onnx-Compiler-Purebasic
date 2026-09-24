@@ -8,7 +8,7 @@
 Global PmoCompileError.s
 Global PmoDynamicError.s
 Declare.i PmoDynamicCommand(ModelPath.s)
-Declare.i PmdExportTargetRuntime(Folder.s,TargetIndex.i,Random.i=0)
+Declare.i PmdExportTargetRuntime(Folder.s,TargetIndex.i,Random.i=0,Ops.i=0)
 
 ; Decide BEFORE tracing: a sample execution may discover dimensions, but may
 ; never turn data-dependent dimensions into the contract of a resident model.
@@ -47,6 +47,9 @@ Procedure.s PmoCompileRuntimeDimensions(*Model.PmoOnnxModel)
           Case "Pad" : Control = Bool(Position = 1 Or Position = 3)
           Case "Resize" : Control = Bool(Position >= 1)
           Case "STFT" : Control = Bool(Position = 1 Or Position = 3)
+          Case "Split", "Tile", "OneHot", "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp"
+            Control = Bool(Position = 1)
+          Case "Dropout" : Control = Bool(Position = 2)
         EndSelect
         Name = *Model\Graph\Nodes()\Inputs()
         If Control And Name <> "" And Constants(Name) = 0
@@ -56,7 +59,7 @@ Procedure.s PmoCompileRuntimeDimensions(*Model.PmoOnnxModel)
       Next
     EndIf
     ; All earlier tensor shapes are fixed if this scan has not returned.
-    If Op = "Shape" : Known = 1 : EndIf
+    If Op = "Shape" Or Op = "Size" : Known = 1 : EndIf
     ForEach *Model\Graph\Nodes()\Outputs()
       Constants(*Model\Graph\Nodes()\Outputs()) = Known
     Next
@@ -150,6 +153,39 @@ Procedure PmoCompileNameAbsentOutputs(*Model.PmoOnnxModel, WithShapes.i)
       Next
     EndIf
     NodeIndex + 1
+  Next
+EndProcedure
+
+; CastLike-15 is Cast to the element type of its second input. On the
+; fixed-shape path every value's type is declared, so the node becomes that
+; Cast (the attribute to, the second input dropped) before anything is
+; planned; one whose target type the model does not declare is refused by
+; the emitter with its sentence.
+Procedure PmoCompileRewriteCastLike(*Model.PmoOnnxModel)
+  Protected Name.s, Target.i
+  ForEach *Model\Graph\Nodes()
+    If *Model\Graph\Nodes()\Operation <> "CastLike" Or ListSize(*Model\Graph\Nodes()\Inputs()) <> 2 : Continue : EndIf
+    SelectElement(*Model\Graph\Nodes()\Inputs(), 1) : Name = *Model\Graph\Nodes()\Inputs()
+    Target = 0
+    ForEach *Model\Graph\Initializers()
+      If *Model\Graph\Initializers()\Name = Name : Target = *Model\Graph\Initializers()\DataType : EndIf
+    Next
+    ForEach *Model\Graph\Inputs()
+      If *Model\Graph\Inputs()\Name = Name And *Model\Graph\Inputs()\HasTensorType : Target = *Model\Graph\Inputs()\ElementType : EndIf
+    Next
+    ForEach *Model\Graph\Values()
+      If *Model\Graph\Values()\Name = Name And *Model\Graph\Values()\HasTensorType : Target = *Model\Graph\Values()\ElementType : EndIf
+    Next
+    ForEach *Model\Graph\Outputs()
+      If *Model\Graph\Outputs()\Name = Name And *Model\Graph\Outputs()\HasTensorType : Target = *Model\Graph\Outputs()\ElementType : EndIf
+    Next
+    If Target = 0 : Continue : EndIf
+    *Model\Graph\Nodes()\Operation = "Cast"
+    DeleteElement(*Model\Graph\Nodes()\Inputs())
+    LastElement(*Model\Graph\Nodes()\Attributes()) : AddElement(*Model\Graph\Nodes()\Attributes())
+    *Model\Graph\Nodes()\Attributes()\Name = "to"
+    *Model\Graph\Nodes()\Attributes()\AttributeType = 2
+    *Model\Graph\Nodes()\Attributes()\IntegerValue = Target
   Next
 EndProcedure
 
@@ -261,6 +297,7 @@ Procedure.i PmoCompileApplyShape(*Model.PmoOnnxModel, Spec.s)
 EndProcedure
 
 Procedure.i PmoCompileSupportedOp(Operation.s)
+  If PmoOpsOwns(Operation) : ProcedureReturn #True : EndIf
   ProcedureReturn Bool(FindString("|Add|Sub|Mul|Div|Pow|Relu|LeakyRelu|Sigmoid|Tanh|Exp|Log|Sqrt|Abs|Neg|Sin|Cos|Atan|Floor|Round|MatMul|Gemm|Softmax|ReduceMean|ReduceSum|CumSum|LayerNormalization|BatchNormalization|Conv|ConvTranspose|Clip|Resize|STFT|LSTM|Gather|Cast|Range|Equal|Greater|GreaterOrEqual|Less|LessOrEqual|And|Where|Slice|Expand|Pad|NonZero|ScatterND|Identity|InstanceNormalization|TopK|ScatterElements|ReduceMax|ReduceProd|Not|Reshape|Flatten|Squeeze|Unsqueeze|Transpose|Concat|RandomNormal|RandomNormalLike|RandomUniform|RandomUniformLike|", "|" + Operation + "|"))
 EndProcedure
 
@@ -496,7 +533,7 @@ Procedure.i PmoCompileValidateTargetIntegers(*Ir.PmoIrModel, *Profile.PmoTargetP
       If OutputName = "" Or FindMapElement(*Ir\ValueByName(), OutputName) = 0 : Continue : EndIf
       *Output = *Ir\ValueByName()
       If *Output\ElementType <> 7 Or *Output\IsConstant : Continue : EndIf
-      If FindString("|Add|Sub|Mul|Div|Pow|Range|CumSum|", "|" + Operation + "|")
+      If FindString("|Add|Sub|Mul|Div|Pow|Range|CumSum|Sum|PRelu|ReduceL1|ReduceSumSquare|", "|" + Operation + "|")
         ProcedureReturn PmoCompileFail("target " + *Profile\Id + " cannot prove that runtime INT64 " +
                                       Operation + " output " + OutputName +
                                       " stays in its checked signed 32-bit execution range. Nothing was emitted.")
@@ -787,6 +824,7 @@ Procedure.i PmoCompileCommand(ModelPath.s)
     ProcedureReturn #True
   EndIf
   PmoCompileNameAbsentOutputs(@Model, #True)
+  PmoCompileRewriteCastLike(@Model)
   ; The attribute forms both paths share (onnx_forms.pbi): an attribute value
   ; this path does not compute is refused here, before anything is planned,
   ; instead of being ignored by the emitter (forum 859).
@@ -833,7 +871,7 @@ Procedure.i PmoCompileCommand(ModelPath.s)
       PmoCompileFail("external-memory address plan overflowed") : Goto PmoCompileCommandFailed
     EndIf
   EndIf
-  If PmdExportTargetRuntime(OutputPrefix+".runtime/",TargetIndex,Bool(RandomInputs=0 And PmoRandomCount(@Model)>0))=0 : PmoCompileFail(PmoDynamicError) : Goto PmoCompileCommandFailed : EndIf
+  If PmdExportTargetRuntime(OutputPrefix+".runtime/",TargetIndex,Bool(RandomInputs=0 And PmoRandomCount(@Model)>0),PmoOpsGraphUses(@Model\Graph))=0 : PmoCompileFail(PmoDynamicError) : Goto PmoCompileCommandFailed : EndIf
   CopyStructure(@PmoTargets(TargetIndex),@EmitProfile,PmoTargetProfile)
   If EmitProfile\SourceDialect = #PMO_SOURCE_HOST
     RuntimeInclude = GetFilePart(OutputPrefix)+".runtime/tensor_fp32_windows.pbi"

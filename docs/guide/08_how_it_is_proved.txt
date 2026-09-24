@@ -461,6 +461,60 @@ Pico and Pico 2, in the cycle model, the gate model's INT8 request takes a
 third of the FP32 one's time. **Neither is a measurement on silicon, and
 the Pi 4 speed of this scheme is still to be measured on the board.**
 
+@SECTION The operator set: one kernel source, the same bits everywhere
+
+The operators added in September 2026 (chapter 4 lists them) have one
+kernel file, `runtime/tensor_ops.pmi`, written in the subset of the
+language both dialects accept, and included unchanged by the Windows
+program and by every bare-metal one. One source is not yet one answer: the
+targets' floating-point hardware and libraries differ. So the file keeps
+three rules.
+
+**One binary32 operation per statement.** The host compiler evaluates a
+float expression on the x87 stack at extended precision; a statement with
+one operation rounds once on the way back to memory and gives the correctly
+rounded result, which is what the Arm cores and the Pico's software floats
+give. The functions the kernels need - exp, expm1, log, log1p, tanh, erf,
+sqrt - are written into the file as fixed sequences of such statements
+(erf follows fdlibm's s_erff.c; sqrt is the integer square root of the
+significand, correctly rounded), not taken from each target's library.
+
+**Decide NaN on the bits.** The host compiler's float comparisons do not
+order a NaN the way IEEE 754 does - a NaN compares below and equal to
+everything - and it adds -0 and -0 to +0. Every kernel therefore tests for
+NaN on the bits before it compares, adds through a helper where a negative
+zero can arise, and writes every NaN it produces as one quiet NaN,
+`$7FC00000`, because the x87 and the Arm cores make different NaNs for an
+invalid operation such as infinity times zero.
+
+**A definition to be held to.** `ops_scheme.py` in the compiler
+repository's `tools/onnx/tests/Diagnostics` writes every kernel out in numpy
+one binary32 operation per line. `ops_kernel_check.py` runs 189 cases -
+the math functions over tables of special values and branch boundaries,
+every operator's kernel, and the awkward cases - on Windows and, in the
+unicorn instruction emulator, on the Pi 4, Pico and Pico 2 builds, and
+requires every output to equal the definition bit for bit; with
+`--mutants` it plants 18 defects and requires each to be caught:
+
+@FRAG
+py -3.12 ops_kernel_check.py --pbcompiler <pbcompiler.exe> --compiler PureMetalForge.exe --runtime <ONNX repository>\runtime --mutants
+windows 189 of 189 cases as the definition
+pi4     189 of 189 cases as the definition
+pico    189 of 189 cases as the definition
+pico2   189 of 189 cases as the definition
+mutants: 18 of 18 killed
+@ENDFRAG
+
+That says the kernels compute what they were written to compute. Whether
+that is what ONNX specifies is the node tests' question:
+`tests/node_suite/targeted_ops.py` re-imports the official cases these
+operators have above opset 20 at opset 20, adds its own forms for both
+emitters, and scores everything against the ONNX reference evaluator,
+cross-checked with ONNX Runtime. `ops_targets_gate.py`, beside the kernel
+check, then compiles the same cases for the Pi 4, Pico and Pico 2, runs the
+generated programs in the emulator, and requires their outputs to pass the
+same comparison and to equal the Windows program's bits.
+
 @SECTION Where the gates live, and why not here
 
 `tests/` is **not tracked by this repository**, with one exception. Its

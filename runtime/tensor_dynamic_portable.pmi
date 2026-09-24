@@ -1948,18 +1948,130 @@ Procedure DGemm(Y.i,A.i,B.i,C.i,TransA.i,TransB.i,Alpha.f,Beta.f)
   EndIf
 EndProcedure
 
+; ReduceSum and ReduceMean over any set of axes (absent or empty axes: all
+; of them): every output sums its elements in row-major order, the mean
+; divides that sum once by the count. The one-final-axis form keeps the fast
+; kernel below.
+Procedure DReduceAxes(Y.i,A.i,Axes.i,Keep.i,Mean.i)
+  Protected Dim dims.i(8)
+  Protected Dim stride.i(8)
+  Protected i.i=0
+  Protected j.i=0
+  Protected d.i=0
+  Protected rank.i=Dt(A)\Rank
+  Protected axis.i=0
+  Protected mask.i=0
+  Protected count.i=0
+  Protected outCount.i=1
+  Protected inner.i=1
+  Protected n.i=1
+  Protected base.i=0
+  Protected at.i=0
+  Protected coord.i=0
+  Protected acc.f=0.0
+  Protected x.f=0.0
+  Protected cf.f=0.0
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Dt(A)\Kind<>1
+    DFail("Reduction requires FLOAT.")
+    ProcedureReturn
+  EndIf
+  If Axes
+    count=Dt(Axes)\Count
+  EndIf
+  For i=0 To count-1
+    axis=DInt(Axes,i)
+    If axis<0
+      axis=axis+rank
+    EndIf
+    If axis<0 Or axis>=rank
+      DFail("A reduction axis is outside the data rank.")
+      ProcedureReturn
+    EndIf
+    If ((mask>>axis)&1)<>0
+      DFail("Reduction axes name the same axis twice.")
+      ProcedureReturn
+    EndIf
+    mask=mask|(1<<axis)
+  Next
+  If count=0
+    mask=(1<<rank)-1
+  EndIf
+  n=1
+  For d=rank-1 To 0 Step -1
+    stride(d)=n
+    n=n*DDims((A)*8+(d))
+  Next
+  j=0
+  For d=0 To rank-1
+    If ((mask>>d)&1)<>0
+      inner=inner*DDims((A)*8+(d))
+      If Keep
+        dims(j)=1
+        j=j+1
+      EndIf
+    Else
+      dims(j)=DDims((A)*8+(d))
+      j=j+1
+      outCount=outCount*DDims((A)*8+(d))
+    EndIf
+  Next
+  If DAlloc(Y,1,j,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  cf=inner
+  For i=0 To outCount-1
+    base=0
+    n=i
+    For d=rank-1 To 0 Step -1
+      If ((mask>>d)&1)=0
+        coord=n%DDims((A)*8+(d))
+        n=n/DDims((A)*8+(d))
+        base=base+coord*stride(d)
+      EndIf
+    Next
+    acc=0.0
+    For j=0 To inner-1
+      at=base
+      n=j
+      For d=rank-1 To 0 Step -1
+        If ((mask>>d)&1)<>0
+          coord=n%DDims((A)*8+(d))
+          n=n/DDims((A)*8+(d))
+          at=at+coord*stride(d)
+        EndIf
+      Next
+      x=PmTensorGet(Dt(A)\Data,at)
+      acc=acc+x
+    Next
+    If Mean
+      acc=acc/cf
+    EndIf
+    PmTensorPut(Dt(Y)\Data,i,acc)
+  Next
+EndProcedure
+
 Procedure DReduce(Y.i,A.i,Axes.i,Keep.i,Mean.i)
   Protected Dim dims.i(8)
   Protected i.i=0
-  Protected axis.i=DInt(Axes,0)
+  Protected axis.i=0
   Protected rank.i=Dt(A)\Rank
   Protected width.i=0
   DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Axes=0
+    DReduceAxes(Y,A,Axes,Keep,Mean)
+    ProcedureReturn
+  EndIf
+  If Dt(Axes)\Count<>1
+    DReduceAxes(Y,A,Axes,Keep,Mean)
+    ProcedureReturn
+  EndIf
+  axis=DInt(Axes,0)
   If axis<0
     axis+rank
   EndIf
-  If Dt(Axes)\Count<>1 Or axis<>rank-1
-    DFail("Reduction currently requires one final axis.")
+  If axis<>rank-1
+    DReduceAxes(Y,A,Axes,Keep,Mean)
     ProcedureReturn
   EndIf
   For i=0 To rank-1
@@ -1983,6 +2095,23 @@ Procedure DReduce(Y.i,A.i,Axes.i,Keep.i,Mean.i)
     ProcedureReturn
   EndIf
   PmFastReduce(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count/width,width,Mean)
+EndProcedure
+
+; noop_with_empty_axes = 1: absent or empty axes copy the data unchanged.
+Procedure DReduceNoopEmpty(Y.i,A.i,Axes.i,Keep.i,Mean.i)
+  Protected empty.i=0
+  If Axes=0
+    empty=1
+  ElseIf Dt(Axes)\Count=0
+    empty=1
+  EndIf
+  If empty
+    If DLike(Y,A,0)
+      DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+    EndIf
+    ProcedureReturn
+  EndIf
+  DReduce(Y,A,Axes,Keep,Mean)
 EndProcedure
 
 Procedure DSoftmax(Y.i,A.i,Axis.i)

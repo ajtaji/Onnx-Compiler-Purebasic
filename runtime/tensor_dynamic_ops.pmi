@@ -1,0 +1,1042 @@
+; ======================================================================
+; tensor_dynamic_ops.pmi - runtime-dimension wrappers for the kernels in
+; tensor_ops.pmi
+; ----------------------------------------------------------------------
+; ONE SOURCE FOR EVERY TARGET, like tensor_ops.pmi. Include tensor_ops.pmi,
+; then the dialect's adapter (tensor_dynamic_ops_windows.pbi or
+; tensor_dynamic_ops_portable.pmi, which defines DOpDim), then this file.
+; Each wrapper checks what the ONNX specification requires of the shapes and
+; element types it meets at run time, allocates its outputs, fills the
+; kernel's parameter arrays and runs the kernel. A form it cannot compute is
+; refused with DFail naming the operator; nothing is approximated.
+;
+; The generated call writes the node's attributes into PmOpT before the
+; call (lists and per-axis values); scalar attributes are arguments.
+; ======================================================================
+
+Global Dim PmOpT.i(96)
+
+; Rank-aligned dims of tensor Id into PmOpDN(Slot*8 ...), leading ones.
+Procedure DOpAlign(Slot.i, Id.i, Rank.i)
+  Protected d.i
+  Protected r.i
+  r = Dt(Id)\Rank
+  d = 0
+  While d < Rank
+    If d < Rank - r
+      PmOpDN(Slot * 8 + d) = 1
+    Else
+      PmOpDN(Slot * 8 + d) = DOpDim(Id, d - (Rank - r))
+    EndIf
+    d = d + 1
+  Wend
+EndProcedure
+
+Procedure.i DOpKindOk(Kind.i, Allowed.i)
+  ; Allowed: bit 0 FLOAT, bit 1 INT32, bit 2 INT64, bit 3 BOOL
+  If Kind = 1 And (Allowed & 1) <> 0
+    ProcedureReturn 1
+  EndIf
+  If Kind = 6 And (Allowed & 2) <> 0
+    ProcedureReturn 1
+  EndIf
+  If Kind = 7 And (Allowed & 4) <> 0
+    ProcedureReturn 1
+  EndIf
+  If Kind = 9 And (Allowed & 8) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DOpStatus()
+  If PmOpStatus = 4
+    DFail("Mod: an integer divisor is zero.")
+    ProcedureReturn 0
+  EndIf
+  If PmOpStatus <> 0
+    DFail("An operator kernel was handed a form it does not compute; this is a runtime defect, report the model and the node.")
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Elementwise functions: Op as in PmOpUnary. PmOpF and PmOpI(0), PmOpI(1)
+; are set by the generated call.
+; ----------------------------------------------------------------------
+Procedure DOpUnary(Y.i, A.i, Op.i)
+  Protected kind.i
+  If A = 0
+    DFail("An elementwise operator has no input tensor.")
+    ProcedureReturn
+  EndIf
+  kind = Dt(A)\Kind
+  If Op = 3
+    If DOpKindOk(kind, 7) = 0
+      DFail("Sign computes FLOAT, INT32 and INT64 tensors only.")
+      ProcedureReturn
+    EndIf
+  ElseIf kind <> 1
+    DFail("This elementwise operator computes FLOAT tensors only.")
+    ProcedureReturn
+  EndIf
+  If Op = 16 Or Op = 17
+    If DLike(Y, A, 9) = 0
+      ProcedureReturn
+    EndIf
+  ElseIf DLike(Y, A, 0) = 0
+    ProcedureReturn
+  EndIf
+  PmOpStatus = 0
+  PmOpUnary(Dt(A)\Data, Dt(Y)\Data, Dt(A)\Count, Op, kind)
+  DOpStatus()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Min, Max, Sum, Mean (N inputs), Mod, PRelu, Or, Xor (two): the input
+; tensor ids are in PmOpN(0 .. N-1). Allowed: the element kinds (as in
+; DOpKindOk). Unidirectional: PRelu's slope must broadcast to X.
+; ----------------------------------------------------------------------
+Procedure DOpVariadic(Y.i, N.i, Op.i, Allowed.i)
+  Protected Dim dims.i(8)
+  Protected k.i
+  Protected d.i
+  Protected rank.i
+  Protected kind.i
+  Protected e.i
+  Protected id.i
+  If N < 1 Or N > 16
+    DFail("A variadic operator takes one to sixteen inputs here.")
+    ProcedureReturn
+  EndIf
+  rank = 0
+  k = 0
+  While k < N
+    id = PmOpN(k)
+    If id = 0
+      DFail("A variadic operator input is missing.")
+      ProcedureReturn
+    EndIf
+    If Dt(id)\Rank > rank
+      rank = Dt(id)\Rank
+    EndIf
+    k = k + 1
+  Wend
+  kind = Dt(PmOpN(0))\Kind
+  If DOpKindOk(kind, Allowed) = 0
+    DFail("The operator does not compute this element type; see the refusal the compiler gives for its declared type.")
+    ProcedureReturn
+  EndIf
+  k = 0
+  While k < N
+    If Dt(PmOpN(k))\Kind <> kind
+      DFail("The inputs of an elementwise operator must share one element type.")
+      ProcedureReturn
+    EndIf
+    DOpAlign(k, PmOpN(k), rank)
+    k = k + 1
+  Wend
+  d = 0
+  While d < rank
+    e = 1
+    k = 0
+    While k < N
+      If PmOpDN(k * 8 + d) <> 1
+        If e <> 1 And PmOpDN(k * 8 + d) <> e
+          DFail("Input dimensions do not broadcast.")
+          ProcedureReturn
+        EndIf
+        e = PmOpDN(k * 8 + d)
+      EndIf
+      k = k + 1
+    Wend
+    If Op = 8 And PmOpDN(d) <> e
+      DFail("PRelu slope must broadcast to X, not X to the slope.")
+      ProcedureReturn
+    EndIf
+    ; a zero extent wins over one
+    k = 0
+    While k < N
+      If PmOpDN(k * 8 + d) = 0
+        e = 0
+      EndIf
+      k = k + 1
+    Wend
+    dims(d) = e
+    PmOpDY(d) = e
+    d = d + 1
+  Wend
+  If DAlloc(Y, kind, rank, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  k = 0
+  While k < N
+    PmOpAddr(k) = Dt(PmOpN(k))\Data
+    k = k + 1
+  Wend
+  PmOpStatus = 0
+  PmOpVariadic(Dt(Y)\Data, N, rank, Op, kind)
+  DOpStatus()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ReduceMin, ReduceL1, ReduceL2, ReduceSumSquare, ReduceLogSum,
+; ReduceLogSumExp (Op as in PmOpReduce). Axes from the tensor Axes (opset 18
+; and later) or, when Axes is 0, from the attribute list PmOpT(1 ..
+; PmOpT(0)); PmOpT(0) = 0 means none. Keep: keepdims; NoopEmpty:
+; noop_with_empty_axes.
+; ----------------------------------------------------------------------
+Procedure DOpReduce(Y.i, A.i, Axes.i, Keep.i, NoopEmpty.i, Op.i)
+  Protected Dim dims.i(8)
+  Protected rank.i
+  Protected count.i
+  Protected i.i
+  Protected axis.i
+  Protected mask.i
+  Protected j.i
+  Protected kind.i
+  If A = 0
+    DFail("A reduction requires data.")
+    ProcedureReturn
+  EndIf
+  kind = Dt(A)\Kind
+  rank = Dt(A)\Rank
+  If Op = 0 Or Op = 1 Or Op = 3
+    If DOpKindOk(kind, 7) = 0
+      DFail("ReduceMin, ReduceL1 and ReduceSumSquare compute FLOAT, INT32 and INT64 data only.")
+      ProcedureReturn
+    EndIf
+  ElseIf kind <> 1
+    DFail("ReduceL2, ReduceLogSum and ReduceLogSumExp compute FLOAT data only.")
+    ProcedureReturn
+  EndIf
+  If Axes <> 0
+    If Dt(Axes)\Kind <> 7 Or Dt(Axes)\Rank > 1
+      DFail("Reduction axes must be a one-dimensional INT64 tensor.")
+      ProcedureReturn
+    EndIf
+    count = Dt(Axes)\Count
+  Else
+    count = PmOpT(0)
+  EndIf
+  mask = 0
+  i = 0
+  While i < count
+    If Axes <> 0
+      axis = DInt(Axes, i)
+    Else
+      axis = PmOpT(1 + i)
+    EndIf
+    If axis < 0
+      axis = axis + rank
+    EndIf
+    If axis < 0 Or axis >= rank
+      DFail("A reduction axis is outside the data rank.")
+      ProcedureReturn
+    EndIf
+    If ((mask >> axis) & 1) <> 0
+      DFail("Reduction axes name the same axis twice.")
+      ProcedureReturn
+    EndIf
+    mask = mask | (1 << axis)
+    i = i + 1
+  Wend
+  If count = 0
+    If NoopEmpty <> 0
+      If DLike(Y, A, 0) <> 0
+        PmOpCopyBytes(Dt(A)\Data, Dt(Y)\Data, Dt(A)\Bytes)
+      EndIf
+      ProcedureReturn
+    EndIf
+    mask = (1 << rank) - 1
+  EndIf
+  j = 0
+  i = 0
+  While i < rank
+    PmOpDA(i) = DOpDim(A, i)
+    If ((mask >> i) & 1) <> 0
+      If Keep <> 0
+        dims(j) = 1
+        j = j + 1
+      EndIf
+    Else
+      dims(j) = DOpDim(A, i)
+      j = j + 1
+    EndIf
+    i = i + 1
+  Wend
+  If DAlloc(Y, kind, j, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpStatus = 0
+  PmOpReduce(Dt(A)\Data, Dt(Y)\Data, rank, mask, Op, kind)
+  DOpStatus()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ArgMax (Op 0) and ArgMin (Op 1).
+; ----------------------------------------------------------------------
+Procedure DOpArg(Y.i, A.i, Axis.i, Keep.i, Last.i, Op.i)
+  Protected Dim dims.i(8)
+  Protected rank.i
+  Protected i.i
+  Protected j.i
+  If A = 0
+    DFail("ArgMax and ArgMin require data.")
+    ProcedureReturn
+  EndIf
+  If DOpKindOk(Dt(A)\Kind, 7) = 0
+    DFail("ArgMax and ArgMin compute FLOAT, INT32 and INT64 data only.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  If Axis < 0
+    Axis = Axis + rank
+  EndIf
+  If Axis < 0 Or Axis >= rank
+    DFail("ArgMax and ArgMin axis is outside the data rank.")
+    ProcedureReturn
+  EndIf
+  If DOpDim(A, Axis) = 0
+    DFail("ArgMax and ArgMin need at least one element along the axis.")
+    ProcedureReturn
+  EndIf
+  j = 0
+  i = 0
+  While i < rank
+    If i = Axis
+      If Keep <> 0
+        dims(j) = 1
+        j = j + 1
+      EndIf
+    Else
+      dims(j) = DOpDim(A, i)
+      j = j + 1
+    EndIf
+    i = i + 1
+  Wend
+  If DAlloc(Y, 7, j, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpArg(Dt(A)\Data, Dt(Y)\Data, DProduct(A, 0, Axis - 1), DOpDim(A, Axis), DProduct(A, Axis + 1, rank - 1), Op, Last, Dt(A)\Kind)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; LogSoftmax-13 along Axis.
+; ----------------------------------------------------------------------
+Procedure DOpLogSoftmax(Y.i, A.i, Axis.i)
+  Protected rank.i
+  If A = 0
+    DFail("LogSoftmax requires an input.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind <> 1
+    DFail("LogSoftmax computes FLOAT tensors only.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  If Axis < 0
+    Axis = Axis + rank
+  EndIf
+  If Axis < 0 Or Axis >= rank
+    DFail("LogSoftmax axis is outside the input rank.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, A, 0) = 0
+    ProcedureReturn
+  EndIf
+  PmOpLogSoftmax(Dt(A)\Data, Dt(Y)\Data, DProduct(A, 0, Axis - 1), DOpDim(A, Axis), DProduct(A, Axis + 1, rank - 1))
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MaxPool, AveragePool, LpPool and the global forms. The generated call has
+; written PmOpT: 0 spatial axes s of kernel_shape (0 for a global pool),
+; 1 auto_pad (0 NOTSET, 1 SAME_UPPER, 2 SAME_LOWER, 3 VALID), 2 ceil_mode,
+; 3 count_include_pad, 4 p, 5 storage_order, 6 mode (0 max, 1 average,
+; 2 Lp); 8+d kernel, 12+d strides, 16+d dilations, 20+d begin pads,
+; 24+d end pads. Output extent (ONNX's pooling shape rule):
+;   floor or ceil of (in + begin + end - ((kernel-1)*dilation + 1)) / stride,
+;   plus one, with ceil_mode; a last window that would start in the end
+;   padding is dropped;
+;   SAME_UPPER/SAME_LOWER: ceil(in / stride), the total padding
+;   max(0, (out-1)*stride + (kernel-1)*dilation + 1 - in) split with the odd
+;   unit at the end (UPPER) or the start (LOWER).
+; ----------------------------------------------------------------------
+Procedure DOpPool(Y.i, Ind.i, A.i)
+  Protected Dim dims.i(8)
+  Protected s.i
+  Protected d.i
+  Protected ext.i
+  Protected k.i
+  Protected st.i
+  Protected dl.i
+  Protected b.i
+  Protected e.i
+  Protected span.i
+  Protected out.i
+  Protected total.i
+  If A = 0
+    DFail("A pooling operator requires an input.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind <> 1
+    DFail("The pooling operators compute FLOAT tensors only.")
+    ProcedureReturn
+  EndIf
+  s = Dt(A)\Rank - 2
+  If s < 1 Or s > 3
+    DFail("The pooling operators take N x C x D1 ... Ds with one to three spatial axes.")
+    ProcedureReturn
+  EndIf
+  If PmOpT(0) <> 0 And PmOpT(0) <> s
+    DFail("kernel_shape does not have one extent per spatial axis of the input.")
+    ProcedureReturn
+  EndIf
+  dims(0) = DOpDim(A, 0)
+  dims(1) = DOpDim(A, 1)
+  d = 0
+  While d < s
+    ext = DOpDim(A, 2 + d)
+    If PmOpT(0) = 0
+      k = ext
+      st = 1
+      dl = 1
+      b = 0
+      e = 0
+    Else
+      k = PmOpT(8 + d)
+      st = PmOpT(12 + d)
+      dl = PmOpT(16 + d)
+      b = PmOpT(20 + d)
+      e = PmOpT(24 + d)
+    EndIf
+    span = (k - 1) * dl + 1
+    If PmOpT(1) = 1 Or PmOpT(1) = 2
+      out = (ext + st - 1) / st
+      total = (out - 1) * st + span - ext
+      If total < 0
+        total = 0
+      EndIf
+      If PmOpT(1) = 1
+        b = total / 2
+      Else
+        b = total - total / 2
+      EndIf
+      e = total - b
+    Else
+      If PmOpT(1) = 3
+        b = 0
+        e = 0
+      EndIf
+      If ext + b + e < span
+        DFail("A pooling window is larger than the padded input.")
+        ProcedureReturn
+      EndIf
+      out = (ext + b + e - span) / st + 1
+      If PmOpT(2) <> 0
+        If (ext + b + e - span) % st <> 0
+          out = out + 1
+        EndIf
+        If (out - 1) * st >= ext + b
+          out = out - 1
+        EndIf
+      EndIf
+    EndIf
+    dims(2 + d) = out
+    PmOpI(8 + d) = ext
+    PmOpI(12 + d) = out
+    PmOpI(16 + d) = k
+    PmOpI(20 + d) = st
+    PmOpI(24 + d) = dl
+    PmOpI(28 + d) = b
+    PmOpI(32 + d) = e
+    d = d + 1
+  Wend
+  PmOpI(0) = s
+  PmOpI(1) = dims(0)
+  PmOpI(2) = dims(1)
+  PmOpI(3) = PmOpT(6)
+  PmOpI(4) = PmOpT(3)
+  PmOpI(5) = PmOpT(4)
+  PmOpI(6) = PmOpT(5)
+  If DAlloc(Y, 1, s + 2, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  If Ind <> 0
+    If DAlloc(Ind, 7, s + 2, @dims(0)) = 0
+      ProcedureReturn
+    EndIf
+    PmOpPool(Dt(A)\Data, Dt(Y)\Data, Dt(Ind)\Data)
+  Else
+    PmOpPool(Dt(A)\Data, Dt(Y)\Data, 0)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Split: A split along Axis into the N outputs whose ids are in PmOpN.
+; Sizes: Split (a tensor, Split-13 and later) when not 0; else PmOpT(1 ..
+; N) when PmOpT(0) = 1 (the attribute, before 13); else equal parts
+; (PmOpT(0) = 0), or with PmOpT(0) = 2 (num_outputs, Split-18) parts of
+; ceil(extent / N) with a smaller last part.
+; ----------------------------------------------------------------------
+Procedure DOpSplit(A.i, Split.i, Axis.i, N.i)
+  Protected Dim dims.i(8)
+  Protected rank.i
+  Protected extent.i
+  Protected k.i
+  Protected d.i
+  Protected size.i
+  Protected offset.i
+  Protected bytes.i
+  Protected chunk.i
+  If A = 0 Or N < 1 Or N > 16
+    DFail("Split requires an input and one to sixteen outputs.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  If Axis < 0
+    Axis = Axis + rank
+  EndIf
+  If Axis < 0 Or Axis >= rank
+    DFail("Split axis is outside the input rank.")
+    ProcedureReturn
+  EndIf
+  extent = DOpDim(A, Axis)
+  bytes = PmOpKindBytes(Dt(A)\Kind)
+  If Split <> 0
+    If Dt(Split)\Kind <> 7 Or Dt(Split)\Count <> N
+      DFail("Split input split must be an INT64 tensor with one size per output.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  ; the sizes first, checked against the extent
+  size = 0
+  k = 0
+  While k < N
+    If Split <> 0
+      PmOpOffset(k) = DInt(Split, k)
+    ElseIf PmOpT(0) = 1
+      PmOpOffset(k) = PmOpT(1 + k)
+    ElseIf PmOpT(0) = 2
+      chunk = (extent + N - 1) / N
+      PmOpOffset(k) = chunk
+      If size + chunk > extent
+        PmOpOffset(k) = extent - size
+      EndIf
+    Else
+      If extent % N <> 0
+        DFail("Split without sizes needs an extent that the number of outputs divides.")
+        ProcedureReturn
+      EndIf
+      PmOpOffset(k) = extent / N
+    EndIf
+    If PmOpOffset(k) < 0
+      DFail("Split sizes must not be negative.")
+      ProcedureReturn
+    EndIf
+    size = size + PmOpOffset(k)
+    k = k + 1
+  Wend
+  If size <> extent
+    DFail("Split sizes must add up to the extent of the split axis.")
+    ProcedureReturn
+  EndIf
+  d = 0
+  While d < rank
+    dims(d) = DOpDim(A, d)
+    d = d + 1
+  Wend
+  offset = 0
+  k = 0
+  While k < N
+    size = PmOpOffset(k)
+    If PmOpN(k) <> 0
+      dims(Axis) = size
+      If DAlloc(PmOpN(k), Dt(A)\Kind, rank, @dims(0)) = 0
+        ProcedureReturn
+      EndIf
+      PmOpSlab(Dt(A)\Data, Dt(PmOpN(k))\Data, DProduct(A, 0, Axis - 1), extent, offset, size, DProduct(A, Axis + 1, rank - 1), bytes)
+    EndIf
+    offset = offset + size
+    k = k + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Tile-13: Repeats an INT64 tensor with one count per axis.
+; ----------------------------------------------------------------------
+Procedure DOpTile(Y.i, A.i, Repeats.i)
+  Protected Dim dims.i(8)
+  Protected rank.i
+  Protected d.i
+  Protected r.i
+  If A = 0 Or Repeats = 0
+    DFail("Tile requires input and repeats.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  If Dt(Repeats)\Kind <> 7 Or Dt(Repeats)\Count <> rank
+    DFail("Tile repeats must be an INT64 tensor with one count per input axis.")
+    ProcedureReturn
+  EndIf
+  d = 0
+  While d < rank
+    r = DInt(Repeats, d)
+    If r < 0
+      DFail("Tile repeats must not be negative.")
+      ProcedureReturn
+    EndIf
+    PmOpDA(d) = DOpDim(A, d)
+    dims(d) = DOpDim(A, d) * r
+    PmOpDY(d) = dims(d)
+    d = d + 1
+  Wend
+  If DAlloc(Y, Dt(A)\Kind, rank, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Count > 0
+    PmOpTile(Dt(A)\Data, Dt(Y)\Data, rank, PmOpKindBytes(Dt(A)\Kind))
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DepthToSpace-13 (ToSpace 1; Mode 0 DCR, 1 CRD) and SpaceToDepth-13
+; (ToSpace 0) on N x C x H x W, as the specification's reshape, transpose,
+; reshape.
+; ----------------------------------------------------------------------
+Procedure DOpDepthSpace(Y.i, A.i, Block.i, Mode.i, ToSpace.i)
+  Protected Dim dims.i(8)
+  Protected n.i
+  Protected c.i
+  Protected h.i
+  Protected w.i
+  If A = 0
+    DFail("DepthToSpace and SpaceToDepth require an input.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Rank <> 4 Or Block < 1
+    DFail("DepthToSpace and SpaceToDepth take an N x C x H x W input and a positive blocksize.")
+    ProcedureReturn
+  EndIf
+  n = DOpDim(A, 0)
+  c = DOpDim(A, 1)
+  h = DOpDim(A, 2)
+  w = DOpDim(A, 3)
+  If ToSpace <> 0
+    If c % (Block * Block) <> 0
+      DFail("DepthToSpace needs channels divisible by blocksize squared.")
+      ProcedureReturn
+    EndIf
+    c = c / (Block * Block)
+    If Mode = 0
+      PmOpDA(0) = n
+      PmOpDA(1) = Block
+      PmOpDA(2) = Block
+      PmOpDA(3) = c
+      PmOpDA(4) = h
+      PmOpDA(5) = w
+      PmOpI(40) = 0
+      PmOpI(41) = 3
+      PmOpI(42) = 4
+      PmOpI(43) = 1
+      PmOpI(44) = 5
+      PmOpI(45) = 2
+    Else
+      PmOpDA(0) = n
+      PmOpDA(1) = c
+      PmOpDA(2) = Block
+      PmOpDA(3) = Block
+      PmOpDA(4) = h
+      PmOpDA(5) = w
+      PmOpI(40) = 0
+      PmOpI(41) = 1
+      PmOpI(42) = 4
+      PmOpI(43) = 2
+      PmOpI(44) = 5
+      PmOpI(45) = 3
+    EndIf
+    dims(0) = n
+    dims(1) = c
+    dims(2) = h * Block
+    dims(3) = w * Block
+  Else
+    If h % Block <> 0 Or w % Block <> 0
+      DFail("SpaceToDepth needs height and width divisible by blocksize.")
+      ProcedureReturn
+    EndIf
+    h = h / Block
+    w = w / Block
+    PmOpDA(0) = n
+    PmOpDA(1) = c
+    PmOpDA(2) = h
+    PmOpDA(3) = Block
+    PmOpDA(4) = w
+    PmOpDA(5) = Block
+    PmOpI(40) = 0
+    PmOpI(41) = 3
+    PmOpI(42) = 5
+    PmOpI(43) = 1
+    PmOpI(44) = 2
+    PmOpI(45) = 4
+    dims(0) = n
+    dims(1) = c * Block * Block
+    dims(2) = h
+    dims(3) = w
+  EndIf
+  If DAlloc(Y, Dt(A)\Kind, 4, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Count > 0
+    PmOpPermute(Dt(A)\Data, Dt(Y)\Data, 6, PmOpKindBytes(Dt(A)\Kind))
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Trilu-14: K an optional INT64 scalar (0 when absent).
+; ----------------------------------------------------------------------
+Procedure DOpTrilu(Y.i, A.i, K.i, Upper.i)
+  Protected rank.i
+  Protected shift.i
+  If A = 0
+    DFail("Trilu requires an input.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  If rank < 2
+    DFail("Trilu requires an input of rank two or more.")
+    ProcedureReturn
+  EndIf
+  shift = 0
+  If K <> 0
+    If Dt(K)\Kind <> 7 Or Dt(K)\Count <> 1
+      DFail("Trilu k must be a one-element INT64 tensor.")
+      ProcedureReturn
+    EndIf
+    shift = DInt(K, 0)
+  EndIf
+  If DLike(Y, A, 0) = 0
+    ProcedureReturn
+  EndIf
+  PmOpTrilu(Dt(A)\Data, Dt(Y)\Data, DProduct(A, 0, rank - 3), DOpDim(A, rank - 2), DOpDim(A, rank - 1), shift, Upper, PmOpKindBytes(Dt(A)\Kind))
+EndProcedure
+
+; ----------------------------------------------------------------------
+; GatherElements-13.
+; ----------------------------------------------------------------------
+Procedure DOpGatherElements(Y.i, A.i, Idx.i, Axis.i)
+  Protected Dim dims.i(8)
+  Protected rank.i
+  Protected d.i
+  If A = 0 Or Idx = 0
+    DFail("GatherElements requires data and indices.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  If Dt(Idx)\Kind <> 6 And Dt(Idx)\Kind <> 7
+    DFail("GatherElements indices must be INT32 or INT64.")
+    ProcedureReturn
+  EndIf
+  If rank < 1 Or Dt(Idx)\Rank <> rank
+    DFail("GatherElements data and indices must share one rank of at least one.")
+    ProcedureReturn
+  EndIf
+  If Axis < 0
+    Axis = Axis + rank
+  EndIf
+  If Axis < 0 Or Axis >= rank
+    DFail("GatherElements axis is outside the data rank.")
+    ProcedureReturn
+  EndIf
+  d = 0
+  While d < rank
+    PmOpDA(d) = DOpDim(A, d)
+    PmOpDB(d) = DOpDim(Idx, d)
+    dims(d) = PmOpDB(d)
+    If d <> Axis And PmOpDB(d) > PmOpDA(d)
+      DFail("GatherElements indices extend past the data on an axis other than the gather axis.")
+      ProcedureReturn
+    EndIf
+    d = d + 1
+  Wend
+  If DAlloc(Y, Dt(A)\Kind, rank, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  If PmOpGatherElements(Dt(A)\Data, Dt(Idx)\Data, Dt(Y)\Data, rank, Axis, PmOpKindBytes(Dt(A)\Kind), Dt(Idx)\Kind) <> 0
+    DFail("GatherElements index is outside [-s, s-1] for an axis of extent s.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+; GatherND-13 with batch_dims.
+; ----------------------------------------------------------------------
+Procedure DOpGatherND(Y.i, A.i, Idx.i, BatchDims.i)
+  Protected Dim dims.i(8)
+  Protected r.i
+  Protected q.i
+  Protected k.i
+  Protected d.i
+  Protected j.i
+  If A = 0 Or Idx = 0
+    DFail("GatherND requires data and indices.")
+    ProcedureReturn
+  EndIf
+  If Dt(Idx)\Kind <> 7
+    DFail("GatherND indices must be INT64.")
+    ProcedureReturn
+  EndIf
+  r = Dt(A)\Rank
+  q = Dt(Idx)\Rank
+  If r < 1 Or q < 1 Or BatchDims < 0 Or BatchDims >= q Or BatchDims >= r
+    DFail("GatherND needs data and indices of rank one or more and batch_dims below both ranks.")
+    ProcedureReturn
+  EndIf
+  k = DOpDim(Idx, q - 1)
+  If k < 1 Or k > r - BatchDims
+    DFail("GatherND index tuples must have one to rank(data) - batch_dims entries.")
+    ProcedureReturn
+  EndIf
+  If q - 1 + r - k - BatchDims > 8
+    DFail("GatherND output rank exceeds eight.")
+    ProcedureReturn
+  EndIf
+  j = 0
+  d = 0
+  While d < q - 1
+    If d < BatchDims And DOpDim(Idx, d) <> DOpDim(A, d)
+      DFail("GatherND batch dimensions of data and indices differ.")
+      ProcedureReturn
+    EndIf
+    dims(j) = DOpDim(Idx, d)
+    j = j + 1
+    d = d + 1
+  Wend
+  d = BatchDims + k
+  While d < r
+    dims(j) = DOpDim(A, d)
+    j = j + 1
+    d = d + 1
+  Wend
+  d = 0
+  While d < 8
+    If d < r
+      PmOpDA(d) = DOpDim(A, d)
+    EndIf
+    If d < q
+      PmOpDB(d) = DOpDim(Idx, d)
+    EndIf
+    d = d + 1
+  Wend
+  If DAlloc(Y, Dt(A)\Kind, j, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = BatchDims
+  PmOpI(1) = r
+  PmOpI(2) = q
+  If PmOpGatherND(Dt(A)\Data, Dt(Idx)\Data, Dt(Y)\Data, PmOpKindBytes(Dt(A)\Kind), 7) <> 0
+    DFail("GatherND index is outside [-s, s-1] for an axis of extent s.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+; OneHot-11: Depth a one-element tensor (FLOAT, INT32 or INT64, a FLOAT
+; depth truncated), Values the two-element [off, on] tensor that gives the
+; output type.
+; ----------------------------------------------------------------------
+Procedure DOpOneHot(Y.i, Idx.i, Depth.i, Values.i, Axis.i)
+  Protected Dim dims.i(8)
+  Protected rank.i
+  Protected depthValue.i
+  Protected d.i
+  Protected j.i
+  If Idx = 0 Or Depth = 0 Or Values = 0
+    DFail("OneHot requires indices, depth and values.")
+    ProcedureReturn
+  EndIf
+  If DOpKindOk(Dt(Idx)\Kind, 7) = 0 Or DOpKindOk(Dt(Depth)\Kind, 7) = 0 Or Dt(Depth)\Count <> 1
+    DFail("OneHot indices and depth must be FLOAT, INT32 or INT64, and depth one element.")
+    ProcedureReturn
+  EndIf
+  If DOpKindOk(Dt(Values)\Kind, 15) = 0 Or Dt(Values)\Count <> 2
+    DFail("OneHot values must be two elements, [off_value, on_value].")
+    ProcedureReturn
+  EndIf
+  If Dt(Depth)\Kind = 1
+    depthValue = PmOpTruncInt(PmTensorGet(Dt(Depth)\Data, 0))
+  Else
+    depthValue = DInt(Depth, 0)
+  EndIf
+  If depthValue < 1
+    DFail("OneHot depth must be at least one.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(Idx)\Rank
+  If Axis < 0
+    Axis = Axis + rank + 1
+  EndIf
+  If Axis < 0 Or Axis > rank Or rank + 1 > 8
+    DFail("OneHot axis is outside the output rank.")
+    ProcedureReturn
+  EndIf
+  j = 0
+  d = 0
+  While d <= rank
+    If d = Axis
+      dims(d) = depthValue
+    Else
+      dims(d) = DOpDim(Idx, j)
+      j = j + 1
+    EndIf
+    d = d + 1
+  Wend
+  If DAlloc(Y, Dt(Values)\Kind, rank + 1, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  If Dt(Values)\Kind = 1
+    PmOpF(0) = PmTensorGet(Dt(Values)\Data, 0)
+    PmOpF(1) = PmTensorGet(Dt(Values)\Data, 1)
+  Else
+    PmOpI(0) = PmOpReadInt(Dt(Values)\Data, 0, Dt(Values)\Kind)
+    PmOpI(1) = PmOpReadInt(Dt(Values)\Data, 1, Dt(Values)\Kind)
+  EndIf
+  PmOpOneHot(Dt(Idx)\Data, Dt(Y)\Data, DProduct(Idx, 0, Axis - 1), depthValue, DProduct(Idx, Axis, rank - 1), Dt(Idx)\Kind, Dt(Values)\Kind)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Einsum-12, FLOAT. The compiler parsed the equation: PmOpT(0) operands n
+; (their ids in PmOpN), PmOpT(1) labels L, PmOpT(2) output labels Lo;
+; PmOpT(4 + k) the rank of operand k and PmOpT(8 + k*8 + a) the label of its
+; axis a. The extents and strides follow from the tensors.
+; ----------------------------------------------------------------------
+Procedure DOpEinsum(Y.i)
+  Protected Dim dims.i(8)
+  Protected n.i
+  Protected labels.i
+  Protected kept.i
+  Protected k.i
+  Protected a.i
+  Protected l.i
+  Protected id.i
+  Protected s.i
+  n = PmOpT(0)
+  labels = PmOpT(1)
+  kept = PmOpT(2)
+  l = 0
+  While l < 96
+    PmOpI(l) = 0
+    l = l + 1
+  Wend
+  l = 0
+  While l < labels
+    PmOpI(4 + l) = -1
+    l = l + 1
+  Wend
+  k = 0
+  While k < n
+    id = PmOpN(k)
+    If id = 0
+      DFail("Einsum operand is missing.")
+      ProcedureReturn
+    EndIf
+    If Dt(id)\Kind <> 1
+      DFail("Einsum computes FLOAT operands only.")
+      ProcedureReturn
+    EndIf
+    If Dt(id)\Rank <> PmOpT(4 + k)
+      DFail("Einsum operand rank does not match its term in the equation.")
+      ProcedureReturn
+    EndIf
+    s = 1
+    a = Dt(id)\Rank - 1
+    While a >= 0
+      l = PmOpT(8 + k * 8 + a)
+      If PmOpI(4 + l) >= 0 And PmOpI(4 + l) <> DOpDim(id, a)
+        DFail("Einsum label extents disagree between operands.")
+        ProcedureReturn
+      EndIf
+      PmOpI(4 + l) = DOpDim(id, a)
+      PmOpI(20 + k * 16 + l) = PmOpI(20 + k * 16 + l) + s
+      s = s * DOpDim(id, a)
+      a = a - 1
+    Wend
+    PmOpAddr(k) = Dt(id)\Data
+    k = k + 1
+  Wend
+  PmOpI(0) = n
+  PmOpI(1) = labels
+  PmOpI(2) = kept
+  l = 0
+  While l < kept
+    dims(l) = PmOpI(4 + l)
+    l = l + 1
+  Wend
+  If DAlloc(Y, 1, kept, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpEinsum(Dt(Y)\Data)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Dropout in inference: Y a copy of A; Mask (when named) all true. Training
+; (training_mode, when named) true with a nonzero Ratio would draw random
+; masks, which is not implemented.
+; ----------------------------------------------------------------------
+Procedure DOpDropout(Y.i, Mask.i, A.i, Ratio.i, Training.i)
+  Protected i.i
+  Protected ratioZero.i
+  If A = 0
+    DFail("Dropout requires data.")
+    ProcedureReturn
+  EndIf
+  If Training <> 0
+    If Dt(Training)\Count <> 1
+      DFail("Dropout training_mode must be one element.")
+      ProcedureReturn
+    EndIf
+    If DInt(Training, 0) <> 0
+      ratioZero = 0
+      If Ratio <> 0
+        If Dt(Ratio)\Kind = 1 And Dt(Ratio)\Count = 1
+          If (PeekL(Dt(Ratio)\Data) & $7FFFFFFF) = 0
+            ratioZero = 1
+          EndIf
+        EndIf
+      EndIf
+      If ratioZero = 0
+        DFail("Dropout with training_mode true and a nonzero ratio draws random masks, which runtime-dimension emission does not implement.")
+        ProcedureReturn
+      EndIf
+    EndIf
+  EndIf
+  If Y <> 0
+    If DLike(Y, A, 0) = 0
+      ProcedureReturn
+    EndIf
+    PmOpCopyBytes(Dt(A)\Data, Dt(Y)\Data, Dt(A)\Bytes)
+  EndIf
+  If Mask <> 0
+    If DLike(Mask, A, 9) = 0
+      ProcedureReturn
+    EndIf
+    i = 0
+    While i < Dt(Mask)\Count
+      PokeA(Dt(Mask)\Data + i, 1)
+      i = i + 1
+    Wend
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Size: the element count of A as an INT64 scalar.
+; ----------------------------------------------------------------------
+Procedure DOpSize(Y.i, A.i)
+  Protected Dim dims.i(8)
+  If A = 0
+    DFail("Size requires an input.")
+    ProcedureReturn
+  EndIf
+  If DAlloc(Y, 7, 0, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmTensorPutI64(Dt(Y)\Data, 0, Dt(A)\Count)
+EndProcedure

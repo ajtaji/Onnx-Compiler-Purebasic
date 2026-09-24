@@ -118,6 +118,13 @@ Procedure.i PmoIrCompileTimeInput(Operation.s, Position.i)
       ProcedureReturn Bool(Position = 1 Or Position = 3)
     Case "STFT"
       ProcedureReturn Bool(Position = 1 Or Position = 3)
+    ; The operator set completed in onnx_emit_ops.pbi: inputs that decide
+    ; shapes or the form (Split's sizes, Tile's repeats, OneHot's depth, a
+    ; reduction's axes, Dropout's ratio and training_mode).
+    Case "Split", "Tile", "OneHot", "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp"
+      ProcedureReturn Bool(Position = 1)
+    Case "Dropout"
+      ProcedureReturn Bool(Position = 1 Or Position = 2)
   EndSelect
   ProcedureReturn #False
 EndProcedure
@@ -637,9 +644,25 @@ Procedure.i PmoIrFoldRange(*Ir.PmoIrModel, *Node.PmoOnnxNode)
   ProcedureReturn #False
 EndProcedure
 
+; Size-1 (Size-13, -19 add element types): the input's element count, an
+; INT64 scalar, known whenever the input's shape is.
+Procedure.i PmoIrFoldSize(*Ir.PmoIrModel, *Node.PmoOnnxNode)
+  Protected *Value.PmoIrValue
+  Protected Count.q
+  NewList Shape.q()
+  If SelectElement(*Node\Inputs(), 0) = 0 Or SelectElement(*Node\Outputs(), 0) = 0 : ProcedureReturn #False : EndIf
+  SelectElement(*Node\Inputs(), 0)
+  If FindMapElement(*Ir\ValueByName(), *Node\Inputs()) = 0 : ProcedureReturn #False : EndIf
+  *Value = *Ir\ValueByName()
+  Count = *Value\Elements
+  SelectElement(*Node\Outputs(), 0)
+  ProcedureReturn PmoIrNewConstant(*Ir, *Node\Outputs(), 7, Shape(), @Count, 8)
+EndProcedure
+
 Procedure.i PmoIrTryFold(*Ir.PmoIrModel, *Node.PmoOnnxNode)
   Select *Node\Operation
     Case "Shape" : ProcedureReturn PmoIrFoldShape(*Ir, *Node)
+    Case "Size" : ProcedureReturn PmoIrFoldSize(*Ir, *Node)
     Case "Gather" : ProcedureReturn PmoIrFoldGather(*Ir, *Node)
     Case "Unsqueeze", "Squeeze", "Reshape", "Identity" : ProcedureReturn PmoIrFoldView(*Ir, *Node)
     Case "Concat" : ProcedureReturn PmoIrFoldConcat(*Ir, *Node)
@@ -656,7 +679,7 @@ Procedure.i PmoIrFoldConstants(*Ir.PmoIrModel)
   PmoIrError = ""
   ClearList(*Ir\Nodes())
   ForEach *Ir\Source\Graph\Nodes()
-    CanTry = Bool(*Ir\Source\Graph\Nodes()\Operation = "Shape")
+    CanTry = Bool(*Ir\Source\Graph\Nodes()\Operation = "Shape" Or *Ir\Source\Graph\Nodes()\Operation = "Size")
     If CanTry = 0
       CanTry = #True
       ForEach *Ir\Source\Graph\Nodes()\Inputs()

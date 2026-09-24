@@ -32,6 +32,7 @@ EndProcedure
 
 Procedure.i PmdNsFloor(Operation.s)
   If PmoNsOwns(Operation) : ProcedureReturn PmoNsFloor(Operation, #False) : EndIf
+  If PmoOpsOwns(Operation) : ProcedureReturn PmoOpsFloor(Operation) : EndIf
   ; Every other operator: the audited floors in onnx_control.pbi (20 when unlisted).
   ProcedureReturn PmcOperatorFloor(Operation)
 EndProcedure

@@ -263,7 +263,10 @@ Procedure.s PmoFormRefusal(*Node.PmoOnnxNode, FixedShape.i)
       If FixedShape : Text = "|keepdims|noop_with_empty_axes|axes|" : EndIf
       Reason = PmoFormUnknown(*Node, Text, Path)
       ; With axes given, noop_with_empty_axes has no effect, whatever its value.
-      If Reason = "" And PmoFormInputPresent(*Node, 1) = 0 And PmoFormAttribute(*Node, "axes") = 0
+      ; The runtime-dimension path reduces over any axes set, the empty one
+      ; included (DReduceAxes, DReduceNoopEmpty); the fixed-shape path's
+      ; kernel reduces one axis.
+      If Reason = "" And FixedShape And PmoFormInputPresent(*Node, 1) = 0 And PmoFormAttribute(*Node, "axes") = 0
         If PmoEmitAttrI(*Node, "noop_with_empty_axes", 0)
           Reason = "axes is absent and noop_with_empty_axes = 1 selects the identity, which " + Path + " does not implement; give the axis to reduce."
         Else

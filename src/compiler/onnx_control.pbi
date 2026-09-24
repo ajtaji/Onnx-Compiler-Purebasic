@@ -157,6 +157,9 @@ Procedure.i PmcNodeFloor(Operation.s)
   CompilerIf Defined(PmoNsOwns, #PB_Procedure)
     If PmoNsOwns(Operation) : ProcedureReturn PmoNsFloor(Operation, #False) : EndIf
   CompilerEndIf
+  CompilerIf Defined(PmoOpsOwns, #PB_Procedure)
+    If PmoOpsOwns(Operation) : ProcedureReturn PmoOpsFloor(Operation) : EndIf
+  CompilerEndIf
   ProcedureReturn PmcOperatorFloor(Operation)
 EndProcedure
 

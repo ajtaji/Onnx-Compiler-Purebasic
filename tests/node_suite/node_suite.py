@@ -131,7 +131,17 @@ def supported_operators(source_root: Path = ROOT) -> tuple[set[str], set[str]]:
         sys.exit("node_suite: cannot find PmoCompileSupportedOp's operator list in src/compiler/onnx_compile.pbi; "
                  "the harness reads the supported set from that source and will not guess it.")
     fixed = set(filter(None, m.group(1).split("|")))
-    dyn_src = (source_root / "src" / "compiler" / "onnx_dynamic_emit.pbi").read_text(encoding="utf-8", errors="replace")
+    # The operators that complete the set (onnx_emit_ops.pbi) are listed once,
+    # by PmoOpsOwns, for both paths.
+    ops_path = source_root / "src" / "compiler" / "onnx_emit_ops.pbi"
+    owned: set[str] = set()
+    if ops_path.exists():
+        ops_src = ops_path.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r'Procedure\.i PmoOpsOwns\(.*?FindString\((.*?), "\|" \+ Operation', ops_src, re.S)
+        if m:
+            owned = set(filter(None, "".join(re.findall(r'"([^"]*)"', m.group(1))).split("|")))
+    fixed |= owned
+    dyn_src =(source_root / "src" / "compiler" / "onnx_dynamic_emit.pbi").read_text(encoding="utf-8", errors="replace")
     m = re.search(r"Procedure\.s PmdCall\(.*?EndProcedure", dyn_src, re.S)
     if not m:
         sys.exit("node_suite: cannot find PmdCall in src/compiler/onnx_dynamic_emit.pbi; "
@@ -141,7 +151,7 @@ def supported_operators(source_root: Path = ROOT) -> tuple[set[str], set[str]]:
         s = line.strip()
         if s.startswith("Case ") and '"' in s:
             dynamic.update(re.findall(r'"([A-Za-z]+)"', s.split(":")[0]))
-    return fixed, dynamic
+    return fixed, dynamic | owned
 
 
 _SNAKE_OPS: list[tuple[str, str]] = []

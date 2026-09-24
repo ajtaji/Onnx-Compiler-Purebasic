@@ -618,11 +618,62 @@ Procedure DGemm(Y.i,A.i,B.i,C.i,TransA.i,TransB.i,Alpha.f,Beta.f)
   If Dt(B)\Kind=3 Or Dt(B)\Kind=33 : DInt8End() : EndIf
 EndProcedure
 
+; ReduceSum and ReduceMean over any set of axes (absent or empty axes: all
+; of them): every output sums its elements in row-major order, the mean
+; divides that sum once by the count. The one-final-axis form keeps the fast
+; kernel below.
+Procedure DReduceAxes(Y.i,A.i,Axes.i,Keep.i,Mean.i)
+  Protected Dim dims.i(7)
+  Protected Dim stride.i(7)
+  Protected i.i,j.i,d.i,rank.i=Dt(A)\Rank,axis.i,mask.i,count.i,outCount.i,inner.i,n.i,base.i,at.i,coord.i
+  Protected acc.f,x.f,cf.f
+  If Dt(A)\Kind<>1 : DFail("Reduction requires FLOAT.") : ProcedureReturn : EndIf
+  If Axes : count=Dt(Axes)\Count : EndIf
+  For i=0 To count-1
+    axis=DInt(Axes,i) : If axis<0 : axis+rank : EndIf
+    If axis<0 Or axis>=rank : DFail("A reduction axis is outside the data rank.") : ProcedureReturn : EndIf
+    If (mask>>axis)&1 : DFail("Reduction axes name the same axis twice.") : ProcedureReturn : EndIf
+    mask|(1<<axis)
+  Next
+  If count=0 : mask=(1<<rank)-1 : EndIf
+  j=0 : outCount=1 : inner=1 : n=1
+  For d=rank-1 To 0 Step -1 : stride(d)=n : n*Dt(A)\D[d] : Next
+  For d=0 To rank-1
+    If (mask>>d)&1
+      inner*Dt(A)\D[d]
+      If Keep : dims(j)=1 : j+1 : EndIf
+    Else
+      dims(j)=Dt(A)\D[d] : j+1 : outCount*Dt(A)\D[d]
+    EndIf
+  Next
+  If DAlloc(Y,1,j,@dims(0))=0 : ProcedureReturn : EndIf
+  cf=inner
+  For i=0 To outCount-1
+    base=0 : n=i
+    For d=rank-1 To 0 Step -1
+      If ((mask>>d)&1)=0 : coord=n%Dt(A)\D[d] : n/Dt(A)\D[d] : base+coord*stride(d) : EndIf
+    Next
+    acc=0.0
+    For j=0 To inner-1
+      at=base : n=j
+      For d=rank-1 To 0 Step -1
+        If (mask>>d)&1 : coord=n%Dt(A)\D[d] : n/Dt(A)\D[d] : at+coord*stride(d) : EndIf
+      Next
+      x=PeekF(Dt(A)\Data+at*4) : acc=acc+x
+    Next
+    If Mean : acc=acc/cf : EndIf
+    PokeF(Dt(Y)\Data+i*4,acc)
+  Next
+EndProcedure
+
 Procedure DReduce(Y.i,A.i,Axes.i,Keep.i,Mean.i)
   Protected Dim dims.i(7)
-  Protected i.i,axis.i=DInt(Axes),rank.i=Dt(A)\Rank,width.i
+  Protected i.i,axis.i,rank.i=Dt(A)\Rank,width.i
+  If Axes=0 : DReduceAxes(Y,A,Axes,Keep,Mean) : ProcedureReturn : EndIf
+  If Dt(Axes)\Count<>1 : DReduceAxes(Y,A,Axes,Keep,Mean) : ProcedureReturn : EndIf
+  axis=DInt(Axes)
   If axis<0 : axis+rank : EndIf
-  If Dt(Axes)\Count<>1 Or axis<>rank-1 : DFail("Reduction currently requires one final axis.") : ProcedureReturn : EndIf
+  If axis<>rank-1 : DReduceAxes(Y,A,Axes,Keep,Mean) : ProcedureReturn : EndIf
   For i=0 To rank-1 : dims(i)=Dt(A)\D[i] : Next
   width=dims(rank-1)
   If Keep : dims(rank-1)=1 : Else : rank-1 : EndIf
@@ -630,6 +681,18 @@ Procedure DReduce(Y.i,A.i,Axes.i,Keep.i,Mean.i)
   If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0 : ProcedureReturn : EndIf
   If Dt(A)\Kind<>1 : DFail("Reduction requires FLOAT.") : ProcedureReturn : EndIf
   PmFastReduce(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count/width,width,Mean)
+EndProcedure
+
+; noop_with_empty_axes = 1: absent or empty axes copy the data unchanged.
+Procedure DReduceNoopEmpty(Y.i,A.i,Axes.i,Keep.i,Mean.i)
+  Protected empty.i
+  If Axes=0 : empty=1 : ElseIf Dt(Axes)\Count=0 : empty=1 : EndIf
+  If empty
+    If DLike(Y,A)=0 : ProcedureReturn : EndIf
+    CopyMemory(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+    ProcedureReturn
+  EndIf
+  DReduce(Y,A,Axes,Keep,Mean)
 EndProcedure
 
 Procedure DSoftmax(Y.i,A.i,Axis.i)
