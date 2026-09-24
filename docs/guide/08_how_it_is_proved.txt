@@ -538,6 +538,50 @@ check, then compiles the same cases for the Pi 4, Pico and Pico 2, runs the
 generated programs in the emulator, and requires their outputs to pass the
 same comparison and to equal the Windows program's bits.
 
+@SECTION Threads on Windows: the same bits at every count
+
+The Windows runtime splits an operator across its workers only by output
+(chapter 5), and one gate holds it to that. `mt_split_gate.py`, beside the
+kernel check, builds a program against the runtime folder that runs every
+operator the runtime splits - element-wise and row-wise kernels, FP32 and
+INT8 products, every convolution form, the recurrent steps, the transform,
+data movement and reductions, the normalizations and the rest - at 1, 2, 3
+and 8 threads, once with the natural split and once with every operator cut
+into its smallest tasks, on odd shapes so no two tasks are the same size.
+Every output's CRC must equal the one-thread run's; an operator that should
+have split and did not fails, and so does a tiny tensor that did. A second
+program narrows its own process's affinity mask and requires the detected
+processor count, the default number of threads and the processor every task
+ran on to follow it. A third ends a program 180 times - straight after
+binding, after one operator, after unbinding - launched with fault dialogs
+off, as the node-suite harness launches, and requires every exit to be the
+program's own. Seven planted defects must each turn it red:
+
+@FRAG
+py -3.12 mt_split_gate.py --pbcompiler <pbcompiler.exe> --runtime <ONNX repository>\runtime --mutants
+split: PASS
+  CASES 144 x 8 configurations, 0 failures
+affinity: PASS
+  mask $1: 1 processors, default pool 1 threads
+  mask $F: 4 processors, default pool 4 threads
+  mask $5555: 8 processors, default pool 8 threads
+  ...
+exit: PASS
+  exit: 180 of 180 ends were clean (bind, run, unbind; fault dialogs off)
+mutant reduction-split: red  (a row's sum taken in two halves)
+mutant racy-scratch: red     (every worker in one working buffer)
+mutant no-join: red          (the run returns before its workers finish)
+mutant ignore-mask: red      (the machine's count instead of the process's)
+mutant no-start-wait: red    (bind returns before its workers have started)
+mutant spin-on-language-memory: red  (workers spin on memory End releases)
+mutant end-at-unbind: red    (unbind ends the workers instead of parking them)
+mutants: 7 of 7 red
+@ENDFRAG
+
+It says the split never moves a bit and never escapes the processors the
+process was given. It does not say anything about speed; chapter 4 has the
+measurement.
+
 @SECTION Where the gates live, and why not here
 
 `tests/` is **not tracked by this repository**, with one exception. Its

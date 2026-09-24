@@ -117,10 +117,68 @@ Procedure.i DInt8End()
   ProcedureReturn DFail("INT8 working memory could not be allocated for this operator.")
 EndProcedure
 
+; ---- the block cache of a multi-threaded model --------------------------------
+; A fresh block of a megabyte or more arrives as untouched pages, and the
+; first write to each page is a page fault the system serves one at a time,
+; however many workers write. With more than one thread, released blocks of
+; that size are therefore kept (at most 64 blocks, 512 MB) and handed out
+; again, zeroed by the pool, so DAlloc still returns zeroed memory. The cache
+; is emptied when the pool stops (unbind, or a new thread count). With one
+; thread nothing is kept and allocation is exactly the single-threaded one.
+#PMD_CACHE_MIN = 1048576
+#PMD_CACHE_SLOTS = 64
+#PMD_CACHE_LIMIT = 536870912
+Global Dim DCacheBlock.i(#PMD_CACHE_SLOTS - 1)
+Global Dim DCacheBytes.i(#PMD_CACHE_SLOTS - 1)
+Global DCacheCount.i, DCacheTotal.i
+; Set by an operator around its own DAlloc when its kernel writes every
+; element of the new tensor (Binary, Unary): a reused block is then handed
+; out as it is, since the kernel overwrites all of it.
+Global DAllocOverwrite.i
+
+Procedure DCacheFlush()
+  Protected i.i
+  For i = 0 To DCacheCount - 1 : FreeMemory(DCacheBlock(i)) : Next
+  DCacheCount = 0 : DCacheTotal = 0
+EndProcedure
+PmPoolStopHook = @DCacheFlush()
+
+; The smallest kept block of at least `bytes` (and at most twice that), zeroed
+; over `bytes`; 0 when there is none.
+Procedure.i DCacheTake(bytes.i)
+  Protected i.i, best.i = -1, *mem
+  For i = 0 To DCacheCount - 1
+    If DCacheBytes(i) >= bytes And DCacheBytes(i) / 2 <= bytes
+      If best < 0 Or DCacheBytes(i) < DCacheBytes(best) : best = i : EndIf
+    EndIf
+  Next
+  If best < 0 : ProcedureReturn 0 : EndIf
+  *mem = DCacheBlock(best) : DCacheTotal - DCacheBytes(best)
+  DCacheCount - 1
+  DCacheBlock(best) = DCacheBlock(DCacheCount) : DCacheBytes(best) = DCacheBytes(DCacheCount)
+  If DAllocOverwrite = 0 : PmPoolZeroFill(*mem, bytes) : EndIf
+  ProcedureReturn *mem
+EndProcedure
+
+Procedure DCacheGive(*mem)
+  Protected bytes.i = MemorySize(*mem), i.i
+  If PmPoolThreads <= 1 Or bytes < #PMD_CACHE_MIN Or bytes > #PMD_CACHE_LIMIT
+    FreeMemory(*mem) : ProcedureReturn
+  EndIf
+  ; Make room by returning the oldest kept blocks to the heap.
+  While DCacheCount > 0 And (DCacheCount = #PMD_CACHE_SLOTS Or DCacheTotal + bytes > #PMD_CACHE_LIMIT)
+    FreeMemory(DCacheBlock(0)) : DCacheTotal - DCacheBytes(0)
+    For i = 1 To DCacheCount - 1 : DCacheBlock(i - 1) = DCacheBlock(i) : DCacheBytes(i - 1) = DCacheBytes(i) : Next
+    DCacheCount - 1
+  Wend
+  DCacheBlock(DCacheCount) = *mem : DCacheBytes(DCacheCount) = bytes
+  DCacheCount + 1 : DCacheTotal + bytes
+EndProcedure
+
 Procedure DRelease(Id.i)
   If Id <= 0 Or Id > #PMD_TENSOR_COUNT : ProcedureReturn : EndIf
   If Dt(Id)\Owned
-    FreeMemory(Dt(Id)\Data)
+    DCacheGive(Dt(Id)\Data)
     DLive - Dt(Id)\Bytes
   EndIf
   ClearStructure(@Dt(Id), PmDynamicTensor)
@@ -140,7 +198,9 @@ Procedure.i DAlloc(Id.i, Kind.i, Rank.i, *Dims)
   bytes = count * size
   DRelease(Id)
   If bytes > DLimit - DLive : ProcedureReturn DFail("Request exceeds the configured working-memory limit.") : EndIf
-  Dt(Id)\Data = AllocateMemory(DMax(bytes, 1))
+  Dt(Id)\Data = 0
+  If bytes >= #PMD_CACHE_MIN And PmPoolThreads > 1 : Dt(Id)\Data = DCacheTake(bytes) : EndIf
+  If Dt(Id)\Data = 0 : Dt(Id)\Data = AllocateMemory(DMax(bytes, 1)) : EndIf
   If Dt(Id)\Data = 0 : ProcedureReturn DFail("Working-memory allocation failed.") : EndIf
   Dt(Id)\Kind = Kind : Dt(Id)\Rank = Rank : Dt(Id)\Count = count
   Dt(Id)\Bytes = bytes : Dt(Id)\Owned = 1 : DLive + bytes
@@ -224,7 +284,131 @@ Procedure.i DBroadcast(Y.i,A.i,B.i,Kind.i=0)
   ProcedureReturn DAlloc(Y,Kind,rank,@dims(0))
 EndProcedure
 
+; ---- runtime-dimension loops on the pool -------------------------------------
+; Each loop below that visits output elements (or output rows) in index order
+; is cut into index ranges; a range runs the loop's own statements, so every
+; element is computed exactly as the whole loop computed it. Loops that can
+; fail part-way (integer division by zero, an index out of range) stay on
+; the calling thread, where DFail may write DError.
+Structure DIndexJob
+  Kind.i
+  Y.i
+  A.i
+  B.i
+  C.i
+  Count.i
+  Chunk.i
+  Size.i
+  Rank.i
+  Op.i
+  Width.i
+  AStep.i
+  BStep.i
+  RowSegments.i
+  SegWidth.i
+  Mask.i
+  Inner.i
+  Mean.i
+  F1.f
+  Dims.i[8]
+  Strides.i[8]
+  Start.i[8]
+  Steps.i[8]
+EndStructure
+
+Declare DIndexTask(*j.DIndexJob,task.i,worker.i)
+
+Procedure DIndexRun(*j.DIndexJob,grain.i,align.i=1)
+  Protected tasks.i=PmPoolTasks(*j\Count,grain,align,@*j\Chunk)
+  If tasks<=1
+    *j\Chunk=*j\Count : DIndexTask(*j,0,0)
+  Else
+    PmPoolRun(@DIndexTask(),*j,tasks)
+  EndIf
+EndProcedure
+Procedure DIndexTask(*j.DIndexJob,task.i,worker.i)
+  Protected first.i=task* *j\Chunk,last.i=first+ *j\Chunk,i.i,n.i,src.i,c.i,d.i,index.i,base.i,at.i,coord.i,seg.i,row.i,c0.i,cols.i,ai.i,bi.i
+  Protected Y.i=*j\Y,A.i=*j\A,B.i=*j\B,size.i=*j\Size,rank.i=*j\Rank
+  Protected av.f,bv.f,v.f,acc.f,x.f,cf.f
+  If last>*j\Count : last=*j\Count : EndIf
+  If first>=last : ProcedureReturn : EndIf
+  Select *j\Kind
+    Case 0 ; DBinary, FLOAT fast path: row segments
+      For seg=first To last-1
+        row=seg/ *j\RowSegments : c0=(seg % *j\RowSegments)* *j\SegWidth
+        cols=*j\Width-c0 : If cols>*j\SegWidth : cols=*j\SegWidth : EndIf
+        i=row* *j\Width : ai=DBroadcastIndex(i,Y,A) : bi=DBroadcastIndex(i,Y,B)
+        PmFastBinary(Dt(A)\Data+(ai+c0* *j\AStep)*4,Dt(B)\Data+(bi+c0* *j\BStep)*4,Dt(Y)\Data+(i+c0)*4,cols,*j\AStep,*j\BStep,*j\Op)
+      Next
+    Case 1 ; DBinary, Pow by one FLOAT scalar
+      bv=*j\F1
+      For i=first To last-1 : PokeF(Dt(Y)\Data+i*4,Pow(PeekF(Dt(A)\Data+i*4),bv)) : Next
+    Case 2 ; DBinary, the general FLOAT broadcast loop
+      For i=first To last-1
+        ai=DBroadcastIndex(i,Y,A) : bi=DBroadcastIndex(i,Y,B)
+        av=DGet(A,ai) : bv=DGet(B,bi)
+        Select *j\Op
+          Case 0 : v=av+bv
+          Case 1 : v=av-bv
+          Case 2 : v=av*bv
+          Case 3 : v=av/bv
+          Case 4 : v=Pow(av,bv)
+          Case 5 : v=Bool(av=bv)
+          Case 6 : v=Bool(av>bv)
+          Case 7 : v=Bool(av<bv)
+          Case 8 : v=Bool(av>=bv)
+          Case 9 : v=Bool(av<>0 And bv<>0)
+        EndSelect
+        DPut(Y,i,v)
+      Next
+    Case 3 ; DTranspose
+      For i=first To last-1
+        n=i : src=0
+        For d=rank-1 To 0 Step -1
+          coord=n % *j\Dims[d] : n/ *j\Dims[d] : src+coord* *j\Strides[d]
+        Next
+        CopyMemory(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
+      Next
+    Case 4 ; DSlice
+      For i=first To last-1
+        n=i : src=0
+        For d=rank-1 To 0 Step -1
+          c=n % *j\Dims[d] : n/ *j\Dims[d] : src+(*j\Start[d]+c* *j\Steps[d])* *j\Strides[d]
+        Next
+        CopyMemory(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
+      Next
+    Case 5 ; DExpand
+      For i=first To last-1 : CopyMemory(Dt(A)\Data+DBroadcastIndex(i,Y,A)*size,Dt(Y)\Data+i*size,size) : Next
+    Case 6 ; DWhere: C is the condition
+      For i=first To last-1
+        If DGet(*j\C,DBroadcastIndex(i,Y,*j\C)) : src=A : Else : src=B : EndIf
+        index=DBroadcastIndex(i,Y,src)
+        CopyMemory(Dt(src)\Data+index*size,Dt(Y)\Data+i*size,size)
+      Next
+    Case 7 ; DCast
+      For i=first To last-1 : DPut(Y,i,DGet(A,i)) : Next
+    Case 8 ; DReduceAxes: one output per index, its elements in row-major order
+      cf=*j\Inner
+      For i=first To last-1
+        base=0 : n=i
+        For d=rank-1 To 0 Step -1
+          If ((*j\Mask>>d)&1)=0 : coord=n%Dt(A)\D[d] : n/Dt(A)\D[d] : base+coord* *j\Strides[d] : EndIf
+        Next
+        acc=0.0
+        For c=0 To *j\Inner-1
+          at=base : n=c
+          For d=rank-1 To 0 Step -1
+            If (*j\Mask>>d)&1 : coord=n%Dt(A)\D[d] : n/Dt(A)\D[d] : at+coord* *j\Strides[d] : EndIf
+          Next
+          x=PeekF(Dt(A)\Data+at*4) : acc=acc+x
+        Next
+        If *j\Mean : acc=acc/cf : EndIf
+        PokeF(Dt(Y)\Data+i*4,acc)
+      Next
+  EndSelect
+EndProcedure
 Procedure DBinary(Y.i,A.i,B.i,Op.i)
+  Protected j.DIndexJob
   Protected i.i, ai.i,bi.i,kind.i=Dt(A)\Kind
   Protected av.f,bv.f,v.f,ia.i,ib.i,iv.i
   Protected width.i,row.i,astep.i,bstep.i
@@ -232,21 +416,37 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
     If PeekF(Dt(B)\Data)=2 : B=A : Op=2 : EndIf
   EndIf
   If Op>=5 : kind=9 : EndIf
-  If DBroadcast(Y,A,B,kind)=0 : ProcedureReturn : EndIf
+  ; Every path below writes every element of Y (or fails the request).
+  DAllocOverwrite=1
+  If DBroadcast(Y,A,B,kind)=0 : DAllocOverwrite=0 : ProcedureReturn : EndIf
+  DAllocOverwrite=0
   If kind=1 And Dt(B)\Kind=1 And Op<=3
     width=1 : If Dt(Y)\Rank : width=Dt(Y)\D[Dt(Y)\Rank-1] : EndIf
     If width=0 : ProcedureReturn : EndIf
     If Dt(A)\Rank : astep=Bool(Dt(A)\D[Dt(A)\Rank-1]<>1) : EndIf
     If Dt(B)\Rank : bstep=Bool(Dt(B)\D[Dt(B)\Rank-1]<>1) : EndIf
-    For row=0 To Dt(Y)\Count/width-1
-      i=row*width : ai=DBroadcastIndex(i,Y,A) : bi=DBroadcastIndex(i,Y,B)
-      PmFastBinary(Dt(A)\Data+ai*4,Dt(B)\Data+bi*4,Dt(Y)\Data+i*4,width,astep,bstep,Op)
-    Next
+    ; Segments: whole rows, or, for rows wider than two grains, pieces of a
+    ; row starting at multiples of 4 so every element keeps its place in the
+    ; four-wide loop or its scalar tail.
+    j\Kind=0 : j\Y=Y : j\A=A : j\B=B : j\Op=Op : j\Width=width : j\AStep=astep : j\BStep=bstep
+    If width>=2*#PMELEM_CHEAP And PmPoolThreads>1
+      j\SegWidth=(#PMELEM_CHEAP+3)&~3 : If PmPoolForceSplit : j\SegWidth=4 : EndIf
+      j\RowSegments=(width+j\SegWidth-1)/j\SegWidth
+    Else
+      j\SegWidth=width : j\RowSegments=1
+    EndIf
+    j\Count=(Dt(Y)\Count/width)*j\RowSegments
+    DIndexRun(@j,PmPoolMax(1,#PMELEM_CHEAP/j\SegWidth))
     ProcedureReturn
   EndIf
   If Op=4 And Dt(A)\Kind=1 And Dt(B)\Kind=1 And Dt(B)\Count=1 And Dt(A)\Count=Dt(Y)\Count
-    bv=PeekF(Dt(B)\Data)
-    For i=0 To Dt(Y)\Count-1 : PokeF(Dt(Y)\Data+i*4,Pow(PeekF(Dt(A)\Data+i*4),bv)) : Next
+    j\Kind=1 : j\Y=Y : j\A=A : j\F1=PeekF(Dt(B)\Data) : j\Count=Dt(Y)\Count
+    DIndexRun(@j,#PMELEM_DEAR)
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind=1 And Op>=0 And Op<=9
+    j\Kind=2 : j\Y=Y : j\A=A : j\B=B : j\Op=Op : j\Count=Dt(Y)\Count
+    DIndexRun(@j,#PMELEM_DEAR)
     ProcedureReturn
   EndIf
   For i=0 To Dt(Y)\Count-1
@@ -294,7 +494,10 @@ EndProcedure
 ; a code above 12 returned with the destination untouched and nothing said.
 Procedure DUnary(Y.i,A.i,Op.i,Alpha.f=0.01)
   If Dt(A)\Kind<>1 : DFail("This unary kernel requires FLOAT input.") : ProcedureReturn : EndIf
-  If DLike(Y,A)=0 : ProcedureReturn : EndIf
+  ; Every kernel below writes every element of Y (or the op is refused).
+  DAllocOverwrite=1
+  If DLike(Y,A)=0 : DAllocOverwrite=0 : ProcedureReturn : EndIf
+  DAllocOverwrite=0
   PmTensorUnaryMathOk=1 : PmTensorTrigOk=1
   Select Op
     Case 0 To 4 : PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
@@ -311,9 +514,10 @@ Procedure DUnary(Y.i,A.i,Op.i,Alpha.f=0.01)
 EndProcedure
 
 Procedure DCast(Y.i,A.i,Kind.i)
-  Protected i.i
+  Protected job.DIndexJob
   If DLike(Y,A,Kind)=0 : ProcedureReturn : EndIf
-  For i=0 To Dt(A)\Count-1 : DPut(Y,i,DGet(A,i)) : Next
+  job\Kind=7 : job\Y=Y : job\A=A : job\Count=Dt(A)\Count
+  DIndexRun(@job,#PMELEM_CHEAP/8)
 EndProcedure
 
 Procedure DShapeOf(Y.i,A.i)
@@ -379,6 +583,7 @@ Procedure DViewAxes(Y.i,A.i,Axes.i,Unsqueeze.i)
 EndProcedure
 
 Procedure DTranspose(Y.i,A.i,Perm.s)
+  Protected job.DIndexJob
   Protected Dim dims.i(7), Dim axes.i(7), Dim strides.i(7), Dim seen.i(7)
   Protected i.i,j.i,n.i,coord.i,src.i,size.i=DSize(Dt(A)\Kind),rank.i=Dt(A)\Rank
   For i=0 To rank-1
@@ -389,13 +594,9 @@ Procedure DTranspose(Y.i,A.i,Perm.s)
     dims(i)=Dt(A)\D[axes(i)] : strides(i)=DProduct(A,axes(i)+1,rank-1)
   Next
   If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0 : ProcedureReturn : EndIf
-  For i=0 To Dt(Y)\Count-1
-    n=i : src=0
-    For j=rank-1 To 0 Step -1
-      coord=n % dims(j) : n/dims(j) : src+coord*strides(j)
-    Next
-    CopyMemory(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
-  Next
+  job\Kind=3 : job\Y=Y : job\A=A : job\Size=size : job\Rank=rank : job\Count=Dt(Y)\Count
+  For i=0 To rank-1 : job\Dims[i]=dims(i) : job\Strides[i]=strides(i) : Next
+  DIndexRun(@job,#PMELEM_CHEAP/4)
 EndProcedure
 
 Procedure DGather(Y.i,A.i,Indices.i,Axis.i)
@@ -444,6 +645,7 @@ Procedure DConcat(Y.i,Inputs.s,Axis.i)
 EndProcedure
 
 Procedure DSlice(Y.i,A.i,Starts.i,Ends.i,Axes.i,Steps.i)
+  Protected job.DIndexJob
   Protected Dim dims.i(7),Dim start.i(7),Dim stepv.i(7),Dim stride.i(7)
   Protected i.i,j.i,ax.i,s.i,e.i,st.i,n.i,src.i,c.i,size.i=DSize(Dt(A)\Kind)
   For i=0 To Dt(A)\Rank-1 : dims(i)=Dt(A)\D[i] : stepv(i)=1 : stride(i)=DProduct(A,i+1,Dt(A)\Rank-1) : Next
@@ -464,16 +666,13 @@ Procedure DSlice(Y.i,A.i,Starts.i,Ends.i,Axes.i,Steps.i)
     start(ax)=s : stepv(ax)=st
   Next
   If DAlloc(Y,Dt(A)\Kind,Dt(A)\Rank,@dims(0))=0 : ProcedureReturn : EndIf
-  For i=0 To Dt(Y)\Count-1
-    n=i : src=0
-    For j=Dt(Y)\Rank-1 To 0 Step -1
-      c=n % dims(j) : n/dims(j) : src+(start(j)+c*stepv(j))*stride(j)
-    Next
-    CopyMemory(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
-  Next
+  job\Kind=4 : job\Y=Y : job\A=A : job\Size=size : job\Rank=Dt(Y)\Rank : job\Count=Dt(Y)\Count
+  For i=0 To 7 : job\Dims[i]=dims(i) : job\Start[i]=start(i) : job\Steps[i]=stepv(i) : job\Strides[i]=stride(i) : Next
+  DIndexRun(@job,#PMELEM_CHEAP/4)
 EndProcedure
 
 Procedure DExpand(Y.i,A.i,Shape.i)
+  Protected job.DIndexJob
   Protected Dim dims.i(7)
   Protected i.i,rank.i=Dt(Shape)\Count,size.i=DSize(Dt(A)\Kind),ax.i
   If rank>8 Or rank<Dt(A)\Rank : DFail("Invalid Expand rank.") : ProcedureReturn : EndIf
@@ -485,7 +684,8 @@ Procedure DExpand(Y.i,A.i,Shape.i)
     EndIf
   Next
   If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0 : ProcedureReturn : EndIf
-  For i=0 To Dt(Y)\Count-1 : CopyMemory(Dt(A)\Data+DBroadcastIndex(i,Y,A)*size,Dt(Y)\Data+i*size,size) : Next
+  job\Kind=5 : job\Y=Y : job\A=A : job\Size=size : job\Count=Dt(Y)\Count
+  DIndexRun(@job,#PMELEM_CHEAP/4)
 EndProcedure
 
 Procedure DConstantShape(Y.i,Shape.i,Kind.i,Value.d)
@@ -510,6 +710,7 @@ Procedure DRange(Y.i,A.i,B.i,C.i)
 EndProcedure
 
 Procedure DWhere(Y.i,Cond.i,A.i,B.i)
+  Protected job.DIndexJob
   Protected i.i,src.i,index.i,size.i=DSize(Dt(A)\Kind),ax.i
   If DBroadcast(Y,A,B)=0 : ProcedureReturn : EndIf
   If Dt(Cond)\Rank>Dt(Y)\Rank : DFail("Where condition expands beyond the data shape.") : ProcedureReturn : EndIf
@@ -517,11 +718,8 @@ Procedure DWhere(Y.i,Cond.i,A.i,B.i)
     ax=i+Dt(Y)\Rank-Dt(Cond)\Rank
     If Dt(Cond)\D[i]<>1 And Dt(Cond)\D[i]<>Dt(Y)\D[ax] : DFail("Where condition broadcast mismatch.") : ProcedureReturn : EndIf
   Next
-  For i=0 To Dt(Y)\Count-1
-    If DGet(Cond,DBroadcastIndex(i,Y,Cond)) : src=A : Else : src=B : EndIf
-    index=DBroadcastIndex(i,Y,src)
-    CopyMemory(Dt(src)\Data+index*size,Dt(Y)\Data+i*size,size)
-  Next
+  job\Kind=6 : job\Y=Y : job\A=A : job\B=B : job\C=Cond : job\Size=size : job\Count=Dt(Y)\Count
+  DIndexRun(@job,#PMELEM_CHEAP/8)
 EndProcedure
 
 Procedure DNonZero(Y.i,A.i)
@@ -559,7 +757,24 @@ Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
   Next
 EndProcedure
 
+Structure DMatMulBatches
+  A.i : B.i : Y.i : M.i : K.i : N.i : Batches.i : Chunk.i : Offsets.i
+EndStructure
+
+Procedure DMatMulBatchTask(*j.DMatMulBatches,task.i,worker.i)
+  Protected batch.i=task* *j\Chunk,last.i=batch+ *j\Chunk,g.PmFastGemmJob
+  If last>*j\Batches : last=*j\Batches : EndIf
+  While batch<last
+    g\A=*j\A+PeekI(*j\Offsets+batch*16)*4 : g\B=*j\B+PeekI(*j\Offsets+batch*16+8)*4
+    g\Dst=*j\Y+batch* *j\M* *j\N*4 : g\Bias=0 : g\K=*j\K : g\N=*j\N : g\M=*j\M
+    g\First=0 : g\Last=*j\M : g\ColFirst=0 : g\ColLast=*j\N
+    PmFastGemmWorker(@g)
+    batch+1
+  Wend
+EndProcedure
+
 Procedure DMatMul(Y.i,A.i,B.i)
+  Protected bj.DMatMulBatches,macs.q,tasks.i
   Protected Dim dims.i(7)
   Protected rank.i=DMax(Dt(A)\Rank,Dt(B)\Rank),i.i,ai.i,bi.i,ad.i,bd.i
   Protected m.i,k.i,n.i,batches.i,batch.i,aoff.i,boff.i,idx.i,c.i,astride.i,bstride.i
@@ -579,6 +794,13 @@ Procedure DMatMul(Y.i,A.i,B.i)
   Next
   dims(rank-2)=m : dims(rank-1)=n
   If DAlloc(Y,1,rank,@dims(0))=0 : ProcedureReturn : EndIf
+  ; Many small FLOAT products (attention heads): the batches themselves are
+  ; split across the pool, each product whole in one task. A product big
+  ; enough to split on its own is split inside PmFastGemm instead.
+  macs=m : macs*PmPoolMax(k,1) : macs*n
+  If Dt(B)\Kind=1 And batches>1 And macs<2*#PMFAST_GEMM_GRAIN And PmPoolThreads>1 And m>0 And n>0
+    bj\Offsets=AllocateMemory(batches*16+16)
+  EndIf
   For batch=0 To batches-1
     idx=batch : aoff=0 : boff=0 : astride=m*k : bstride=k*n
     For i=rank-3 To 0 Step -1
@@ -597,10 +819,22 @@ Procedure DMatMul(Y.i,A.i,B.i)
       DInt8Begin()
       If PmI8MatMul(Dt(A)\Data+aoff*4,Dt(B)\Data+boff,Dt(Y)\Data+batch*m*n*4,m,k,n,Dt(B)\Scales,Bool(Dt(B)\Kind=33),Dt(B)\Count)=0 And PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
       If DInt8End()=0 : ProcedureReturn : EndIf
+    ElseIf bj\Offsets
+      PokeI(bj\Offsets+batch*16,aoff) : PokeI(bj\Offsets+batch*16+8,boff)
     Else
       PmFastGemm(Dt(A)\Data+aoff*4,Dt(B)\Data+boff*4,Dt(Y)\Data+batch*m*n*4,m,k,n)
     EndIf
   Next
+  If bj\Offsets
+    bj\A=Dt(A)\Data : bj\B=Dt(B)\Data : bj\Y=Dt(Y)\Data : bj\M=m : bj\K=k : bj\N=n : bj\Batches=batches
+    tasks=PmPoolTasks(batches,PmPoolMax(1,#PMFAST_GEMM_GRAIN/PmPoolMax(macs,1)),1,@bj\Chunk)
+    If tasks<=1
+      bj\Chunk=batches : DMatMulBatchTask(@bj,0,0)
+    Else
+      PmPoolRun(@DMatMulBatchTask(),@bj,tasks)
+    EndIf
+    FreeMemory(bj\Offsets)
+  EndIf
 EndProcedure
 
 Procedure DGemm(Y.i,A.i,B.i,C.i,TransA.i,TransB.i,Alpha.f,Beta.f)
@@ -626,6 +860,7 @@ EndProcedure
 ; divides that sum once by the count. The one-final-axis form keeps the fast
 ; kernel below.
 Procedure DReduceAxes(Y.i,A.i,Axes.i,Keep.i,Mean.i)
+  Protected job.DIndexJob
   Protected Dim dims.i(7)
   Protected Dim stride.i(7)
   Protected i.i,j.i,d.i,rank.i=Dt(A)\Rank,axis.i,mask.i,count.i,outCount.i,inner.i,n.i,base.i,at.i,coord.i
@@ -650,23 +885,10 @@ Procedure DReduceAxes(Y.i,A.i,Axes.i,Keep.i,Mean.i)
     EndIf
   Next
   If DAlloc(Y,1,j,@dims(0))=0 : ProcedureReturn : EndIf
-  cf=inner
-  For i=0 To outCount-1
-    base=0 : n=i
-    For d=rank-1 To 0 Step -1
-      If ((mask>>d)&1)=0 : coord=n%Dt(A)\D[d] : n/Dt(A)\D[d] : base+coord*stride(d) : EndIf
-    Next
-    acc=0.0
-    For j=0 To inner-1
-      at=base : n=j
-      For d=rank-1 To 0 Step -1
-        If (mask>>d)&1 : coord=n%Dt(A)\D[d] : n/Dt(A)\D[d] : at+coord*stride(d) : EndIf
-      Next
-      x=PeekF(Dt(A)\Data+at*4) : acc=acc+x
-    Next
-    If Mean : acc=acc/cf : EndIf
-    PokeF(Dt(Y)\Data+i*4,acc)
-  Next
+  ; Outputs split across the pool; each output's sum runs whole in one task.
+  job\Kind=8 : job\Y=Y : job\A=A : job\Rank=rank : job\Mask=mask : job\Inner=inner : job\Mean=Mean : job\Count=outCount
+  For d=0 To 7 : job\Strides[d]=stride(d) : Next
+  DIndexRun(@job,PmPoolMax(1,#PMELEM_CHEAP/PmPoolMax(inner,1)))
 EndProcedure
 
 Procedure DReduce(Y.i,A.i,Axes.i,Keep.i,Mean.i)

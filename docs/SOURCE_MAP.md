@@ -77,11 +77,12 @@ An emitted application uses its exported runtime, not files from this checkout.
 | File | Responsibility |
 |---|---|
 | [tensor_fp32.pmi](../runtime/tensor_fp32.pmi) | Portable tensor foundation and scalar kernels, and the INT8 scheme: its portable definition and the AArch64 Advanced SIMD bodies that compute the same bits. |
-| [tensor_fp32_windows.pbi](../runtime/tensor_fp32_windows.pbi) | Windows-native tensor foundation and host execution support. |
-| [tensor_simd_windows.pbi](../runtime/tensor_simd_windows.pbi) | Native x64 SSE2/AVX kernels, threaded dense operations, convolution, and reductions. No inference DLL. |
+| [tensor_pool_windows.pbi](../runtime/tensor_pool_windows.pbi) | The Windows worker pool: taken when a model is bound and parked (blocked, running nothing) when it is unbound, never ended; how many processors the process may use (affinity mask, processor groups, default CPU set), lowered by `--threads` or the run-time setting; tasks over disjoint output ranges, the caller's floating-point environment in every worker, no nesting. |
+| [tensor_fp32_windows.pbi](../runtime/tensor_fp32_windows.pbi) | Windows-native tensor foundation and host execution support; its operators split across the pool by output elements, rows or channels, each output computed exactly as on one thread. |
+| [tensor_simd_windows.pbi](../runtime/tensor_simd_windows.pbi) | Native x64 SSE2/AVX kernels: dense products split by row and column blocks, convolution by position blocks and output-row groups, recurrent steps by units, reductions by rows, all on the pool. No inference DLL. |
 | [tensor_fp32_neon.pmi](../runtime/tensor_fp32_neon.pmi) | AArch64 NEON acceleration selected by the Pi 4 and UNO Q profiles, including the four-core split of FP32 and INT8 convolution. |
 | [tensor_fp32_a64.pmi](../runtime/tensor_fp32_a64.pmi) | Retained ordered scalar-register AArch64 acceleration; distinct from the current NEON profile. |
-| [tensor_dynamic_windows.pbi](../runtime/tensor_dynamic_windows.pbi) | Runtime tensor descriptors, dimensions, typed operators, checked heap allocation, errors, and live/peak storage tracking. |
+| [tensor_dynamic_windows.pbi](../runtime/tensor_dynamic_windows.pbi) | Runtime tensor descriptors, dimensions, typed operators, checked heap allocation, errors, and live/peak storage tracking; its index loops split across the pool, and the block cache that spares a multi-threaded model the page faults of fresh large blocks. |
 | [tensor_dynamic_portable.pmi](../runtime/tensor_dynamic_portable.pmi) | Portable dynamic tensor implementation using a caller-owned arena with splitting and coalescing. |
 | [tensor_control_windows.pbi](../runtime/tensor_control_windows.pbi) | Sequences as one block each, value moves and copies for If and Loop, and the sequence operators, on Windows. Exported only for a model that uses them. |
 | [tensor_control_portable.pmi](../runtime/tensor_control_portable.pmi) | The same for the bare-metal targets, allocating from the caller's bound arena. |
@@ -141,7 +142,7 @@ The rest of `tests/` is not part of this export; see [validation](VALIDATION.md)
 | Add a target | `onnx_targets.pbi`, then runtime export and launch handling in the emitters. |
 | Add an ONNX operator | Parser/IR validation, both applicable emitters, and both relevant execution runtimes. |
 | Change supported precision | `onnx_quant.pbi` or `onnx_storage.pbi`, packing, runtime kernels/decoder, and capacity reporting. |
-| Improve Windows tensor speed | `tensor_simd_windows.pbi`; preserve shape, tail, and numerical contracts. |
+| Improve Windows tensor speed | `tensor_simd_windows.pbi`, `tensor_pool_windows.pbi`; preserve shape, tail, and numerical contracts, and split only by outputs: every value computed by one task in the one-thread order (`mt_split_gate.py` holds it at 1, 2, 3 and 8 threads). |
 | Improve AArch64 tensor speed | `tensor_fp32_neon.pmi`; verify tolerances and memory access bounds. |
 | Change the generator window | `onnx_ui.pbi`; keep generation separate from downstream compilation. |
 | Change speech controls or reading | `kokoro_speech_windows.pbi` and `kokoro_reader_windows.pbi`. |

@@ -45,6 +45,9 @@ EndProcedure
 ; Embed them in the native tool, then emit a self-contained source closure.
 ; The release still ships no model, voice, pronunciation data or loose loader.
 DataSection
+  PmdPoolStart:
+  IncludeBinary "../../runtime/tensor_pool_windows.pbi"
+  PmdPoolEnd:
   PmdScalarStart:
   IncludeBinary "../../runtime/tensor_fp32_windows.pbi"
   PmdScalarEnd:
@@ -191,6 +194,7 @@ Procedure.i PmdExportRuntime(Folder.s,Speech.i,TargetIndex.i,Random.i=0,Ops.i=0)
     EndSelect
     ProcedureReturn 1
   EndIf
+  If PmdWriteSupport(Folder+"tensor_pool_windows.pbi",?PmdPoolStart,?PmdPoolEnd-?PmdPoolStart)=0 : ProcedureReturn 0 : EndIf
   If PmdWriteSupport(Folder+"tensor_fp32_windows.pbi",?PmdScalarStart,?PmdScalarEnd-?PmdScalarStart)=0 : ProcedureReturn 0 : EndIf
   If PmdWriteSupport(Folder+"tensor_dynamic_windows.pbi",?PmdDynamicStart,?PmdDynamicEnd-?PmdDynamicStart)=0 : ProcedureReturn 0 : EndIf
   If PmdWriteSupport(Folder+"tensor_norm_small_windows.pbi",?PmdNormSmallWindowsStart,?PmdNormSmallWindowsEnd-?PmdNormSmallWindowsStart)=0 : ProcedureReturn 0 : EndIf
@@ -499,6 +503,9 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
       Case "--random-inputs" : PmdRandomInputs=1
       Case "--library", "--simplify"
         ; All models are resident; constant scheduling is always enabled.
+      Case "--threads"
+        ; Checked, and stored in PmoThreads, by PmoCompileCommand.
+        index+1
       Case "--precision"
         index+1
         precision=LCase(ProgramParameter(index))
@@ -680,6 +687,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
       PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_random_dynamic_portable.pmi"+Chr(34))
     EndIf
   Else
+    If PmoThreads>0 : PmdLine(file,"#PMO_THREADS = "+Str(PmoThreads)) : EndIf
     PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_dynamic_windows.pbi"+Chr(34))
     If randomCount
       PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_random.pmi"+Chr(34))
@@ -759,6 +767,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   If PmdPortable
     PmdLine(file,"  DHeap=0 : DHeapBytes=0 : DHeapUsed=0")
   Else
+    PmdLine(file,"  PmPoolStop()")
     PmdLine(file,"  If PmModelWeights : FreeMemory(PmModelWeights) : EndIf")
   EndIf
   PmdLine(file,"  PmModelWeights=0 : PmModelReady=0")
@@ -851,6 +860,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   ForEach ir\QuantWeights()
     PmdLine(file,"  Dt("+Str(ids(ir\QuantWeights()\Name))+")\Scales=Dt("+Str(ids(ir\QuantWeights()\ScaleName))+")\Data")
   Next
+  If PmdPortable=0 : PmdLine(file,"  PmPoolStart()") : EndIf
   PmdLine(file,"  PmModelStage0()")
   PmdLine(file,"  DPoll(#PMD_PROGRESS_BIND_AFTER,-1)")
   PmdLine(file,"  PmModelReady=Bool(DError="+Chr(34)+Chr(34)+" And DCancel=0)")
@@ -864,6 +874,14 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
     PmdLine(file,"Procedure.i PmModelSetRandomSeed(seed.i)")
     PmdLine(file,"  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf")
     PmdLine(file,"  ProcedureReturn PmRandomSetSeed(seed)")
+    PmdLine(file,"EndProcedure")
+  EndIf
+  If PmdPortable=0
+    PmdLine(file,"; Worker threads for the bound model: 0 uses every processor this process may")
+    PmdLine(file,"; use; a smaller number lowers it. Returns the count in use (1 while unbound).")
+    PmdLine(file,"Procedure.i PmModelSetThreads(threads.i)")
+    PmdLine(file,"  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf")
+    PmdLine(file,"  ProcedureReturn PmPoolSetThreads(threads)")
     PmdLine(file,"EndProcedure")
   EndIf
   PmdLine(file,"Procedure.i PmModelInput(index.i)")

@@ -605,6 +605,14 @@ a 69-token sentence, INT8            0 of 69             0.442 dB
 Speed on the same machine, the two builds alternated request by request
 because the processor throttles: the reference request took **5.51 s at FP32 and 4.47 s at INT8** (medians of five rounds): INT8 is 1.23 times faster. The rest of the model - element-wise arithmetic, the transforms, the transposed convolutions - is FP32 in both builds.
 
+Those two numbers are from before the Windows runtime used every processor
+(chapter 5, "Threads on Windows"). On all 32 logical processors of the same
+machine, five interleaved rounds against the previous build: **1.39 s at
+FP32 and 1.24 s at INT8** (medians), where the previous build took 6.55 s and
+5.09 s in the same rounds - and every waveform bit-identical to the previous
+build's. With `--threads 1` the same request takes 11.2 s and 10.1 s; the
+curve through 2, 4, 8 and 16 threads is in `docs/VALIDATION.md`.
+
 The Pi 4 and UNO Q (Advanced SIMD) and the Pico and Pico 2 run the same
 INT8 arithmetic bit for bit (chapter 8). The speech model does not fit a
 Pico. **It has not yet been measured on Pi 4 silicon with this scheme**; the

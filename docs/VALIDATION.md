@@ -826,6 +826,78 @@ compared. Harnesses whose expected values are this compiler's generator
 contract (`targeted_ops.py`, the private random gate) still compare every
 value and end those cases in PASS.
 
+## Windows multicore — September 24, 2026
+
+A Windows model now runs on every logical processor its process may use,
+counted when the model is bound: the process's affinity mask, every active
+processor of every group when the process is not narrowed to part of one,
+lowered by a default CPU set. `--threads N` and `PmModelSetThreads` /
+`PmOnnxSetThreads` can only lower it. Bind takes the workers (creating any
+that do not exist yet) and unbind parks them - blocked, running nothing -
+for the next bind; no operator creates a thread. Operators are split by output
+elements, rows, channels, positions or recurrent units, each output computed
+by one task in the one-thread order, so the thread count never changes a bit
+([chapter 5](guide/05_what_comes_out.txt)). The operators whose kernels are in
+`runtime/tensor_ops.pmi` run on the calling thread: that file keeps its
+parameters and scratch in shared globals and is one source for every target.
+
+| Check | Result |
+|---|---|
+| `mt_split_gate.py` (compiler repository, `tools/onnx/tests/Diagnostics`): every operator the runtime splits - element-wise, row-wise, FP32 and INT8 products and Gemm, every convolution form, transposed convolution, the LSTM (FLOAT, mixed and INT8, hidden sizes 35 and 36), STFT, data movement, reductions, InstanceNormalization, TopK, Pad - at 1, 2, 3 and 8 threads, natural and forced smallest split, odd shapes | 144 cases x 8 configurations, every output CRC equal to the one-thread run's; every case split when forced, the large ones naturally too, a 101-element add did not |
+| The same gate's affinity program: the process narrows its own mask to 1, F, FF, 5555, F0F0, every other processor, all but one, all | detected count, default pool size and the processor of every task follow the mask in every case; a request above the mask gives the mask's count; the allowed-processor rule on two- and three-group machines and with a CPU set |
+| The same gate's exit program, launched as the node-suite harness launches (fault dialogs off): 180 ends straight after bind, after one parallel operator, and after an unbind | 180 of 180 clean |
+| `--mutants`: a reduction summed in two halves, every STFT worker in one working buffer, the pool returning before its workers finish, the count ignoring the mask, bind returning before the workers have started, workers spinning on slots in the language's memory, unbind ending the workers instead of parking them | 7 of 7 red (the last three: 58, 177 and 16 of 180 exits faulted) |
+| Kokoro-82M, reference request, FP32 and INT8, threads 1, 2, 4, 8, 16, 32 and main's CLI (and again at 1 and 32 on the merged tree against `d455afb`'s CLI) | every waveform byte-identical to main's: FP32 `5993F501...`, INT8 `086B8558...` |
+| Kokoro under `start /affinity` 1, F, FF, 5555 and all | threads used = the mask's processor count: 1, 4, 8, 8 and 32; FP32 13.7, 5.4, 3.0, 2.4 and 1.7 s, INT8 10.9, 4.7, 2.6, 2.8 and 1.6 s (one run each); every waveform byte-identical to the one-thread run |
+| `targeted_ops.py`, `node_suite.py`, `int8_model_gate.py`, each run with every processor and again with `--threads 1` (`mt_threads_rerun.py`), on this change merged onto `d455afb` | targeted_ops 864 of 864 as expected; node suite PASS 849 and PASS_SHAPE 1 of 1,750 at both counts, every outcome equal between them and to the published `2026-09-24h` record; int8_model_gate PASS; the 1,607 Windows result files of the two runs byte-identical. Before the merge (on `c995378`) the same comparison over `targeted_defaults.py` 148, `targeted_norm_small.py` 132, `targeted_control.py` 29 and `targeted_optional_outputs.py` 14 of 14 was identical too |
+| `ops_kernel_check.py` on the merged tree; before the merge, `ops_kernel_check.py --mutants`, `int8_kernel_check.py --mutants`, `ops_targets_gate.py`, `int8_conv_split_gate.py --mutants` and `kokoro_int8_nodes.py` | 566 of 566 on Windows, Pi 4, Pico and Pico 2. Before the merge: 386 of 386 and 40 of 40 mutants; 51 INT8 cases bit-identical everywhere and 17 of 17 mutants; 1,296 of 1,296 target builds bit-identical to the 32-thread Windows program; 4 of 4; the nine real Kokoro INT8 nodes dumped from the 32-thread build bit-identical on Pi 4, Pico and Pico 2 |
+| Six models (fp32, fp16, bf16, int4, int8; two of them with operator-set kernels), this change against main's CLI | Pi 4, UNO Q, Pico and Pico 2: 108 of 108 output sets (source, pack, manifest, runtime folder) byte-identical, 15 refused alike. Windows: packs and manifests identical; the source differs by the dispatch lines only - `PmPoolStart()` at bind, `PmPoolStop()` at unbind, the four-line `PmModelSetThreads` / one-line `PmOnnxSetThreads` procedure with its two comment lines, and `#PMO_THREADS = N` when `--threads` is given |
+
+Speed, Kokoro-82M reference request on the i9-14900HX (8 performance cores
+with two threads each, 16 efficiency cores; 32 logical processors), the
+second request of each run, configurations interleaved, five rounds; this
+laptop throttles, so only numbers from the same round compare:
+
+| threads | FP32 median (min) | INT8 median (min) |
+|---|---:|---:|
+| main's CLI (per-operator threads, at most 8, in convolution, the product and the INT8 tiles only) | 6.55 s (5.58) | 5.09 s (4.51) |
+| 1 | 11.22 s (9.34) | 10.14 s (7.19) |
+| 2 | 5.27 s (4.51) | 4.64 s (3.15) |
+| 4 | 3.38 s (2.42) | 3.08 s (1.84) |
+| 8 | 1.90 s (1.61) | 2.33 s (1.30) |
+| 16 | 1.58 s (1.41) | 1.66 s (1.11) |
+| 32 (the default here) | **1.39 s (1.33)** | **1.24 s (0.99)** |
+
+32 threads against one: 8.1 times (FP32) and 8.2 (INT8); against main's CLI
+in the same rounds 4.7 and 4.1 times; against the published 5.51 s and
+4.47 s, 4.0 and 3.6. The curve flattens after 8 threads, and a per-node
+profile at 16 and 32 threads says where: convolution (0.74 s of 1.59 at 32)
+is compute-bound and the efficiency cores add about half again; the
+element-wise operators (0.30 s) stream 20 MB tensors and stay at the
+memory's bandwidth from 16 threads on; the six recurrent layers (0.04 s) are about 2,100
+strictly ordered steps; and on this laptop more active cores lower the
+clock of all of them. Workers block between operators rather than spin:
+blocking measured as fast as spinning 10 or 50 us, and spinning 2 ms made
+32 threads slower than 16 (3.6 s), because spinning workers spend the
+package power the working ones need.
+
+A defect found while merging, and fixed: with every processor in use, 2 of
+817 targeted builds and 1 node-suite case ended with an access violation
+after writing correct results (0 at `--threads 1`). The cause is the exit,
+not the arithmetic: ending the workers at unbind leaves work for Windows'
+own thread-pool workers, and a program that ends straight after races them
+- reproduced in a twelve-line program with no model and no pool (89 of 600
+exits, fault dialogs off). Two earlier forms of the same race were found on
+the way: ending the program while a worker was still starting (bind now
+waits for every worker to block), and workers spinning on slots in the
+language's memory, which End releases (the slots are system memory, and
+workers no longer spin). Workers are now parked at unbind and reused at the
+next bind; the gate's exit program holds all three.
+
+`--threads 1` is slower than main's CLI: main was not single-threaded - its
+convolution, product and INT8 tiles created up to eight threads per call -
+and `--threads 1` now means the calling thread alone.
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.
@@ -848,6 +920,9 @@ value and end those cases in PASS.
 - SIMD/NEON may change floating-point summation order. Do not demand bitwise
   equality where the execution contract calls for numerical tolerances.
 - Model execution uses generated globals. Serialize calls to one model instance.
+- On Windows the kernels of `runtime/tensor_ops.pmi` (pooling, the quantized
+  operators, GRU and RNN and the rest of the 2026 operator set) run on one
+  thread; every other operator uses the model's worker pool.
 - Random operators follow this compiler's specified generator; their values
   match another runtime only through `--random-inputs`. FLOAT output only.
 - Optional reference tracing needs a separately supplied compatible ONNX Runtime

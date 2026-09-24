@@ -8,6 +8,10 @@
 XIncludeFile "onnx_emit_random.pbi"
 
 Global PmoEmitError.s
+; --threads N (Windows only): the most worker threads the generated program
+; may use. 0 when the option is absent: the program then uses every
+; processor its process may use, found when the model is bound.
+Global PmoThreads.i
 
 Procedure.i PmoEmitFail(Message.s)
   If PmoEmitError = "" : PmoEmitError = Message : EndIf
@@ -1521,6 +1525,7 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
   PmoEmitLine(File)
   If *Profile\MathInclude <> "" : PmoEmitLine(File, "XIncludeFile " + Chr(34) + *Profile\MathInclude + Chr(34)) : EndIf
   If RuntimeInclude <> ""
+    If PmoThreads > 0 : PmoEmitLine(File, "#PMO_THREADS = " + Str(PmoThreads)) : EndIf
     PmoEmitLine(File, "XIncludeFile " + Chr(34) + RuntimeInclude + Chr(34))
   Else
     PmoEmitLine(File, "XIncludeFile " + Chr(34) + *Profile\TensorInclude + Chr(34))
@@ -1607,9 +1612,16 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
     PmoEmitLine(File, "  PmTensorInt8Scratch = *arena + #PMO_INT8_SCRATCH_OFFSET")
     PmoEmitLine(File, "  PmTensorInt8ScratchBytes = #PMO_INT8_SCRATCH_BYTES")
   EndIf
+  If RuntimeInclude <> "" : PmoEmitLine(File, "  PmPoolStart()") : EndIf
   PmoEmitLine(File, "  ProcedureReturn 1")
   PmoEmitLine(File, "EndProcedure")
   PmoEmitLine(File)
+  If RuntimeInclude <> ""
+    PmoEmitLine(File, "; Worker threads for the bound model: 0 uses every processor this process may")
+    PmoEmitLine(File, "; use; a smaller number lowers it. Returns the count in use (1 while unbound).")
+    PmoEmitLine(File, "Procedure.i PmOnnxSetThreads(threads.i) : ProcedureReturn PmPoolSetThreads(threads) : EndProcedure")
+    PmoEmitLine(File)
+  EndIf
   ; ------------------------------------------------------------------
   ;  THE ANVIL ENTRY, ON THE 64-BIT BARE-METAL TARGETS ONLY.
   ;
@@ -1702,6 +1714,7 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
     PmoEmitLine(File, "  PmTensorInt8Scratch = 0 : PmTensorInt8ScratchBytes = 0")
     PmoEmitLine(File, "  PmTensorInt8Release()")
   EndIf
+  If RuntimeInclude <> "" : PmoEmitLine(File, "  PmPoolStop()") : EndIf
   PmoEmitLine(File, "EndProcedure")
   If *Profile\Launch = #PMO_LAUNCH_EMBEDDED_WEIGHTS
     If PmoEmitEmbeddedWeights(File, WeightsPath) = 0 : Goto PmoEmitSourceFailed : EndIf

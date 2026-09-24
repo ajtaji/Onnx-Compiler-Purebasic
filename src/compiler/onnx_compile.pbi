@@ -870,6 +870,7 @@ Procedure.i PmoCompileCommand(ModelPath.s)
   Protected PendingWeights.s
   Protected Manifest.s
   Protected RuntimeInclude.s
+  Protected ThreadsText.s
   Protected WeightsAddress.q
   Protected ArenaAddress.q
   NewList Specs.s()
@@ -905,6 +906,8 @@ Procedure.i PmoCompileCommand(ModelPath.s)
       RandomInputs = #True
     ElseIf OptionName = "--simplify"
       ; Checked constant folding and dead shape work removal are always enabled.
+    ElseIf OptionName = "--threads" And Index + 1 < CountProgramParameters()
+      Index + 1 : ThreadsText = ProgramParameter(Index)
     Else
       ProcedureReturn PmoCompileFail("unknown or incomplete compile option " + OptionName)
     EndIf
@@ -918,6 +921,18 @@ Procedure.i PmoCompileCommand(ModelPath.s)
   If PmoStoragePrecision(Precision)=0 : ProcedureReturn PmoCompileFail("--precision must be fp32, int8, fp16, bf16, or int4") : EndIf
   If SpeechUi And TargetId <> "windows"
     ProcedureReturn PmoCompileFail("The speech-window adapter requires Windows. Remove --speech-ui when generating a model library for another target.")
+  EndIf
+  ; --threads can only lower the count the program finds when the model is
+  ; bound (every processor its process may use), so it is a ceiling.
+  PmoThreads = 0
+  If ThreadsText <> ""
+    If TargetIndex <> #PMO_TARGET_WINDOWS
+      ProcedureReturn PmoCompileFail("--threads sets the worker count of the Windows runtime only; target " + TargetId + " keeps its own core use. Remove --threads for this target.")
+    EndIf
+    If PmoCompileDigits(ThreadsText) = 0 Or Len(ThreadsText) > 4 Or Val(ThreadsText) < 1 Or Val(ThreadsText) > 4096
+      ProcedureReturn PmoCompileFail("--threads needs a whole number from 1 to 4096; " + ThreadsText + " is not one. 1 runs the model on the calling thread alone; leave the option out to use every processor the process may use.")
+    EndIf
+    PmoThreads = Val(ThreadsText)
   EndIf
   If KokoroText And TargetIndex<>#PMO_TARGET_PI4 And TargetIndex<>#PMO_TARGET_UNOQ
     ProcedureReturn PmoCompileFail("--kokoro-text requires pi4 or unoq; Windows uses --speech-ui. Full Kokoro cannot fit Pico RAM.")

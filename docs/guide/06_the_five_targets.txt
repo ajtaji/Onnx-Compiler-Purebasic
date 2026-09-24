@@ -25,13 +25,15 @@ build with a toolchain that is not in this repository.
 @SECTION Windows
 
 The only target you can build with nothing beyond the compiler you already
-used in chapter 2. Emits `.pb`, uses native x64 SSE2/AVX kernels with
-threaded dense operations, and takes its weights from a file path.
+used in chapter 2. Emits `.pb`, uses native x64 SSE2/AVX kernels on every
+processor the process may use (chapter 5, "Threads on Windows"), and takes
+its weights from a file path.
 
 @FRAG
 | what you build it with  | the host language, x64, thread-safe + optimizer |
 | you supply              | input data, output handling, the .pmw file       |
 | initialization          | PmModelInitialize(weightPath) - it reads the pack |
+| threads                 | every processor the process may use; --threads N or PmModelSetThreads(n) lower it |
 @ENDFRAG
 
 Use it as the correctness bench even when the destination is a board. It

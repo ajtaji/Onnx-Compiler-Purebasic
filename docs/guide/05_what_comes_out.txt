@@ -143,6 +143,7 @@ time and they belong to that generation.
 @FRAG
 dense-fp32.runtime\        (windows)
   tensor_dynamic_windows.pbi   tensor_fp32_windows.pbi   tensor_simd_windows.pbi
+  tensor_pool_windows.pbi
 
 dense-pi4.runtime\         (pi4 / unoq)
   math.pmi   tensor_fp32.pmi   tensor_fp32_neon.pmi
@@ -167,6 +168,7 @@ PmOnnxExecuteBound()           ; check the result
 PmOnnxOutputAddress(index)     ; read before the next execution
 PmOnnxLastErrorNode()          ; which node failed
 PmOnnxUnbindMemory()           ; before you free anything
+PmOnnxSetThreads(n)            ; Windows: at most n worker threads (see below)
 @ENDFRAG
 
 You supply aligned, non-overlapping weight and working buffers, sized from
@@ -184,6 +186,7 @@ PmModelBindMemory(w,wb,a,ab)    ; portable: you supply both, as above
   PmModelExecute()              ; check the result and DError
   PmModelOutput(index)          ; read while its storage is live
 PmModelClose()
+PmModelSetThreads(n)            ; Windows: at most n worker threads (see below)
 @ENDFRAG
 
 @TRAP `DError` is a string on Windows and an ASCII string POINTER on the
@@ -236,13 +239,77 @@ included unchanged on every target - and the runtime-dimension wrapper for
 the target, `tensor_random_dynamic_windows.pbi` or
 `tensor_random_dynamic_portable.pmi`.
 
+@SECTION Threads on Windows
+
+A Windows model runs on every logical processor its process may use. The
+count is taken when the model is bound, on the machine it is running on,
+not when it was compiled, and it is the process's own allowance, not the
+machine's: the affinity mask the process was started with (`start
+/affinity`, a job object's affinity, a parent's mask), every active
+processor of every processor group when the process has not been narrowed
+to part of one, and lower again when the process has a default CPU set.
+Started with `start /affinity 0xF` on a 32-processor machine, the same
+program uses 4 threads.
+
+Binding takes the workers - `PmModelInitialize` and `PmOnnxBindMemory` do
+it - creating any that do not exist yet. `PmModelClose` and
+`PmOnnxUnbindMemory` park every one of them before they return: each is
+blocked on its own semaphore, runs nothing and holds no working buffer, and
+the next bind takes it again. No operator creates a thread, and no worker
+runs outside a bound model's operators.
+
+Workers are parked rather than ended because ending them made the program's
+own exit fault: a thread of this runtime that has run procedures leaves work
+for Windows' thread-pool workers when it ends, and a program that ends soon
+after races them. With fault dialogs switched off, as a test harness does,
+89 of 600 exits of a twelve-line program with no model in it reported an
+access violation; with the threads blocked instead, none did.
+
+Two settings can lower the count; nothing raises it past the allowance:
+
+@FRAG
+--threads N              compile option, Windows only: at most N threads;
+                         1 runs the model on the calling thread alone
+PmModelSetThreads(n)     run time: at most n; 0 = every allowed processor
+PmOnnxSetThreads(n)      the fixed-shape API's name for the same setting
+@ENDFRAG
+
+Both procedures return the count now in use. On a bound model the workers
+are rebuilt at once; before binding the setting waits for the bind.
+
+**The thread count never changes an output bit.** Each operator is cut
+into tasks by output - elements, rows, channels, positions - and every
+output value is computed by one task with exactly the arithmetic and the
+summation order it has on one thread. No sum is ever divided between
+threads. So 1 thread and 32 give the same bytes, and the Windows program
+still agrees with the Pi 4 and the Picos wherever it did before.
+
+An operator smaller than its measured break-even stays on the calling
+thread; handing a hundred additions to 31 other threads costs more than
+doing them.
+
+@NOTE What is not split, today: the operators whose kernels are in
+`tensor_ops.pmi` - the pools, the quantized products and convolutions, GRU
+and RNN, and the rest of the operator set added in 2026 - run on the
+calling thread. That file is one source for every target and keeps its
+parameters and scratch in shared globals, so two threads cannot run it at
+once without a change to it that every target would see. The bare-metal
+targets keep their own core use, chapter 6.
+
+@NOTE A program may end without closing its model - on an error path, say.
+Bind returns only once every worker has started and is blocked, and a
+worker between operators is always blocked, so the exit is clean. Close
+the model anyway when you are done with it: that is what frees its memory
+and its workers' buffers.
+
 @SECTION The resident lifecycle, stated once
 
 Bind once. Submit inputs. Read outputs. Release.
 
 - **Bind** validates the pack, decodes reduced-storage weights into
-  resident FP32 memory, and runs the model's constant-preparation stage.
-  This is where the CRC and the identity check are paid for.
+  resident FP32 memory, takes the Windows worker threads, and runs the
+  model's constant-preparation stage. This is where the CRC and the
+  identity check are paid for.
 - **Submit** fills the input buffers - or, on the runtime-dimension path,
   declares this request's shapes and then fills them.
 - **Execute** runs the emitted schedule. Outputs are valid until the next
@@ -250,8 +317,9 @@ Bind once. Submit inputs. Read outputs. Release.
 - **Reset** frees the request's temporaries and keeps the model. This is
   the step that makes the next request cheap, and it is the step people
   forget.
-- **Close** or **unbind** releases everything. On the portable targets
-  your buffers are still yours and still need freeing.
+- **Close** or **unbind** releases everything and, on Windows, parks the
+  worker threads. On the portable targets your buffers are still yours and
+  still need freeing.
 
 @NOTE The generated globals are ONE model instance. Serialize your calls.
 There is no per-instance handle, so two threads in the same model are two

@@ -18,6 +18,9 @@
 ; Log, Pow or Sqr list RaspberryPi4/Lib/math.pi4 before this file.
 ; ======================================================================
 
+; The worker pool every parallel operator below runs on.
+XIncludeFile "tensor_pool_windows.pbi"
+
 Global Dim PmTensorCrcTable.i(256)
 Global PmTensorCrcReady.i
 
@@ -95,7 +98,7 @@ Procedure PmTensorPutBool(*base, index.i, value.i)
   PokeA(*base + index, value)
 EndProcedure
 
-Procedure PmTensorZero(*dst, count.i)
+Procedure PmTensorZeroSerial(*dst, count.i)
   Protected i.i
   Protected p.i
   i = 0
@@ -107,7 +110,7 @@ Procedure PmTensorZero(*dst, count.i)
   Wend
 EndProcedure
 
-Procedure PmTensorCopy(*src, *dst, count.i)
+Procedure PmTensorCopySerial(*src, *dst, count.i)
   Protected i.i
   Protected ps.i
   Protected pd.i
@@ -140,7 +143,7 @@ Procedure PmTensorCopyBool(*src, *dst, count.i)
   Wend
 EndProcedure
 
-Procedure PmTensorAdd(*a, *b, *dst, count.i)
+Procedure PmTensorAddSerial(*a, *b, *dst, count.i)
   Protected i.i
   Protected pa.i
   Protected pb.i
@@ -152,7 +155,7 @@ Procedure PmTensorAdd(*a, *b, *dst, count.i)
   Wend
 EndProcedure
 
-Procedure PmTensorSub(*a, *b, *dst, count.i)
+Procedure PmTensorSubSerial(*a, *b, *dst, count.i)
   Protected i.i
   Protected pa.i
   Protected pb.i
@@ -164,7 +167,7 @@ Procedure PmTensorSub(*a, *b, *dst, count.i)
   Wend
 EndProcedure
 
-Procedure PmTensorMul(*a, *b, *dst, count.i)
+Procedure PmTensorMulSerial(*a, *b, *dst, count.i)
   Protected i.i
   Protected pa.i
   Protected pb.i
@@ -176,7 +179,7 @@ Procedure PmTensorMul(*a, *b, *dst, count.i)
   Wend
 EndProcedure
 
-Procedure PmTensorDiv(*a, *b, *dst, count.i)
+Procedure PmTensorDivSerial(*a, *b, *dst, count.i)
   Protected i.i
   Protected pa.i
   Protected pb.i
@@ -190,7 +193,7 @@ EndProcedure
 
 ; op: 0 add, 1 subtract, 2 multiply, 3 divide. scalarSide is 0 when
 ; the scalar is the left operand and 1 when it is the right operand.
-Procedure PmTensorBinaryScalar(*vec, scalar.f, *dst, count.i, op.i, scalarSide.i)
+Procedure PmTensorBinaryScalarSerial(*vec, scalar.f, *dst, count.i, op.i, scalarSide.i)
   Protected i.i
   Protected pv.i
   Protected pd.i
@@ -211,7 +214,7 @@ Procedure PmTensorBinaryScalar(*vec, scalar.f, *dst, count.i, op.i, scalarSide.i
   Wend
 EndProcedure
 
-Procedure PmTensorRelu(*src, *dst, count.i)
+Procedure PmTensorReluSerial(*src, *dst, count.i)
   Protected i.i
   Protected ps.i
   Protected pd.i
@@ -225,7 +228,7 @@ Procedure PmTensorRelu(*src, *dst, count.i)
   Wend
 EndProcedure
 
-Procedure PmTensorLeakyRelu(*src, *dst, count.i, alpha.f)
+Procedure PmTensorLeakyReluSerial(*src, *dst, count.i, alpha.f)
   Protected i.i
   Protected ps.i
   Protected pd.i
@@ -257,7 +260,7 @@ Procedure.f PmTensorTanhValue(value.f)
   ProcedureReturn (e - 1.0) / (e + 1.0)
 EndProcedure
 
-Procedure PmTensorSigmoid(*src, *dst, count.i)
+Procedure PmTensorSigmoidSerial(*src, *dst, count.i)
   Protected i.i
   Protected ps.i
   Protected pd.i
@@ -270,7 +273,7 @@ Procedure PmTensorSigmoid(*src, *dst, count.i)
   Wend
 EndProcedure
 
-Procedure PmTensorTanh(*src, *dst, count.i)
+Procedure PmTensorTanhSerial(*src, *dst, count.i)
   Protected i.i
   Protected ps.i
   Protected pd.i
@@ -315,7 +318,7 @@ Global PmTensorTrigOk.i
 ; as the caller left it and PmTensorUnaryMathOk is cleared.  The op is decided
 ; once, before the loop, because a per-element test can only ever be a slower
 ; way to get the same answer.
-Procedure PmTensorUnaryMath(*src, *dst, count.i, op.i)
+Procedure PmTensorUnaryMathSerial(*src, *dst, count.i, op.i)
   Protected i.i
   Protected ps.i
   Protected pd.i
@@ -357,7 +360,7 @@ EndProcedure
 ; cleared.  PmFastTrig hands every code it does not own down to here, and
 ; DUnary turns a cleared flag into a DError, so the model stops on the node
 ; that did it.  The op is decided once, before the loop.
-Procedure PmTensorTrig(*src, *dst, count.i, op.i)
+Procedure PmTensorTrigSerial(*src, *dst, count.i, op.i)
   Protected i.i
   Protected v.f
   If op < 0 Or op > 2
@@ -379,7 +382,7 @@ Procedure PmTensorTrig(*src, *dst, count.i, op.i)
   Wend
 EndProcedure
 
-Procedure PmTensorFloor(*src, *dst, count.i)
+Procedure PmTensorFloorSerial(*src, *dst, count.i)
   Protected i.i
   Protected n.i
   Protected whole.f
@@ -397,7 +400,7 @@ Procedure PmTensorFloor(*src, *dst, count.i)
 EndProcedure
 
 ; ONNX Round uses nearest integer with ties to even.
-Procedure PmTensorRoundEven(*src, *dst, count.i)
+Procedure PmTensorRoundEvenSerial(*src, *dst, count.i)
   Protected i.i
   Protected base.i
   Protected result.i
@@ -424,7 +427,7 @@ Procedure PmTensorRoundEven(*src, *dst, count.i)
   Wend
 EndProcedure
 
-Procedure PmTensorPow(*a, *b, *dst, count.i)
+Procedure PmTensorPowSerial(*a, *b, *dst, count.i)
   Protected i.i
   Protected pa.i
   Protected pb.i
@@ -436,7 +439,7 @@ Procedure PmTensorPow(*a, *b, *dst, count.i)
   Wend
 EndProcedure
 
-Procedure PmTensorPowScalar(*vec, scalar.f, *dst, count.i, scalarSide.i)
+Procedure PmTensorPowScalarSerial(*vec, scalar.f, *dst, count.i, scalarSide.i)
   Protected i.i
   Protected value.f
   i = 0
@@ -452,7 +455,7 @@ Procedure PmTensorPowScalar(*vec, scalar.f, *dst, count.i, scalarSide.i)
   Wend
 EndProcedure
 
-Procedure PmTensorClip(*src, *dst, count.i, lo.f, hi.f)
+Procedure PmTensorClipSerial(*src, *dst, count.i, lo.f, hi.f)
   Protected i.i
   Protected ps.i
   Protected pd.i
@@ -465,6 +468,185 @@ Procedure PmTensorClip(*src, *dst, count.i, lo.f, hi.f)
     PokeF(pd, v)
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend
+EndProcedure
+
+; ---- the element-wise operators on the pool ----------------------------------
+; Each public name below cuts its elements into contiguous ranges and runs
+; the serial kernel above on each range. Every element is computed by the
+; same statement whichever range holds it, so any split gives the same bits.
+; Grains (elements per task) were measured on the reference machine: a
+; cheap element is one add, compare or copy; a dear one calls a library
+; transcendental.
+#PMELEM_CHEAP = 32768
+#PMELEM_DEAR = 4096
+
+Structure PmElemJob
+  Kind.i
+  A.i
+  B.i
+  Dst.i
+  Count.i
+  Chunk.i
+  Op.i
+  Side.i
+  F1.f
+  F2.f
+EndStructure
+
+; The loops of the runtime-dimension path's PmFastTrig (tensor_simd_windows.pbi),
+; exactly as they were written there, for one range of elements.
+Procedure PmFastTrigRange(*Src, *Dst, Count.i, Op.i)
+  Protected i.i
+  Select Op
+    Case 0
+      For i=0 To Count-1 : PokeF(*Dst+i*4,Sin(PeekF(*Src+i*4))) : Next
+    Case 1
+      For i=0 To Count-1 : PokeF(*Dst+i*4,Cos(PeekF(*Src+i*4))) : Next
+    Case 2
+      For i=0 To Count-1 : PokeF(*Dst+i*4,ATan(PeekF(*Src+i*4))) : Next
+  EndSelect
+EndProcedure
+
+Procedure PmElemTask(*j.PmElemJob, task.i, worker.i)
+  Protected first.i = task * *j\Chunk, n.i = *j\Count - first, a.i, b.i, d.i
+  If n > *j\Chunk : n = *j\Chunk : EndIf
+  If n <= 0 : ProcedureReturn : EndIf
+  a = *j\A + first * 4 : b = *j\B + first * 4 : d = *j\Dst + first * 4
+  Select *j\Kind
+    Case 0 : PmTensorAddSerial(a, b, d, n)
+    Case 1 : PmTensorSubSerial(a, b, d, n)
+    Case 2 : PmTensorMulSerial(a, b, d, n)
+    Case 3 : PmTensorDivSerial(a, b, d, n)
+    Case 4 : PmTensorPowSerial(a, b, d, n)
+    Case 5 : PmTensorBinaryScalarSerial(a, *j\F1, d, n, *j\Op, *j\Side)
+    Case 6 : PmTensorPowScalarSerial(a, *j\F1, d, n, *j\Side)
+    Case 7 : PmTensorReluSerial(a, d, n)
+    Case 8 : PmTensorLeakyReluSerial(a, d, n, *j\F1)
+    Case 9 : PmTensorSigmoidSerial(a, d, n)
+    Case 10 : PmTensorTanhSerial(a, d, n)
+    Case 11 : PmTensorUnaryMathSerial(a, d, n, *j\Op)
+    Case 12 : PmTensorTrigSerial(a, d, n, *j\Op)
+    Case 13 : PmTensorFloorSerial(a, d, n)
+    Case 14 : PmTensorRoundEvenSerial(a, d, n)
+    Case 15 : PmTensorClipSerial(a, d, n, *j\F1, *j\F2)
+    Case 16 : PmTensorCopySerial(a, d, n)
+    Case 17 : PmTensorZeroSerial(d, n)
+    Case 18 : PmFastTrigRange(a, d, n, *j\Op)
+  EndSelect
+EndProcedure
+
+Procedure PmElemRun(kind.i, *a, *b, *dst, count.i, op.i, side.i, f1.f, f2.f, grain.i)
+  Protected j.PmElemJob, tasks.i
+  j\Kind = kind : j\A = *a : j\B = *b : j\Dst = *dst : j\Count = count
+  j\Op = op : j\Side = side : j\F1 = f1 : j\F2 = f2
+  tasks = PmPoolTasks(count, grain, 16, @j\Chunk)
+  If tasks <= 1
+    j\Chunk = count : PmElemTask(@j, 0, 0)
+  Else
+    PmPoolRun(@PmElemTask(), @j, tasks)
+  EndIf
+EndProcedure
+
+Procedure PmTensorZero(*dst, count.i)
+  PmElemRun(17, 0, 0, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorCopy(*src, *dst, count.i)
+  PmElemRun(16, *src, 0, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorAdd(*a, *b, *dst, count.i)
+  PmElemRun(0, *a, *b, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorSub(*a, *b, *dst, count.i)
+  PmElemRun(1, *a, *b, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorMul(*a, *b, *dst, count.i)
+  PmElemRun(2, *a, *b, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorDiv(*a, *b, *dst, count.i)
+  PmElemRun(3, *a, *b, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorPow(*a, *b, *dst, count.i)
+  PmElemRun(4, *a, *b, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_DEAR)
+EndProcedure
+Procedure PmTensorBinaryScalar(*vec, scalar.f, *dst, count.i, op.i, scalarSide.i)
+  PmElemRun(5, *vec, 0, *dst, count, op, scalarSide, scalar, 0.0, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorPowScalar(*vec, scalar.f, *dst, count.i, scalarSide.i)
+  PmElemRun(6, *vec, 0, *dst, count, 0, scalarSide, scalar, 0.0, #PMELEM_DEAR)
+EndProcedure
+Procedure PmTensorRelu(*src, *dst, count.i)
+  PmElemRun(7, *src, 0, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorLeakyRelu(*src, *dst, count.i, alpha.f)
+  PmElemRun(8, *src, 0, *dst, count, 0, 0, alpha, 0.0, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorSigmoid(*src, *dst, count.i)
+  PmElemRun(9, *src, 0, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_DEAR)
+EndProcedure
+Procedure PmTensorTanh(*src, *dst, count.i)
+  PmElemRun(10, *src, 0, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_DEAR)
+EndProcedure
+; An op outside the closed set goes to the serial kernel, which refuses it
+; by clearing its flag; only the calling thread ever writes the flag.
+Procedure PmTensorUnaryMath(*src, *dst, count.i, op.i)
+  If op < 0 Or op > 4 : PmTensorUnaryMathSerial(*src, *dst, count, op) : ProcedureReturn : EndIf
+  If op <= 2
+    PmElemRun(11, *src, 0, *dst, count, op, 0, 0.0, 0.0, #PMELEM_DEAR)
+  Else
+    PmElemRun(11, *src, 0, *dst, count, op, 0, 0.0, 0.0, #PMELEM_CHEAP)
+  EndIf
+EndProcedure
+Procedure PmTensorTrig(*src, *dst, count.i, op.i)
+  If op < 0 Or op > 2 : PmTensorTrigSerial(*src, *dst, count, op) : ProcedureReturn : EndIf
+  PmElemRun(12, *src, 0, *dst, count, op, 0, 0.0, 0.0, #PMELEM_DEAR)
+EndProcedure
+Procedure PmTensorFloor(*src, *dst, count.i)
+  PmElemRun(13, *src, 0, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorRoundEven(*src, *dst, count.i)
+  PmElemRun(14, *src, 0, *dst, count, 0, 0, 0.0, 0.0, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorClip(*src, *dst, count.i, lo.f, hi.f)
+  PmElemRun(15, *src, 0, *dst, count, 0, 0, lo, hi, #PMELEM_CHEAP)
+EndProcedure
+
+; ---- row-wise helpers --------------------------------------------------------
+; A row job runs a serial kernel over rows [first, first + n) by offsetting
+; its base addresses; every row is computed whole by one task.
+Structure PmRowJob
+  Kind.i
+  Src.i
+  Dst.i
+  Rows.i
+  Width.i
+  Chunk.i
+  SrcRowBytes.i
+  DstRowBytes.i
+  Args.i
+  I1.i
+  I2.i
+  I3.i
+  F1.f
+EndStructure
+
+Declare PmRowTask(*j.PmRowJob, task.i, worker.i)
+
+; Rows per task so each task holds at least `grain` elements.
+Procedure.i PmRowTasks(*j.PmRowJob, grain.i)
+  Protected w.i = *j\Width, tasks.i
+  If w < 1 : w = 1 : EndIf
+  tasks = PmPoolTasks(*j\Rows, (grain + w - 1) / w, 1, @*j\Chunk)
+  If tasks < 1 : tasks = 1 : *j\Chunk = *j\Rows : EndIf
+  ProcedureReturn tasks
+EndProcedure
+
+Procedure PmRowRun(*j.PmRowJob, grain.i)
+  Protected tasks.i = PmRowTasks(*j, grain)
+  If tasks <= 1
+    *j\Chunk = *j\Rows : PmRowTask(*j, 0, 0)
+  Else
+    PmPoolRun(@PmRowTask(), *j, tasks)
+  EndIf
 EndProcedure
 
 Structure PmTensorInt8DotArgs
@@ -1201,90 +1383,69 @@ EndStructure
 #PMI8_MODE_CONV = 0
 #PMI8_MODE_MATMUL = 1
 
-; The next task number of a shared counter (lock xadd).
-Procedure.i PmI8Claim(*counter)
-  Protected pc.i=*counter, v.i
-  !mov rcx,[p.v_pc]
-  !mov rax,1
-  !lock xadd [rcx],rax
-  !mov [p.v_v],rax
-  ProcedureReturn v
-EndProcedure
-
-; Workers claim tasks from one counter - a position tile (every row block) or
-; a row block (every tile) - so a slower core simply takes fewer of them.
-Procedure PmI8TileWorker(*j.PmI8TileJob)
-  Dim f.f(63)
-  Dim e.f(63)
+; One task: a position tile (every row block) or a row block (every tile),
+; so a slower core simply takes fewer of them. Its outputs are the task's
+; own tile or rows; f and e are this call's own scratch.
+Procedure PmI8TileTask(*j.PmI8TileJob, task.i, worker.i)
+  Protected Dim f.f(63)
+  Protected Dim e.f(63)
   Protected a.PmI8TileArgs
-  Protected task.i, t.i, t0.i, t1.i, rb.i, r0.i, r1.i, c.i, p.i, ch0.i, local.i, valid.i, channels.i, n.i
+  Protected t.i, t0.i, t1.i, rb.i, r0.i, r1.i, c.i, p.i, ch0.i, local.i, valid.i, channels.i, n.i
   a\WStride=*j\WRowBytes : a\XStride=*j\XStride : a\XTap=*j\XTap : a\STap=*j\STap
   a\Taps=*j\Taps : a\Pairs=*j\Pairs : a\Flush=*j\Flush : a\F=@f(0)
-  Repeat
-    task=PmI8Claim(*j\Counter)
-    If *j\ByTiles
-      If task>=*j\TileCount : Break : EndIf
-      t0=task : t1=task+1 : r0=*j\RowFirst : r1=*j\RowLast
-    Else
-      If task>=(*j\RowLast-*j\RowFirst)/4 : Break : EndIf
-      t0=0 : t1=*j\TileCount : r0=*j\RowFirst+task*4 : r1=r0+4
-    EndIf
-    For t=t0 To t1-1
-      valid=*j\Positions-t*16 : If valid>16 : valid=16 : EndIf
-      rb=r0
-      While rb<r1
-        local=(rb-*j\RowBase) >> *j\Wide
-        channels=*j\Rows-local : If channels>(4 >> *j\Wide) : channels=4 >> *j\Wide : EndIf
-        If channels>0
-          FillMemory(@f(0),256,0)
-          a\W=*j\W+rb* *j\WRowBytes : a\X=*j\X+t*64 : a\S=*j\S+t*64
-          PmI8TileAll(@a)
-          ch0=*j\ChannelBase+local
-          If *j\Bias : n=*j\Bias+ch0*4 : Else : n=0 : EndIf
-          PmI8Epilogue(@f(0),@e(0),channels,*j\Wide,*j\Scales+ch0*4,n)
-          If *j\Mode=#PMI8_MODE_CONV
-            For c=0 To channels-1
-              CopyMemory(@e(c*16),*j\Dst+((ch0+c)* *j\DstRowStride+t*16)*4,valid*4)
+  If *j\ByTiles
+    If task>=*j\TileCount : ProcedureReturn : EndIf
+    t0=task : t1=task+1 : r0=*j\RowFirst : r1=*j\RowLast
+  Else
+    If task>=(*j\RowLast-*j\RowFirst)/4 : ProcedureReturn : EndIf
+    t0=0 : t1=*j\TileCount : r0=*j\RowFirst+task*4 : r1=r0+4
+  EndIf
+  For t=t0 To t1-1
+    valid=*j\Positions-t*16 : If valid>16 : valid=16 : EndIf
+    rb=r0
+    While rb<r1
+      local=(rb-*j\RowBase) >> *j\Wide
+      channels=*j\Rows-local : If channels>(4 >> *j\Wide) : channels=4 >> *j\Wide : EndIf
+      If channels>0
+        FillMemory(@f(0),256,0)
+        a\W=*j\W+rb* *j\WRowBytes : a\X=*j\X+t*64 : a\S=*j\S+t*64
+        PmI8TileAll(@a)
+        ch0=*j\ChannelBase+local
+        If *j\Bias : n=*j\Bias+ch0*4 : Else : n=0 : EndIf
+        PmI8Epilogue(@f(0),@e(0),channels,*j\Wide,*j\Scales+ch0*4,n)
+        If *j\Mode=#PMI8_MODE_CONV
+          For c=0 To channels-1
+            CopyMemory(@e(c*16),*j\Dst+((ch0+c)* *j\DstRowStride+t*16)*4,valid*4)
+          Next
+        Else
+          For c=0 To channels-1
+            For p=0 To valid-1
+              PokeF(*j\Dst+((t*16+p)* *j\DstRowStride+ch0+c)*4,e(c*16+p))
             Next
-          Else
-            For c=0 To channels-1
-              For p=0 To valid-1
-                PokeF(*j\Dst+((t*16+p)* *j\DstRowStride+ch0+c)*4,e(c*16+p))
-              Next
-            Next
-          EndIf
+          Next
         EndIf
-        rb+4
-      Wend
-    Next
-  ForEver
+      EndIf
+      rb+4
+    Wend
+  Next
 EndProcedure
 
+; Below two million multiply-accumulates the product stays on the calling
+; thread (the pool's hand-off costs more than it saves).
 Procedure PmI8RunTiles(*proto.PmI8TileJob, rowBase.i, rowsPadded.i, tiles.i)
-  Protected workers.i=CountCPUs(#PB_System_ProcessCPUs), i.i, counter.i=0
+  Protected job.PmI8TileJob, tasks.i, t.i
   Protected macs.q=rowsPadded
-  Protected Dim jobs.PmI8TileJob(7), Dim threads.i(7)
   macs*tiles*16 : macs* *proto\Pairs* *proto\Taps*2
-  If workers>8 : workers=8 : EndIf
-  If macs<2000000 : workers=1 : EndIf
-  If workers<1 : workers=1 : EndIf
-  For i=0 To workers-1
-    CopyStructure(*proto,@jobs(i),PmI8TileJob)
-    jobs(i)\RowFirst=rowBase : jobs(i)\RowLast=rowBase+rowsPadded
-    jobs(i)\TileCount=tiles : jobs(i)\Counter=@counter
-    jobs(i)\ByTiles=Bool(tiles>=workers*4 Or tiles>=rowsPadded/4)
-  Next
-  For i=0 To workers-1
-    If i=workers-1
-      PmI8TileWorker(@jobs(i))
-    Else
-      threads(i)=CreateThread(@PmI8TileWorker(),@jobs(i))
-      If threads(i)=0 : PmI8TileWorker(@jobs(i)) : EndIf
-    EndIf
-  Next
-  For i=0 To workers-1 : If threads(i) : WaitThread(threads(i)) : EndIf : Next
+  CopyStructure(*proto,@job,PmI8TileJob)
+  job\RowFirst=rowBase : job\RowLast=rowBase+rowsPadded : job\TileCount=tiles
+  job\ByTiles=Bool(tiles>=PmPoolThreads*4 Or tiles>=rowsPadded/4)
+  If job\ByTiles : tasks=tiles : Else : tasks=rowsPadded/4 : EndIf
+  If PmPoolThreads<=1 Or (macs<2000000 And PmPoolForceSplit=0)
+    For t=0 To tasks-1 : PmI8TileTask(@job,t,0) : Next
+  Else
+    PmPoolRun(@PmI8TileTask(),@job,tasks)
+  EndIf
 EndProcedure
-
 ; ---- operators ------------------------------------------------------------
 ; MatMul: A is [m][k] (one batch slice), B is INT8 [k][n], dst [m][n].
 ; Returns 0 for a NaN or an infinity in A, or when memory runs out.
@@ -1359,7 +1520,7 @@ EndProcedure
 CompilerEndIf
 
 ; A is MxK, B is KxN and dst is MxN, all row-major.
-Procedure PmTensorMatMul2(*a, *b, *dst, m.i, k.i, n.i)
+Procedure PmTensorMatMul2Serial(*a, *b, *dst, m.i, k.i, n.i)
   Protected row.i
   Protected col.i
   Protected inner.i
@@ -1389,6 +1550,14 @@ Procedure PmTensorMatMul2(*a, *b, *dst, m.i, k.i, n.i)
   Wend
 EndProcedure
 
+; Rows of A (and of dst) split across the pool; each row whole in one task.
+Procedure PmTensorMatMul2(*a, *b, *dst, m.i, k.i, n.i)
+  Protected j.PmRowJob
+  j\Kind = 5 : j\Src = *a : j\Dst = *dst : j\Rows = m : j\Width = k * n : j\Args = *b
+  j\I1 = k : j\I2 = n
+  PmRowRun(@j, #PMELEM_CHEAP)
+EndProcedure
+
 CompilerIf #PMO_USE_INT8 = 1
 ; The fixed-shape entry: narrow weights, one scale per row of A.
 Procedure PmTensorMatMul2Int8(*a, *b, *dst, m.i, k.i, n.i, *weightScales)
@@ -1415,23 +1584,34 @@ EndStructure
 
 CompilerIf #PMO_USE_INT8 = 1
 
-; ONNX Gemm with an INT8 B: one scale per row of A' (per token).
-Procedure.i PmI8Gemm(*g.PmTensorGemmArgs)
-  Protected wide.i=*g\Wide, qmax.i=127, row.i, col.i, i.i, ic.i, *rows, *xq, *acc, *f1, *f2, *arow, ok.i=0
+; ONNX Gemm with an INT8 B: one scale per row of A' (per token). Rows of A'
+; are split across the pool; each task has its own row buffers, and reports
+; a fault in its own slot (1 not finite, 2 no memory).
+Structure PmI8GemmJob
+  G.i
+  Rows.i
+  Chunk.i
+  Faults.i
+EndStructure
+
+Procedure PmI8GemmTask(*j.PmI8GemmJob, task.i, worker.i)
+  Protected *g.PmTensorGemmArgs=*j\G, *rows=*j\Rows
+  Protected wide.i=*g\Wide, qmax.i=127, row.i, col.i, i.i, ic.i, *xq, *acc, *f1, *f2, *arow, r0.i, r1.i
   Protected xs.f, v.f, t.f, elements.i=*g\K * *g\N, rowbytes.i=*g\K
   If wide : qmax=32767 : EndIf
-  If *g\TransB : *rows=*g\B : Else : *rows=PmI8PrepareRows(*g\B,*g\K,*g\N,wide,elements) : EndIf
+  r0=task* *j\Chunk : r1=r0+ *j\Chunk : If r1>*g\M : r1=*g\M : EndIf
   *xq=AllocateMemory(*g\K*2+64) : *acc=AllocateMemory(*g\N*4+64)
   *f1=AllocateMemory(*g\N*4+64) : *f2=AllocateMemory(*g\N*4+64) : *arow=AllocateMemory(*g\K*4+64)
-  If *rows And *xq And *acc And *f1 And *f2 And *arow
-    ok=1
-    For row=0 To *g\M-1
+  If *xq=0 Or *acc=0 Or *f1=0 Or *f2=0 Or *arow=0
+    PokeI(*j\Faults+task*8,2)
+  Else
+    For row=r0 To r1-1
       If *g\TransA
         For i=0 To *g\K-1 : PokeL(*arow+i*4,PeekL(*g\A+(i* *g\M+row)*4)) : Next
       Else
         CopyMemory(*g\A+row* *g\K*4,*arow,*g\K*4)
       EndIf
-      If PmI8QuantizeVector(*arow,*g\K,qmax,*xq,@xs)=0 : PmTensorInt8Fault=1 : ok=0 : Break : EndIf
+      If PmI8QuantizeVector(*arow,*g\K,qmax,*xq,@xs)=0 : PokeI(*j\Faults+task*8,1) : Break : EndIf
       PmI8DotRowsScaled(*rows,rowbytes,*g\N,*xq,*g\K,xs,wide,*acc,*f1)
       If wide : PmI8DotRowsScaled(*rows+elements,rowbytes,*g\N,*xq,*g\K,xs,wide,*acc,*f2) : EndIf
       For col=0 To *g\N-1
@@ -1455,7 +1635,24 @@ Procedure.i PmI8Gemm(*g.PmTensorGemmArgs)
   If *f1 : FreeMemory(*f1) : EndIf
   If *f2 : FreeMemory(*f2) : EndIf
   If *arow : FreeMemory(*arow) : EndIf
-  ProcedureReturn ok
+EndProcedure
+
+Procedure.i PmI8Gemm(*g.PmTensorGemmArgs)
+  Protected j.PmI8GemmJob, tasks.i, t.i, fault.i, elements.i=*g\K * *g\N
+  If *g\TransB : j\Rows=*g\B : Else : j\Rows=PmI8PrepareRows(*g\B,*g\K,*g\N,*g\Wide,elements) : EndIf
+  If j\Rows=0 : ProcedureReturn 0 : EndIf
+  j\G=*g
+  tasks=PmPoolTasks(*g\M,(65536+elements-1)/PmPoolMax(elements,1),1,@j\Chunk)
+  If tasks<1 : ProcedureReturn 1 : EndIf
+  j\Faults=AllocateMemory(tasks*8+8)
+  If j\Faults=0 : ProcedureReturn 0 : EndIf
+  If tasks=1 : j\Chunk=*g\M : PmI8GemmTask(@j,0,0) : Else : PmPoolRun(@PmI8GemmTask(),@j,tasks) : EndIf
+  For t=0 To tasks-1
+    If PeekI(j\Faults+t*8)=1 : fault=1 : ElseIf PeekI(j\Faults+t*8)=2 And fault=0 : fault=2 : EndIf
+  Next
+  FreeMemory(j\Faults)
+  If fault=1 : PmTensorInt8Fault=1 : EndIf
+  ProcedureReturn Bool(fault=0)
 EndProcedure
 CompilerEndIf
 
@@ -1463,8 +1660,8 @@ CompilerEndIf
 ; scalar (cCount=1), one value per column (cCount=n), or a full MxN matrix.
 ; One argument block is used because the A64 calling convention implemented
 ; by Forge currently has eight register arguments and no stack arguments.
-Procedure PmTensorGemm(*g.PmTensorGemmArgs)
-  Protected dot.PmTensorInt8DotArgs
+; Rows [first, last) of the FLOAT form; the pool gives each task its rows.
+Procedure PmTensorGemmRows(*g.PmTensorGemmArgs, first.i, last.i)
   Protected row.i
   Protected col.i
   Protected inner.i
@@ -1472,17 +1669,9 @@ Procedure PmTensorGemm(*g.PmTensorGemmArgs)
   Protected ib.i
   Protected ic.i
   Protected accumulator.i
-  Protected aScale.f
-  Protected converted.f
   Protected sum.f
-  CompilerIf #PMO_USE_INT8 = 1
-  If *g\WeightScales <> 0
-    If PmI8Gemm(*g)=0 And PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
-    ProcedureReturn
-  EndIf
-  CompilerEndIf
-  row = 0
-  While row < *g\M
+  row = first
+  While row < last
     col = 0
     While col < *g\N
       sum = 0.0 : accumulator = 0
@@ -1511,9 +1700,21 @@ Procedure PmTensorGemm(*g.PmTensorGemmArgs)
   Wend
 EndProcedure
 
+Procedure PmTensorGemm(*g.PmTensorGemmArgs)
+  Protected j.PmRowJob
+  CompilerIf #PMO_USE_INT8 = 1
+  If *g\WeightScales <> 0
+    If PmI8Gemm(*g)=0 And PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+  j\Kind = 6 : j\Rows = *g\M : j\Width = *g\K * *g\N : j\Args = *g
+  PmRowRun(@j, #PMELEM_CHEAP)
+EndProcedure
+
 ; Softmax over the final dimension. outer is the product of every earlier
 ; dimension and width is the final dimension.
-Procedure PmTensorSoftmaxLast(*src, *dst, outer.i, width.i)
+Procedure PmTensorSoftmaxLastSerial(*src, *dst, outer.i, width.i)
   Protected o.i
   Protected j.i
   Protected base.i
@@ -1547,7 +1748,7 @@ Procedure PmTensorSoftmaxLast(*src, *dst, outer.i, width.i)
   Wend
 EndProcedure
 
-Procedure PmTensorReduceMeanLast(*src, *dst, outer.i, width.i)
+Procedure PmTensorReduceMeanLastSerial(*src, *dst, outer.i, width.i)
   Protected o.i
   Protected j.i
   Protected base.i
@@ -1568,7 +1769,7 @@ Procedure PmTensorReduceMeanLast(*src, *dst, outer.i, width.i)
   Wend
 EndProcedure
 
-Procedure PmTensorReduceSumLast(*src, *dst, outer.i, width.i)
+Procedure PmTensorReduceSumLastSerial(*src, *dst, outer.i, width.i)
   Protected row.i
   Protected col.i
   Protected sum.f
@@ -1583,6 +1784,24 @@ Procedure PmTensorReduceSumLast(*src, *dst, outer.i, width.i)
     PmTensorPut(*dst, row, sum)
     row = row + 1
   Wend
+EndProcedure
+
+; Softmax and the last-axis reductions split by rows: a row's sum is never
+; divided between tasks.
+Procedure PmTensorSoftmaxLast(*src, *dst, outer.i, width.i)
+  Protected j.PmRowJob
+  j\Kind = 0 : j\Src = *src : j\Dst = *dst : j\Rows = outer : j\Width = width
+  PmRowRun(@j, #PMELEM_DEAR)
+EndProcedure
+Procedure PmTensorReduceMeanLast(*src, *dst, outer.i, width.i)
+  Protected j.PmRowJob
+  j\Kind = 1 : j\Src = *src : j\Dst = *dst : j\Rows = outer : j\Width = width
+  PmRowRun(@j, #PMELEM_CHEAP)
+EndProcedure
+Procedure PmTensorReduceSumLast(*src, *dst, outer.i, width.i)
+  Protected j.PmRowJob
+  j\Kind = 2 : j\Src = *src : j\Dst = *dst : j\Rows = outer : j\Width = width
+  PmRowRun(@j, #PMELEM_CHEAP)
 EndProcedure
 
 ; Prefix sum along one contiguous logical axis. Data before/after that axis
@@ -1663,7 +1882,7 @@ Structure PmTensorLayerNormArgs
   Epsilon.f
 EndStructure
 
-Procedure PmTensorLayerNorm(*g.PmTensorLayerNormArgs)
+Procedure PmTensorLayerNormSerial(*g.PmTensorLayerNormArgs)
   Protected o.i
   Protected j.i
   Protected base.i
@@ -1712,6 +1931,14 @@ Procedure PmTensorLayerNorm(*g.PmTensorLayerNormArgs)
   Wend
 EndProcedure
 
+; Blocks split across the pool; each block's mean and variance are summed
+; whole by one task.
+Procedure PmTensorLayerNorm(*g.PmTensorLayerNormArgs)
+  Protected j.PmRowJob
+  j\Kind = 3 : j\Rows = *g\Outer : j\Width = *g\Width : j\Args = *g
+  PmRowRun(@j, #PMELEM_CHEAP)
+EndProcedure
+
 ; The same kernel without the Mean and InvStdDev outputs.
 Procedure PmTensorLayerNormLast(*src, *scale, *bias, *dst, outer.i, width.i, epsilon.f)
   Protected g.PmTensorLayerNormArgs
@@ -1738,29 +1965,37 @@ Structure PmTensorBatchNormArgs
 EndStructure
 
 CompilerIf #PMO_USE_BATCHNORM = 1
-Procedure PmTensorBatchNorm(*g.PmTensorBatchNormArgs)
+; Planes [first, last) of the N x C planes, plane = bn * C + ch, each
+; normalised by the statements the whole-tensor loop used.
+Procedure PmTensorBatchNormPlanes(*g.PmTensorBatchNormArgs, first.i, last.i)
   Protected bn.i
   Protected ch.i
   Protected s.i
   Protected idx.i
+  Protected plane.i
   Protected mul.f
   Protected add.f
-  bn = 0
-  While bn < *g\N
-    ch = 0
-    While ch < *g\C
-      mul = PmTensorGet(*g\Scale, ch) / Sqr(PmTensorGet(*g\Variance, ch) + *g\Epsilon)
-      add = PmTensorGet(*g\Bias, ch) - PmTensorGet(*g\Mean, ch) * mul
-      s = 0
-      While s < *g\Spatial
-        idx = (bn * *g\C + ch) * *g\Spatial + s
-        PmTensorPut(*g\Dst, idx, PmTensorGet(*g\Src, idx) * mul + add)
-        s = s + 1
-      Wend
-      ch = ch + 1
+  plane = first
+  While plane < last
+    bn = plane / *g\C
+    ch = plane % *g\C
+    mul = PmTensorGet(*g\Scale, ch) / Sqr(PmTensorGet(*g\Variance, ch) + *g\Epsilon)
+    add = PmTensorGet(*g\Bias, ch) - PmTensorGet(*g\Mean, ch) * mul
+    s = 0
+    While s < *g\Spatial
+      idx = (bn * *g\C + ch) * *g\Spatial + s
+      PmTensorPut(*g\Dst, idx, PmTensorGet(*g\Src, idx) * mul + add)
+      s = s + 1
     Wend
-    bn = bn + 1
+    plane = plane + 1
   Wend
+EndProcedure
+
+Procedure PmTensorBatchNorm(*g.PmTensorBatchNormArgs)
+  Protected j.PmRowJob
+  If *g\C <= 0 : ProcedureReturn : EndIf
+  j\Kind = 7 : j\Rows = *g\N * *g\C : j\Width = *g\Spatial : j\Args = *g
+  PmRowRun(@j, #PMELEM_CHEAP)
 EndProcedure
 
 ; BatchNormalization-15 with training_mode = 1
@@ -1772,7 +2007,8 @@ EndProcedure
 ;   running_mean = input_mean * momentum + current_mean * (1 - momentum)
 ;   running_var  = input_var * momentum + current_var * (1 - momentum).
 ; Mean and Variance hold input_mean and input_var.
-Procedure PmTensorBatchNormTraining(*g.PmTensorBatchNormArgs)
+; Channels [first, last): each channel's statistics are summed whole by one task.
+Procedure PmTensorBatchNormTrainingChannels(*g.PmTensorBatchNormArgs, first.i, last.i)
   Protected bn.i
   Protected ch.i
   Protected s.i
@@ -1789,8 +2025,8 @@ Procedure PmTensorBatchNormTraining(*g.PmTensorBatchNormArgs)
   EndIf
   divisor = *g\N * *g\Spatial
   keep = 1.0 - *g\Momentum
-  ch = 0
-  While ch < *g\C
+  ch = first
+  While ch < last
     mean = 0.0
     bn = 0
     While bn < *g\N
@@ -1830,6 +2066,13 @@ Procedure PmTensorBatchNormTraining(*g.PmTensorBatchNormArgs)
     Wend
     ch = ch + 1
   Wend
+EndProcedure
+
+Procedure PmTensorBatchNormTraining(*g.PmTensorBatchNormArgs)
+  Protected j.PmRowJob
+  If *g\N * *g\Spatial <= 0 : ProcedureReturn : EndIf
+  j\Kind = 8 : j\Rows = *g\C : j\Width = *g\N * *g\Spatial : j\Args = *g
+  PmRowRun(@j, #PMELEM_CHEAP)
 EndProcedure
 CompilerEndIf
 
@@ -1942,7 +2185,101 @@ Procedure PmTensorStftFft(*srcR, *srcI, *dstR, *dstI, *rootsR, *rootsI, count.i,
   EndIf
 EndProcedure
 
+Structure PmStftJob
+  G.i
+  ComplexCount.i
+  Total.i
+  Chunk.i
+  BR.i
+  BI.i
+  ChirpR.i
+  ChirpI.i
+  RootsR.i
+  RootsI.i
+  Work.i
+  Failed.i
+EndStructure
+
+; Frames [first, last) of every batch (index = bn * Frames + frame), with the
+; four working arrays at *work, by the statements of the single-threaded loop.
+Procedure PmStftFrames(*j.PmStftJob, first.i, last.i, *work)
+  Protected *g.PmTensorStftArgs = *j\G
+  Protected complexCount.i = *j\ComplexCount
+  Protected *work1R = *work
+  Protected *work1I = *work1R + complexCount * 4
+  Protected *work2R = *work1I + complexCount * 4
+  Protected *work2I = *work2R + complexCount * 4
+  Protected *bR = *j\BR, *bI = *j\BI, *chirpR = *j\ChirpR, *chirpI = *j\ChirpI, *rootsR = *j\RootsR, *rootsI = *j\RootsI
+  Protected index.i, bn.i, frame.i, bin.i, sample.i, signalIndex.i, outputIndex.i, mirror.i
+  Protected value.f, sourceR.f, sourceI.f, weightR.f, weightI.f, resultR.f, resultI.f
+  index = first
+  While index < last
+      bn = index / *g\Frames
+      frame = index % *g\Frames
+      PmTensorZeroSerial(*work1R, complexCount)
+      PmTensorZeroSerial(*work1I, complexCount)
+      sample = 0
+      While sample < *g\FrameLength
+        signalIndex = bn * *g\SignalLength + frame * *g\FrameStep + sample
+        value = PmTensorGet(*g\Signal, signalIndex)
+        If *g\Window <> 0 : value = value * PmTensorGet(*g\Window, sample) : EndIf
+        weightR = PmTensorGet(*chirpR, sample)
+        weightI = PmTensorGet(*chirpI, sample)
+        PmTensorPut(*work1R, sample, value * weightR)
+        PmTensorPut(*work1I, sample, value * weightI)
+        sample = sample + 1
+      Wend
+      PmTensorStftFft(*work1R, *work1I, *work2R, *work2I, *rootsR, *rootsI, complexCount, 0)
+      sample = 0
+      While sample < complexCount
+        sourceR = PmTensorGet(*work2R, sample)
+        sourceI = PmTensorGet(*work2I, sample)
+        weightR = PmTensorGet(*bR, sample)
+        weightI = PmTensorGet(*bI, sample)
+        resultR = sourceR * weightR - sourceI * weightI
+        resultI = sourceR * weightI + sourceI * weightR
+        PmTensorPut(*work2R, sample, resultR)
+        PmTensorPut(*work2I, sample, resultI)
+        sample = sample + 1
+      Wend
+      PmTensorStftFft(*work2R, *work2I, *work1R, *work1I, *rootsR, *rootsI, complexCount, 1)
+      bin = 0
+      While bin < *g\Bins
+        mirror = bin
+        If mirror > 0 : mirror = complexCount - mirror : EndIf
+        sourceR = PmTensorGet(*work1R, mirror)
+        sourceI = PmTensorGet(*work1I, mirror)
+        weightR = PmTensorGet(*chirpR, bin)
+        weightI = PmTensorGet(*chirpI, bin)
+        resultR = sourceR * weightR - sourceI * weightI
+        resultI = sourceR * weightI + sourceI * weightR
+        outputIndex = ((bn * *g\Frames + frame) * *g\Bins + bin) * 2
+        PmTensorPut(*g\Dst, outputIndex, resultR)
+        PmTensorPut(*g\Dst, outputIndex + 1, resultI)
+        bin = bin + 1
+      Wend
+      index = index + 1
+  Wend
+EndProcedure
+
+Procedure PmStftTask(*j.PmStftJob, task.i, worker.i)
+  Protected first.i = task * *j\Chunk, last.i = first + *j\Chunk, *work, *g.PmTensorStftArgs = *j\G
+  If last > *j\Total : last = *j\Total : EndIf
+  If worker = 0
+    *work = *g\Scratch
+  Else
+    *work = PeekI(*j\Work + worker * 8)
+    If *work = 0
+      *work = AllocateMemory(*j\ComplexCount * 16 + 64)
+      If *work = 0 : PokeI(*j\Failed + task * 8, 1) : ProcedureReturn : EndIf
+      PokeI(*j\Work + worker * 8, *work)
+    EndIf
+  EndIf
+  PmStftFrames(*j, first, last, *work)
+EndProcedure
+
 Procedure.i PmTensorStft(*g.PmTensorStftArgs)
+  Protected job.PmStftJob, tasks.i, t.i
   Protected bn.i
   Protected frame.i
   Protected bin.i
@@ -2049,56 +2386,37 @@ Procedure.i PmTensorStft(*g.PmTensorStftArgs)
   Wend
   PmTensorStftFft(*work1R, *work1I, *bR, *bI, *rootsR, *rootsI, complexCount, 0)
 
-  bn = 0
-  While bn < *g\Batches
-    frame = 0
-    While frame < *g\Frames
-      PmTensorZero(*work1R, complexCount)
-      PmTensorZero(*work1I, complexCount)
-      sample = 0
-      While sample < *g\FrameLength
-        signalIndex = bn * *g\SignalLength + frame * *g\FrameStep + sample
-        value = PmTensorGet(*g\Signal, signalIndex)
-        If *g\Window <> 0 : value = value * PmTensorGet(*g\Window, sample) : EndIf
-        weightR = PmTensorGet(*chirpR, sample)
-        weightI = PmTensorGet(*chirpI, sample)
-        PmTensorPut(*work1R, sample, value * weightR)
-        PmTensorPut(*work1I, sample, value * weightI)
-        sample = sample + 1
-      Wend
-      PmTensorStftFft(*work1R, *work1I, *work2R, *work2I, *rootsR, *rootsI, complexCount, 0)
-      sample = 0
-      While sample < complexCount
-        sourceR = PmTensorGet(*work2R, sample)
-        sourceI = PmTensorGet(*work2I, sample)
-        weightR = PmTensorGet(*bR, sample)
-        weightI = PmTensorGet(*bI, sample)
-        resultR = sourceR * weightR - sourceI * weightI
-        resultI = sourceR * weightI + sourceI * weightR
-        PmTensorPut(*work2R, sample, resultR)
-        PmTensorPut(*work2I, sample, resultI)
-        sample = sample + 1
-      Wend
-      PmTensorStftFft(*work2R, *work2I, *work1R, *work1I, *rootsR, *rootsI, complexCount, 1)
-      bin = 0
-      While bin < *g\Bins
-        mirror = bin
-        If mirror > 0 : mirror = complexCount - mirror : EndIf
-        sourceR = PmTensorGet(*work1R, mirror)
-        sourceI = PmTensorGet(*work1I, mirror)
-        weightR = PmTensorGet(*chirpR, bin)
-        weightI = PmTensorGet(*chirpI, bin)
-        resultR = sourceR * weightR - sourceI * weightI
-        resultI = sourceR * weightI + sourceI * weightR
-        outputIndex = ((bn * *g\Frames + frame) * *g\Bins + bin) * 2
-        PmTensorPut(*g\Dst, outputIndex, resultR)
-        PmTensorPut(*g\Dst, outputIndex + 1, resultI)
-        bin = bin + 1
-      Wend
-      frame = frame + 1
-    Wend
-    bn = bn + 1
-  Wend
+  ; The frames, split across the pool. Worker 0 uses the planned working
+  ; arrays; every other worker its own four, made on its first frame. The
+  ; tables above are read-only from here on.
+  job\G = *g : job\ComplexCount = complexCount : job\Total = *g\Batches * *g\Frames
+  job\BR = *bR : job\BI = *bI : job\ChirpR = *chirpR : job\ChirpI = *chirpI
+  job\RootsR = *rootsR : job\RootsI = *rootsI
+  tasks = PmPoolTasks(job\Total, PmPoolMax(1, 262144 / (complexCount * 8)), 1, @job\Chunk)
+  If tasks <= 1
+    PmStftFrames(@job, 0, job\Total, *g\Scratch)
+    ProcedureReturn 1
+  EndIf
+  job\Work = AllocateMemory(PmPoolThreads * 8 + 8)
+  job\Failed = AllocateMemory(tasks * 8 + 8)
+  If job\Work = 0 Or job\Failed = 0
+    If job\Work : FreeMemory(job\Work) : EndIf
+    If job\Failed : FreeMemory(job\Failed) : EndIf
+    PmStftFrames(@job, 0, job\Total, *g\Scratch)
+    ProcedureReturn 1
+  EndIf
+  PmPoolRun(@PmStftTask(), @job, tasks)
+  For t = 0 To tasks - 1
+    ; A worker that could not get working arrays left its frames undone.
+    If PeekI(job\Failed + t * 8)
+      frame = t * job\Chunk : sample = frame + job\Chunk : If sample > job\Total : sample = job\Total : EndIf
+      PmStftFrames(@job, frame, sample, *g\Scratch)
+    EndIf
+  Next
+  For t = 1 To PmPoolThreads - 1
+    If PeekI(job\Work + t * 8) : FreeMemory(PeekI(job\Work + t * 8)) : EndIf
+  Next
+  FreeMemory(job\Work) : FreeMemory(job\Failed)
   ProcedureReturn 1
 EndProcedure
 CompilerEndIf
@@ -2106,7 +2424,7 @@ CompilerEndIf
 ; Resize the final axis of a contiguous FLOAT tensor. mode 0 is nearest/floor,
 ; mode 1 is linear. coordinateMode 0 is asymmetric, 1 is half_pixel.
 CompilerIf #PMO_USE_RESIZE = 1
-Procedure PmTensorResize1D(*src, *dst, outer.i, inWidth.i, outWidth.i, mode.i, coordinateMode.i, scale.f)
+Procedure PmTensorResize1DSerial(*src, *dst, outer.i, inWidth.i, outWidth.i, mode.i, coordinateMode.i, scale.f)
   Protected row.i
   Protected ox.i
   Protected ix0.i
@@ -2153,7 +2471,43 @@ Procedure PmTensorResize1D(*src, *dst, outer.i, inWidth.i, outWidth.i, mode.i, c
     row = row + 1
   Wend
 EndProcedure
+
+Procedure PmTensorResize1D(*src, *dst, outer.i, inWidth.i, outWidth.i, mode.i, coordinateMode.i, scale.f)
+  Protected j.PmRowJob
+  j\Kind = 4 : j\Src = *src : j\Dst = *dst : j\Rows = outer : j\Width = outWidth
+  j\I1 = mode : j\I2 = coordinateMode : j\I3 = inWidth : j\F1 = scale
+  PmRowRun(@j, #PMELEM_CHEAP)
+EndProcedure
 CompilerEndIf
+
+; The row kinds of PmRowRun: the serial kernel over rows [first, first + n).
+Procedure PmRowTask(*j.PmRowJob, task.i, worker.i)
+  Protected first.i = task * *j\Chunk, n.i = *j\Rows - first, w.i = *j\Width
+  Protected g.PmTensorLayerNormArgs, *ln.PmTensorLayerNormArgs
+  If n > *j\Chunk : n = *j\Chunk : EndIf
+  If n <= 0 : ProcedureReturn : EndIf
+  Select *j\Kind
+    Case 0 : PmTensorSoftmaxLastSerial(*j\Src + first * w * 4, *j\Dst + first * w * 4, n, w)
+    Case 1 : PmTensorReduceMeanLastSerial(*j\Src + first * w * 4, *j\Dst + first * 4, n, w)
+    Case 2 : PmTensorReduceSumLastSerial(*j\Src + first * w * 4, *j\Dst + first * 4, n, w)
+    Case 3
+      *ln = *j\Args
+      CopyStructure(*ln, @g, PmTensorLayerNormArgs)
+      g\Src + first * w * 4 : g\Dst + first * w * 4 : g\Outer = n
+      If g\Mean : g\Mean + first * 4 : EndIf
+      If g\InvStdDev : g\InvStdDev + first * 4 : EndIf
+      PmTensorLayerNormSerial(@g)
+    CompilerIf #PMO_USE_RESIZE = 1
+    Case 4 : PmTensorResize1DSerial(*j\Src + first * *j\I3 * 4, *j\Dst + first * w * 4, n, *j\I3, w, *j\I1, *j\I2, *j\F1)
+    CompilerEndIf
+    Case 5 : PmTensorMatMul2Serial(*j\Src + first * *j\I1 * 4, *j\Args, *j\Dst + first * *j\I2 * 4, n, *j\I1, *j\I2)
+    Case 6 : PmTensorGemmRows(*j\Args, first, first + n)
+    CompilerIf #PMO_USE_BATCHNORM = 1
+    Case 7 : PmTensorBatchNormPlanes(*j\Args, first, first + n)
+    Case 8 : PmTensorBatchNormTrainingChannels(*j\Args, first, first + n)
+    CompilerEndIf
+  EndSelect
+EndProcedure
 
 ; ONNX 1-D transposed convolution. W is [inChannels,
 ; outChannels/group, kernel]. The output is initialized with bias before the
@@ -2175,8 +2529,34 @@ Structure PmTensorConvTranspose1DArgs
   Groups.i
 EndStructure
 
+Structure PmConvRowsJob
+  Args.i
+  Rows.i
+  Chunk.i
+  Kind.i
+EndStructure
+
+Declare PmConvRowsTask(*j.PmConvRowsJob, task.i, worker.i)
+
+; Output rows split across the pool; `rowMacs` is one row's work.
+Procedure PmConvRowsRun(kind.i, *g, rows.i, rowMacs.q)
+  Protected j.PmConvRowsJob, tasks.i, grain.i
+  j\Kind = kind : j\Args = *g : j\Rows = rows
+  If rowMacs < 1 : rowMacs = 1 : EndIf
+  grain = (65536 + rowMacs - 1) / rowMacs
+  tasks = PmPoolTasks(rows, grain, 1, @j\Chunk)
+  If tasks <= 1
+    j\Chunk = rows : PmConvRowsTask(@j, 0, 0)
+  Else
+    PmPoolRun(@PmConvRowsTask(), @j, tasks)
+  EndIf
+EndProcedure
 CompilerIf #PMO_USE_CONVTRANSPOSE = 1
-Procedure PmTensorConvTranspose1D(*g.PmTensorConvTranspose1DArgs)
+; Output rows [first, last), row = bn * OutChannels + oc. A row starts at its
+; bias and takes its contributions in the order the whole-tensor loop gave
+; them: input channel, then input position, then kernel tap, ascending.
+Procedure PmTensorConvTranspose1DRows(*g.PmTensorConvTranspose1DArgs, first.i, last.i)
+  Protected work.i
   Protected bn.i
   Protected ic.i
   Protected ix.i
@@ -2193,47 +2573,49 @@ Procedure PmTensorConvTranspose1D(*g.PmTensorConvTranspose1DArgs)
   Protected value.f
   inPerGroup = *g\InChannels / *g\Groups
   outPerGroup = *g\OutChannels / *g\Groups
-  bn = 0
-  While bn < *g\Batches
-    oc = 0
-    While oc < *g\OutChannels
-      ox = 0
-      While ox < *g\OutWidth
-        value = 0.0
-        If *g\Bias <> 0 : value = PmTensorGet(*g\Bias, oc) : EndIf
-        PmTensorPut(*g\Dst, (bn * *g\OutChannels + oc) * *g\OutWidth + ox, value)
-        ox = ox + 1
-      Wend
-      oc = oc + 1
+  work = first
+  While work < last
+    bn = work / *g\OutChannels
+    oc = work % *g\OutChannels
+    group = oc / outPerGroup
+    ocg = oc % outPerGroup
+    ox = 0
+    While ox < *g\OutWidth
+      value = 0.0
+      If *g\Bias <> 0 : value = PmTensorGet(*g\Bias, oc) : EndIf
+      PmTensorPut(*g\Dst, (bn * *g\OutChannels + oc) * *g\OutWidth + ox, value)
+      ox = ox + 1
     Wend
-    ic = 0
-    While ic < *g\InChannels
-      group = ic / inPerGroup
+    ic = group * inPerGroup
+    While ic < (group + 1) * inPerGroup
       ix = 0
       While ix < *g\InWidth
         srcIndex = (bn * *g\InChannels + ic) * *g\InWidth + ix
         value = PmTensorGet(*g\Src, srcIndex)
-        ocg = 0
-        While ocg < outPerGroup
-          oc = group * outPerGroup + ocg
-          kx = 0
-          While kx < *g\Kernel
-            ox = ix * *g\Stride - *g\PadLeft + kx * *g\Dilation
-            If ox >= 0 And ox < *g\OutWidth
-              weightIndex = (ic * outPerGroup + ocg) * *g\Kernel + kx
-              dstIndex = (bn * *g\OutChannels + oc) * *g\OutWidth + ox
-              PmTensorPut(*g\Dst, dstIndex, PmTensorGet(*g\Dst, dstIndex) + value * PmTensorGet(*g\Weight, weightIndex))
-            EndIf
-            kx = kx + 1
-          Wend
-          ocg = ocg + 1
+        kx = 0
+        While kx < *g\Kernel
+          ox = ix * *g\Stride - *g\PadLeft + kx * *g\Dilation
+          If ox >= 0 And ox < *g\OutWidth
+            weightIndex = (ic * outPerGroup + ocg) * *g\Kernel + kx
+            dstIndex = (bn * *g\OutChannels + oc) * *g\OutWidth + ox
+            PmTensorPut(*g\Dst, dstIndex, PmTensorGet(*g\Dst, dstIndex) + value * PmTensorGet(*g\Weight, weightIndex))
+          EndIf
+          kx = kx + 1
         Wend
         ix = ix + 1
       Wend
       ic = ic + 1
     Wend
-    bn = bn + 1
+    work = work + 1
   Wend
+EndProcedure
+
+
+Procedure PmTensorConvTranspose1D(*g.PmTensorConvTranspose1DArgs)
+  Protected macs.q = *g\InWidth
+  If *g\Groups <= 0 Or *g\OutChannels <= 0 : ProcedureReturn : EndIf
+  macs * *g\Kernel * (*g\InChannels / *g\Groups)
+  PmConvRowsRun(0, *g, *g\Batches * *g\OutChannels, macs)
 EndProcedure
 CompilerEndIf
 
@@ -2295,30 +2677,43 @@ Procedure PmI8QuantWorker(*q.PmI8QuantJob)
   Next
 EndProcedure
 
+; Position ranges (multiples of eight) split across the pool; each task
+; reports a NaN or an infinity in its own slot.
+Structure PmI8QuantRun
+  Proto.i
+  Chunk.i
+  Faults.i
+EndStructure
+
+Procedure PmI8QuantTask(*r.PmI8QuantRun, task.i, worker.i)
+  Protected q.PmI8QuantJob
+  CopyStructure(*r\Proto, @q, PmI8QuantJob)
+  q\First = task * *r\Chunk : q\Last = q\First + *r\Chunk : q\Fault = 0
+  If q\Last > q\Width : q\Last = q\Width : EndIf
+  If q\First > q\Width : q\First = q\Width : EndIf
+  PmI8QuantWorker(@q)
+  If q\Fault : PokeI(*r\Faults + task * 8, 1) : EndIf
+EndProcedure
+
 Procedure.i PmI8QuantConvInput(*proto.PmI8QuantJob)
-  Protected workers.i=CountCPUs(#PB_System_ProcessCPUs), i.i, chunk.i, fault.i
-  Protected Dim jobs.PmI8QuantJob(7), Dim threads.i(7)
-  If workers>8 : workers=8 : EndIf
-  If *proto\Width* *proto\Channels<65536 : workers=1 : EndIf
-  If workers<1 : workers=1 : EndIf
-  chunk=((*proto\Width+workers-1)/workers+7)&~7
-  For i=0 To workers-1
-    CopyStructure(*proto,@jobs(i),PmI8QuantJob)
-    jobs(i)\First=i*chunk : jobs(i)\Last=(i+1)*chunk
-    If jobs(i)\Last>*proto\Width : jobs(i)\Last=*proto\Width : EndIf
-    If jobs(i)\First>*proto\Width : jobs(i)\First=*proto\Width : EndIf
-    If i=workers-1
-      PmI8QuantWorker(@jobs(i))
-    Else
-      threads(i)=CreateThread(@PmI8QuantWorker(),@jobs(i))
-      If threads(i)=0 : PmI8QuantWorker(@jobs(i)) : EndIf
-    EndIf
-  Next
-  For i=0 To workers-1
-    If threads(i) : WaitThread(threads(i)) : EndIf
-    If jobs(i)\Fault : fault=1 : EndIf
-  Next
-  ProcedureReturn 1-fault
+  Protected r.PmI8QuantRun, tasks.i, t.i, fault.i
+  r\Proto = *proto
+  tasks = PmPoolTasks(*proto\Width, PmPoolMax(8, 65536 / PmPoolMax(*proto\Channels, 1)), 8, @r\Chunk)
+  If tasks <= 1
+    *proto\First = 0 : *proto\Last = *proto\Width : *proto\Fault = 0
+    PmI8QuantWorker(*proto)
+    ProcedureReturn 1 - Bool(*proto\Fault <> 0)
+  EndIf
+  r\Faults = AllocateMemory(tasks * 8 + 8)
+  If r\Faults = 0
+    *proto\First = 0 : *proto\Last = *proto\Width : *proto\Fault = 0
+    PmI8QuantWorker(*proto)
+    ProcedureReturn 1 - Bool(*proto\Fault <> 0)
+  EndIf
+  PmPoolRun(@PmI8QuantTask(), @r, tasks)
+  For t = 0 To tasks - 1 : If PeekI(r\Faults + t * 8) : fault = 1 : EndIf : Next
+  FreeMemory(r\Faults)
+  ProcedureReturn 1 - fault
 EndProcedure
 
 ; 1-D convolution, NCW, W [out][in/groups][kernel] INT8 (both planes if wide).
@@ -2459,7 +2854,6 @@ Procedure PmTensorConv1DWorker(*worker.PmTensorConv1DWorker)
 EndProcedure
 
 Procedure PmTensorConv1D(*g.PmTensorConv1DArgs)
-  Protected workerCount.i = CountCPUs(#PB_System_ProcessCPUs)
   Protected workCount.i = *g\Batches * *g\OutChannels
   Protected chunk.i
   Protected first.i
@@ -2472,27 +2866,9 @@ Procedure PmTensorConv1D(*g.PmTensorConv1DArgs)
     ProcedureReturn
   EndIf
   CompilerEndIf
-  totalMacs = workCount : totalMacs * *g\OutWidth : totalMacs * (*g\InChannels / *g\Groups) : totalMacs * *g\Kernel
-  If workerCount > workCount : workerCount = workCount : EndIf
-  If totalMacs < 1000000 Or workerCount < 2 : workerCount = 1 : EndIf
-  Dim workers.PmTensorConv1DWorker(workerCount - 1)
-  Dim threads.i(workerCount - 1)
-  chunk = (workCount + workerCount - 1) / workerCount
-  For index = 0 To workerCount - 1
-    first = index * chunk
-    workers(index)\Args = *g : workers(index)\WorkStart = first
-    workers(index)\WorkEnd = first + chunk : workers(index)\AScale = aScale
-    If workers(index)\WorkEnd > workCount : workers(index)\WorkEnd = workCount : EndIf
-    If workerCount = 1 Or workers(index)\WorkStart >= workers(index)\WorkEnd
-      PmTensorConv1DWorker(@workers(index))
-    Else
-      threads(index) = CreateThread(@PmTensorConv1DWorker(), @workers(index))
-      If threads(index) = 0 : PmTensorConv1DWorker(@workers(index)) : EndIf
-    EndIf
-  Next
-  For index = 0 To workerCount - 1
-    If threads(index) : WaitThread(threads(index)) : EndIf
-  Next
+  ; Output rows (bn, oc) split across the pool; a row's sums are whole in one task.
+  totalMacs = *g\OutWidth : totalMacs * (*g\InChannels / *g\Groups) : totalMacs * *g\Kernel
+  PmConvRowsRun(1, *g, workCount, totalMacs)
 EndProcedure
 CompilerEndIf
 
@@ -2525,10 +2901,51 @@ CompilerIf #PMO_USE_CONV = 1
 CompilerIf #PMO_USE_INT8 = 1
 ; 2-D convolution with INT8 weights (the fixed-shape path; narrow only): one
 ; scale per input position (y, x) over every channel, one FP32 partial per tap.
+; Output channels [first, last) of batch Bn, from the quantized input.
+Structure PmI8Conv2DJob
+  G.i
+  Q.i
+  S.i
+  Positions.i
+  Bn.i
+EndStructure
+
+Procedure PmI8Conv2DRows(*j.PmI8Conv2DJob, first.i, last.i)
+  Protected *g.PmTensorConv2DArgs=*j\G, positions.i=*j\Positions, cg.i=*g\InChannels / *g\Groups, og.i=*g\OutChannels / *g\Groups
+  Protected bn.i=*j\Bn, oc.i, oy.i, ox.i, ky.i, kx.i, iy.i, ix.i, c.i, grp.i, pos.i, acc.l
+  Protected *s=*j\S, *q=*j\Q, w.i, f.f, v.f, bias.f
+  For oc=first To last-1
+    grp=oc/og
+    bias=0.0 : If *g\Bias : bias=PeekF(*g\Bias+oc*4) : EndIf
+    For oy=0 To *g\OutH-1
+      For ox=0 To *g\OutW-1
+        f=0.0
+        For ky=0 To *g\KernelH-1
+          iy=oy* *g\StrideH-*g\PadTop+ky* *g\DilationH
+          If iy<0 Or iy>=*g\InH : Continue : EndIf
+          For kx=0 To *g\KernelW-1
+            ix=ox* *g\StrideW-*g\PadLeft+kx* *g\DilationW
+            If ix<0 Or ix>=*g\InW : Continue : EndIf
+            pos=iy* *g\InW+ix : acc=0
+            For c=0 To cg-1
+              w=*g\Weight+((oc*cg+c)* *g\KernelH+ky)* *g\KernelW+kx
+              acc+PeekB(w)*PeekB(*q+(grp*cg+c)*positions+pos)
+            Next
+            v=acc : v=v*PeekF(*s+pos*4) : f=f+v
+          Next
+        Next
+        v=f*PeekF(*g\WeightScales+oc*4) : v=bias+v
+        PokeF(*g\Dst+(((bn* *g\OutChannels+oc)* *g\OutH+oy)* *g\OutW+ox)*4,v)
+      Next
+    Next
+  Next
+EndProcedure
+
 Procedure.i PmI8Conv2D(*g.PmTensorConv2DArgs)
-  Protected positions.i=*g\InH* *g\InW, cg.i=*g\InChannels / *g\Groups, og.i=*g\OutChannels / *g\Groups
-  Protected bn.i, oc.i, oy.i, ox.i, ky.i, kx.i, iy.i, ix.i, c.i, grp.i, pos.i, q.i, acc.l, ok.i=1
-  Protected *bits, *s, *inv, *q, src.i, w.i, f.f, v.f, bias.f
+  Protected positions.i=*g\InH* *g\InW, cg.i=*g\InChannels / *g\Groups
+  Protected bn.i, c.i, pos.i, q.i, ok.i=1
+  Protected *bits, *s, *inv, *q, src.i
+  Protected j.PmI8Conv2DJob, macs.q
   *bits=AllocateMemory(positions*4+64) : *s=AllocateMemory(positions*4+64)
   *inv=AllocateMemory(positions*4+64) : *q=AllocateMemory(*g\InChannels*positions+64)
   If *bits=0 Or *s=0 Or *inv=0 Or *q=0 : ok=0 : EndIf
@@ -2544,31 +2961,9 @@ Procedure.i PmI8Conv2D(*g.PmTensorConv2DArgs)
         PokeB(*q+c*positions+pos,q)
       Next
     Next
-    For oc=0 To *g\OutChannels-1
-      grp=oc/og
-      bias=0.0 : If *g\Bias : bias=PeekF(*g\Bias+oc*4) : EndIf
-      For oy=0 To *g\OutH-1
-        For ox=0 To *g\OutW-1
-          f=0.0
-          For ky=0 To *g\KernelH-1
-            iy=oy* *g\StrideH-*g\PadTop+ky* *g\DilationH
-            If iy<0 Or iy>=*g\InH : Continue : EndIf
-            For kx=0 To *g\KernelW-1
-              ix=ox* *g\StrideW-*g\PadLeft+kx* *g\DilationW
-              If ix<0 Or ix>=*g\InW : Continue : EndIf
-              pos=iy* *g\InW+ix : acc=0
-              For c=0 To cg-1
-                w=*g\Weight+((oc*cg+c)* *g\KernelH+ky)* *g\KernelW+kx
-                acc+PeekB(w)*PeekB(*q+(grp*cg+c)*positions+pos)
-              Next
-              v=acc : v=v*PeekF(*s+pos*4) : f=f+v
-            Next
-          Next
-          v=f*PeekF(*g\WeightScales+oc*4) : v=bias+v
-          PokeF(*g\Dst+(((bn* *g\OutChannels+oc)* *g\OutH+oy)* *g\OutW+ox)*4,v)
-        Next
-      Next
-    Next
+    j\G=*g : j\Q=*q : j\S=*s : j\Positions=positions : j\Bn=bn
+    macs=*g\OutH : macs* *g\OutW* *g\KernelH* *g\KernelW*cg
+    PmConvRowsRun(3,@j,*g\OutChannels,macs)
     bn+1
   Wend
   If *bits : FreeMemory(*bits) : EndIf
@@ -2579,7 +2974,9 @@ Procedure.i PmI8Conv2D(*g.PmTensorConv2DArgs)
 EndProcedure
 CompilerEndIf
 
-Procedure PmTensorConv2D(*g.PmTensorConv2DArgs)
+; Output rows [first, last), row = bn * OutChannels + oc, each row's sums whole.
+Procedure PmTensorConv2DRows(*g.PmTensorConv2DArgs, first.i, last.i)
+  Protected work.i
   Protected bn.i
   Protected oc.i
   Protected oy.i
@@ -2602,16 +2999,10 @@ Procedure PmTensorConv2D(*g.PmTensorConv2DArgs)
   Protected sum.f
   inPerGroup = *g\InChannels / *g\Groups
   outPerGroup = *g\OutChannels / *g\Groups
-  CompilerIf #PMO_USE_INT8 = 1
-  If *g\WeightScales <> 0
-    If PmI8Conv2D(*g)=0 And PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
-    ProcedureReturn
-  EndIf
-  CompilerEndIf
-  bn = 0
-  While bn < *g\Batches
-    oc = 0
-    While oc < *g\OutChannels
+  work = first
+  While work < last
+    bn = work / *g\OutChannels
+    oc = work % *g\OutChannels
       group = oc / outPerGroup
       oy = 0
       While oy < *g\OutH
@@ -2647,12 +3038,47 @@ Procedure PmTensorConv2D(*g.PmTensorConv2DArgs)
         Wend
         oy = oy + 1
       Wend
-      oc = oc + 1
-    Wend
-    bn = bn + 1
+    work = work + 1
   Wend
 EndProcedure
+
+Procedure PmTensorConv2D(*g.PmTensorConv2DArgs)
+  Protected macs.q
+  CompilerIf #PMO_USE_INT8 = 1
+  If *g\WeightScales <> 0
+    If PmI8Conv2D(*g)=0 And PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+  If *g\Groups <= 0 : ProcedureReturn : EndIf
+  macs = *g\OutH : macs * *g\OutW * *g\KernelH * *g\KernelW * (*g\InChannels / *g\Groups)
+  PmConvRowsRun(2, *g, *g\Batches * *g\OutChannels, macs)
+EndProcedure
 CompilerEndIf
+
+; The conv row kinds of PmConvRowsRun.
+Procedure PmConvRowsTask(*j.PmConvRowsJob, task.i, worker.i)
+  Protected first.i = task * *j\Chunk, last.i = first + *j\Chunk
+  CompilerIf #PMO_USE_CONV = 1
+  Protected w.PmTensorConv1DWorker
+  CompilerEndIf
+  If last > *j\Rows : last = *j\Rows : EndIf
+  If first >= last : ProcedureReturn : EndIf
+  Select *j\Kind
+    CompilerIf #PMO_USE_CONVTRANSPOSE = 1
+    Case 0 : PmTensorConvTranspose1DRows(*j\Args, first, last)
+    CompilerEndIf
+    CompilerIf #PMO_USE_CONV = 1
+    Case 1
+      w\Args = *j\Args : w\WorkStart = first : w\WorkEnd = last
+      PmTensorConv1DWorker(@w)
+    Case 2 : PmTensorConv2DRows(*j\Args, first, last)
+    CompilerIf #PMO_USE_INT8 = 1
+    Case 3 : PmI8Conv2DRows(*j\Args, first, last)
+    CompilerEndIf
+    CompilerEndIf
+  EndSelect
+EndProcedure
 
 ; ONNX LSTM, layout=0, default activation triplet, without peepholes.
 ; Gate order in ONNX weights is input, output, forget, cell (iofc).
@@ -2730,7 +3156,114 @@ Procedure.f PmI8GateValue(*f1, *f2, row.i, wide.i, *scales, scaleBase.i)
 EndProcedure
 CompilerEndIf
 
+; One recurrent step of one batch row: units [u0, u1), each unit's four
+; gates, cell and output computed whole by one task, from H(t-1) and C(t-1),
+; which no task writes until the step is complete (YC(unit) is each unit's own).
+Structure PmLstmStep
+  G.i
+  Dir.i
+  T.i
+  Bn.i
+  XIndex.i
+  Rows4.i
+  GW1.i
+  GW2.i
+  GR1.i
+  GR2.i
+  Chunk.i
+EndStructure
+
+Procedure PmTensorLstmUnits(*s.PmLstmStep, u0.i, u1.i)
+  Protected *g.PmTensorLstmArgs = *s\G
+  Protected dir.i = *s\Dir, t.i = *s\T, bn.i = *s\Bn, xIndex.i = *s\XIndex, rows4.i = *s\Rows4
+  Protected *gw1 = *s\GW1, *gw2 = *s\GW2, *gr1 = *s\GR1, *gr2 = *s\GR2
+  Protected unit.i, k.i, stateIndex.i, wBase.i, rBase.i, bBase.i, yIndex.i, leftPointer.i, rightPointer.i
+  Protected iv.f, ov.f, fv.f, cv.f, previousC.f, newC.f
+  Protected floatFour.PmTensorLstmFloatFourArgs
+  unit = u0
+  While unit < u1
+            iv = 0.0 : ov = 0.0 : fv = 0.0 : cv = 0.0
+            iv = 0.0 : ov = 0.0 : fv = 0.0 : cv = 0.0
+            bBase = dir * 8 * *g\Hidden
+            If *g\B <> 0
+              iv = PmTensorGet(*g\B, bBase + unit) + PmTensorGet(*g\B, bBase + 4 * *g\Hidden + unit)
+              ov = PmTensorGet(*g\B, bBase + *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 5 * *g\Hidden + unit)
+              fv = PmTensorGet(*g\B, bBase + 2 * *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 6 * *g\Hidden + unit)
+              cv = PmTensorGet(*g\B, bBase + 3 * *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 7 * *g\Hidden + unit)
+            EndIf
+            wBase = (dir * 4 * *g\Hidden) * *g\InputSize
+            CompilerIf #PMO_USE_INT8 = 1
+            If *g\WScales <> 0
+              iv = iv + PmI8GateValue(*gw1, *gw2, unit, *g\WWide, *g\WScales, dir * rows4)
+              ov = ov + PmI8GateValue(*gw1, *gw2, *g\Hidden + unit, *g\WWide, *g\WScales, dir * rows4)
+              fv = fv + PmI8GateValue(*gw1, *gw2, 2 * *g\Hidden + unit, *g\WWide, *g\WScales, dir * rows4)
+              cv = cv + PmI8GateValue(*gw1, *gw2, 3 * *g\Hidden + unit, *g\WWide, *g\WScales, dir * rows4)
+            Else
+              leftPointer = *g\X : k = xIndex : k = k * 4 : leftPointer = leftPointer + k
+              rightPointer = *g\W : k = wBase : k = k * 4 : rightPointer = rightPointer + k
+              floatFour\A = leftPointer : floatFour\B = rightPointer
+              floatFour\Count = *g\InputSize : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
+              PmTensorLstmFloatFour(@floatFour)
+              iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
+              fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
+            EndIf
+            CompilerElse
+              leftPointer = *g\X : k = xIndex : k = k * 4 : leftPointer = leftPointer + k
+              rightPointer = *g\W : k = wBase : k = k * 4 : rightPointer = rightPointer + k
+              floatFour\A = leftPointer : floatFour\B = rightPointer
+              floatFour\Count = *g\InputSize : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
+              PmTensorLstmFloatFour(@floatFour)
+              iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
+              fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
+            CompilerEndIf
+            stateIndex = (dir * *g\Batch + bn) * *g\Hidden
+            rBase = (dir * 4 * *g\Hidden) * *g\Hidden
+            CompilerIf #PMO_USE_INT8 = 1
+            If *g\RScales <> 0
+              iv = iv + PmI8GateValue(*gr1, *gr2, unit, *g\RWide, *g\RScales, dir * rows4)
+              ov = ov + PmI8GateValue(*gr1, *gr2, *g\Hidden + unit, *g\RWide, *g\RScales, dir * rows4)
+              fv = fv + PmI8GateValue(*gr1, *gr2, 2 * *g\Hidden + unit, *g\RWide, *g\RScales, dir * rows4)
+              cv = cv + PmI8GateValue(*gr1, *gr2, 3 * *g\Hidden + unit, *g\RWide, *g\RScales, dir * rows4)
+            Else
+              leftPointer = *g\YH : k = stateIndex : k = k * 4 : leftPointer = leftPointer + k
+              rightPointer = *g\R : k = rBase : k = k * 4 : rightPointer = rightPointer + k
+              floatFour\A = leftPointer : floatFour\B = rightPointer
+              floatFour\Count = *g\Hidden : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
+              PmTensorLstmFloatFour(@floatFour)
+              iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
+              fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
+            EndIf
+            CompilerElse
+              leftPointer = *g\YH : k = stateIndex : k = k * 4 : leftPointer = leftPointer + k
+              rightPointer = *g\R : k = rBase : k = k * 4 : rightPointer = rightPointer + k
+              floatFour\A = leftPointer : floatFour\B = rightPointer
+              floatFour\Count = *g\Hidden : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
+              PmTensorLstmFloatFour(@floatFour)
+              iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
+              fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
+            CompilerEndIf
+            stateIndex = (dir * *g\Batch + bn) * *g\Hidden + unit
+            previousC = PmTensorGet(*g\YC, stateIndex)
+            iv = PmTensorSigmoidValue(iv)
+            ov = PmTensorSigmoidValue(ov)
+            fv = PmTensorSigmoidValue(fv)
+            cv = PmTensorTanhValue(cv)
+            newC = fv * previousC + iv * cv
+            PmTensorPut(*g\YC, stateIndex, newC)
+            yIndex = ((t * *g\Directions + dir) * *g\Batch + bn) * *g\Hidden + unit
+            PmTensorPut(*g\Y, yIndex, ov * PmTensorTanhValue(newC))
+            unit = unit + 1
+  Wend
+EndProcedure
+
+Procedure PmLstmUnitsTask(*s.PmLstmStep, task.i, worker.i)
+  Protected u0.i = task * *s\Chunk, u1.i = u0 + *s\Chunk, *g.PmTensorLstmArgs = *s\G
+  If u1 > *g\Hidden : u1 = *g\Hidden : EndIf
+  If u0 < u1 : PmTensorLstmUnits(*s, u0, u1) : EndIf
+EndProcedure
+
 Procedure PmTensorLstm(*g.PmTensorLstmArgs)
+  Protected st.PmLstmStep, stepTasks.i
   Protected dir.i
   Protected timeStep.i
   Protected t.i
@@ -2830,79 +3363,16 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
             If *g\RWide : PmI8DotRowsScaled(rightPointer + rElements, *g\Hidden, rows4, *hq, *g\Hidden, hScale, 1, *acc, *gr2) : EndIf
           EndIf
           CompilerEndIf
-          unit = 0
-          While unit < *g\Hidden
-            iv = 0.0 : ov = 0.0 : fv = 0.0 : cv = 0.0
-            bBase = dir * 8 * *g\Hidden
-            If *g\B <> 0
-              iv = PmTensorGet(*g\B, bBase + unit) + PmTensorGet(*g\B, bBase + 4 * *g\Hidden + unit)
-              ov = PmTensorGet(*g\B, bBase + *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 5 * *g\Hidden + unit)
-              fv = PmTensorGet(*g\B, bBase + 2 * *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 6 * *g\Hidden + unit)
-              cv = PmTensorGet(*g\B, bBase + 3 * *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 7 * *g\Hidden + unit)
-            EndIf
-            wBase = (dir * 4 * *g\Hidden) * *g\InputSize
-            CompilerIf #PMO_USE_INT8 = 1
-            If *g\WScales <> 0
-              iv = iv + PmI8GateValue(*gw1, *gw2, unit, *g\WWide, *g\WScales, dir * rows4)
-              ov = ov + PmI8GateValue(*gw1, *gw2, *g\Hidden + unit, *g\WWide, *g\WScales, dir * rows4)
-              fv = fv + PmI8GateValue(*gw1, *gw2, 2 * *g\Hidden + unit, *g\WWide, *g\WScales, dir * rows4)
-              cv = cv + PmI8GateValue(*gw1, *gw2, 3 * *g\Hidden + unit, *g\WWide, *g\WScales, dir * rows4)
-            Else
-              leftPointer = *g\X : k = xIndex : k = k * 4 : leftPointer = leftPointer + k
-              rightPointer = *g\W : k = wBase : k = k * 4 : rightPointer = rightPointer + k
-              floatFour\A = leftPointer : floatFour\B = rightPointer
-              floatFour\Count = *g\InputSize : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
-              PmTensorLstmFloatFour(@floatFour)
-              iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
-              fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
-            EndIf
-            CompilerElse
-              leftPointer = *g\X : k = xIndex : k = k * 4 : leftPointer = leftPointer + k
-              rightPointer = *g\W : k = wBase : k = k * 4 : rightPointer = rightPointer + k
-              floatFour\A = leftPointer : floatFour\B = rightPointer
-              floatFour\Count = *g\InputSize : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
-              PmTensorLstmFloatFour(@floatFour)
-              iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
-              fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
-            CompilerEndIf
-            stateIndex = (dir * *g\Batch + bn) * *g\Hidden
-            rBase = (dir * 4 * *g\Hidden) * *g\Hidden
-            CompilerIf #PMO_USE_INT8 = 1
-            If *g\RScales <> 0
-              iv = iv + PmI8GateValue(*gr1, *gr2, unit, *g\RWide, *g\RScales, dir * rows4)
-              ov = ov + PmI8GateValue(*gr1, *gr2, *g\Hidden + unit, *g\RWide, *g\RScales, dir * rows4)
-              fv = fv + PmI8GateValue(*gr1, *gr2, 2 * *g\Hidden + unit, *g\RWide, *g\RScales, dir * rows4)
-              cv = cv + PmI8GateValue(*gr1, *gr2, 3 * *g\Hidden + unit, *g\RWide, *g\RScales, dir * rows4)
-            Else
-              leftPointer = *g\YH : k = stateIndex : k = k * 4 : leftPointer = leftPointer + k
-              rightPointer = *g\R : k = rBase : k = k * 4 : rightPointer = rightPointer + k
-              floatFour\A = leftPointer : floatFour\B = rightPointer
-              floatFour\Count = *g\Hidden : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
-              PmTensorLstmFloatFour(@floatFour)
-              iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
-              fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
-            EndIf
-            CompilerElse
-              leftPointer = *g\YH : k = stateIndex : k = k * 4 : leftPointer = leftPointer + k
-              rightPointer = *g\R : k = rBase : k = k * 4 : rightPointer = rightPointer + k
-              floatFour\A = leftPointer : floatFour\B = rightPointer
-              floatFour\Count = *g\Hidden : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
-              PmTensorLstmFloatFour(@floatFour)
-              iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
-              fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
-            CompilerEndIf
-            stateIndex = (dir * *g\Batch + bn) * *g\Hidden + unit
-            previousC = PmTensorGet(*g\YC, stateIndex)
-            iv = PmTensorSigmoidValue(iv)
-            ov = PmTensorSigmoidValue(ov)
-            fv = PmTensorSigmoidValue(fv)
-            cv = PmTensorTanhValue(cv)
-            newC = fv * previousC + iv * cv
-            PmTensorPut(*g\YC, stateIndex, newC)
-            yIndex = ((t * *g\Directions + dir) * *g\Batch + bn) * *g\Hidden + unit
-            PmTensorPut(*g\Y, yIndex, ov * PmTensorTanhValue(newC))
-            unit = unit + 1
-          Wend
+          st\G = *g : st\Dir = dir : st\T = t : st\Bn = bn : st\XIndex = xIndex
+          CompilerIf #PMO_USE_INT8 = 1
+          st\Rows4 = rows4 : st\GW1 = *gw1 : st\GW2 = *gw2 : st\GR1 = *gr1 : st\GR2 = *gr2
+          CompilerEndIf
+          stepTasks = PmPoolTasks(*g\Hidden, PmPoolMax(4, 2048 / PmPoolMax(*g\InputSize + *g\Hidden, 1)), 4, @st\Chunk)
+          If stepTasks <= 1
+            PmTensorLstmUnits(@st, 0, *g\Hidden)
+          Else
+            PmPoolRun(@PmLstmUnitsTask(), @st, stepTasks)
+          EndIf
           ; Copy the completed timestep only after all recurrent reads used H(t-1).
           unit = 0
           While unit < *g\Hidden
@@ -2935,7 +3405,61 @@ CompilerIf #PMO_USE_INT8 = 1
 ; projected at once by the INT8 product (one scale per step, as the scheme
 ; says), then per step one scale for h(t-1) and every recurrent row at once.
 ; Returns 0 on a fault (PmTensorInt8Fault says which).
+; One recurrent step of the INT8 LSTM: units [u0, u1). The four gate rows of
+; each unit are dotted with the quantized H(t-1) (rows g*H + u, each whole in
+; this task, into this task's own slices of Acc, R1 and R2), then the gates.
+Structure PmI8LstmStep
+  G.i
+  Dir.i
+  Hq.i
+  Hs.f
+  Acc.i
+  R1.i
+  R2.i
+  XProj.i
+  InputRow.i
+  State.i
+  OutRow.i
+  Chunk.i
+EndStructure
+
+Procedure PmI8LstmUnits(*s.PmI8LstmStep, u0.i, u1.i)
+  Protected *g.PmTensorLstmArgs=*s\G, width.i=4* *g\Hidden, dir.i=*s\Dir, gate.i, row.i, unit.i, n.i=u1-u0
+  Protected rElements.i=*g\Directions*width* *g\Hidden, bbase.i=dir*8* *g\Hidden
+  Protected *r1=*s\R1, *r2=*s\R2, *xproj=*s\XProj, inputRow.i=*s\InputRow, state.i=*s\State, outRow.i=*s\OutRow
+  Protected iv.f, ov.f, fv.f, cv.f, previous.f
+  If n<=0 : ProcedureReturn : EndIf
+  For gate=0 To 3
+    row=gate* *g\Hidden+u0
+    PmI8DotRowsScaled(*g\R+dir*width* *g\Hidden+row* *g\Hidden,*g\Hidden,n,*s\Hq,*g\Hidden,*s\Hs,*g\RWide,*s\Acc+row*4,*r1+row*4)
+    If *g\RWide : PmI8DotRowsScaled(*g\R+rElements+dir*width* *g\Hidden+row* *g\Hidden,*g\Hidden,n,*s\Hq,*g\Hidden,*s\Hs,1,*s\Acc+row*4,*r2+row*4) : EndIf
+  Next
+  For unit=u0 To u1-1
+    iv=0 : ov=0 : fv=0 : cv=0
+    If *g\B
+      iv=PeekF(*g\B+(bbase+unit)*4)+PeekF(*g\B+(bbase+4* *g\Hidden+unit)*4)
+      ov=PeekF(*g\B+(bbase+ *g\Hidden+unit)*4)+PeekF(*g\B+(bbase+5* *g\Hidden+unit)*4)
+      fv=PeekF(*g\B+(bbase+2* *g\Hidden+unit)*4)+PeekF(*g\B+(bbase+6* *g\Hidden+unit)*4)
+      cv=PeekF(*g\B+(bbase+3* *g\Hidden+unit)*4)+PeekF(*g\B+(bbase+7* *g\Hidden+unit)*4)
+    EndIf
+    iv+PeekF(*xproj+(inputRow+unit)*4) : iv+PmI8GateValue(*r1,*r2,unit,*g\RWide,*g\RScales,dir*width)
+    ov+PeekF(*xproj+(inputRow+ *g\Hidden+unit)*4) : ov+PmI8GateValue(*r1,*r2,*g\Hidden+unit,*g\RWide,*g\RScales,dir*width)
+    fv+PeekF(*xproj+(inputRow+2* *g\Hidden+unit)*4) : fv+PmI8GateValue(*r1,*r2,2* *g\Hidden+unit,*g\RWide,*g\RScales,dir*width)
+    cv+PeekF(*xproj+(inputRow+3* *g\Hidden+unit)*4) : cv+PmI8GateValue(*r1,*r2,3* *g\Hidden+unit,*g\RWide,*g\RScales,dir*width)
+    previous=PeekF(*g\YC+(state+unit)*4)
+    cv=PmTensorSigmoidValue(fv)*previous+PmTensorSigmoidValue(iv)*PmTensorTanhValue(cv)
+    ov=PmTensorSigmoidValue(ov)*PmTensorTanhValue(cv)
+    PokeF(*g\YC+(state+unit)*4,cv) : PokeF(*g\Y+(outRow+unit)*4,ov)
+  Next
+EndProcedure
+
+Procedure PmI8LstmUnitsTask(*s.PmI8LstmStep, task.i, worker.i)
+  Protected u0.i=task* *s\Chunk, u1.i=u0+ *s\Chunk, *g.PmTensorLstmArgs=*s\G
+  If u1>*g\Hidden : u1=*g\Hidden : EndIf
+  PmI8LstmUnits(*s,u0,u1)
+EndProcedure
 Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
+  Protected st.PmI8LstmStep, stepTasks.i
   Protected width.i=4* *g\Hidden, dir.i, i.i, t.i, bn.i, unit.i, stepIndex.i, valid.i, state.i, inputRow.i, outRow.i, bbase.i
   Protected wElements.i=*g\Directions*width* *g\InputSize, rElements.i=*g\Directions*width* *g\Hidden, qh.i=127
   Protected *xproj, *hq, *acc, *r1, *r2, hs.f, iv.f, ov.f, fv.f, cv.f, previous.f, ok.i=1
@@ -2951,6 +3475,7 @@ Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
       PokeF(*g\YH+i*4,iv) : PokeF(*g\YC+i*4,cv)
     Next
   EndIf
+  stepTasks=PmPoolTasks(*g\Hidden,PmPoolMax(4,4096/PmPoolMax(*g\Hidden,1)),4,@st\Chunk)
   dir=0
   While ok And dir<*g\Directions
     If PmI8MatMul(*g\X,*g\W+dir*width* *g\InputSize,*xproj,*g\Sequence* *g\Batch,*g\InputSize,width,*g\WScales+dir*width*4,*g\WWide,wElements,1)=0
@@ -2968,25 +3493,13 @@ Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
         outRow=((t* *g\Directions+dir)* *g\Batch+bn)* *g\Hidden
         bbase=dir*8* *g\Hidden
         If PmI8QuantizeVector(*g\YH+state*4,*g\Hidden,qh,*hq,@hs)=0 : PmTensorInt8Fault=1 : ok=0 : Break 2 : EndIf
-        PmI8DotRowsScaled(*g\R+dir*width* *g\Hidden,*g\Hidden,width,*hq,*g\Hidden,hs,*g\RWide,*acc,*r1)
-        If *g\RWide : PmI8DotRowsScaled(*g\R+rElements+dir*width* *g\Hidden,*g\Hidden,width,*hq,*g\Hidden,hs,1,*acc,*r2) : EndIf
-        For unit=0 To *g\Hidden-1
-          iv=0 : ov=0 : fv=0 : cv=0
-          If *g\B
-            iv=PeekF(*g\B+(bbase+unit)*4)+PeekF(*g\B+(bbase+4* *g\Hidden+unit)*4)
-            ov=PeekF(*g\B+(bbase+ *g\Hidden+unit)*4)+PeekF(*g\B+(bbase+5* *g\Hidden+unit)*4)
-            fv=PeekF(*g\B+(bbase+2* *g\Hidden+unit)*4)+PeekF(*g\B+(bbase+6* *g\Hidden+unit)*4)
-            cv=PeekF(*g\B+(bbase+3* *g\Hidden+unit)*4)+PeekF(*g\B+(bbase+7* *g\Hidden+unit)*4)
-          EndIf
-          iv+PeekF(*xproj+(inputRow+unit)*4) : iv+PmI8GateValue(*r1,*r2,unit,*g\RWide,*g\RScales,dir*width)
-          ov+PeekF(*xproj+(inputRow+ *g\Hidden+unit)*4) : ov+PmI8GateValue(*r1,*r2,*g\Hidden+unit,*g\RWide,*g\RScales,dir*width)
-          fv+PeekF(*xproj+(inputRow+2* *g\Hidden+unit)*4) : fv+PmI8GateValue(*r1,*r2,2* *g\Hidden+unit,*g\RWide,*g\RScales,dir*width)
-          cv+PeekF(*xproj+(inputRow+3* *g\Hidden+unit)*4) : cv+PmI8GateValue(*r1,*r2,3* *g\Hidden+unit,*g\RWide,*g\RScales,dir*width)
-          previous=PeekF(*g\YC+(state+unit)*4)
-          cv=PmTensorSigmoidValue(fv)*previous+PmTensorSigmoidValue(iv)*PmTensorTanhValue(cv)
-          ov=PmTensorSigmoidValue(ov)*PmTensorTanhValue(cv)
-          PokeF(*g\YC+(state+unit)*4,cv) : PokeF(*g\Y+(outRow+unit)*4,ov)
-        Next
+        st\G=*g : st\Dir=dir : st\Hq=*hq : st\Hs=hs : st\Acc=*acc : st\R1=*r1 : st\R2=*r2 : st\XProj=*xproj
+        st\InputRow=inputRow : st\State=state : st\OutRow=outRow
+        If stepTasks<=1
+          PmI8LstmUnits(@st,0,*g\Hidden)
+        Else
+          PmPoolRun(@PmI8LstmUnitsTask(),@st,stepTasks)
+        EndIf
         CopyMemory(*g\Y+outRow*4,*g\YH+state*4,*g\Hidden*4)
       Next
     Next

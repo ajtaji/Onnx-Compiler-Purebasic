@@ -266,17 +266,50 @@ CompilerEndIf
 ; The whole operator. fast=0 runs the scalar reference, fast=1 the vector
 ; bodies; the two write identical bits. scale and bias hold `channels`
 ; elements each; *dst may equal *src.
+;
+; The (n, c) planes are split across the pool: a plane's statistics are
+; summed whole by one task with that task's own work block.
+Structure PmInstanceNormJob
+  Src.i
+  Scale.i
+  Bias.i
+  Dst.i
+  Channels.i
+  Spatial.i
+  Planes.i
+  Fast.i
+  Chunk.i
+  Epsilon.f
+EndStructure
+
+Declare PmInstanceNormTask(*j.PmInstanceNormJob, task.i, worker.i)
+
 Procedure PmTensorInstanceNormRun(*src, *scale, *bias, *dst, batches.i, channels.i, spatial.i, epsilon.f, fast.i)
-  Protected work.PmTensorInstanceNormWork
-  Protected n.i, c.i, plane.i
+  Protected j.PmInstanceNormJob, tasks.i
   If spatial <= 0 Or batches <= 0 Or channels <= 0 : ProcedureReturn : EndIf
+  j\Src = *src : j\Scale = *scale : j\Bias = *bias : j\Dst = *dst : j\Channels = channels
+  j\Spatial = spatial : j\Planes = batches * channels : j\Fast = fast
+  PokeL(@j\Epsilon, PeekL(@epsilon))
+  tasks = PmPoolTasks(j\Planes, PmPoolMax(1, 32768 / spatial), 1, @j\Chunk)
+  If tasks <= 1
+    j\Chunk = j\Planes : PmInstanceNormTask(@j, 0, 0)
+  Else
+    PmPoolRun(@PmInstanceNormTask(), @j, tasks)
+  EndIf
+EndProcedure
+
+Procedure PmInstanceNormTask(*j.PmInstanceNormJob, task.i, worker.i)
+  Protected work.PmTensorInstanceNormWork
+  Protected c.i, plane.i, index.i, last.i, spatial.i = *j\Spatial, *src = *j\Src, *dst = *j\Dst
+  Protected *scale = *j\Scale, *bias = *j\Bias, fast.i = *j\Fast
+  index = task * *j\Chunk : last = index + *j\Chunk : If last > *j\Planes : last = *j\Planes : EndIf
   ; Integer-to-float of the count and the epsilon attribute's bits are the
   ; only host-language float moves, and both are shared by the two forms.
   work\Count = spatial
-  PokeL(@work\Epsilon, PeekL(@epsilon))
-  For n = 0 To batches - 1
-    For c = 0 To channels - 1
-      plane = (n * channels + c) * spatial * 4
+  PokeL(@work\Epsilon, PeekL(@*j\Epsilon))
+  While index < last
+      c = index % *j\Channels
+      plane = index * spatial * 4
       PokeL(@work\Scale, PeekL(*scale + c * 4))
       PokeL(@work\Bias, PeekL(*bias + c * 4))
       If fast
@@ -292,8 +325,8 @@ Procedure PmTensorInstanceNormRun(*src, *scale, *bias, *dst, batches.i, channels
         PmTensorInstanceNormStats(@work, 1)
         PmTensorInstanceNormAffine(*src + plane, *dst + plane, spatial, @work)
       EndIf
-    Next
-  Next
+    index + 1
+  Wend
 EndProcedure
 
 Procedure PmTensorInstanceNorm(*src, *scale, *bias, *dst, batches.i, channels.i, spatial.i, epsilon.f)
@@ -373,15 +406,16 @@ Structure PmTensorTopKArgs
   Kind.i
 EndStructure
 
-Procedure PmTensorTopK(*g.PmTensorTopKArgs)
-  Protected o.i, i.i, j.i, size.i, base.i, span.i, lo.i, mid.i, hi.i, a.i, b.i, out.i
+; Slices [first, last), slice = o * Inner + i, sorted with the index scratch
+; at *order (2 * Width native integers).
+Procedure PmTensorTopKSlices(*g.PmTensorTopKArgs, first.i, last.i, *order)
+  Protected o.i, i.i, j.i, size.i, base.i, span.i, lo.i, mid.i, hi.i, a.i, b.i, out.i, slice.i
   Protected *from, *into, *swap, ia.i, ib.i, takeRight.i
   size = PmNsElementBytes(*g\Kind)
-  If size = 0 Or *g\Width <= 0 Or *g\K <= 0 : ProcedureReturn : EndIf
-  For o = 0 To *g\Outer - 1
-    For i = 0 To *g\Inner - 1
+  For slice = first To last - 1
+      o = slice / *g\Inner : i = slice % *g\Inner
       base = o * *g\Width * *g\Inner + i
-      *from = *g\Order : *into = *g\Order + *g\Width * SizeOf(Integer)
+      *from = *order : *into = *order + *g\Width * SizeOf(Integer)
       For j = 0 To *g\Width - 1 : PokeI(*from + j * SizeOf(Integer), j) : Next
       span = 1
       While span < *g\Width
@@ -422,8 +456,64 @@ Procedure PmTensorTopK(*g.PmTensorTopKArgs)
         CopyMemory(*g\Src + (base + ia * *g\Inner) * size, *g\Values + ((o * *g\K + j) * *g\Inner + i) * size, size)
         PokeQ(*g\Indices + ((o * *g\K + j) * *g\Inner + i) * 8, ia)
       Next
-    Next
   Next
+EndProcedure
+
+; Slices split across the pool. Worker 0 sorts in the caller's Order scratch;
+; every other worker in its own, made on its first slice. A slice whose
+; worker could not get scratch is sorted afterwards on the calling thread.
+Structure PmTopKJob
+  G.i
+  Slices.i
+  Chunk.i
+  Orders.i
+  Failed.i
+EndStructure
+
+Procedure PmTopKTask(*j.PmTopKJob, task.i, worker.i)
+  Protected *g.PmTensorTopKArgs = *j\G, first.i = task * *j\Chunk, last.i = first + *j\Chunk, *order
+  If last > *j\Slices : last = *j\Slices : EndIf
+  If worker = 0
+    *order = *g\Order
+  Else
+    *order = PeekI(*j\Orders + worker * 8)
+    If *order = 0
+      *order = AllocateMemory(2 * *g\Width * SizeOf(Integer) + 64)
+      If *order = 0 : PokeI(*j\Failed + task * 8, 1) : ProcedureReturn : EndIf
+      PokeI(*j\Orders + worker * 8, *order)
+    EndIf
+  EndIf
+  PmTensorTopKSlices(*g, first, last, *order)
+EndProcedure
+
+Procedure PmTensorTopK(*g.PmTensorTopKArgs)
+  Protected j.PmTopKJob, tasks.i, t.i, last.i
+  If PmNsElementBytes(*g\Kind) = 0 Or *g\Width <= 0 Or *g\K <= 0 : ProcedureReturn : EndIf
+  j\G = *g : j\Slices = *g\Outer * *g\Inner
+  tasks = PmPoolTasks(j\Slices, PmPoolMax(1, 4096 / *g\Width), 1, @j\Chunk)
+  If tasks > 1
+    j\Orders = AllocateMemory(PmPoolThreads * 8 + 8) : j\Failed = AllocateMemory(tasks * 8 + 8)
+    If j\Orders = 0 Or j\Failed = 0
+      If j\Orders : FreeMemory(j\Orders) : EndIf
+      If j\Failed : FreeMemory(j\Failed) : EndIf
+      tasks = 1
+    EndIf
+  EndIf
+  If tasks <= 1
+    PmTensorTopKSlices(*g, 0, j\Slices, *g\Order)
+    ProcedureReturn
+  EndIf
+  PmPoolRun(@PmTopKTask(), @j, tasks)
+  For t = 0 To tasks - 1
+    If PeekI(j\Failed + t * 8)
+      last = (t + 1) * j\Chunk : If last > j\Slices : last = j\Slices : EndIf
+      PmTensorTopKSlices(*g, t * j\Chunk, last, *g\Order)
+    EndIf
+  Next
+  For t = 1 To PmPoolThreads - 1
+    If PeekI(j\Orders + t * 8) : FreeMemory(PeekI(j\Orders + t * 8)) : EndIf
+  Next
+  FreeMemory(j\Orders) : FreeMemory(j\Failed)
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -530,10 +620,76 @@ Structure PmTensorReduceArgs
   Kind.i
 EndStructure
 
+; Outputs [first, last): each output starts at the identity and combines its
+; input elements in row-major order - the order the whole loop below meets
+; them in, since for one output they are exactly the elements whose reduced
+; coordinates run in row-major order.
+Structure PmReduceJob
+  G.i
+  Size.i
+  Outputs.i
+  Reduced.i
+  Chunk.i
+  SrcStride.i[8]
+EndStructure
+
+Procedure PmReduceTask(*j.PmReduceJob, task.i, worker.i)
+  Protected *g.PmTensorReduceArgs = *j\G, o.i, r.i, d.i, n.i, coord.i, base.i, at.i, extent.i, size.i = *j\Size
+  Protected first.i = task * *j\Chunk, last.i = first + *j\Chunk
+  Protected cur.f, value.f, ci.i, vi.i, *t, *s
+  If last > *j\Outputs : last = *j\Outputs : EndIf
+  For o = first To last - 1
+    *t = *g\Dst + o * size
+    If *g\Op = 1
+      If *g\Kind = 1 : PokeL(*t, $3F800000) : Else : PmNsWriteInt(*t, 0, *g\Kind, 1) : EndIf
+    Else
+      Select *g\Kind
+        Case 1 : PokeL(*t, $FF800000)
+        Case 6 : PokeL(*t, $80000000)
+        Case 7 : PokeQ(*t, -9223372036854775807 - 1)
+        Case 9 : PokeA(*t, 0)
+      EndSelect
+    EndIf
+    base = 0 : n = o
+    For d = *g\Rank - 1 To 0 Step -1
+      If ((*g\Mask >> d) & 1) = 0
+        extent = PeekI(*g\Dims + d * SizeOf(Integer))
+        coord = n % extent : n / extent : base + coord * *j\SrcStride[d]
+      EndIf
+    Next
+    For r = 0 To *j\Reduced - 1
+      at = base : n = r
+      For d = *g\Rank - 1 To 0 Step -1
+        If (*g\Mask >> d) & 1
+          extent = PeekI(*g\Dims + d * SizeOf(Integer))
+          coord = n % extent : n / extent : at + coord * *j\SrcStride[d]
+        EndIf
+      Next
+      *s = *g\Src + at * size
+      If *g\Kind = 1
+        If *g\Op = 1
+          cur = PeekF(*t) : value = PeekF(*s) : cur = cur * value : PokeF(*t, cur)
+        ElseIf PmNsIsNan(*t) = 0 And (PmNsIsNan(*s) Or PeekF(*s) > PeekF(*t))
+          PokeL(*t, PeekL(*s))
+        EndIf
+      Else
+        ci = PmNsReadInt(*t, 0, *g\Kind) : vi = PmNsReadInt(*s, 0, *g\Kind)
+        If *g\Op = 1
+          ci = ci * vi
+        ElseIf vi > ci
+          ci = vi
+        EndIf
+        PmNsWriteInt(*t, 0, *g\Kind, ci)
+      EndIf
+    Next
+  Next
+EndProcedure
+
 Procedure PmTensorReduce(*g.PmTensorReduceArgs)
   Protected Dim outStride.i(8)
   Protected i.i, d.i, n.i, coord.i, target.i, size.i, srcCount.i, outCount.i, extent.i
   Protected cur.f, value.f, ci.i, vi.i, *t, *s
+  Protected j.PmReduceJob, tasks.i, stride.i
   size = PmNsElementBytes(*g\Kind)
   If size = 0 : ProcedureReturn : EndIf
   srcCount = 1 : outCount = 1
@@ -546,6 +702,17 @@ Procedure PmTensorReduce(*g.PmTensorReduceArgs)
       outStride(d) = outCount : outCount * extent
     EndIf
   Next
+  ; Large reductions with several outputs: outputs split across the pool.
+  If outCount > 1 And (srcCount >= 2 * 32768 Or PmPoolForceSplit) And PmPoolThreads > 1
+    j\G = *g : j\Size = size : j\Outputs = outCount : j\Reduced = srcCount / outCount
+    stride = 1
+    For d = *g\Rank - 1 To 0 Step -1 : j\SrcStride[d] = stride : stride * PeekI(*g\Dims + d * SizeOf(Integer)) : Next
+    tasks = PmPoolTasks(outCount, PmPoolMax(1, 32768 / PmPoolMax(j\Reduced, 1)), 1, @j\Chunk)
+    If tasks > 1
+      PmPoolRun(@PmReduceTask(), @j, tasks)
+      ProcedureReturn
+    EndIf
+  EndIf
   For i = 0 To outCount - 1
     *t = *g\Dst + i * size
     If *g\Op = 1
@@ -642,7 +809,48 @@ Procedure.i PmNsPadCoordinate(c.i, before.i, srcExtent.i, dstExtent.i, mode.i)
   ProcedureReturn lo + r
 EndProcedure
 
+; Rows [first, last) of the padded output, by the whole loop's statements.
+; Returns 1 when a copying mode needs an element from an emptied axis.
+Structure PmPadJob
+  G.i
+  Rows.i
+  Width.i
+  Size.i
+  Chunk.i
+  Failed.i
+  SrcStride.i[8]
+EndStructure
+
+Procedure PmPadTask(*j.PmPadJob, task.i, worker.i)
+  Protected *g.PmTensorPadArgs = *j\G, row.i, n.i, d.i, coord.i, source.i, outside.i, x.i, k.i, last.i = *g\Rank - 1
+  Protected width.i = *j\Width, size.i = *j\Size, first.i = task * *j\Chunk, stop.i = first + *j\Chunk
+  If stop > *j\Rows : stop = *j\Rows : EndIf
+  For row = first To stop - 1
+    n = row : source = 0 : outside = 0
+    For d = last - 1 To 0 Step -1
+      coord = n % PeekI(*g\DstDims + d * SizeOf(Integer))
+      n / PeekI(*g\DstDims + d * SizeOf(Integer))
+      coord = PmNsPadCoordinate(coord, PeekI(*g\Begins + d * SizeOf(Integer)), PeekI(*g\SrcDims + d * SizeOf(Integer)), PeekI(*g\DstDims + d * SizeOf(Integer)), *g\Mode)
+      If coord = -2 : PokeI(*j\Failed + task * 8, 1) : ProcedureReturn : EndIf
+      If coord = -1 : outside = 1 : Else : source + coord * *j\SrcStride[d] : EndIf
+    Next
+    For x = 0 To width - 1
+      coord = PeekI(*g\Map + x * SizeOf(Integer))
+      If outside Or coord = -1
+        If *g\Value
+          CopyMemory(*g\Value, *g\Dst + (row * width + x) * size, size)
+        Else
+          For k = 0 To size - 1 : PokeA(*g\Dst + (row * width + x) * size + k, 0) : Next
+        EndIf
+      Else
+        CopyMemory(*g\Src + (source + coord) * size, *g\Dst + (row * width + x) * size, size)
+      EndIf
+    Next
+  Next
+EndProcedure
+
 Procedure.i PmTensorPad(*g.PmTensorPadArgs)
+  Protected j.PmPadJob, tasks.i
   Protected Dim srcStride.i(8)
   Protected i.i, d.i, n.i, coord.i, source.i, outside.i, size.i, count.i, width.i, rows.i, row.i, last.i, x.i
   Protected k.i
@@ -665,6 +873,19 @@ Procedure.i PmTensorPad(*g.PmTensorPadArgs)
     If coord = -2 : ProcedureReturn 1 : EndIf
     PokeI(*g\Map + x * SizeOf(Integer), coord)
   Next
+  ; The rows are independent copies: split across the pool.
+  j\G = *g : j\Rows = rows : j\Width = width : j\Size = size
+  For d = 0 To 7 : j\SrcStride[d] = srcStride(d) : Next
+  tasks = PmPoolTasks(rows, PmPoolMax(1, 16384 / width), 1, @j\Chunk)
+  If tasks > 1
+    j\Failed = AllocateMemory(tasks * 8 + 8)
+    If j\Failed
+      PmPoolRun(@PmPadTask(), @j, tasks)
+      For row = 0 To tasks - 1 : If PeekI(j\Failed + row * 8) : k = 1 : EndIf : Next
+      FreeMemory(j\Failed)
+      ProcedureReturn k
+    EndIf
+  EndIf
   For row = 0 To rows - 1
     n = row : source = 0 : outside = 0
     For d = last - 1 To 0 Step -1
