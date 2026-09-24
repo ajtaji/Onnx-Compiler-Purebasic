@@ -2976,3 +2976,168 @@ Procedure DOpCumProd(Y.i, X.i, AxisT.i, Exclusive.i, Reverse.i)
   EndIf
   PmOpCumProd(Dt(X)\Data, Dt(Y)\Data, DProduct(X, 0, axis - 1), DOpDim(X, axis), DProduct(X, axis + 1, r - 1), Dt(X)\Kind, Exclusive, Reverse)
 EndProcedure
+
+; ----------------------------------------------------------------------
+; BitCast-26: the bytes of X as element type Kind (the same width).
+; ----------------------------------------------------------------------
+Procedure.i DOpKindWidth(Kind.i)
+  If Kind = 1 Or Kind = 6
+    ProcedureReturn 4
+  EndIf
+  If Kind = 7
+    ProcedureReturn 8
+  EndIf
+  If Kind = 2 Or Kind = 3 Or Kind = 9
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure DOpBitCast(Y.i, X.i, Kind.i)
+  If X = 0
+    DFail("BitCast requires an input.")
+    ProcedureReturn
+  EndIf
+  If DOpKindWidth(Kind) = 0 Or DOpKindWidth(Dt(X)\Kind) <> DOpKindWidth(Kind)
+    DFail("BitCast keeps the bit width: FLOAT and INT32, INT64, or UINT8, INT8 and BOOL.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, X, Kind) = 0
+    ProcedureReturn
+  EndIf
+  PmOpCopyBytes(Dt(X)\Data, Dt(Y)\Data, Dt(X)\Count * DOpKindWidth(Kind))
+EndProcedure
+
+; ----------------------------------------------------------------------
+; RotaryEmbedding-23: X [B, S, H*D] (Heads) or [B, H, S, D]; caches
+; [max_position, rd/2] with position ids P, [B, S, rd/2] without.
+; ----------------------------------------------------------------------
+Procedure DOpRotary(Y.i, X.i, C.i, Sn.i, P.i, Heads.i, Rd.i, Interleaved.i)
+  Protected bn.i
+  Protected sq.i
+  Protected hn.i
+  Protected dn.i
+  Protected rank4.i
+  Protected maxPos.i
+  If X = 0 Or C = 0 Or Sn = 0
+    DFail("RotaryEmbedding requires X, cos_cache and sin_cache.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(C)\Kind <> 1 Or Dt(Sn)\Kind <> 1
+    DFail("RotaryEmbedding takes FLOAT X and caches.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Rank = 4
+    rank4 = 1
+    bn = DOpDim(X, 0)
+    hn = DOpDim(X, 1)
+    sq = DOpDim(X, 2)
+    dn = DOpDim(X, 3)
+  ElseIf Dt(X)\Rank = 3
+    If Heads < 1
+      DFail("RotaryEmbedding with a rank-3 input needs num_heads.")
+      ProcedureReturn
+    EndIf
+    If DOpDim(X, 2) % Heads <> 0
+      DFail("RotaryEmbedding's num_heads must divide the hidden size.")
+      ProcedureReturn
+    EndIf
+    bn = DOpDim(X, 0)
+    sq = DOpDim(X, 1)
+    hn = Heads
+    dn = DOpDim(X, 2) / Heads
+  Else
+    DFail("RotaryEmbedding takes X of rank 3 or 4.")
+    ProcedureReturn
+  EndIf
+  If Rd = 0
+    Rd = dn
+  EndIf
+  If Rd < 2 Or Rd % 2 <> 0 Or Rd > dn
+    DFail("RotaryEmbedding's rotary_embedding_dim must be even and at most the head size.")
+    ProcedureReturn
+  EndIf
+  maxPos = 0
+  If P <> 0
+    If Dt(P)\Kind <> 7 Or Dt(P)\Rank <> 2 Or Dt(C)\Rank <> 2 Or Dt(Sn)\Rank <> 2
+      DFail("RotaryEmbedding with position_ids takes INT64 ids [B, S] and caches [max_position, rotary_embedding_dim/2].")
+      ProcedureReturn
+    EndIf
+    If DOpDim(P, 0) <> bn Or DOpDim(P, 1) <> sq Or DOpDim(C, 1) <> Rd / 2 Or DOpDim(Sn, 1) <> Rd / 2 Or DOpDim(C, 0) <> DOpDim(Sn, 0)
+      DFail("RotaryEmbedding's position_ids or caches have the wrong extents.")
+      ProcedureReturn
+    EndIf
+    maxPos = DOpDim(C, 0)
+  Else
+    If Dt(C)\Rank <> 3 Or Dt(Sn)\Rank <> 3
+      DFail("RotaryEmbedding without position_ids takes caches [B, S, rotary_embedding_dim/2].")
+      ProcedureReturn
+    EndIf
+    If DOpDim(C, 0) <> bn Or DOpDim(C, 1) <> sq Or DOpDim(C, 2) <> Rd / 2 Or DOpDim(Sn, 0) <> bn Or DOpDim(Sn, 1) <> sq Or DOpDim(Sn, 2) <> Rd / 2
+      DFail("RotaryEmbedding's caches have the wrong extents.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  If DLike(Y, X, 0) = 0
+    ProcedureReturn
+  EndIf
+  If P <> 0
+    If PmOpRotary(Dt(X)\Data, Dt(C)\Data, Dt(Sn)\Data, Dt(P)\Data, Dt(Y)\Data, bn, sq, hn, dn, Rd, Interleaved, rank4, 1, maxPos) <> 0
+      DFail("A RotaryEmbedding position id is outside the caches.")
+    EndIf
+  Else
+    PmOpRotary(Dt(X)\Data, Dt(C)\Data, Dt(Sn)\Data, 0, Dt(Y)\Data, bn, sq, hn, dn, Rd, Interleaved, rank4, 0, 0)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+; TensorScatter-24: the past cache with the update written along Axis at
+; each sample's write index (W, INT64, optional), linear or circular.
+; ----------------------------------------------------------------------
+Procedure DOpTensorScatter(Y.i, P.i, U.i, W.i, Axis.i, Circular.i)
+  Protected r.i
+  Protected d.i
+  Protected wia.i
+  If P = 0 Or U = 0
+    DFail("TensorScatter requires past_cache and update.")
+    ProcedureReturn
+  EndIf
+  If DOpKindWidth(Dt(P)\Kind) = 0 Or Dt(U)\Kind <> Dt(P)\Kind
+    DFail("TensorScatter takes a FLOAT, UINT8, INT8, INT32, INT64 or BOOL cache and an update of its type.")
+    ProcedureReturn
+  EndIf
+  r = Dt(P)\Rank
+  If Axis < 0
+    Axis = Axis + r
+  EndIf
+  If Axis < 1 Or Axis >= r Or Dt(U)\Rank <> r
+    DFail("TensorScatter's axis must name a sequence axis after the batch axis, and the update must have the cache's rank.")
+    ProcedureReturn
+  EndIf
+  d = 0
+  While d < r
+    If d <> Axis And DOpDim(U, d) <> DOpDim(P, d)
+      DFail("TensorScatter's update must match the cache on every axis but the sequence axis.")
+      ProcedureReturn
+    EndIf
+    d = d + 1
+  Wend
+  If DOpDim(U, Axis) > DOpDim(P, Axis)
+    DFail("TensorScatter's update is longer than the cache.")
+    ProcedureReturn
+  EndIf
+  wia = 0
+  If W <> 0
+    If Dt(W)\Kind <> 7 Or Dt(W)\Rank <> 1 Or DOpDim(W, 0) <> DOpDim(P, 0)
+      DFail("TensorScatter's write_indices must be INT64, one index per batch sample.")
+      ProcedureReturn
+    EndIf
+    wia = Dt(W)\Data
+  EndIf
+  If DLike(Y, P, 0) = 0
+    ProcedureReturn
+  EndIf
+  If PmOpTensorScatter(Dt(P)\Data, Dt(U)\Data, wia, Dt(Y)\Data, DProduct(P, 0, Axis - 1), DProduct(P, 1, Axis - 1), DOpDim(P, Axis), DOpDim(U, Axis), DProduct(P, Axis + 1, r - 1), DOpKindWidth(Dt(P)\Kind), Circular) <> 0
+    DFail("A TensorScatter write index places the update past the cache (mode linear).")
+  EndIf
+EndProcedure

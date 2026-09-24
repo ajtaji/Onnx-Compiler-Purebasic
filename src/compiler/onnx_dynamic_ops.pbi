@@ -83,6 +83,9 @@ Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
     Case "Unique" : ProcedureReturn "|axis|sorted|"
     Case "RMSNormalization" : ProcedureReturn "|axis|epsilon|stash_type|"
     Case "CumProd" : ProcedureReturn "|exclusive|reverse|"
+    Case "BitCast" : ProcedureReturn "|to|"
+    Case "RotaryEmbedding" : ProcedureReturn "|interleaved|num_heads|rotary_embedding_dim|"
+    Case "TensorScatter" : ProcedureReturn "|axis|mode|"
     Case "DeformConv" : ProcedureReturn "|dilations|group|kernel_shape|offset_group|pads|strides|"
     Case "RoiAlign"
       If Opset >= 16 : ProcedureReturn "|coordinate_transformation_mode|mode|output_height|output_width|sampling_ratio|spatial_scale|" : EndIf
@@ -134,6 +137,16 @@ EndProcedure
 
 ; Returns 1 when the node's form is implemented, else 0 with PmoDynamicError
 ; holding the sentence.
+; The byte width of a carried element type (BitCast), 0 for another.
+Procedure.i PmdOpsKindWidth(Kind.i)
+  Select Kind
+    Case 1, 6 : ProcedureReturn 4
+    Case 7 : ProcedureReturn 8
+    Case 2, 3, 9 : ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
   Protected Op.s = *Node\Operation, Allowed.s = PmdOpsAllowed(*Node, PmdNsOpset), Reason.s, Name.s, Text.s, n.i
   Protected Labels.Integer, Kept.Integer, k.i, Found.Integer, Ratio.d
@@ -272,6 +285,27 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "scale", "|1|") : EndIf
         If Reason = "" And PmoEmitAttrI(*Node, "stash_type", 1) <> 1 : Reason = "attribute stash_type = " + Str(PmoEmitAttrI(*Node, "stash_type", 1)) + "; the computation is FLOAT (stash_type 1)." : EndIf
         If Reason = "" And PmdNsInputPresent(*Node, 1) = 0 : Reason = "input scale is required." : EndIf
+      Case "BitCast"
+        Reason = PmdNsTypeReason(*Node, 0, "input", "|1|2|3|6|7|9|")
+        If Reason = "" And PmoEmitNsAttributePresent(*Node, "to") = 0 : Reason = "attribute to is required." : EndIf
+        If Reason = "" And FindString("|1|2|3|6|7|9|", "|" + Str(PmoEmitAttrI(*Node, "to", 0)) + "|") = 0
+          Reason = "to = " + Str(PmoEmitAttrI(*Node, "to", 0)) + " is not implemented; FLOAT, UINT8, INT8, INT32, INT64 and BOOL are."
+        EndIf
+        If Reason = "" And PmdNsDeclaredType(PmoEmitInput(*Node, 0)) <> 0
+          If PmdOpsKindWidth(PmdNsDeclaredType(PmoEmitInput(*Node, 0))) <> PmdOpsKindWidth(PmoEmitAttrI(*Node, "to", 0))
+            Reason = "to = " + PmdNsTypeName(PmoEmitAttrI(*Node, "to", 0)) + " has another bit width than the input's " + PmdNsTypeName(PmdNsDeclaredType(PmoEmitInput(*Node, 0))) + "; BitCast keeps the width."
+          EndIf
+        EndIf
+      Case "RotaryEmbedding"
+        Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "cos_cache", "|1|") : EndIf
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 2, "sin_cache", "|1|") : EndIf
+        If Reason = "" And PmdNsInputPresent(*Node, 3) : Reason = PmdNsTypeReason(*Node, 3, "position_ids", "|7|") : EndIf
+      Case "TensorScatter"
+        Reason = PmdNsTypeReason(*Node, 0, "past_cache", "|1|2|3|6|7|9|")
+        If Reason = "" And PmoEmitAttrS(*Node, "mode", "linear") <> "linear" And PmoEmitAttrS(*Node, "mode", "linear") <> "circular"
+          Reason = "attribute mode = " + PmoEmitAttrS(*Node, "mode", "linear") + "; linear and circular are defined."
+        EndIf
       Case "CumProd"
         Reason = PmdNsTypeReason(*Node, 0, "x", "|1|6|7|")
         If Reason = "" And PmdNsInputPresent(*Node, 1) = 0 : Reason = "input axis is required." : EndIf
@@ -417,6 +451,14 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
     Case "RMSNormalization"
       Call = "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "epsilon", 0.00001)) + ") : DOpRmsNorm(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," +
              Str(PmoEmitAttrI(*Node, "axis", -1)) + ")"
+    Case "BitCast"
+      Call = "DOpBitCast(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + Str(PmoEmitAttrI(*Node, "to", 0)) + ")"
+    Case "RotaryEmbedding"
+      Call = "DOpRotary(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + "," + a(3) + "," +
+             Str(PmoEmitAttrI(*Node, "num_heads", 0)) + "," + Str(PmoEmitAttrI(*Node, "rotary_embedding_dim", 0)) + "," + Str(Bool(PmoEmitAttrI(*Node, "interleaved", 0) <> 0)) + ")"
+    Case "TensorScatter"
+      Call = "DOpTensorScatter(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + "," + Str(PmoEmitAttrI(*Node, "axis", -2)) + "," +
+             Str(Bool(PmoEmitAttrS(*Node, "mode", "linear") = "circular")) + ")"
     Case "CumProd"
       Call = "DOpCumProd(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + Str(Bool(PmoEmitAttrI(*Node, "exclusive", 0) <> 0)) + "," +
              Str(Bool(PmoEmitAttrI(*Node, "reverse", 0) <> 0)) + ")"

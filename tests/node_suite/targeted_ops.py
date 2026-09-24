@@ -988,6 +988,46 @@ def cases() -> list[Case]:
                           [("x", elem, [3, 4, 5])], [("y", elem, [3, 4, 5])], {"x": x}, [init("a", np.array(axis, np.int64))], opset=26))
     c.append(Case("cumprod_axis_input", [N("CumProd", ["x", "a"], ["y"])], [("x", F, [3, 4]), ("a", I32, [])], [("y", F, [3, 4])],
                   {"x": cpf[0, :3, :4].copy(), "a": np.array(1, np.int32)}, opset=26))
+    # BitCast, RotaryEmbedding, TensorScatter
+    bf = f32(3, 4)
+    bf.flat[0], bf.flat[1] = -0.0, np.inf
+    c.append(Case("bitcast_float_to_int32", [N("BitCast", ["x"], ["y"], to=I32)], [("x", F, [3, 4])], [("y", I32, [3, 4])], {"x": bf}, opset=26))
+    c.append(Case("bitcast_int32_to_float", [N("BitCast", ["x"], ["y"], to=F)], [("x", I32, [5])], [("y", F, [5])],
+                  {"x": np.array([0, 1065353216, -1082130432, 8388608, 2139095040], np.int32)}, opset=26))
+    c.append(Case("bitcast_uint8_to_int8", [N("BitCast", ["x"], ["y"], to=TensorProto.INT8)], [("x", TensorProto.UINT8, [6])],
+                  [("y", TensorProto.INT8, [6])], {"x": np.array([0, 1, 127, 128, 200, 255], np.uint8)}, opset=26))
+    c.append(Case("bitcast_int8_to_bool", [N("BitCast", ["x"], ["y"], to=B)], [("x", TensorProto.INT8, [4])], [("y", B, [4])],
+                  {"x": np.array([0, 1, 1, 0], np.int8)}, opset=26))
+    c.append(Case("refuse_bitcast_width", [N("BitCast", ["x"], ["y"], to=I64)], [("x", F, [4])], [("y", I64, [4])], {"x": f32(4)}, opset=26,
+                  refuse="width"))
+    rx3 = f32(2, 3, 16)
+    rpos = np.array([[0, 5, 2], [7, 1, 3]], np.int64)
+    rc, rs = f32(8, 4), f32(8, 4)
+    c.append(Case("rotary_rank3_positions", [N("RotaryEmbedding", ["x", "c", "s", "p"], ["y"], num_heads=2)],
+                  [("x", F, [2, 3, 16]), ("c", F, [8, 4]), ("s", F, [8, 4]), ("p", I64, [2, 3])], [("y", F, [2, 3, 16])],
+                  {"x": rx3, "c": rc, "s": rs, "p": rpos}, opset=23))
+    c.append(Case("rotary_rank4_interleaved_partial", [N("RotaryEmbedding", ["x", "c", "s"], ["y"], interleaved=1, rotary_embedding_dim=4)],
+                  [("x", F, [2, 2, 3, 6]), ("c", F, [2, 3, 2]), ("s", F, [2, 3, 2])], [("y", F, [2, 2, 3, 6])],
+                  {"x": f32(2, 2, 3, 6), "c": f32(2, 3, 2), "s": f32(2, 3, 2)}, opset=23))
+    c.append(Case("rotary_rank4_positions_halves", [N("RotaryEmbedding", ["x", "c", "s", "p"], ["y"])],
+                  [("x", F, [1, 2, 3, 8]), ("p", I64, [1, 3])], [("y", F, [1, 2, 3, 8])],
+                  {"x": f32(1, 2, 3, 8), "p": np.array([[4, 0, 9]], np.int64)}, [init("c", f32(10, 4)), init("s", f32(10, 4))], opset=23))
+    c.append(Case("refuse_rotary_odd_dim", [N("RotaryEmbedding", ["x", "c", "s"], ["y"], rotary_embedding_dim=3)],
+                  [("x", F, [1, 2, 3, 6]), ("c", F, [1, 3, 1]), ("s", F, [1, 3, 1])], [("y", F, [1, 2, 3, 6])],
+                  {"x": f32(1, 2, 3, 6), "c": f32(1, 3, 1), "s": f32(1, 3, 1)}, opset=23, dynamic=False, refuse="must be even"))
+    tpast, tupd = f32(2, 3, 6, 4), f32(2, 3, 2, 4)
+    c.append(Case("tensorscatter_linear_indices", [N("TensorScatter", ["p", "u", "w"], ["y"])],
+                  [("p", F, [2, 3, 6, 4]), ("u", F, [2, 3, 2, 4]), ("w", I64, [2])], [("y", F, [2, 3, 6, 4])],
+                  {"p": tpast, "u": tupd, "w": np.array([4, 1], np.int64)}, opset=24))
+    c.append(Case("tensorscatter_circular", [N("TensorScatter", ["p", "u", "w"], ["y"], mode="circular")],
+                  [("p", F, [2, 3, 6, 4]), ("u", F, [2, 3, 2, 4]), ("w", I64, [2])], [("y", F, [2, 3, 6, 4])],
+                  {"p": tpast, "u": tupd, "w": np.array([5, 11], np.int64)}, opset=24))
+    c.append(Case("tensorscatter_int64_axis1_no_indices", [N("TensorScatter", ["p", "u"], ["y"], axis=1)],
+                  [("p", I64, [2, 5, 3]), ("u", I64, [2, 2, 3])], [("y", I64, [2, 5, 3])],
+                  {"p": RNG.integers(-9, 9, (2, 5, 3)).astype(np.int64), "u": RNG.integers(-9, 9, (2, 2, 3)).astype(np.int64)}, opset=24))
+    c.append(Case("refuse_tensorscatter_mode", [N("TensorScatter", ["p", "u"], ["y"], mode="wrap")],
+                  [("p", F, [2, 5, 3]), ("u", F, [2, 2, 3])], [("y", F, [2, 5, 3])], {"p": f32(2, 5, 3), "u": f32(2, 2, 3)}, opset=24,
+                  refuse="linear and circular"))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

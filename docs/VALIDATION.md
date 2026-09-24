@@ -898,6 +898,26 @@ next bind; the gate's exit program holds all three.
 convolution, product and INT8 tiles created up to eight threads per call -
 and `--threads 1` now means the calling thread alone.
 
+## Above opset 20, second batch: BitCast, RotaryEmbedding, TensorScatter — September 24, 2026
+
+BitCast (opset 26), RotaryEmbedding (23) and TensorScatter (24) compile on
+both paths for every target.
+
+| Operator | Computed as |
+|---|---|
+| BitCast | the input's bytes, little-endian, read as `to`: FLOAT and INT32; INT64; UINT8, INT8 and BOOL. A `to` of another width is refused (the specification requires the same width) |
+| RotaryEmbedding | X as `[B, S, hidden]` (with `num_heads`) or `[B, H, S, D]`; the caches `[max_position, rd/2]` read at `position_ids`, or `[B, S, rd/2]` without them; the first `rd` elements of each head rotate in halves or interleaved pairs, `c*x1 - s*x2` and `s*x1 + c*x2`, each product and sum one binary32 step; the rest is copied. A position id outside the caches fails the request |
+| TensorScatter | the past cache with the update written along `axis` at each sample's write index (0 without `write_indices`), linear or circular; any carried element type. A linear write past the cache fails the request |
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 575 cases - the 566 before; RotaryEmbedding in rank 3 and 4, halves and interleaved, partial rotation, with and without position ids; TensorScatter linear and circular, with and without write indices, FLOAT, INT64 and UINT8, and a linear write past the cache | Windows, Pi 4, Pico and Pico 2: 575 of 575 bit-identical to the definition; `--mutants` 62 of 62 caught (two new: the rotation's sign, the circular modulo) |
+| `tests/node_suite/targeted_ops.py`: 889 cases - the 864 before; BitCast FLOAT to INT32 (with -0 and infinity), INT32 to FLOAT, UINT8 to INT8, INT8 to BOOL; RotaryEmbedding rank 3 with position ids, rank 4 interleaved with a partial rotation, rank 4 with initializer caches; TensorScatter linear with indices, circular, INT64 along axis 1 without indices; a width change, an odd rotary dimension and an unknown mode refused | 889 of 889 as expected |
+| `ops_targets_gate.py`: the new builds on the Pi 4, Pico and Pico 2 in unicorn | 20 builds, 60 runs: 60 of 60 bit-identical to the Windows program |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 849 of 1,750 before, 866 after (and one PASS_SHAPE in both): six BitCast cases, the eight RotaryEmbedding cases and the three TensorScatter cases; no case that passed fails. The function-expanded RotaryEmbedding cases stay refused (their folded Shape has no graph value); BitCast of DOUBLE, UINT16 and UINT32 is refused by type |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `628ee1c` (the multicore Windows runtime) | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
+| Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

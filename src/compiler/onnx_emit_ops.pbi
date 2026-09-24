@@ -25,7 +25,7 @@ Procedure.i PmoOpsOwns(Operation.s)
                                   "RNN|GRU|NonMaxSuppression|RoiAlign|GridSample|QuantizeLinear|DequantizeLinear|" +
                                   "DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|HannWindow|HammingWindow|" +
                                   "BlackmanWindow|DFT|MelWeightMatrix|NegativeLogLikelihoodLoss|SoftmaxCrossEntropyLoss|Col2Im|" +
-                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|Unique|Swish|RMSNormalization|CumProd|", "|" + Operation + "|"))
+                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|Unique|Swish|RMSNormalization|CumProd|BitCast|RotaryEmbedding|TensorScatter|", "|" + Operation + "|"))
 EndProcedure
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
@@ -60,6 +60,9 @@ Procedure.i PmoOpsFloor(Operation.s)
     Case "RMSNormalization" : ProcedureReturn 23
     Case "Swish" : ProcedureReturn 24
     Case "CumProd" : ProcedureReturn 26
+    Case "RotaryEmbedding" : ProcedureReturn 23
+    Case "TensorScatter" : ProcedureReturn 24
+    Case "BitCast" : ProcedureReturn 26
     Case "QuantizeLinear", "DequantizeLinear", "MatMulInteger", "QLinearMatMul", "ConvInteger", "QLinearConv" : ProcedureReturn 10
     Case "DynamicQuantizeLinear" : ProcedureReturn 11
     Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss" : ProcedureReturn 12
@@ -1344,6 +1347,113 @@ Procedure.i PmoEmitOpsCumProd(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcNam
   ProcedureReturn #True
 EndProcedure
 
+; BitCast-26: the bytes copied; `to` one of the carried types of the input's width.
+Procedure.i PmoOpsKindWidth(Kind.i)
+  Select Kind
+    Case 1, 6 : ProcedureReturn 4
+    Case 7 : ProcedureReturn 8
+    Case 2, 3, 9 : ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PmoEmitOpsBitCast(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Kind.i
+  If PmoEmitNsAttributesAllowed(*Node, "|to|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "input", 1 | 2 | 4 | 8 | 16 | 32) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitNsAttributePresent(*Node, "to") = 0 : ProcedureReturn PmoEmitNsFail(*Node, "attribute to is required.") : EndIf
+  Kind = PmoEmitAttrI(*Node, "to", 0)
+  If PmoOpsKindWidth(Kind) = 0
+    ProcedureReturn PmoEmitNsFail(*Node, "to = " + Str(Kind) + " (" + PmoEmitNsTypeName(Kind) + ") is not implemented; FLOAT, UINT8, INT8, INT32, INT64 and BOOL are.")
+  EndIf
+  If PmoOpsKindWidth(Kind) <> PmoOpsKindWidth(*X\ElementType)
+    ProcedureReturn PmoEmitNsFail(*Node, "to = " + PmoEmitNsTypeName(Kind) + " has another bit width than the input's " + PmoEmitNsTypeName(*X\ElementType) + "; BitCast keeps the width.")
+  EndIf
+  If PmoOpsSameShape(*Node, *X, *Y, Kind) = 0 : ProcedureReturn #False : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpCopyBytes(*i0, *o0, " + Str(*X\Elements * PmoOpsKindWidth(Kind)) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+; RotaryEmbedding-23: X [B, S, H*D] (num_heads) or [B, H, S, D]; caches
+; [max_position, rd/2] with position_ids, [B, S, rd/2] without.
+Procedure.i PmoEmitOpsRotary(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *C.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *Sn.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+  Protected *P.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 3))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Rank.i, Bn.q, Sq.q, Hn.q, Dn.q, Rd.q, HasPos.i, MaxPos.q
+  If PmoEmitNsAttributesAllowed(*Node, "|interleaved|num_heads|rotary_embedding_dim|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "X", 1) = 0 Or PmoOpsTypeOk(*Node, *C, "cos_cache", 1) = 0 Or PmoOpsTypeOk(*Node, *Sn, "sin_cache", 1) = 0 : ProcedureReturn #False : EndIf
+  HasPos = Bool(PmoEmitInput(*Node, 3) <> "")
+  If HasPos And PmoOpsTypeOk(*Node, *P, "position_ids", 4) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsSameShape(*Node, *X, *Y, 1) = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*X)
+  If Rank = 4
+    Bn = PmoEmitDim(*X, 0) : Hn = PmoEmitDim(*X, 1) : Sq = PmoEmitDim(*X, 2) : Dn = PmoEmitDim(*X, 3)
+  ElseIf Rank = 3
+    Hn = PmoEmitAttrI(*Node, "num_heads", 0)
+    If Hn < 1 Or PmoEmitDim(*X, 2) % Hn <> 0 : ProcedureReturn PmoEmitNsFail(*Node, "a rank-3 input needs num_heads dividing its last extent.") : EndIf
+    Bn = PmoEmitDim(*X, 0) : Sq = PmoEmitDim(*X, 1) : Dn = PmoEmitDim(*X, 2) / Hn
+  Else
+    ProcedureReturn PmoEmitNsFail(*Node, "X has rank " + Str(Rank) + "; RotaryEmbedding takes [B, S, hidden] or [B, H, S, D].")
+  EndIf
+  Rd = PmoEmitAttrI(*Node, "rotary_embedding_dim", 0)
+  If Rd = 0 : Rd = Dn : EndIf
+  If Rd < 2 Or Rd % 2 <> 0 Or Rd > Dn : ProcedureReturn PmoEmitNsFail(*Node, "rotary_embedding_dim = " + Str(Rd) + " must be even and at most the head size " + Str(Dn) + ".") : EndIf
+  If HasPos
+    If PmoEmitRank(*C) <> 2 Or PmoEmitDim(*C, 1) <> Rd / 2 Or PmoEmitShapeEqual(*C, *Sn) = 0 Or PmoEmitRank(*P) <> 2 Or PmoEmitDim(*P, 0) <> Bn Or PmoEmitDim(*P, 1) <> Sq
+      ProcedureReturn PmoEmitNsFail(*Node, "with position_ids [B, S], the caches must be [max_position, rotary_embedding_dim/2].")
+    EndIf
+    MaxPos = PmoEmitDim(*C, 0)
+  ElseIf PmoEmitRank(*C) <> 3 Or PmoEmitDim(*C, 0) <> Bn Or PmoEmitDim(*C, 1) <> Sq Or PmoEmitDim(*C, 2) <> Rd / 2 Or PmoEmitShapeEqual(*C, *Sn) = 0
+    ProcedureReturn PmoEmitNsFail(*Node, "without position_ids, the caches must be [B, S, rotary_embedding_dim/2].")
+  EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  If PmOpRotary(*i0, *i1, *i2, " + PmoOpsIn(*Node, 3) + ", *o0, " + Str(Bn) + ", " + Str(Sq) + ", " + Str(Hn) + ", " + Str(Dn) + ", " + Str(Rd) + ", " +
+                    Str(Bool(PmoEmitAttrI(*Node, "interleaved", 0) <> 0)) + ", " + Str(Bool(Rank = 4)) + ", " + Str(HasPos) + ", " + Str(MaxPos) + ") <> 0 : PmOnnxRuntimeOk = 0 : EndIf")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+; TensorScatter-24: past cache, update, optional write_indices; linear or circular.
+Procedure.i PmoEmitOpsTensorScatter(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *P.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *U.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *W.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Rank.i, Axis.i, d.i, Mode.s
+  If PmoEmitNsAttributesAllowed(*Node, "|axis|mode|", Opset) = 0 : ProcedureReturn #False : EndIf
+  Mode = PmoEmitAttrS(*Node, "mode", "linear")
+  If Mode <> "linear" And Mode <> "circular" : ProcedureReturn PmoEmitNsFail(*Node, "attribute mode = " + Mode + "; linear and circular are defined.") : EndIf
+  If PmoOpsTypeOk(*Node, *P, "past_cache", 1 | 2 | 4 | 8 | 16 | 32) = 0 Or PmoOpsTypeOk(*Node, *U, "update", 1 | 2 | 4 | 8 | 16 | 32) = 0 : ProcedureReturn #False : EndIf
+  If *U\ElementType <> *P\ElementType : ProcedureReturn PmoEmitNsFail(*Node, "update must have the past cache's element type.") : EndIf
+  If PmoEmitInput(*Node, 2) <> "" And PmoOpsTypeOk(*Node, *W, "write_indices", 4) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsSameShape(*Node, *P, *Y, *P\ElementType) = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*P)
+  Axis = PmoEmitAttrI(*Node, "axis", -2)
+  If Axis < 0 : Axis + Rank : EndIf
+  If Axis < 1 Or Axis >= Rank : ProcedureReturn PmoEmitNsFail(*Node, "attribute axis must name a sequence axis after the batch axis.") : EndIf
+  If PmoEmitRank(*U) <> Rank : ProcedureReturn PmoEmitNsFail(*Node, "update must have the past cache's rank.") : EndIf
+  For d = 0 To Rank - 1
+    If d <> Axis And PmoEmitDim(*U, d) <> PmoEmitDim(*P, d) : ProcedureReturn PmoEmitNsFail(*Node, "update must match the past cache on every axis but the sequence axis.") : EndIf
+  Next
+  If PmoEmitDim(*U, Axis) > PmoEmitDim(*P, Axis) : ProcedureReturn PmoEmitNsFail(*Node, "update's sequence extent exceeds the cache's.") : EndIf
+  If PmoEmitInput(*Node, 2) <> "" And (PmoEmitRank(*W) <> 1 Or PmoEmitDim(*W, 0) <> PmoEmitDim(*P, 0))
+    ProcedureReturn PmoEmitNsFail(*Node, "write_indices must hold one index per batch sample.")
+  EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  If PmOpTensorScatter(*i0, *i1, " + PmoOpsIn(*Node, 2) + ", *o0, " + Str(PmoEmitProduct(*P, 0, Axis - 1)) + ", " + Str(PmoEmitProduct(*P, 1, Axis - 1)) + ", " +
+                    Str(PmoEmitDim(*P, Axis)) + ", " + Str(PmoEmitDim(*U, Axis)) + ", " + Str(PmoEmitProduct(*P, Axis + 1, Rank - 1)) + ", " + Str(PmoOpsKindWidth(*P\ElementType)) + ", " +
+                    Str(Bool(Mode = "circular")) + ") <> 0 : PmOnnxRuntimeOk = 0 : EndIf")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
 Procedure.i PmoEmitOpsEyeLike(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
   Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
   Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
@@ -2376,6 +2486,9 @@ Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
   Select *Node\Operation
     Case "RMSNormalization" : Done = PmoEmitOpsRmsNorm(File, *Ir, *Node, ProcName, Opset)
     Case "CumProd" : Done = PmoEmitOpsCumProd(File, *Ir, *Node, ProcName, Opset)
+    Case "BitCast" : Done = PmoEmitOpsBitCast(File, *Ir, *Node, ProcName, Opset)
+    Case "RotaryEmbedding" : Done = PmoEmitOpsRotary(File, *Ir, *Node, ProcName, Opset)
+    Case "TensorScatter" : Done = PmoEmitOpsTensorScatter(File, *Ir, *Node, ProcName, Opset)
     Case "Erf", "Reciprocal", "Ceil", "Sign", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish", "Gelu", "Swish",
          "ThresholdedRelu", "Shrink", "IsNaN", "IsInf", "Tan", "Asin", "Acos", "Sinh", "Cosh", "Asinh", "Acosh", "Atanh", "BitwiseNot"
       Done = PmoEmitOpsUnary(File, *Ir, *Node, ProcName, Opset)

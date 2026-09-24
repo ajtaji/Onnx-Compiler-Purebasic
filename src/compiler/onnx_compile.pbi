@@ -458,7 +458,7 @@ Procedure.i PmoCompileValidate(*Ir.PmoIrModel)
       ; operators that only rename
       If *Value\ElementType <> 1 And *Value\ElementType <> 7 And *Value\ElementType <> 9 And
          Not ((*Value\ElementType = 2 Or *Value\ElementType = 3 Or *Value\ElementType = 6) And
-              FindString("|QuantizeLinear|DequantizeLinear|DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|Cast|Bernoulli|Multinomial|CumProd|Identity|Reshape|Flatten|Squeeze|Unsqueeze|", "|" + *Ir\Nodes()\Node\Operation + "|"))
+              FindString("|QuantizeLinear|DequantizeLinear|DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|Cast|Bernoulli|Multinomial|CumProd|BitCast|TensorScatter|Identity|Reshape|Flatten|Squeeze|Unsqueeze|", "|" + *Ir\Nodes()\Node\Operation + "|"))
         ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " output " + Name + " uses unsupported runtime type " + Str(*Value\ElementType))
       EndIf
       Produced(Name) = #True

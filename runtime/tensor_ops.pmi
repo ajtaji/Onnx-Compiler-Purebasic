@@ -6591,7 +6591,7 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ; CumProd-26 along an axis of extent n with inner stride `inner`, over
 ; outer blocks; exclusive and reverse as CumSum. kind 1 FLOAT (one binary32
-; multiply per pos), 6 INT32, 7 INT64 (products wrap to the element
+; multiply per step), 6 INT32, 7 INT64 (products wrap to the element
 ; width; an INT64 product outside 32 bits trips the INT64 contract on the
 ; 32-bit targets; PmOpWrap32 is the quantized part's).
 ; ----------------------------------------------------------------------
@@ -6647,4 +6647,131 @@ Procedure PmOpCumProd(x.i, y.i, outer.i, n.i, inner.i, kind.i, exclusive.i, reve
     Wend
     o = o + 1
   Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; RotaryEmbedding-23. x is [B, S, H*D] (rank 3, heads from num_heads) or
+; [B, H, S, D] (rank 4); cosc and sinc are rows of rd/2 values, row
+; pos[b*S + s] when position ids are given (hasPos, INT64 at pos, rows
+; below maxPos), else row b*S + s. The first rd elements of each head
+; rotate: halves (x1 = d, x2 = d + rd/2) or interleaved pairs (x1 = 2i,
+; x2 = 2i + 1); real = c*x1 - s*x2, imag = s*x1 + c*x2; the rest is copied.
+; Returns 1 for a position id outside [0, maxPos), after writing nothing
+; more.
+; ----------------------------------------------------------------------
+Procedure.i PmOpRotaryAt(b.i, s.i, h.i, d.i, sq.i, hn.i, dn.i, rank4.i)
+  If rank4 <> 0
+    ProcedureReturn ((b * hn + h) * sq + s) * dn + d
+  EndIf
+  ProcedureReturn ((b * sq + s) * hn + h) * dn + d
+EndProcedure
+
+Procedure.i PmOpRotary(x.i, cosc.i, sinc.i, pos.i, y.i, bn.i, sq.i, hn.i, dn.i, rd.i, interleaved.i, rank4.i, hasPos.i, maxPos.i)
+  Protected b.i
+  Protected s.i
+  Protected h.i
+  Protected i.i
+  Protected half.i
+  Protected row.i
+  Protected i1.i
+  Protected i2.i
+  Protected c.f
+  Protected sn.f
+  Protected x1.f
+  Protected x2.f
+  Protected t1.f
+  Protected t2.f
+  PmOpInit()
+  half = rd / 2
+  b = 0
+  While b < bn
+    s = 0
+    While s < sq
+      row = b * sq + s
+      If hasPos <> 0
+        row = PmTensorGetI64(pos, b * sq + s)
+        If row < 0 Or row >= maxPos
+          ProcedureReturn 1
+        EndIf
+      EndIf
+      h = 0
+      While h < hn
+        i = 0
+        While i < half
+          If interleaved <> 0
+            i1 = PmOpRotaryAt(b, s, h, 2 * i, sq, hn, dn, rank4)
+            i2 = i1 + 1
+          Else
+            i1 = PmOpRotaryAt(b, s, h, i, sq, hn, dn, rank4)
+            i2 = i1 + half
+          EndIf
+          c = PmTensorGet(cosc, row * half + i)
+          sn = PmTensorGet(sinc, row * half + i)
+          x1 = PmTensorGet(x, i1)
+          x2 = PmTensorGet(x, i2)
+          t1 = c * x1
+          t2 = sn * x2
+          t1 = t1 - t2
+          PmOpStoreF(y, i1, t1)
+          t1 = sn * x1
+          t2 = c * x2
+          t1 = t1 + t2
+          PmOpStoreF(y, i2, t1)
+          i = i + 1
+        Wend
+        i = rd
+        While i < dn
+          i1 = PmOpRotaryAt(b, s, h, i, sq, hn, dn, rank4)
+          PokeL(y + i1 * 4, PeekL(x + i1 * 4))
+          i = i + 1
+        Wend
+        h = h + 1
+      Wend
+      s = s + 1
+    Wend
+    b = b + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; TensorScatter-24. The cache is outer x maxS x inner elements of `bytes`
+; each (outer the extents before the sequence axis, batch first with
+; `batchInner` outer blocks per sample); the update holds outer x sq x
+; inner. The output is the past cache with the update written at the
+; sample's write index (wi, INT64 per sample, 0 when wi is 0), modulo maxS
+; when circular. Returns 1 for a linear write past maxS or a negative
+; index, after copying the past cache.
+; ----------------------------------------------------------------------
+Procedure.i PmOpTensorScatter(past.i, upd.i, wi.i, y.i, outer.i, batchInner.i, maxS.i, sq.i, inner.i, bytes.i, circular.i)
+  Protected o.i
+  Protected s.i
+  Protected at.i
+  Protected start.i
+  Protected run.i
+  PmOpCopyBytes(past, y, outer * maxS * inner * bytes)
+  run = inner * bytes
+  o = 0
+  While o < outer
+    start = 0
+    If wi <> 0
+      start = PmTensorGetI64(wi, o / batchInner)
+    EndIf
+    s = 0
+    While s < sq
+      at = start + s
+      If circular <> 0
+        at = at % maxS
+        If at < 0
+          at = at + maxS
+        EndIf
+      ElseIf at < 0 Or at >= maxS
+        ProcedureReturn 1
+      EndIf
+      PmOpCopyBytes(upd + ((o * sq + s) * run), y + ((o * maxS + at) * run), run)
+      s = s + 1
+    Wend
+    o = o + 1
+  Wend
+  ProcedureReturn 0
 EndProcedure
