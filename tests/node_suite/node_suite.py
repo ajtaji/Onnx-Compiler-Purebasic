@@ -21,8 +21,13 @@ model imports ai.onnx at opset 27 or lower, it:
      data.json, applied by np.testing.assert_allclose in
      onnx/backend/test/runner/__init__.py assert_similar_outputs).
 
-Each case ends in exactly one outcome: PASS, FAIL_NUMERIC, FAIL_SHAPE,
-FAIL_DTYPE, REFUSED, BUILD_ERROR, RUN_ERROR or HARNESS_ERROR.
+Each case ends in exactly one outcome: PASS, PASS_SHAPE, FAIL_NUMERIC,
+FAIL_SHAPE, FAIL_DTYPE, REFUSED, BUILD_ERROR, RUN_ERROR or HARNESS_ERROR.
+PASS_SHAPE is a case whose values the specification leaves open (a random
+operator: RandomNormal, RandomUniform, their Like forms, Bernoulli,
+Multinomial). The compiler draws them from its own specified generator and
+the reference from numpy, so only the shape, the element type and a 0/1
+output's staying 0/1 are compared. It is counted apart from PASS, never in it.
 
 The corpus is not in this repository. It ships inside the onnx Python package;
 the harness locates it through the interpreter running this script and refuses,
@@ -76,7 +81,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 DRIVER = HERE / "node_driver_windows.pbi"
 
-OUTCOMES = ["PASS", "FAIL_NUMERIC", "FAIL_SHAPE", "FAIL_DTYPE", "REFUSED",
+OUTCOMES = ["PASS", "PASS_SHAPE", "FAIL_NUMERIC", "FAIL_SHAPE", "FAIL_DTYPE", "REFUSED",
             "BUILD_ERROR", "RUN_ERROR", "HARNESS_ERROR"]
 FAILING = {"FAIL_NUMERIC", "FAIL_SHAPE", "FAIL_DTYPE", "BUILD_ERROR", "RUN_ERROR"}
 
@@ -324,11 +329,15 @@ def elem_name(elem: int) -> str:
 
 
 # Operators whose values the ONNX specification leaves to the implementation:
-# a case that uses one is scored on shape and element type (and, where the
-# expected output holds only 0 and 1, on the program's doing the same); the
-# values themselves are this compiler's specified generator, not the
-# reference's numpy draws.
+# a case that uses one is scored PASS_SHAPE at best - on shape and element
+# type, and, where the expected output holds only 0 and 1, on the program's
+# doing the same; the values themselves are this compiler's specified
+# generator, not the reference's numpy draws.
 RANDOM_OPS = {"RandomNormal", "RandomNormalLike", "RandomUniform", "RandomUniformLike", "Bernoulli", "Multinomial"}
+# A harness whose expected values come from this compiler's generator contract
+# (targeted_ops.py, the private random gate) sets this, and random cases are
+# then compared value for value like any other.
+RANDOM_VALUES_EXPECTED = False
 
 
 def compare(expected: np.ndarray, expected_elem: int, elem: int, dims: list[int], raw: bytes,
@@ -347,7 +356,7 @@ def compare(expected: np.ndarray, expected_elem: int, elem: int, dims: list[int]
         e01 = np.isin(expected.astype(np.float64), (0.0, 1.0)).all()
         if e01 and not np.isin(actual.astype(np.float64), (0.0, 1.0)).all():
             return "FAIL_NUMERIC", "output %d: a random operator's 0/1 output holds other values" % index
-        return "PASS", "values drawn by this compiler's specified generator; shape and element type checked"
+        return "PASS_SHAPE", "values drawn by this compiler's specified generator; shape and element type checked, not values"
     if np.issubdtype(expected.dtype, np.floating) or np.issubdtype(expected.dtype, np.complexfloating):
         a = actual.astype(np.float64)
         e = expected.astype(np.float64)
@@ -431,7 +440,7 @@ def run_case(case_dir: Path, name: str, work: Path, tools: Tools, supported: set
     if outcome == "REFUSED":
         record["named_ops"] = [op for op in record["ops"] if re.search(r"\b%s\b" % re.escape(op), detail)]
     record["subject"] = subject_operator(name, record["ops"], detail if outcome == "REFUSED" else "")
-    if not keep and outcome in ("PASS", "REFUSED"):
+    if not keep and outcome in ("PASS", "PASS_SHAPE", "REFUSED"):
         shutil.rmtree(scratch, ignore_errors=True)
     return record
 
@@ -481,7 +490,7 @@ def _compile_build_run(case_dir, record, model, graph_inputs, loaded, scratch: P
         if len(m_in) != len(graph_inputs):
             return "FAIL_SHAPE", "the compiled model declares %d inputs; the model has %d" % (len(m_in), len(graph_inputs))
 
-    note = ""
+    shape_only = ""
     for ds_name, ins, outs in loaded:
         inputs = []
         for i, (kind, proto, arr) in enumerate(ins):
@@ -528,7 +537,9 @@ def _compile_build_run(case_dir, record, model, graph_inputs, loaded, scratch: P
                     return "FAIL_SHAPE", "%s output %d: a sequence of %d elements, expected %d" % (ds_name, i, len(raw), len(expected))
                 for j, ((edims, eraw), earr, eproto) in enumerate(zip(raw, expected, proto.tensor_values)):
                     outcome, detail = compare(earr, eproto.data_type, elem & ~SEQUENCE_FLAG, edims, eraw, rtol, atol, i)
-                    if outcome != "PASS":
+                    if outcome == "PASS_SHAPE":
+                        shape_only = detail
+                    elif outcome != "PASS":
                         return outcome, ("%s " % ds_name if len(loaded) > 1 else "") + "sequence element %d: " % j + detail
                 continue
             if elem & SEQUENCE_FLAG:
@@ -539,11 +550,14 @@ def _compile_build_run(case_dir, record, model, graph_inputs, loaded, scratch: P
                 decl = manifest["outputs"][i]
                 elem, dims = decl["element_type"], list(decl["shape"])
             outcome, detail = compare(expected, proto.data_type, elem, dims, raw, rtol, atol, i,
-                                      drawn=bool(RANDOM_OPS & set(record["ops"])))
-            if outcome != "PASS":
+                                      drawn=bool(RANDOM_OPS & set(record["ops"])) and not RANDOM_VALUES_EXPECTED)
+            if outcome == "PASS_SHAPE":
+                shape_only = detail
+            elif outcome != "PASS":
                 return outcome, ("%s " % ds_name if len(loaded) > 1 else "") + detail
-            note = detail or note
-    return "PASS", note
+    if shape_only:
+        return "PASS_SHAPE", shape_only
+    return "PASS", ""
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +596,11 @@ def summarize(records: list[dict], header: dict, supported: set[str]) -> str:
       "emitted source; a REFUSED case was declined with a sentence and is a coverage gap, not a wrong answer."
       % (counts["PASS"], attempted, 100.0 * counts["PASS"] / max(attempted, 1),
          counts["PASS"], total, 100.0 * counts["PASS"] / max(total, 1)))
+    if counts["PASS_SHAPE"]:
+        w("")
+        w("PASS counts value-checked cases only. The %d PASS_SHAPE cases use a random operator, whose values the "
+          "specification leaves to the implementation: their shape and element type were checked, and a 0/1 output "
+          "stayed 0/1, but their values were not compared." % counts["PASS_SHAPE"])
     w("")
     w("| outcome | cases |")
     w("|---|---:|")
@@ -966,7 +985,7 @@ def main() -> int:
     elapsed = time.time() - started
     counts = {o: sum(1 for r in records if r["outcome"] == o) for o in OUTCOMES}
     attempted = len(records) - counts["REFUSED"] - counts["HARNESS_ERROR"]
-    print("PASS %d of %d attempted, %d of %d scored; %s; %.0f s" % (
+    print("PASS %d of %d attempted, %d of %d scored (value-checked); %s; %.0f s" % (
         counts["PASS"], attempted, counts["PASS"], len(records),
         ", ".join("%s %d" % (o, counts[o]) for o in OUTCOMES), elapsed))
     if args.no_report or args.cases:
@@ -993,6 +1012,7 @@ def main() -> int:
         "tolerance": {"rtol": DEFAULT_RTOL, "atol": DEFAULT_ATOL, "source": "onnx/backend/test/loader/__init__.py:31-32"},
         "listed_operators": sorted(supported),
         "outcomes": counts, "pass_of_attempted": [counts["PASS"], attempted], "pass_of_scored": [counts["PASS"], len(records)],
+        "pass_shape": counts["PASS_SHAPE"],
         "cases": records,
     }
     (args.results / (stem + ".json")).write_text(compact_json(document), encoding="utf-8")

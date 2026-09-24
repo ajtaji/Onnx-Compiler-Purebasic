@@ -81,6 +81,8 @@ Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
     Case "AffineGrid" : ProcedureReturn "|align_corners|"
     Case "MaxRoiPool" : ProcedureReturn "|pooled_shape|spatial_scale|"
     Case "Unique" : ProcedureReturn "|axis|sorted|"
+    Case "RMSNormalization" : ProcedureReturn "|axis|epsilon|stash_type|"
+    Case "CumProd" : ProcedureReturn "|exclusive|reverse|"
     Case "DeformConv" : ProcedureReturn "|dilations|group|kernel_shape|offset_group|pads|strides|"
     Case "RoiAlign"
       If Opset >= 16 : ProcedureReturn "|coordinate_transformation_mode|mode|output_height|output_width|sampling_ratio|spatial_scale|" : EndIf
@@ -157,7 +159,7 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
     Select Op
       Case "Gelu" : Reason = PmoOpsUnaryForm(*Node)
       Case "Sign" : Reason = PmdNsTypeReason(*Node, 0, "input", "|1|6|7|")
-      Case "Erf", "Reciprocal", "Ceil", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish",
+      Case "Erf", "Reciprocal", "Ceil", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish", "Swish",
            "ThresholdedRelu", "Shrink", "IsNaN", "IsInf", "LogSoftmax", "MaxPool", "AveragePool", "LpPool", "GlobalMaxPool",
            "GlobalAveragePool", "GlobalLpPool", "ReduceL2", "ReduceLogSum", "ReduceLogSumExp"
         Reason = PmdNsTypeReason(*Node, 0, "input", "|1|")
@@ -265,6 +267,14 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         Reason = PmdNsTypeReason(*Node, 0, "input", "|1|2|3|6|7|9|")
       Case "Unique"
         Reason = PmdNsTypeReason(*Node, 0, "X", "|1|2|3|6|7|9|")
+      Case "RMSNormalization"
+        Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "scale", "|1|") : EndIf
+        If Reason = "" And PmoEmitAttrI(*Node, "stash_type", 1) <> 1 : Reason = "attribute stash_type = " + Str(PmoEmitAttrI(*Node, "stash_type", 1)) + "; the computation is FLOAT (stash_type 1)." : EndIf
+        If Reason = "" And PmdNsInputPresent(*Node, 1) = 0 : Reason = "input scale is required." : EndIf
+      Case "CumProd"
+        Reason = PmdNsTypeReason(*Node, 0, "x", "|1|6|7|")
+        If Reason = "" And PmdNsInputPresent(*Node, 1) = 0 : Reason = "input axis is required." : EndIf
       Case "QuantizeLinear"
         Reason = PmdNsTypeReason(*Node, 0, "x", "|1|")
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "y_scale", "|1|") : EndIf
@@ -404,7 +414,13 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
   NewList Lines.s()
   For i = 0 To 7 : a(i) = PmdNsId(Ids(), PmoEmitInput(*Node, i)) : Next
   Select Op
-    Case "Erf", "Reciprocal", "Ceil", "Sign", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish", "Gelu",
+    Case "RMSNormalization"
+      Call = "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "epsilon", 0.00001)) + ") : DOpRmsNorm(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," +
+             Str(PmoEmitAttrI(*Node, "axis", -1)) + ")"
+    Case "CumProd"
+      Call = "DOpCumProd(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + Str(Bool(PmoEmitAttrI(*Node, "exclusive", 0) <> 0)) + "," +
+             Str(Bool(PmoEmitAttrI(*Node, "reverse", 0) <> 0)) + ")"
+    Case "Erf", "Reciprocal", "Ceil", "Sign", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish", "Gelu", "Swish",
          "ThresholdedRelu", "Shrink", "IsNaN", "IsInf", "Tan", "Asin", "Acos", "Sinh", "Cosh", "Asinh", "Acosh", "Atanh", "BitwiseNot"
       PmoOpsUnaryParams(*Node, Lines())
       ForEach Lines() : Pre + Lines() + " : " : Next

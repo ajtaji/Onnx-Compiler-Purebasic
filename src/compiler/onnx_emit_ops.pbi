@@ -25,7 +25,7 @@ Procedure.i PmoOpsOwns(Operation.s)
                                   "RNN|GRU|NonMaxSuppression|RoiAlign|GridSample|QuantizeLinear|DequantizeLinear|" +
                                   "DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|HannWindow|HammingWindow|" +
                                   "BlackmanWindow|DFT|MelWeightMatrix|NegativeLogLikelihoodLoss|SoftmaxCrossEntropyLoss|Col2Im|" +
-                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|Unique|", "|" + Operation + "|"))
+                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|Unique|Swish|RMSNormalization|CumProd|", "|" + Operation + "|"))
 EndProcedure
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
@@ -57,6 +57,9 @@ Procedure.i PmoOpsFloor(Operation.s)
     Case "DeformConv" : ProcedureReturn 19
     Case "AffineGrid" : ProcedureReturn 20
     Case "Unique" : ProcedureReturn 11
+    Case "RMSNormalization" : ProcedureReturn 23
+    Case "Swish" : ProcedureReturn 24
+    Case "CumProd" : ProcedureReturn 26
     Case "QuantizeLinear", "DequantizeLinear", "MatMulInteger", "QLinearMatMul", "ConvInteger", "QLinearConv" : ProcedureReturn 10
     Case "DynamicQuantizeLinear" : ProcedureReturn 11
     Case "NegativeLogLikelihoodLoss", "SoftmaxCrossEntropyLoss" : ProcedureReturn 12
@@ -108,6 +111,7 @@ Procedure.i PmoOpsUnaryCode(*Node.PmoOnnxNode)
     Case "IsNaN" : ProcedureReturn 16
     Case "IsInf" : ProcedureReturn 17
     Case "Tan" : ProcedureReturn 19
+    Case "Swish" : ProcedureReturn 28
     Case "Asin" : ProcedureReturn 20
     Case "Acos" : ProcedureReturn 21
     Case "Sinh" : ProcedureReturn 22
@@ -124,7 +128,7 @@ EndProcedure
 ; a value it does not implement.
 Procedure.s PmoOpsUnaryAllowed(Operation.s)
   Select Operation
-    Case "Elu", "Celu", "ThresholdedRelu" : ProcedureReturn "|alpha|"
+    Case "Elu", "Celu", "ThresholdedRelu", "Swish" : ProcedureReturn "|alpha|"
     Case "Selu" : ProcedureReturn "|alpha|gamma|"
     Case "HardSigmoid" : ProcedureReturn "|alpha|beta|"
     Case "Shrink" : ProcedureReturn "|bias|lambd|"
@@ -159,7 +163,7 @@ Procedure PmoOpsUnaryParams(*Node.PmoOnnxNode, List Lines.s())
   Protected F0.f, F1.f, Two.i
   ClearList(Lines())
   Select *Node\Operation
-    Case "Elu", "Celu", "ThresholdedRelu" : F0 = PmoEmitAttrF(*Node, "alpha", 1.0)
+    Case "Elu", "Celu", "ThresholdedRelu", "Swish" : F0 = PmoEmitAttrF(*Node, "alpha", 1.0)
     Case "Selu" : F0 = PmoEmitAttrF(*Node, "alpha", 1.6732632) : F1 = PmoEmitAttrF(*Node, "gamma", 1.050701) : Two = 1 ; the binary32 defaults
     Case "HardSigmoid" : F0 = PmoEmitAttrF(*Node, "alpha", 0.2) : F1 = PmoEmitAttrF(*Node, "beta", 0.5) : Two = 1
     Case "Shrink" : F0 = PmoEmitAttrF(*Node, "bias", 0.0) : F1 = PmoEmitAttrF(*Node, "lambd", 0.5) : Two = 1
@@ -1285,6 +1289,61 @@ Procedure.i PmoEmitOpsGroupNorm(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcN
   ProcedureReturn #True
 EndProcedure
 
+; RMSNormalization-23 (stash_type 1): the axes from `axis` on are normalized;
+; scale's extents, leading 1s aside, must be the trailing normalized extents.
+Procedure.i PmoOpsRmsScaleOk(*X.PmoIrValue, *S.PmoIrValue, Axis.i)
+  Protected r.i = PmoEmitRank(*X), s.i = PmoEmitRank(*S), k.i, f.i = -1
+  If s > r - Axis : ProcedureReturn #False : EndIf
+  For k = 0 To s - 1
+    If f < 0 And PmoEmitDim(*S, k) <> 1 : f = k : EndIf
+    If f >= 0 And PmoEmitDim(*S, k) <> PmoEmitDim(*X, r - s + k) : ProcedureReturn #False : EndIf
+  Next
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsRmsNorm(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *S.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Axis.i, n.q
+  If PmoEmitNsAttributesAllowed(*Node, "|axis|epsilon|stash_type|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitAttrI(*Node, "stash_type", 1) <> 1 : ProcedureReturn PmoEmitNsFail(*Node, "attribute stash_type = " + Str(PmoEmitAttrI(*Node, "stash_type", 1)) + "; the computation is FLOAT (stash_type 1).") : EndIf
+  If PmoOpsTypeOk(*Node, *X, "X", 1) = 0 Or PmoOpsTypeOk(*Node, *S, "scale", 1) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsSameShape(*Node, *X, *Y, 1) = 0 : ProcedureReturn #False : EndIf
+  Axis = PmoEmitAttrI(*Node, "axis", -1)
+  If Axis < 0 : Axis + PmoEmitRank(*X) : EndIf
+  If Axis < 0 Or Axis >= PmoEmitRank(*X) : ProcedureReturn PmoEmitNsFail(*Node, "attribute axis = " + Str(PmoEmitAttrI(*Node, "axis", -1)) + " is outside the input rank " + Str(PmoEmitRank(*X)) + ".") : EndIf
+  If PmoOpsRmsScaleOk(*X, *S, Axis) = 0
+    ProcedureReturn PmoEmitNsFail(*Node, "scale must have the trailing normalized extents (leading 1s allowed); a scale that broadcasts inside them is not implemented.")
+  EndIf
+  n = PmoEmitProduct(*X, Axis, PmoEmitRank(*X) - 1)
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpSetBits(@PmOpF(0), " + PmoOpsBits(PmoEmitAttrF(*Node, "epsilon", 0.00001)) + ")")
+  PmoEmitLine(File, "  PmOpRmsNorm(*i0, *i1, *o0, " + Str(*X\Elements / n) + ", " + Str(n) + ", " + Str(*S\Elements) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+; CumProd-26: the axis a constant input; exclusive and reverse as CumSum.
+Procedure.i PmoEmitOpsCumProd(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Ok.Integer, Axis.q, r.i
+  If PmoEmitNsAttributesAllowed(*Node, "|exclusive|reverse|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "x", 1 | 2 | 4) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsSameShape(*Node, *X, *Y, *X\ElementType) = 0 : ProcedureReturn #False : EndIf
+  Axis = PmoEmitConstI(*Ir, PmoEmitInput(*Node, 1), 0, @Ok)
+  If Ok\i = 0 : ProcedureReturn PmoEmitNsFail(*Node, "input axis must be a constant for fixed-shape emission.") : EndIf
+  r = PmoEmitRank(*X)
+  If Axis < 0 : Axis + r : EndIf
+  If Axis < 0 Or Axis >= r : ProcedureReturn PmoEmitNsFail(*Node, "axis is outside the input rank " + Str(r) + ".") : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpCumProd(*i0, *o0, " + Str(PmoEmitProduct(*X, 0, Axis - 1)) + ", " + Str(PmoEmitDim(*X, Axis)) + ", " + Str(PmoEmitProduct(*X, Axis + 1, r - 1)) + ", " +
+                    Str(*X\ElementType) + ", " + Str(Bool(PmoEmitAttrI(*Node, "exclusive", 0) <> 0)) + ", " + Str(Bool(PmoEmitAttrI(*Node, "reverse", 0) <> 0)) + ")")
+  PmoOpsTail(File, #True)
+  ProcedureReturn #True
+EndProcedure
+
 Procedure.i PmoEmitOpsEyeLike(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
   Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
   Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
@@ -2315,7 +2374,9 @@ Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
   Protected ProcName.s = "PmOnnxNode" + Str(*Ref\Index), Opset.i = PmoEmitNsOpset(*Ir), Done.i, *Node.PmoOnnxNode = *Ref\Node
   If PmoOpsOpsetOk(*Node, Opset) = 0 : ProcedureReturn #False : EndIf
   Select *Node\Operation
-    Case "Erf", "Reciprocal", "Ceil", "Sign", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish", "Gelu",
+    Case "RMSNormalization" : Done = PmoEmitOpsRmsNorm(File, *Ir, *Node, ProcName, Opset)
+    Case "CumProd" : Done = PmoEmitOpsCumProd(File, *Ir, *Node, ProcName, Opset)
+    Case "Erf", "Reciprocal", "Ceil", "Sign", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish", "Gelu", "Swish",
          "ThresholdedRelu", "Shrink", "IsNaN", "IsInf", "Tan", "Asin", "Acos", "Sinh", "Cosh", "Asinh", "Acosh", "Atanh", "BitwiseNot"
       Done = PmoEmitOpsUnary(File, *Ir, *Node, ProcName, Opset)
     Case "Min", "Max", "Sum", "Mean", "Mod", "PRelu", "Or", "Xor", "BitwiseAnd", "BitwiseOr", "BitwiseXor"

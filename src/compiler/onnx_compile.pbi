@@ -58,6 +58,7 @@ Procedure.s PmoCompileRuntimeDimensions(*Model.PmoOnnxModel)
           Case "Col2Im" : Control = Bool(Position = 1 Or Position = 2)
           Case "CenterCropPad", "AffineGrid" : Control = Bool(Position = 1)
           Case "MaxUnpool" : Control = Bool(Position = 2)
+          Case "CumProd" : Control = Bool(Position = 1)
         EndSelect
         Name = *Model\Graph\Nodes()\Inputs()
         If Control And Name <> "" And Constants(Name) = 0
@@ -457,7 +458,7 @@ Procedure.i PmoCompileValidate(*Ir.PmoIrModel)
       ; operators that only rename
       If *Value\ElementType <> 1 And *Value\ElementType <> 7 And *Value\ElementType <> 9 And
          Not ((*Value\ElementType = 2 Or *Value\ElementType = 3 Or *Value\ElementType = 6) And
-              FindString("|QuantizeLinear|DequantizeLinear|DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|Cast|Bernoulli|Multinomial|Identity|Reshape|Flatten|Squeeze|Unsqueeze|", "|" + *Ir\Nodes()\Node\Operation + "|"))
+              FindString("|QuantizeLinear|DequantizeLinear|DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|Cast|Bernoulli|Multinomial|CumProd|Identity|Reshape|Flatten|Squeeze|Unsqueeze|", "|" + *Ir\Nodes()\Node\Operation + "|"))
         ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " output " + Name + " uses unsupported runtime type " + Str(*Value\ElementType))
       EndIf
       Produced(Name) = #True

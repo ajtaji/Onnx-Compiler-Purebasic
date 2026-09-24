@@ -501,20 +501,20 @@ invalid operation such as infinity times zero.
 
 **A definition to be held to.** `ops_scheme.py` in the compiler
 repository's `tools/onnx/tests/Diagnostics` writes every kernel out in numpy
-one binary32 operation per line. `ops_kernel_check.py` runs 537 cases -
+one binary32 operation per line. `ops_kernel_check.py` runs 566 cases -
 the math functions over tables of special values and branch boundaries,
 every operator's kernel, and the awkward cases - on Windows and, in the
 unicorn instruction emulator, on the Pi 4, Pico and Pico 2 builds, and
 requires every output to equal the definition bit for bit; with
-`--mutants` it plants 57 defects and requires each to be caught:
+`--mutants` it plants 60 defects and requires each to be caught:
 
 @FRAG
 py -3.12 ops_kernel_check.py --pbcompiler <pbcompiler.exe> --compiler PureMetalForge.exe --runtime <ONNX repository>\runtime --mutants
-windows 537 of 537 cases as the definition
-pi4     537 of 537 cases as the definition
-pico    537 of 537 cases as the definition
-pico2   537 of 537 cases as the definition
-mutants: 57 of 57 killed
+windows 566 of 566 cases as the definition
+pi4     566 of 566 cases as the definition
+pico    566 of 566 cases as the definition
+pico2   566 of 566 cases as the definition
+mutants: 60 of 60 killed
 @ENDFRAG
 
 That says the kernels compute what they were written to compute. Whether

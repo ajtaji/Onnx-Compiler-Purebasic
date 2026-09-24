@@ -43,7 +43,7 @@ or it is refused.
 @FRAG
 Arithmetic      Add  Sub  Mul  Div  Pow  Mod  Min  Max  Sum  Mean  Reciprocal
 Activations     Relu  LeakyRelu  PRelu  Sigmoid  Tanh  Clip  Elu  Selu  Celu
-                HardSigmoid  HardSwish  Softplus  Softsign  Mish  Gelu
+                HardSigmoid  HardSwish  Softplus  Softsign  Mish  Gelu  Swish
                 ThresholdedRelu  Shrink  Hardmax
 Elementwise     Exp  Log  Sqrt  Abs  Neg  Sin  Cos  Tan  Asin  Acos  Atan
                 Sinh  Cosh  Asinh  Acosh  Atanh  Floor  Round  Ceil
@@ -53,7 +53,7 @@ Linear algebra  MatMul  Gemm  Conv  ConvTranspose  DeformConv  LSTM  RNN  GRU
                 Einsum  Det
 Normalization   Softmax  LogSoftmax  LayerNormalization  BatchNormalization
                 InstanceNormalization  GroupNormalization  LpNormalization
-                MeanVarianceNormalization  LRN
+                MeanVarianceNormalization  LRN  RMSNormalization
 Detection       NonMaxSuppression  RoiAlign
 Losses          NegativeLogLikelihoodLoss  SoftmaxCrossEntropyLoss
 Quantized       QuantizeLinear  DequantizeLinear  DynamicQuantizeLinear
@@ -62,7 +62,7 @@ Pooling         MaxPool  AveragePool  LpPool  GlobalMaxPool  GlobalAveragePool
                 GlobalLpPool  MaxUnpool  MaxRoiPool
 Reductions      ReduceMean  ReduceSum  ReduceMax  ReduceMin  ReduceProd  ReduceL1
                 ReduceL2  ReduceSumSquare  ReduceLogSum  ReduceLogSumExp
-                ArgMax  ArgMin  CumSum
+                ArgMax  ArgMin  CumSum  CumProd
 Signal          STFT  DFT  HannWindow  HammingWindow  BlackmanWindow
                 MelWeightMatrix  Resize  Upsample  GridSample  AffineGrid
 Comparison      Equal  Greater  GreaterOrEqual  Less  LessOrEqual  And  Or  Xor
@@ -248,7 +248,8 @@ refused by name. The operators added in September 2026 each start at the
 opset whose definition they compute (Mish at 18, Gelu at 20, Trilu and
 HardSwish at 14, GridSample at 16, DFT and the windows at 17, the bitwise
 operators, GroupNormalization, Col2Im and CenterCropPad at 18, DeformConv at
-19, AffineGrid at 20, most of the rest at 11 or earlier), and LogSoftmax and Hardmax before 13 are
+19, AffineGrid at 20, RMSNormalization at 23, Swish at 24, CumProd at 26,
+most of the rest at 11 or earlier), and LogSoftmax and Hardmax before 13 are
 accepted only on the last axis, where the old flattening definition and the
 new one agree. Two have a ceiling as well: GroupNormalization up to 20
 (from 21 its scale is per channel, not per group), and Upsample up to 9,

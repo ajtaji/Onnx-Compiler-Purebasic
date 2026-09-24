@@ -45,6 +45,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import node_suite as ns  # noqa: E402
 
+# the random cases' expected values are the generator contract written out below
+ns.RANDOM_VALUES_EXPECTED = True
+
 try:
     import onnxruntime as ort
 except ImportError:  # pragma: no cover
@@ -961,6 +964,30 @@ def cases() -> list[Case]:
                                               N("ConcatFromSequence", ["ms"], ["y"], axis=0)],
                   [("x", F, [9]), ("w", F, [])], [("y", F, [9])], {"x": f32(9), "w": np.array(-1.5, np.float32)},
                   [init("l", np.array([2, 4, 3], np.int64))], opset=17, oracle="ort", symbolic_axes=()))
+    # opset 23 and later: Swish, RMSNormalization, CumProd
+    for alpha in (1.0, 0.25, -1.5):
+        c.append(Case("swish_alpha_%s" % str(alpha).replace("-", "m").replace(".", "_"), [N("Swish", ["x"], ["y"], alpha=alpha)],
+                      [("x", F, [3, 4, 5])], [("y", F, [3, 4, 5])], {"x": f32(3, 4, 5, scale=4.0)}, opset=24))
+    rx = f32(2, 3, 4, 5)
+    for axis, sshape in ((-1, [5]), (2, [4, 5]), (2, [1, 5]), (1, [3, 4, 5]), (0, [2, 3, 4, 5])):
+        c.append(Case("rmsnorm_axis%s_scale%s" % (str(axis).replace("-", "m"), "x".join(map(str, sshape))),
+                      [N("RMSNormalization", ["x", "s"], ["y"], axis=axis, epsilon=1e-3)],
+                      [("x", F, [2, 3, 4, 5]), ("s", F, sshape)], [("y", F, [2, 3, 4, 5])], {"x": rx, "s": f32(*sshape)}, opset=23))
+    c.append(Case("rmsnorm_scale_initializer", [N("RMSNormalization", ["x", "s"], ["y"])], [("x", F, [4, 6])], [("y", F, [4, 6])],
+                  {"x": f32(4, 6)}, [init("s", f32(6))], opset=23))
+    c.append(Case("refuse_rmsnorm_stash_type", [N("RMSNormalization", ["x", "s"], ["y"], stash_type=0)], [("x", F, [4, 6]), ("s", F, [6])],
+                  [("y", F, [4, 6])], {"x": f32(4, 6), "s": f32(6)}, opset=23, refuse="stash_type = 0"))
+    c.append(Case("refuse_rmsnorm_scale_inner_broadcast", [N("RMSNormalization", ["x", "s"], ["y"], axis=1)], [("x", F, [2, 4, 6]), ("s", F, [4, 1])],
+                  [("y", F, [2, 4, 6])], {"x": f32(2, 4, 6), "s": f32(4, 1)}, opset=23, dynamic=False, refuse="scale must have the trailing normalized extents"))
+    cpf = (RNG.uniform(0.5, 1.5, (3, 4, 5)) * RNG.choice([-1, 1], (3, 4, 5))).astype(np.float32)
+    for dt, elem, x in ((np.float32, F, cpf), (np.int32, I32, RNG.integers(-9, 9, (3, 4, 5)).astype(np.int32)),
+                        (np.int64, I64, RNG.integers(-9, 9, (3, 4, 5)).astype(np.int64))):
+        for axis, exclusive, reverse in ((1, 0, 0), (-1, 1, 0), (0, 0, 1), (2, 1, 1)):
+            c.append(Case("cumprod_%s_axis%s_ex%d_rev%d" % (np.dtype(dt).name, str(axis).replace("-", "m"), exclusive, reverse),
+                          [N("CumProd", ["x", "a"], ["y"], exclusive=exclusive, reverse=reverse)],
+                          [("x", elem, [3, 4, 5])], [("y", elem, [3, 4, 5])], {"x": x}, [init("a", np.array(axis, np.int64))], opset=26))
+    c.append(Case("cumprod_axis_input", [N("CumProd", ["x", "a"], ["y"])], [("x", F, [3, 4]), ("a", I32, [])], [("y", F, [3, 4])],
+                  {"x": cpf[0, :3, :4].copy(), "a": np.array(1, np.int32)}, opset=26))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

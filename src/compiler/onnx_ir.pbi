@@ -138,6 +138,8 @@ Procedure.i PmoIrCompileTimeInput(Operation.s, Position.i)
       ProcedureReturn Bool(Position = 1)
     Case "MaxUnpool"
       ProcedureReturn Bool(Position = 2)
+    Case "CumProd"
+      ProcedureReturn Bool(Position = 1)
   EndSelect
   ProcedureReturn #False
 EndProcedure

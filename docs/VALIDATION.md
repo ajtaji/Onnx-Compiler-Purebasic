@@ -784,15 +784,47 @@ maximum set to 28. All three are caught.
 The node-test harness now scores every case at opset 27 or lower, 1,750 of
 the corpus's 1,765 (15 import no ai.onnx opset). Random operators have no
 comparable values: the reference draws with numpy and this compiler with
-its own specified generator. A case that uses one is therefore scored on
-shape and element type, and on 0/1 outputs staying 0/1.
+its own specified generator. A case that uses one is therefore scored
+PASS_SHAPE: shape and element type checked, and 0/1 outputs staying 0/1,
+but not the values. PASS_SHAPE is its own outcome, counted apart from PASS,
+from the commit that adds Swish, RMSNormalization and CumProd (the
+2026-09-24g files predate it).
 
 | Check | Result |
 |---|---|
 | `opset_ceiling_check.py --mutants` | PASS: 182 operators listed, 121 version steps above 20 compared; 3 of 3 mutants caught |
-| Official node tests, this change against the previous compiler under the same harness (opset 27 or lower) | PASS 738 of 1,750 before, 828 after: 90 cases at opsets 22 to 27 now compile and pass (63 at opset 25, 15 at 27, 9 at 24, 3 at 22); no case that passed fails, and the 964 cases at opset 20 or lower score exactly as before (568). Seven new RUN_ERROR cases are refusals when the program runs: Dropout in training mode with a nonzero ratio (four, opset 22), and float16 or bfloat16 inputs the driver cannot supply (three). Every case: [`tests/node_suite/results/2026-09-24g-onnx-1.22.0.md`](../tests/node_suite/results/2026-09-24g-onnx-1.22.0.md) and `.json`, measured with `--from-commit` at `39a0748` |
+| Official node tests, this change against the previous compiler under the same harness (opset 27 or lower) | PASS 737 of 1,750 before, 827 after, and in both one case PASS_SHAPE (test_bernoulli_seed, a random operator: shape and element type checked, not values; the published 2026-09-24g files count it as PASS, the harness has since given it its own outcome): 90 cases at opsets 22 to 27 now compile and pass (63 at opset 25, 15 at 27, 9 at 24, 3 at 22); no case that passed fails, and the 964 cases at opset 20 or lower score exactly as before (568). Seven new RUN_ERROR cases are refusals when the program runs: Dropout in training mode with a nonzero ratio (four, opset 22), and float16 or bfloat16 inputs the driver cannot supply (three). Every case: [`tests/node_suite/results/2026-09-24g-onnx-1.22.0.md`](../tests/node_suite/results/2026-09-24g-onnx-1.22.0.md) and `.json`, measured with `--from-commit` at `39a0748` |
 | Models at opset 20 or lower: the four identity models (fp32/fp16/bf16/int4, five targets) and every targeted suite, this change against `bd07ecf` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs. Targeted suites unchanged: ops 817, defaults 148, norm_small 132, control 41, optional outputs 14 |
 | Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
+
+## Above opset 20, first batch: Swish, RMSNormalization, CumProd — September 24, 2026
+
+Swish (opset 24), RMSNormalization (23) and CumProd (26), three of the nine
+operators onnx defines only above opset 20, compile on both paths for every
+target. Their kernels join `runtime/tensor_ops.pmi` under the same rules.
+
+| Operator | Computed as |
+|---|---|
+| Swish | `x / (1 + exp(-alpha x))`, the binary32 `exp` of the kernel set; FLOAT |
+| RMSNormalization | `stash_type` 1: per row of the axes from `axis` on, the sum of `x*x` in order, divided by the count, plus epsilon; the correctly rounded square root; `(x / r) * scale`. FLOAT X and scale; a scale whose extents, leading 1s aside, are the trailing normalized extents |
+| CumProd | running products along the axis (a constant on the fixed-shape path, a one-element INT32 or INT64 tensor on the runtime-dimension path), exclusive and reverse as CumSum has them; FLOAT one binary32 multiply per step, INT32 and INT64 wrapping at their width |
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 566 cases - the 537 before; Swish with alpha 1.702; RMSNormalization over one and two axes, three scale shapes, a zero row and a NaN; CumProd on FLOAT with a NaN, INT32 with wrapping products and INT64, every axis, exclusive and reverse | Windows, Pi 4, Pico and Pico 2: 566 of 566 bit-identical to the definition; `--mutants` 60 of 60 caught (three new: RMSNormalization's mean, CumProd's exclusive order, Swish's sign) |
+| `tests/node_suite/targeted_ops.py`: 864 cases - the 817 before; 47 new builds (Swish at three alphas; RMSNormalization over five axis and scale forms and with an initializer scale; CumProd on FLOAT, INT32 and INT64 in four axis, exclusive and reverse forms, and with its axis as an input; stash_type 0 and a scale broadcast inside the normalized block refused) | 864 of 864 as expected |
+| `ops_targets_gate.py`: the new builds on the Pi 4, Pico and Pico 2 in unicorn | 44 builds, 132 runs: 132 of 132 bit-identical to the Windows program |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 827 of 1,750 before, 849 after (and one PASS_SHAPE in both): the 19 RMSNormalization cases, test_swish and the two INT32 CumProd cases; no case that passed fails. The function-expanded RMSNormalization cases stay refused (their folded Shape has no graph value), and the other CumProd cases are DOUBLE, refused by type |
+| `random_operator_gate.py` after the harness change below | 235 checks PASS |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `16ab909` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
+| Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
+
+**The harness's PASS_SHAPE.** The node-test harness now ends a case that
+uses a random operator in its own outcome, PASS_SHAPE, counted apart from
+PASS: shape and element type checked, 0/1 outputs staying 0/1, values not
+compared. Harnesses whose expected values are this compiler's generator
+contract (`targeted_ops.py`, the private random gate) still compare every
+value and end those cases in PASS.
 
 ## Explicit limitations
 

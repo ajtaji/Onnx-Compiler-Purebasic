@@ -1483,6 +1483,14 @@ Procedure.f PmOpUnaryValue(x.f, op.i)
       ProcedureReturn PmOpAcosh(x)
     Case 26
       ProcedureReturn PmOpAtanh(x)
+    Case 28
+      ; Swish-24: x / (1 + exp(-alpha x)), alpha in PmOpF(0)
+      t = PmOpF(0) * x
+      t = PmOpNeg(t)
+      t = PmOpExp(t)
+      t = PmOpOne + t
+      t = x / t
+      ProcedureReturn t
   EndSelect
   PmOpStatus = 2
   ProcedureReturn x
@@ -6535,5 +6543,108 @@ Procedure PmOpMultinomial(x.i, y.i, batch.i, classes.i, samples.i, kind.i)
       PokeL(y + i * 4, pick)
     EndIf
     i = i - 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; RMSNormalization-23 (stash_type 1). x is rows of n elements (the axes
+; from `axis` on); scale holds sn elements repeated along the row (sn
+; divides n: scale broadcasts over the leading normalized axes). Per row:
+; s = sum of x*x in order, m = s / n + epsilon, r = sqrt(m) correctly
+; rounded, y = (x / r) * scale. Epsilon in PmOpF(0).
+; ----------------------------------------------------------------------
+Procedure PmOpRmsNorm(x.i, scale.i, y.i, rows.i, n.i, sn.i)
+  Protected r.i
+  Protected j.i
+  Protected v.f
+  Protected s.f
+  Protected m.f
+  Protected root.f
+  Protected fn.f
+  PmOpInit()
+  fn = PmOpIntToF(n)
+  r = 0
+  While r < rows
+    s = 0.0
+    j = 0
+    While j < n
+      v = PmTensorGet(x, r * n + j)
+      v = v * v
+      s = s + v
+      j = j + 1
+    Wend
+    m = s / fn
+    m = m + PmOpF(0)
+    root = PmOpSqrt(m)
+    j = 0
+    While j < n
+      v = PmTensorGet(x, r * n + j)
+      v = v / root
+      v = v * PmTensorGet(scale, j % sn)
+      PmOpStoreF(y, r * n + j, v)
+      j = j + 1
+    Wend
+    r = r + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; CumProd-26 along an axis of extent n with inner stride `inner`, over
+; outer blocks; exclusive and reverse as CumSum. kind 1 FLOAT (one binary32
+; multiply per pos), 6 INT32, 7 INT64 (products wrap to the element
+; width; an INT64 product outside 32 bits trips the INT64 contract on the
+; 32-bit targets; PmOpWrap32 is the quantized part's).
+; ----------------------------------------------------------------------
+Procedure PmOpCumProd(x.i, y.i, outer.i, n.i, inner.i, kind.i, exclusive.i, reverse.i)
+  Protected o.i
+  Protected i.i
+  Protected k.i
+  Protected pos.i
+  Protected at.i
+  Protected accI.i
+  Protected accF.f
+  Protected v.f
+  PmOpInit()
+  o = 0
+  While o < outer
+    i = 0
+    While i < inner
+      accF = PmOpOne
+      accI = 1
+      pos = 0
+      While pos < n
+        k = pos
+        If reverse <> 0
+          k = n - 1 - pos
+        EndIf
+        at = (o * n + k) * inner + i
+        If exclusive <> 0
+          If kind = 1
+            PmOpStoreF(y, at, accF)
+            v = PmTensorGet(x, at)
+            accF = accF * v
+          Else
+            PmOpWriteInt(y, at, kind, accI)
+            accI = PmOpMulI(accI, PmOpReadInt(x, at, kind), kind)
+            If kind = 6
+              accI = PmOpWrap32(accI)
+            EndIf
+          EndIf
+        ElseIf kind = 1
+          v = PmTensorGet(x, at)
+          accF = accF * v
+          PmOpStoreF(y, at, accF)
+        Else
+          accI = PmOpMulI(accI, PmOpReadInt(x, at, kind), kind)
+          If kind = 6
+            accI = PmOpWrap32(accI)
+          EndIf
+          PmOpWriteInt(y, at, kind, accI)
+        EndIf
+        pos = pos + 1
+      Wend
+      i = i + 1
+    Wend
+    o = o + 1
   Wend
 EndProcedure

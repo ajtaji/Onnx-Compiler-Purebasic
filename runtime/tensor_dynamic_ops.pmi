@@ -2891,3 +2891,88 @@ EndProcedure
 Procedure DOpMultinomialPick(Y.i, X.i, Samples.i, Kind.i)
   PmOpMultinomial(Dt(X)\Data, Dt(Y)\Data, DOpDim(X, 0), DOpDim(X, 1), Samples, Kind)
 EndProcedure
+
+; ----------------------------------------------------------------------
+; RMSNormalization-23 (epsilon in PmOpF(0)); scale's extents, leading 1s
+; aside, must be the trailing normalized extents.
+; ----------------------------------------------------------------------
+Procedure DOpRmsNorm(Y.i, X.i, S.i, Axis.i)
+  Protected r.i
+  Protected sr.i
+  Protected k.i
+  Protected f.i
+  Protected n.i
+  If X = 0 Or S = 0
+    DFail("RMSNormalization requires X and scale.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(S)\Kind <> 1
+    DFail("RMSNormalization takes FLOAT X and scale.")
+    ProcedureReturn
+  EndIf
+  r = Dt(X)\Rank
+  If Axis < 0
+    Axis = Axis + r
+  EndIf
+  If Axis < 0 Or Axis >= r
+    DFail("RMSNormalization's axis is outside the input rank.")
+    ProcedureReturn
+  EndIf
+  sr = Dt(S)\Rank
+  If sr > r - Axis
+    DFail("RMSNormalization's scale has more axes than the normalized shape.")
+    ProcedureReturn
+  EndIf
+  f = -1
+  k = 0
+  While k < sr
+    If f < 0 And DOpDim(S, k) <> 1
+      f = k
+    EndIf
+    If f >= 0 And DOpDim(S, k) <> DOpDim(X, r - sr + k)
+      DFail("RMSNormalization's scale must have the trailing normalized extents (leading 1s allowed).")
+      ProcedureReturn
+    EndIf
+    k = k + 1
+  Wend
+  n = DProduct(X, Axis, r - 1)
+  If DLike(Y, X, 0) = 0
+    ProcedureReturn
+  EndIf
+  If n > 0
+    PmOpRmsNorm(Dt(X)\Data, Dt(S)\Data, Dt(Y)\Data, Dt(X)\Count / n, n, Dt(S)\Count)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+; CumProd-26: the axis a one-element INT32 or INT64 tensor.
+; ----------------------------------------------------------------------
+Procedure DOpCumProd(Y.i, X.i, AxisT.i, Exclusive.i, Reverse.i)
+  Protected r.i
+  Protected axis.i
+  If X = 0 Or AxisT = 0
+    DFail("CumProd requires x and axis.")
+    ProcedureReturn
+  EndIf
+  If DOpKindOk(Dt(X)\Kind, 7) = 0
+    DFail("CumProd takes FLOAT, INT32 or INT64 x.")
+    ProcedureReturn
+  EndIf
+  If (Dt(AxisT)\Kind <> 6 And Dt(AxisT)\Kind <> 7) Or Dt(AxisT)\Count <> 1
+    DFail("CumProd's axis must be an INT32 or INT64 tensor holding one element.")
+    ProcedureReturn
+  EndIf
+  r = Dt(X)\Rank
+  axis = DInt(AxisT, 0)
+  If axis < 0
+    axis = axis + r
+  EndIf
+  If axis < 0 Or axis >= r
+    DFail("CumProd's axis is outside the input rank.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, X, 0) = 0
+    ProcedureReturn
+  EndIf
+  PmOpCumProd(Dt(X)\Data, Dt(Y)\Data, DProduct(X, 0, axis - 1), DOpDim(X, axis), DProduct(X, axis + 1, r - 1), Dt(X)\Kind, Exclusive, Reverse)
+EndProcedure
