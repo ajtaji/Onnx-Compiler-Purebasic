@@ -516,6 +516,57 @@ names and the reverse; a GridSample-16 input that is not 4-D; four or more
 spatial axes; cubic over other than two; element types other than FLOAT;
 Scatter from opset 11, where it is deprecated for ScatterElements.
 
+## The quantized operators — September 24, 2026
+
+QuantizeLinear and DequantizeLinear (opset 10 to 20, per tensor and, from
+13, per axis), DynamicQuantizeLinear, MatMulInteger, QLinearMatMul,
+ConvInteger and QLinearConv, on both paths and every target. They are the
+operators of a model quantized before export, and they bring UINT8 and INT8
+tensors - graph inputs, outputs, initializers and values - to both paths,
+and INT32 values to the fixed-shape path. Cast converts between UINT8, INT8,
+INT32, INT64, FLOAT and BOOL on both paths (integer conversions keep the low
+bits, as numpy does; a float converts toward zero first). On the fixed-shape
+path a UINT8, INT8 or INT32 value is produced only by these operators, Cast
+and the operators that rename (Identity, Reshape, Flatten, Squeeze,
+Unsqueeze); an operator that would compute one otherwise is refused with a
+sentence naming the type.
+
+The kernels join `runtime/tensor_ops.pmi`. QuantizeLinear divides and rounds
+half to even in binary32, as the reference does. QLinearMatMul and
+QLinearConv requantize as the reference does - the INT32 accumulator times
+the binary32 multiplier `scale_a * scale_b / scale_y` in binary64, the zero
+point added in binary64, rounded half to even - and binary64 is not an
+operation the file may use, so the kernel reproduces it exactly: the
+product is formed in 12-bit integer digits, rounded to 53 bits as binary64
+rounds it, and the sum's own rounding is applied where it can move the
+result, within a hair of a half. An INT32 is converted to binary32 on the
+bits, ties to even, so every target converts one above 2^24 the same way.
+Where the reference's answer is not defined, the kernel defines it: a NaN
+quantizes to the low end of the range (what the reference's numpy gives on
+x86); infinities saturate; DynamicQuantizeLinear refuses a NaN or an
+infinite input at run time.
+
+A defect found on the way, and fixed: on the Pico and Pico 2 the
+runtime-dimension runtime converted an integer to binary32 by returning it
+from a binary32 procedure, which returns its bits, not its value; a Cast
+from an integer type to FLOAT there gave denormals. An assignment converts.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 386 cases - the 310 before; QuantizeLinear per tensor and per axis over special values and halves; DequantizeLinear of UINT8, INT8 and INT32 (above 2^24 too); DynamicQuantizeLinear including all-zero, all-negative and NaN inputs; the requantization over 756 accumulator, multiplier and zero-point triples, to UINT8 and to INT8, where 39 and 29 of the results differ from the exactly rounded ones because binary64 rounds twice - the kernel must reproduce each; the INT32 conversion; MatMulInteger and QLinearMatMul with batch broadcasting, 1-D operands and per-column zero points and scales; ConvInteger and QLinearConv over one to three spatial axes with groups, strides, dilations, pads, bias and per-channel zero points and scales | Windows, Pi 4, Pico and Pico 2: 386 of 386 bit-identical to the definition; `--mutants` 40 of 40 caught (eight new, among them the product's 53-bit rounding and the sum's rounding window) |
+| `tests/node_suite/targeted_ops.py`: 665 cases - the 598 before; the official QuantizeLinear, DequantizeLinear and QLinearMatMul cases published above opset 20, re-imported at 20; 53 new builds of the quantized operators and of Cast | 665 of 665 as expected; re-imported official cases 135 PASS (127 before), every QuantizeLinear, DequantizeLinear and QLinearMatMul case over UINT8 and INT8 among them; the float8 forms refused for their element type |
+| Official node tests at opset 20 or lower, this change against the previous compiler | PASS 470 of 964 before, 490 after: ConvInteger (2), DynamicQuantizeLinear (3), MatMulInteger, QLinearConv, and 13 cases the new element types admit: Equal, Greater, GreaterOrEqual, Less and LessOrEqual over INT8, UINT8 and INT32 inputs, and a function-expanded Clip over INT8; no case that passed fails |
+| `ops_targets_gate.py`: the 432 targeted builds that must pass, all groups, compiled for the Pi 4, Pico and Pico 2 and run in unicorn | 1,296 of 1,296 as expected, bit-identical to the Windows program; it found the defect below first |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `5148bac` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical. The runtime-dimension support files differ: they read and write UINT8 and INT8 |
+| Kokoro-82M FP32 for Windows (runtime-dimension path) | source and pack byte-identical; the reference request's waveform byte-identical with the new support files |
+
+**Refused, with a sentence:** a per-row zero point for MatMulInteger's A (the
+reference evaluator broadcasts it along the wrong axis, and ONNX Runtime
+does not implement it); QuantizeLinear of other than FLOAT; DequantizeLinear
+of other than UINT8, INT8 and INT32; the float8, 4-bit, 2-bit and 16-bit
+quantized types; blocked quantization (opset 21); a scale of more than one
+value before opset 13; FLOAT16 scales.
+
 
 ## Explicit limitations
 

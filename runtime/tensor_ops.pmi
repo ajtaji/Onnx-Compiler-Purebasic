@@ -4490,3 +4490,792 @@ Procedure PmOpGridSample(x.i, grid.i, y.i)
     n = n + 1
   Wend
 EndProcedure
+
+; ----------------------------------------------------------------------
+; The quantized operators: QuantizeLinear, DequantizeLinear,
+; DynamicQuantizeLinear, MatMulInteger, QLinearMatMul, ConvInteger and
+; QLinearConv. Integer kinds 2 UINT8, 3 INT8, 6 INT32.
+; ----------------------------------------------------------------------
+Global Dim PmOpQd.i(8)
+Global PmOpQ255.f
+
+Procedure.i PmOpQRead(address.i, index.i, kind.i)
+  Protected v.i
+  If kind = 6
+    ProcedureReturn PeekL(address + index * 4)
+  EndIf
+  v = PeekA(address + index) & 255
+  If kind = 3
+    If v > 127
+      v = v - 256
+    EndIf
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+Procedure PmOpQWrite(address.i, index.i, kind.i, value.i)
+  If kind = 6
+    PokeL(address + index * 4, value)
+  Else
+    PokeA(address + index, value & 255)
+  EndIf
+EndProcedure
+
+Procedure.i PmOpQMin(kind.i)
+  If kind = 3
+    ProcedureReturn -128
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PmOpQMax(kind.i)
+  If kind = 3
+    ProcedureReturn 127
+  EndIf
+  ProcedureReturn 255
+EndProcedure
+
+; A 32-bit signed integer as the nearest binary32 (ties to even), on the bits,
+; so every target converts an INT32 above 2^24 the same way.
+Procedure.f PmOpIntToF(v.i)
+  Protected a.i
+  Protected p.i
+  Protected sign.i
+  Protected m.i
+  Protected rest.i
+  Protected half.i
+  Protected sh.i
+  If v = 0
+    ProcedureReturn 0.0
+  EndIf
+  If v = -2147483648
+    ProcedureReturn PmOpFromBits($CF000000)
+  EndIf
+  sign = 0
+  a = v
+  If v < 0
+    sign = $80000000
+    a = 0 - v
+  EndIf
+  p = 0
+  While (a >> p) > 1
+    p = p + 1
+  Wend
+  If p <= 23
+    m = a << (23 - p)
+  Else
+    sh = p - 23
+    m = a >> sh
+    rest = a & ((1 << sh) - 1)
+    half = 1 << (sh - 1)
+    If rest > half Or (rest = half And (m & 1) <> 0)
+      m = m + 1
+      If m = $1000000
+        m = m >> 1
+        p = p + 1
+      EndIf
+    EndIf
+  EndIf
+  ProcedureReturn PmOpFromBits(sign | ((p + 127) << 23) | (m & $7FFFFF))
+EndProcedure
+
+; QuantizeLinear of one element: rint(x / s) + zp saturated to the kind's
+; range; a NaN quotient gives the low end (the reference's numpy on x86).
+Procedure.i PmOpQuantizeValue(x.f, s.f, zp.i, kind.i)
+  Protected q.f
+  Protected lo.f
+  Protected hi.f
+  q = x / s
+  If PmOpIsNan(q) <> 0
+    ProcedureReturn PmOpQMin(kind)
+  EndIf
+  q = PmOpRint(q)
+  lo = PmOpQMin(kind) - zp
+  hi = PmOpQMax(kind) - zp
+  If q < lo
+    q = lo
+  EndIf
+  If q > hi
+    q = hi
+  EndIf
+  ProcedureReturn PmOpTruncInt(q) + zp
+EndProcedure
+
+; QuantizeLinear-10/13/19. PmOpI(0) outer, (1) the axis extent, (2) inner,
+; (3) 1 for per-axis scale and zero point, (4) the zero point's kind or 0
+; when absent, (5) the output kind.
+Procedure PmOpQuantize(x.i, scale.i, zp.i, y.i)
+  Protected count.i
+  Protected i.i
+  Protected k.i
+  Protected z.i
+  PmOpInit()
+  count = PmOpI(0) * PmOpI(1) * PmOpI(2)
+  i = 0
+  While i < count
+    k = 0
+    If PmOpI(3) <> 0
+      k = (i / PmOpI(2)) % PmOpI(1)
+    EndIf
+    z = 0
+    If PmOpI(4) <> 0
+      z = PmOpQRead(zp, k, PmOpI(4))
+    EndIf
+    PmOpQWrite(y, i, PmOpI(5), PmOpQuantizeValue(PmTensorGet(x, i), PmTensorGet(scale, k), z, PmOpI(5)))
+    i = i + 1
+  Wend
+EndProcedure
+
+; DequantizeLinear-10/13/19: (x - zp) * scale. PmOpI(0 .. 3) as for
+; PmOpQuantize, (4) the kind of x, (5) 1 when the zero point is present.
+Procedure PmOpDequantize(x.i, scale.i, zp.i, y.i)
+  Protected count.i
+  Protected i.i
+  Protected k.i
+  Protected d.f
+  Protected t.f
+  PmOpInit()
+  count = PmOpI(0) * PmOpI(1) * PmOpI(2)
+  i = 0
+  While i < count
+    k = 0
+    If PmOpI(3) <> 0
+      k = (i / PmOpI(2)) % PmOpI(1)
+    EndIf
+    d = PmOpIntToF(PmOpQRead(x, i, PmOpI(4)))
+    If PmOpI(5) <> 0
+      t = PmOpIntToF(PmOpQRead(zp, k, PmOpI(4)))
+      d = d - t
+    EndIf
+    d = d * PmTensorGet(scale, k)
+    PmOpStoreF(y, i, d)
+    i = i + 1
+  Wend
+EndProcedure
+
+; DynamicQuantizeLinear-11 over count elements; 1 for a NaN or infinite
+; input (the reference's answer for one is not defined), 0 otherwise.
+Procedure.i PmOpDynQuantize(x.i, y.i, yScale.i, yZero.i, count.i)
+  Protected i.i
+  Protected v.f
+  Protected mx.f
+  Protected mn.f
+  Protected s.f
+  Protected zpf.f
+  Protected t.f
+  PmOpInit()
+  PmOpSetBits(@PmOpQ255, $437F0000)
+  mx = 0.0
+  mn = 0.0
+  i = 0
+  While i < count
+    v = PmTensorGet(x, i)
+    If (PmOpBits(v) & $7FFFFFFF) >= $7F800000
+      ProcedureReturn 1
+    EndIf
+    If v > mx
+      mx = v
+    EndIf
+    If v < mn
+      mn = v
+    EndIf
+    i = i + 1
+  Wend
+  If mx = mn
+    s = PmOpOne / PmOpQ255
+  Else
+    s = mx - mn
+    s = s / PmOpQ255
+  EndIf
+  t = mn / s
+  zpf = 0.0 - t
+  If zpf < 0.0
+    zpf = 0.0
+  EndIf
+  If zpf > PmOpQ255
+    zpf = PmOpQ255
+  EndIf
+  zpf = PmOpRint(zpf)
+  i = 0
+  While i < count
+    t = PmTensorGet(x, i) / s
+    t = PmOpRint(t)
+    t = t + zpf
+    If t < 0.0
+      t = 0.0
+    EndIf
+    If t > PmOpQ255
+      t = PmOpQ255
+    EndIf
+    PokeA(y + i, PmOpTruncInt(t) & 255)
+    i = i + 1
+  Wend
+  PmTensorPut(yScale, 0, s)
+  PokeA(yZero, PmOpTruncInt(zpf) & 255)
+  ProcedureReturn 0
+EndProcedure
+
+; ---- exact requantization --------------------------------------------
+; The reference multiplies an INT32 accumulator by a binary32 multiplier in
+; binary64, adds the zero point in binary64 and rounds half to even. Here
+; the product is formed exactly in 12-bit digits (PmOpQd), rounded to 53
+; bits as binary64 would round it, and the sum's own rounding is applied
+; where it can decide the final rounding: near a half.
+
+Procedure.i PmOpQBit(pos.i)
+  If pos < 0 Or pos >= 60
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn (PmOpQd(pos / 12) >> (pos % 12)) & 1
+EndProcedure
+
+; 1 when a bit below pos is set.
+Procedure.i PmOpQAnyBelow(pos.i)
+  Protected j.i
+  If pos > 60
+    pos = 60
+  EndIf
+  j = 0
+  While j < pos
+    If PmOpQBit(j) <> 0
+      ProcedureReturn 1
+    EndIf
+    j = j + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PmOpQLength()
+  Protected j.i
+  j = 59
+  While j >= 0
+    If PmOpQBit(j) <> 0
+      ProcedureReturn j + 1
+    EndIf
+    j = j - 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; The fraction F = (the digits' bits below s) * 2^-s against 1/2 + dir * 2^-t
+; (dir +1 or -1): 1 above, 0 equal, -1 below.
+Procedure.i PmOpQFracCmp(s.i, t.i, dir.i)
+  Protected j.i
+  Protected last.i
+  Protected fb.i
+  Protected cb.i
+  last = s
+  If t > last
+    last = t
+  EndIf
+  j = 1
+  While j <= last
+    fb = 0
+    If j <= s
+      fb = PmOpQBit(s - j)
+    EndIf
+    If dir > 0
+      cb = 0
+      If j = 1 Or j = t
+        cb = 1
+      EndIf
+    Else
+      cb = 0
+      If j >= 2 And j <= t
+        cb = 1
+      EndIf
+    EndIf
+    If fb <> cb
+      If fb > cb
+        ProcedureReturn 1
+      EndIf
+      ProcedureReturn -1
+    EndIf
+    j = j + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; rint(c * m + zp) saturated to [qmin, qmax], c * m and the sum in binary64.
+Procedure.i PmOpRequant(c.i, m.f, zp.i, qmin.i, qmax.i)
+  Protected mb.i
+  Protected em.i
+  Protected mant.i
+  Protected e.i
+  Protected neg.i
+  Protected ca0.i
+  Protected ca1.i
+  Protected ca2.i
+  Protected cm0.i
+  Protected cm1.i
+  Protected t.i
+  Protected carry.i
+  Protected i.i
+  Protected L.i
+  Protected k.i
+  Protected s.i
+  Protected iD.i
+  Protected fz.i
+  Protected j.i
+  Protected flip.i
+  Protected ia.i
+  Protected sgn.i
+  Protected li.i
+  Protected q.i
+  Protected up.i
+  Protected r.i
+  mb = PmOpBits(m)
+  If (mb & $7FFFFFFF) > $7F800000
+    ProcedureReturn qmin
+  EndIf
+  If (mb & $7FFFFFFF) = $7F800000
+    If c = 0
+      ProcedureReturn qmin
+    EndIf
+    neg = 0
+    If c < 0
+      neg = 1
+    EndIf
+    If (mb & $80000000) <> 0
+      neg = 1 - neg
+    EndIf
+    If neg <> 0
+      ProcedureReturn qmin
+    EndIf
+    ProcedureReturn qmax
+  EndIf
+  r = zp
+  If c = 0 Or (mb & $7FFFFFFF) = 0
+    If r < qmin
+      r = qmin
+    EndIf
+    If r > qmax
+      r = qmax
+    EndIf
+    ProcedureReturn r
+  EndIf
+  em = (mb >> 23) & 255
+  If em = 0
+    mant = mb & $7FFFFF
+    e = -149
+  Else
+    mant = (mb & $7FFFFF) | $800000
+    e = em - 150
+  EndIf
+  neg = 0
+  If (mb & $80000000) <> 0
+    neg = 1
+  EndIf
+  If c = -2147483648
+    ca0 = 0
+    ca1 = 0
+    ca2 = 128
+    neg = 1 - neg
+  Else
+    If c < 0
+      c = 0 - c
+      neg = 1 - neg
+    EndIf
+    ca0 = c & $FFF
+    ca1 = (c >> 12) & $FFF
+    ca2 = (c >> 24) & $FF
+  EndIf
+  cm0 = mant & $FFF
+  cm1 = mant >> 12
+  PmOpQd(0) = ca0 * cm0
+  PmOpQd(1) = ca0 * cm1 + ca1 * cm0
+  PmOpQd(2) = ca1 * cm1 + ca2 * cm0
+  PmOpQd(3) = ca2 * cm1
+  PmOpQd(4) = 0
+  carry = 0
+  i = 0
+  While i < 5
+    t = PmOpQd(i) + carry
+    PmOpQd(i) = t & $FFF
+    carry = t >> 12
+    i = i + 1
+  Wend
+  ; round the product to 53 significant bits, ties to even
+  L = PmOpQLength()
+  If L > 53
+    k = L - 53
+    up = 0
+    If PmOpQBit(k - 1) <> 0
+      If PmOpQAnyBelow(k - 1) <> 0 Or PmOpQBit(k) <> 0
+        up = 1
+      EndIf
+    EndIf
+    j = 0
+    While j < k
+      PmOpQd(j / 12) = PmOpQd(j / 12) & ($FFF ! (1 << (j % 12)))
+      j = j + 1
+    Wend
+    If up <> 0
+      PmOpQd(k / 12) = PmOpQd(k / 12) + (1 << (k % 12))
+      i = k / 12
+      While i < 4
+        If PmOpQd(i) > $FFF
+          PmOpQd(i) = PmOpQd(i) - $1000
+          PmOpQd(i + 1) = PmOpQd(i + 1) + 1
+        EndIf
+        i = i + 1
+      Wend
+    EndIf
+    L = PmOpQLength()
+  EndIf
+  ; |product| = N * 2^e: saturate from 2^11, the zero point alone below 2^-60
+  If L + e > 11
+    If neg <> 0
+      ProcedureReturn qmin
+    EndIf
+    ProcedureReturn qmax
+  EndIf
+  If L + e < -60
+    r = zp
+    If r < qmin
+      r = qmin
+    EndIf
+    If r > qmax
+      r = qmax
+    EndIf
+    ProcedureReturn r
+  EndIf
+  ; the integer part iD and whether a fraction is present (fz)
+  iD = 0
+  fz = 0
+  If e >= 0
+    j = L - 1
+    While j >= 0
+      iD = iD * 2 + PmOpQBit(j)
+      j = j - 1
+    Wend
+    iD = iD << e
+    s = 0
+  Else
+    s = 0 - e
+    j = L - 1
+    While j >= s
+      iD = iD * 2 + PmOpQBit(j)
+      j = j - 1
+    Wend
+    fz = PmOpQAnyBelow(s)
+  EndIf
+  ; the sum as J + G, G the fraction (flip: G = 1 - F)
+  flip = 0
+  If neg = 0
+    j = zp + iD
+  Else
+    j = zp - iD
+    If fz <> 0
+      j = j - 1
+      flip = 1
+    EndIf
+  EndIf
+  sgn = 1
+  ia = j
+  If j < 0
+    sgn = -1
+    If fz = 0
+      ia = 0 - j
+    Else
+      ia = 0 - j - 1
+      flip = 1 - flip
+    EndIf
+  EndIf
+  up = 0
+  If fz <> 0
+    li = 0
+    While (ia >> li) > 0
+      li = li + 1
+    Wend
+    q = 53 - li
+    ; FA = F (flip 0) or 1 - F (flip 1): FA above 1/2 + 2^-(q+1) rounds up,
+    ; below 1/2 - 2^-(q+1) (2^-(q+2) when ia = 0) rounds down, else a tie
+    If flip = 0
+      If PmOpQFracCmp(s, q + 1, 1) > 0
+        up = 1
+      ElseIf ia = 0 And PmOpQFracCmp(s, q + 2, -1) < 0
+        up = 0
+      ElseIf ia > 0 And PmOpQFracCmp(s, q + 1, -1) < 0
+        up = 0
+      Else
+        up = 2
+      EndIf
+    Else
+      ; 1 - F above 1/2 + d means F below 1/2 - d
+      If PmOpQFracCmp(s, q + 1, -1) < 0
+        up = 1
+      ElseIf ia = 0 And PmOpQFracCmp(s, q + 2, 1) > 0
+        up = 0
+      ElseIf ia > 0 And PmOpQFracCmp(s, q + 1, 1) > 0
+        up = 0
+      Else
+        up = 2
+      EndIf
+    EndIf
+  EndIf
+  If up = 2
+    up = ia & 1
+  EndIf
+  r = sgn * (ia + up)
+  If r < qmin
+    r = qmin
+  EndIf
+  If r > qmax
+    r = qmax
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; An accumulator as INT32 (its low 32 bits, signed), as numpy's INT32
+; matmul and the reference's conversion leave it.
+Procedure.i PmOpWrap32(v.i)
+  CompilerIf #PMO_OPS_INT32 = 0
+    v = v & $FFFFFFFF
+    If v >= $80000000
+      v = v - $100000000
+    EndIf
+  CompilerEndIf
+  ProcedureReturn v
+EndProcedure
+
+; MatMulInteger-10 (PmOpI(8) = 0, INT32 out) and QLinearMatMul-10 (1,
+; requantized) with numpy matmul's batch broadcasting: PmOpI(0) the batch
+; rank, PmOpDY / PmOpDA / PmOpDB the batch extents of Y, A and B (1 where
+; one broadcasts), (1) M, (2) K, (3) N, (4) A's kind, (5) B's kind, (6) 1
+; when a_zero_point is present (one value), (7) b_zero_point: 0 absent, 1
+; one value, 2 one per column, (9) 1 for a b_scale per column, (10) Y's kind.
+Procedure PmOpQMatMul(a.i, b.i, azp.i, bzp.i, y.i, aScale.i, bScale.i, yScale.i, yZp.i)
+  Protected r.i
+  Protected batches.i
+  Protected bi.i
+  Protected rest.i
+  Protected d.i
+  Protected coord.i
+  Protected offA.i
+  Protected offB.i
+  Protected strideA.i
+  Protected strideB.i
+  Protected i.i
+  Protected j.i
+  Protected k.i
+  Protected az.i
+  Protected bz.i
+  Protected acc.i
+  Protected at.i
+  Protected mm.f
+  Protected yz.i
+  Protected va.i
+  Protected vb.i
+  PmOpInit()
+  r = PmOpI(0)
+  batches = 1
+  d = 0
+  While d < r
+    batches = batches * PmOpDY(d)
+    d = d + 1
+  Wend
+  az = 0
+  If PmOpI(6) <> 0
+    az = PmOpQRead(azp, 0, PmOpI(4))
+  EndIf
+  yz = 0
+  If PmOpI(8) <> 0
+    yz = PmOpQRead(yZp, 0, PmOpI(10))
+  EndIf
+  bi = 0
+  While bi < batches
+    rest = bi
+    offA = 0
+    offB = 0
+    strideA = 1
+    strideB = 1
+    d = r - 1
+    While d >= 0
+      coord = rest % PmOpDY(d)
+      rest = rest / PmOpDY(d)
+      If PmOpDA(d) <> 1
+        offA = offA + coord * strideA
+      EndIf
+      If PmOpDB(d) <> 1
+        offB = offB + coord * strideB
+      EndIf
+      strideA = strideA * PmOpDA(d)
+      strideB = strideB * PmOpDB(d)
+      d = d - 1
+    Wend
+    offA = offA * PmOpI(1) * PmOpI(2)
+    offB = offB * PmOpI(2) * PmOpI(3)
+    i = 0
+    While i < PmOpI(1)
+      j = 0
+      While j < PmOpI(3)
+        bz = 0
+        If PmOpI(7) = 1
+          bz = PmOpQRead(bzp, 0, PmOpI(5))
+        ElseIf PmOpI(7) = 2
+          bz = PmOpQRead(bzp, j, PmOpI(5))
+        EndIf
+        acc = 0
+        k = 0
+        While k < PmOpI(2)
+          va = PmOpQRead(a, offA + i * PmOpI(2) + k, PmOpI(4))
+          va = va - az
+          vb = PmOpQRead(b, offB + k * PmOpI(3) + j, PmOpI(5))
+          vb = vb - bz
+          acc = acc + va * vb
+          k = k + 1
+        Wend
+        acc = PmOpWrap32(acc)
+        at = (bi * PmOpI(1) + i) * PmOpI(3) + j
+        If PmOpI(8) = 0
+          PokeL(y + at * 4, acc)
+        Else
+          If PmOpI(9) <> 0
+            mm = PmTensorGet(aScale, 0) * PmTensorGet(bScale, j)
+          Else
+            mm = PmTensorGet(aScale, 0) * PmTensorGet(bScale, 0)
+          EndIf
+          mm = mm / PmTensorGet(yScale, 0)
+          PmOpQWrite(y, at, PmOpI(10), PmOpRequant(acc, mm, yz, PmOpQMin(PmOpI(10)), PmOpQMax(PmOpI(10))))
+        EndIf
+        j = j + 1
+      Wend
+      i = i + 1
+    Wend
+    bi = bi + 1
+  Wend
+EndProcedure
+
+; ConvInteger-10 (PmOpI(45) = 0, INT32 out) and QLinearConv-10 (1,
+; requantized). PmOpI(0) the spatial rank s, (1) N, (2) C, (3) M, (4) group,
+; (8 + d) input extents, (12 + d) output extents, (16 + d) kernel, (20 + d)
+; strides, (24 + d) dilations, (28 + d) leading pads, (40) X's kind, (41)
+; W's kind, (42) 1 when x_zero_point is present, (43) w_zero_point: 0 absent,
+; 1 one value, 2 one per output channel, (44) 1 when the INT32 bias is
+; present, (46) 1 for a w_scale per output channel, (47) Y's kind.
+Procedure PmOpQConv(x.i, w.i, xzp.i, wzp.i, bias.i, y.i, xScale.i, wScale.i, yScale.i, yZp.i)
+  Protected s.i
+  Protected n.i
+  Protected m.i
+  Protected g.i
+  Protected cg.i
+  Protected mg.i
+  Protected c.i
+  Protected o.i
+  Protected outCount.i
+  Protected inCount.i
+  Protected kCount.i
+  Protected kk.i
+  Protected d.i
+  Protected rest.i
+  Protected pos.i
+  Protected inside.i
+  Protected xi.i
+  Protected acc.i
+  Protected xz.i
+  Protected wz.i
+  Protected yz.i
+  Protected at.i
+  Protected mm.f
+  Protected va.i
+  Protected vb.i
+  PmOpInit()
+  s = PmOpI(0)
+  outCount = 1
+  inCount = 1
+  kCount = 1
+  d = 0
+  While d < s
+    outCount = outCount * PmOpI(12 + d)
+    inCount = inCount * PmOpI(8 + d)
+    kCount = kCount * PmOpI(16 + d)
+    d = d + 1
+  Wend
+  cg = PmOpI(2) / PmOpI(4)
+  mg = PmOpI(3) / PmOpI(4)
+  xz = 0
+  If PmOpI(42) <> 0
+    xz = PmOpQRead(xzp, 0, PmOpI(40))
+  EndIf
+  yz = 0
+  If PmOpI(45) <> 0
+    yz = PmOpQRead(yZp, 0, PmOpI(47))
+  EndIf
+  n = 0
+  While n < PmOpI(1)
+    m = 0
+    While m < PmOpI(3)
+      g = m / mg
+      wz = 0
+      If PmOpI(43) = 1
+        wz = PmOpQRead(wzp, 0, PmOpI(41))
+      ElseIf PmOpI(43) = 2
+        wz = PmOpQRead(wzp, m, PmOpI(41))
+      EndIf
+      o = 0
+      While o < outCount
+        rest = o
+        d = s - 1
+        While d >= 0
+          PmOpCoord(d) = rest % PmOpI(12 + d)
+          rest = rest / PmOpI(12 + d)
+          d = d - 1
+        Wend
+        acc = 0
+        c = 0
+        While c < cg
+          kk = 0
+          While kk < kCount
+            rest = kk
+            d = s - 1
+            While d >= 0
+              PmOpOffset(d) = rest % PmOpI(16 + d)
+              rest = rest / PmOpI(16 + d)
+              d = d - 1
+            Wend
+            inside = 1
+            xi = 0
+            d = 0
+            While d < s
+              pos = PmOpCoord(d) * PmOpI(20 + d) + PmOpOffset(d) * PmOpI(24 + d) - PmOpI(28 + d)
+              If pos < 0 Or pos >= PmOpI(8 + d)
+                inside = 0
+              EndIf
+              xi = xi * PmOpI(8 + d) + pos
+              d = d + 1
+            Wend
+            If inside <> 0
+              va = PmOpQRead(x, (n * PmOpI(2) + g * cg + c) * inCount + xi, PmOpI(40))
+              va = va - xz
+              vb = PmOpQRead(w, (m * cg + c) * kCount + kk, PmOpI(41))
+              vb = vb - wz
+              acc = acc + va * vb
+            EndIf
+            kk = kk + 1
+          Wend
+          c = c + 1
+        Wend
+        If PmOpI(44) <> 0
+          acc = acc + PeekL(bias + m * 4)
+        EndIf
+        acc = PmOpWrap32(acc)
+        at = (n * PmOpI(3) + m) * outCount + o
+        If PmOpI(45) = 0
+          PokeL(y + at * 4, acc)
+        Else
+          If PmOpI(46) <> 0
+            mm = PmTensorGet(xScale, 0) * PmTensorGet(wScale, m)
+          Else
+            mm = PmTensorGet(xScale, 0) * PmTensorGet(wScale, 0)
+          EndIf
+          mm = mm / PmTensorGet(yScale, 0)
+          PmOpQWrite(y, at, PmOpI(47), PmOpRequant(acc, mm, yz, PmOpQMin(PmOpI(47)), PmOpQMax(PmOpI(47))))
+        EndIf
+        o = o + 1
+      Wend
+      m = m + 1
+    Wend
+    n = n + 1
+  Wend
+EndProcedure

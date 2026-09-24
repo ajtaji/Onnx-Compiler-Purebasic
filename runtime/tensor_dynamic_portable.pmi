@@ -156,10 +156,13 @@ Procedure.i DIntegerOp(A.i,B.i,Op.i)
   ProcedureReturn 0
 EndProcedure
 Procedure.f DFloat(Value.i)
+  Protected r.f=0.0
   CompilerIf #PMD_NATIVE_BYTES=8
     ProcedureReturn MathFFromInt(Value)
   CompilerElse
-    ProcedureReturn Value
+    ; an assignment converts; returning the integer returned its bits
+    r=Value
+    ProcedureReturn r
   CompilerEndIf
 EndProcedure
 Procedure.f DReadF(Address.i)
@@ -304,6 +307,8 @@ Procedure.i DSize(Kind.i)
       ProcedureReturn 4
     Case 7
       ProcedureReturn 8
+    Case 2
+      ProcedureReturn 1
     Case 3
       ProcedureReturn 1
     Case 9
@@ -414,6 +419,10 @@ Procedure.i DInt(Id.i,Index.i)
       ProcedureReturn PeekL(Dt(Id)\Data+Index*4)
     Case 9
       ProcedureReturn PeekA(Dt(Id)\Data+Index) & 255
+    Case 2
+      ProcedureReturn PeekA(Dt(Id)\Data+Index) & 255
+    Case 3
+      ProcedureReturn ((PeekA(Dt(Id)\Data+Index) & 255) ! 128) - 128
   EndSelect
   DFail("Integer shape controls require integer tensors.")
   ProcedureReturn 0
@@ -442,6 +451,10 @@ Procedure DPut(Id.i,Index.i,Value.f)
       PokeL(Dt(Id)\Data+Index*4,Int(Value))
     Case 9
       PokeA(Dt(Id)\Data+Index,Bool(Value<>0.0))
+    Case 2
+      PokeA(Dt(Id)\Data+Index,Int(Value) & 255)
+    Case 3
+      PokeA(Dt(Id)\Data+Index,Int(Value) & 255)
   EndSelect
 EndProcedure
 ; The FP32 LSTM's working memory and its input check: the reference LSTM
@@ -1182,6 +1195,8 @@ Procedure DCast(Y.i,A.i,Kind.i)
         PokeL(Dt(Y)\Data+i*4,value)
       ElseIf Kind=9
         PokeA(Dt(Y)\Data+i,Bool(value<>0))
+      ElseIf Kind=2 Or Kind=3
+        PokeA(Dt(Y)\Data+i,value & 255)
       EndIf
     Else
       DPut(Y,i,DGet(A,i))

@@ -22,7 +22,8 @@ Procedure.i PmoOpsOwns(Operation.s)
                                   "GatherElements|GatherND|OneHot|Einsum|Dropout|CastLike|Size|Tan|Asin|Acos|Sinh|Cosh|Asinh|" +
                                   "Acosh|Atanh|BitwiseNot|BitwiseAnd|BitwiseOr|BitwiseXor|Hardmax|LpNormalization|" +
                                   "MeanVarianceNormalization|LRN|GroupNormalization|EyeLike|Det|Compress|ReverseSequence|Upsample|" +
-                                  "RNN|GRU|NonMaxSuppression|RoiAlign|GridSample|", "|" + Operation + "|"))
+                                  "RNN|GRU|NonMaxSuppression|RoiAlign|GridSample|QuantizeLinear|DequantizeLinear|" +
+                                  "DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|", "|" + Operation + "|"))
 EndProcedure
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
@@ -48,6 +49,8 @@ Procedure.i PmoOpsFloor(Operation.s)
     Case "HardSwish", "Trilu" : ProcedureReturn 14
     Case "CastLike" : ProcedureReturn 15
     Case "GridSample" : ProcedureReturn 16
+    Case "QuantizeLinear", "DequantizeLinear", "MatMulInteger", "QLinearMatMul", "ConvInteger", "QLinearConv" : ProcedureReturn 10
+    Case "DynamicQuantizeLinear" : ProcedureReturn 11
     Case "Mish", "BitwiseNot", "BitwiseAnd", "BitwiseOr", "BitwiseXor", "GroupNormalization" : ProcedureReturn 18
     Case "Gelu" : ProcedureReturn 20
   EndSelect
@@ -210,17 +213,21 @@ Procedure.i PmoOpsKindBit(ElementType.i)
     Case 6 : ProcedureReturn 2
     Case 7 : ProcedureReturn 4
     Case 9 : ProcedureReturn 8
+    Case 2 : ProcedureReturn 16
+    Case 3 : ProcedureReturn 32
   EndSelect
   ProcedureReturn 0
 EndProcedure
 
 Procedure.s PmoOpsKindNames(Bits.i)
   Protected Text.s, Count.i, i.i
-  Protected Dim Names.s(3)
+  Protected Dim Names.s(5)
   If Bits & 1 : Names(Count) = "FLOAT" : Count + 1 : EndIf
   If Bits & 2 : Names(Count) = "INT32" : Count + 1 : EndIf
   If Bits & 4 : Names(Count) = "INT64" : Count + 1 : EndIf
   If Bits & 8 : Names(Count) = "BOOL" : Count + 1 : EndIf
+  If Bits & 16 : Names(Count) = "UINT8" : Count + 1 : EndIf
+  If Bits & 32 : Names(Count) = "INT8" : Count + 1 : EndIf
   For i = 0 To Count - 1
     If i > 0 And i = Count - 1 : Text + " and " : ElseIf i > 0 : Text + ", " : EndIf
     Text + Names(i)
@@ -1527,6 +1534,293 @@ Procedure.i PmoEmitOpsRoiAlign(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcNa
   ProcedureReturn #True
 EndProcedure
 
+; ---- the quantized operators ------------------------------------------------
+; One value (a scalar or a one-element tensor) or one per element of Extent.
+Procedure.i PmoOpsQCount(*V.PmoIrValue, Extent.q)
+  If *V = 0 : ProcedureReturn 0 : EndIf
+  If *V\Elements = 1 And PmoEmitRank(*V) <= 1 : ProcedureReturn 1 : EndIf
+  If PmoEmitRank(*V) = 1 And *V\Elements = Extent : ProcedureReturn 2 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PmoEmitOpsQuantizeLinear(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *S.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *Z.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Quant.i = Bool(*Node\Operation = "QuantizeLinear"), Axis.q, Rank.i, Outer.q = 1, Inner.q = 1, Per.i, d.i, Kind.i, Allowed.s = "|"
+  If Opset >= 13 : Allowed = "|axis|" : EndIf
+  If Opset >= 19 And Quant : Allowed = "|axis|saturate|" : EndIf
+  If PmoEmitNsAttributesAllowed(*Node, Allowed, Opset) = 0 : ProcedureReturn #False : EndIf
+  If Quant
+    If PmoOpsTypeOk(*Node, *X, "x", 1) = 0 : ProcedureReturn #False : EndIf
+  ElseIf PmoOpsTypeOk(*Node, *X, "x", 2 | 16 | 32) = 0
+    ProcedureReturn #False
+  EndIf
+  If PmoOpsTypeOk(*Node, *S, "the scale", 1) = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*X)
+  Axis = PmoEmitAttrI(*Node, "axis", 1)
+  If Axis < 0 : Axis + Rank : EndIf
+  Per = 0
+  If *S\Elements > 1 Or PmoEmitRank(*S) > 1
+    If Opset < 13 : ProcedureReturn PmoEmitNsFail(*Node, "the scale holds " + Str(*S\Elements) + " values; before opset 13 it is one value.") : EndIf
+    If Axis < 0 Or Axis >= Rank : ProcedureReturn PmoEmitNsFail(*Node, "attribute axis = " + Str(PmoEmitAttrI(*Node, "axis", 1)) + " is outside the input rank " + Str(Rank) + ".") : EndIf
+    If PmoOpsQCount(*S, PmoEmitDim(*X, Axis)) <> 2
+      ProcedureReturn PmoEmitNsFail(*Node, "the scale must be one value or a 1-D tensor with one value per element of axis " + Str(Axis) + "; blocked quantization belongs to opset 21.")
+    EndIf
+    Per = 1
+  EndIf
+  Kind = 2
+  If *Z
+    If *Node\Operation = "QuantizeLinear"
+      If PmoOpsTypeOk(*Node, *Z, "the zero point", 16 | 32) = 0 : ProcedureReturn #False : EndIf
+    ElseIf *Z\ElementType <> *X\ElementType
+      ProcedureReturn PmoEmitNsFail(*Node, "the zero point must have the element type of x.")
+    EndIf
+    If *Z\Elements <> *S\Elements : ProcedureReturn PmoEmitNsFail(*Node, "the zero point must hold as many values as the scale.") : EndIf
+    Kind = *Z\ElementType
+  EndIf
+  If Quant
+    If *Y = 0 Or *Y\ElementType <> Kind Or PmoEmitShapeEqual(*X, *Y) = 0
+      ProcedureReturn PmoEmitNsFail(*Node, "the declared output must have x's shape and the zero point's element type (UINT8 without one).")
+    EndIf
+  ElseIf *Y = 0 Or *Y\ElementType <> 1 Or PmoEmitShapeEqual(*X, *Y) = 0
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT with x's shape.")
+  EndIf
+  If Per
+    For d = 0 To Axis - 1 : Outer * PmoEmitDim(*X, d) : Next
+    For d = Axis + 1 To Rank - 1 : Inner * PmoEmitDim(*X, d) : Next
+  Else
+    Outer = *X\Elements : Inner = 1
+  EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(Outer))
+  If Per : PmoEmitLine(File, "  PmOpI(1) = " + Str(PmoEmitDim(*X, Axis))) : Else : PmoEmitLine(File, "  PmOpI(1) = 1") : EndIf
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(Inner))
+  PmoEmitLine(File, "  PmOpI(3) = " + Str(Per))
+  If Quant
+    If *Z : PmoEmitLine(File, "  PmOpI(4) = " + Str(Kind)) : Else : PmoEmitLine(File, "  PmOpI(4) = 0") : EndIf
+    PmoEmitLine(File, "  PmOpI(5) = " + Str(Kind))
+    PmoEmitLine(File, "  PmOpQuantize(*i0, *i1, " + PmoOpsIn(*Node, 2) + ", *o0)")
+  Else
+    PmoEmitLine(File, "  PmOpI(4) = " + Str(*X\ElementType))
+    PmoEmitLine(File, "  PmOpI(5) = " + Str(Bool(*Z <> 0)))
+    PmoEmitLine(File, "  PmOpDequantize(*i0, *i1, " + PmoOpsIn(*Node, 2) + ", *o0)")
+  EndIf
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+Procedure.i PmoEmitOpsDynQuantize(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected *S.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 1))
+  Protected *Z.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 2))
+  If PmoEmitNsAttributesAllowed(*Node, "|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "x", 1) = 0 : ProcedureReturn #False : EndIf
+  If *Y = 0 Or *S = 0 Or *Z = 0 : ProcedureReturn PmoEmitNsFail(*Node, "outputs y, y_scale and y_zero_point are all required.") : EndIf
+  If *Y\ElementType <> 2 Or PmoEmitShapeEqual(*X, *Y) = 0 Or *S\ElementType <> 1 Or *S\Elements <> 1 Or *Z\ElementType <> 2 Or *Z\Elements <> 1
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared outputs must be UINT8 y with x's shape, a FLOAT y_scale and a UINT8 y_zero_point.")
+  EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  If PmOpDynQuantize(*i0, *o0, *o1, *o2, " + Str(*X\Elements) + ") <> 0 : PmOnnxRuntimeOk = 0 : EndIf")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+; MatMulInteger (Mode 0) and QLinearMatMul (1): the kernel's parameters from
+; the operand shapes, or the sentence that refuses them.
+Procedure.i PmoEmitOpsQMatMul(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected Mode.i = Bool(*Node\Operation = "QLinearMatMul")
+  Protected IA.i = 0, IB.i = 1, IAZ.i = 2, IBZ.i = 3, *A.PmoIrValue, *B.PmoIrValue, *AZ.PmoIrValue, *BZ.PmoIrValue
+  Protected *AS.PmoIrValue, *BS.PmoIrValue, *YS.PmoIrValue, *YZ.PmoIrValue, *Y.PmoIrValue
+  Protected RA.i, RB.i, M.q, K.q, N.q, KB.q, R.i, d.i, EA.q, EB.q, EY.q, Kind.i, BZMode.i, YRank.i, Text.s
+  If Mode : IA = 0 : IB = 3 : IAZ = 2 : IBZ = 5 : EndIf
+  *A = PmoEmitValue(*Ir, PmoEmitInput(*Node, IA)) : *B = PmoEmitValue(*Ir, PmoEmitInput(*Node, IB))
+  *AZ = PmoEmitValue(*Ir, PmoEmitInput(*Node, IAZ)) : *BZ = PmoEmitValue(*Ir, PmoEmitInput(*Node, IBZ))
+  *Y = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  If PmoEmitNsAttributesAllowed(*Node, "|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *A, "A", 16 | 32) = 0 Or PmoOpsTypeOk(*Node, *B, "B", 16 | 32) = 0 : ProcedureReturn #False : EndIf
+  RA = PmoEmitRank(*A) : RB = PmoEmitRank(*B)
+  If RA < 1 Or RB < 1 : ProcedureReturn PmoEmitNsFail(*Node, "A and B must have rank one or more.") : EndIf
+  If RA = 1 : M = 1 : K = PmoEmitDim(*A, 0) : Else : M = PmoEmitDim(*A, RA - 2) : K = PmoEmitDim(*A, RA - 1) : EndIf
+  If RB = 1 : KB = PmoEmitDim(*B, 0) : N = 1 : Else : KB = PmoEmitDim(*B, RB - 2) : N = PmoEmitDim(*B, RB - 1) : EndIf
+  If K <> KB : ProcedureReturn PmoEmitNsFail(*Node, "A has " + Str(K) + " columns and B " + Str(KB) + " rows.") : EndIf
+  R = 0
+  If RA > 2 : R = RA - 2 : EndIf
+  If RB > 2 And RB - 2 > R : R = RB - 2 : EndIf
+  If R > 8 : ProcedureReturn PmoEmitNsFail(*Node, "more than eight batch axes.") : EndIf
+  If *AZ
+    If *AZ\ElementType <> *A\ElementType Or PmoOpsQCount(*AZ, 1) <> 1
+      ProcedureReturn PmoEmitNsFail(*Node, "the zero point of A must be one value of A's element type; a per-row zero point is not implemented.")
+    EndIf
+  EndIf
+  BZMode = 0
+  If *BZ
+    BZMode = PmoOpsQCount(*BZ, N)
+    If N = 1 And BZMode = 2 : BZMode = 1 : EndIf
+    If *BZ\ElementType <> *B\ElementType Or BZMode = 0
+      ProcedureReturn PmoEmitNsFail(*Node, "the zero point of B must be of B's element type, one value or one per column of B.")
+    EndIf
+  EndIf
+  Kind = 6
+  If Mode
+    *AS = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1)) : *BS = PmoEmitValue(*Ir, PmoEmitInput(*Node, 4))
+    *YS = PmoEmitValue(*Ir, PmoEmitInput(*Node, 6)) : *YZ = PmoEmitValue(*Ir, PmoEmitInput(*Node, 7))
+    If *AZ = 0 Or *BZ = 0 Or *YZ = 0 : ProcedureReturn PmoEmitNsFail(*Node, "the zero points of a, b and y are required.") : EndIf
+    If PmoOpsTypeOk(*Node, *AS, "a_scale", 1) = 0 Or PmoOpsTypeOk(*Node, *BS, "b_scale", 1) = 0 Or PmoOpsTypeOk(*Node, *YS, "y_scale", 1) = 0 : ProcedureReturn #False : EndIf
+    If PmoOpsQCount(*AS, 1) <> 1 Or PmoOpsQCount(*YS, 1) <> 1 Or PmoOpsQCount(*BS, N) = 0 Or PmoOpsQCount(*YZ, 1) <> 1
+      ProcedureReturn PmoEmitNsFail(*Node, "a_scale, y_scale and y_zero_point must be one value each, b_scale one value or one per column of b.")
+    EndIf
+    If PmoOpsTypeOk(*Node, *YZ, "y_zero_point", 16 | 32) = 0 : ProcedureReturn #False : EndIf
+    Kind = *YZ\ElementType
+  EndIf
+  ; Y: the broadcast batch axes, then M unless A is 1-D, then N unless B is 1-D
+  YRank = R
+  If RA > 1 : YRank + 1 : EndIf
+  If RB > 1 : YRank + 1 : EndIf
+  Text = "the declared output must be " + PmoEmitNsTypeName(Kind) + " with numpy matmul's shape."
+  If *Y = 0 Or *Y\ElementType <> Kind Or PmoEmitRank(*Y) <> YRank : ProcedureReturn PmoEmitNsFail(*Node, Text) : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(R))
+  For d = 0 To R - 1
+    EA = 1 : EB = 1
+    If RA - 2 - R + d >= 0 : EA = PmoEmitDim(*A, RA - 2 - R + d) : EndIf
+    If RB - 2 - R + d >= 0 : EB = PmoEmitDim(*B, RB - 2 - R + d) : EndIf
+    If EA <> EB And EA <> 1 And EB <> 1 : ProcedureReturn PmoEmitNsFail(*Node, "batch axes of A and B do not broadcast.") : EndIf
+    EY = EA : If EA = 1 : EY = EB : EndIf
+    If PmoEmitDim(*Y, d) <> EY : ProcedureReturn PmoEmitNsFail(*Node, Text) : EndIf
+    PmoEmitLine(File, "  PmOpDY(" + Str(d) + ") = " + Str(EY))
+    PmoEmitLine(File, "  PmOpDA(" + Str(d) + ") = " + Str(EA))
+    PmoEmitLine(File, "  PmOpDB(" + Str(d) + ") = " + Str(EB))
+  Next
+  If RA > 1 And PmoEmitDim(*Y, R) <> M : ProcedureReturn PmoEmitNsFail(*Node, Text) : EndIf
+  If RB > 1 And PmoEmitDim(*Y, YRank - 1) <> N : ProcedureReturn PmoEmitNsFail(*Node, Text) : EndIf
+  PmoEmitLine(File, "  PmOpI(1) = " + Str(M))
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(K))
+  PmoEmitLine(File, "  PmOpI(3) = " + Str(N))
+  PmoEmitLine(File, "  PmOpI(4) = " + Str(*A\ElementType))
+  PmoEmitLine(File, "  PmOpI(5) = " + Str(*B\ElementType))
+  PmoEmitLine(File, "  PmOpI(6) = " + Str(Bool(*AZ <> 0)))
+  PmoEmitLine(File, "  PmOpI(7) = " + Str(BZMode))
+  PmoEmitLine(File, "  PmOpI(8) = " + Str(Mode))
+  If Mode
+    PmoEmitLine(File, "  PmOpI(9) = " + Str(Bool(PmoOpsQCount(*BS, N) = 2 And N > 1)))
+    PmoEmitLine(File, "  PmOpI(10) = " + Str(Kind))
+    PmoEmitLine(File, "  PmOpQMatMul(*i0, *i3, " + PmoOpsIn(*Node, 2) + ", " + PmoOpsIn(*Node, 5) + ", *o0, *i1, *i4, *i6, *i7)")
+  Else
+    PmoEmitLine(File, "  PmOpI(9) = 0")
+    PmoEmitLine(File, "  PmOpI(10) = 0")
+    PmoEmitLine(File, "  PmOpQMatMul(*i0, *i1, " + PmoOpsIn(*Node, 2) + ", " + PmoOpsIn(*Node, 3) + ", *o0, 0, 0, 0, 0)")
+  EndIf
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+; ConvInteger (Mode 0) and QLinearConv (1).
+Procedure.i PmoEmitOpsQConv(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected Mode.i = Bool(*Node\Operation = "QLinearConv")
+  Protected IX.i = 0, IW.i = 1, IXZ.i = 2, IWZ.i = 3, *X.PmoIrValue, *W.PmoIrValue, *XZ.PmoIrValue, *WZ.PmoIrValue, *Bias.PmoIrValue
+  Protected *XS.PmoIrValue, *WS.PmoIrValue, *YS.PmoIrValue, *YZ.PmoIrValue, *Y.PmoIrValue
+  Protected s.i, d.i, Group.q, C.q, M.q, Kind.i, WZMode.i, AutoPad.s, Kernel.q, Stride.q, Dilation.q, Begin.Quad, EndPad.Quad, Out.q
+  If Mode : IX = 0 : IW = 3 : IXZ = 2 : IWZ = 5 : EndIf
+  *X = PmoEmitValue(*Ir, PmoEmitInput(*Node, IX)) : *W = PmoEmitValue(*Ir, PmoEmitInput(*Node, IW))
+  *XZ = PmoEmitValue(*Ir, PmoEmitInput(*Node, IXZ)) : *WZ = PmoEmitValue(*Ir, PmoEmitInput(*Node, IWZ))
+  *Y = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  If PmoEmitNsAttributesAllowed(*Node, "|auto_pad|dilations|group|kernel_shape|pads|strides|", Opset) = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsTypeOk(*Node, *X, "x", 16 | 32) = 0 Or PmoOpsTypeOk(*Node, *W, "w", 16 | 32) = 0 : ProcedureReturn #False : EndIf
+  s = PmoEmitRank(*X) - 2
+  If s < 1 Or s > 3 : ProcedureReturn PmoEmitNsFail(*Node, "x has rank " + Str(PmoEmitRank(*X)) + "; N x C x D1 ... Ds with one to three spatial axes is implemented.") : EndIf
+  If PmoEmitRank(*W) <> s + 2 : ProcedureReturn PmoEmitNsFail(*Node, "w must have x's rank.") : EndIf
+  Group = PmoEmitAttrI(*Node, "group", 1)
+  C = PmoEmitDim(*X, 1) : M = PmoEmitDim(*W, 0)
+  If Group < 1 Or C <> Group * PmoEmitDim(*W, 1) Or M % Group <> 0
+    ProcedureReturn PmoEmitNsFail(*Node, "group = " + Str(Group) + " does not divide x's " + Str(C) + " channels and w's " + Str(M) + " filters as w's shape requires.")
+  EndIf
+  If PmoEmitAttrListCount(*Node, "kernel_shape") > 0
+    For d = 0 To s - 1
+      If PmoEmitAttrListI(*Node, "kernel_shape", d, 0) <> PmoEmitDim(*W, 2 + d) : ProcedureReturn PmoEmitNsFail(*Node, "attribute kernel_shape does not match w's spatial extents.") : EndIf
+    Next
+  EndIf
+  If *XZ
+    If *XZ\ElementType <> *X\ElementType Or PmoOpsQCount(*XZ, 1) <> 1 : ProcedureReturn PmoEmitNsFail(*Node, "the zero point of x must be one value of x's element type.") : EndIf
+  EndIf
+  WZMode = 0
+  If *WZ
+    WZMode = PmoOpsQCount(*WZ, M)
+    If M = 1 And WZMode = 2 : WZMode = 1 : EndIf
+    If *WZ\ElementType <> *W\ElementType Or WZMode = 0 : ProcedureReturn PmoEmitNsFail(*Node, "the zero point of w must be of w's element type, one value or one per output channel.") : EndIf
+  EndIf
+  Kind = 6
+  If Mode
+    *XS = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1)) : *WS = PmoEmitValue(*Ir, PmoEmitInput(*Node, 4))
+    *YS = PmoEmitValue(*Ir, PmoEmitInput(*Node, 6)) : *YZ = PmoEmitValue(*Ir, PmoEmitInput(*Node, 7))
+    *Bias = PmoEmitValue(*Ir, PmoEmitInput(*Node, 8))
+    If *XZ = 0 Or *WZ = 0 Or *YZ = 0 : ProcedureReturn PmoEmitNsFail(*Node, "the zero points of x, w and y are required.") : EndIf
+    If PmoOpsTypeOk(*Node, *XS, "x_scale", 1) = 0 Or PmoOpsTypeOk(*Node, *WS, "w_scale", 1) = 0 Or PmoOpsTypeOk(*Node, *YS, "y_scale", 1) = 0 : ProcedureReturn #False : EndIf
+    If PmoOpsQCount(*XS, 1) <> 1 Or PmoOpsQCount(*YS, 1) <> 1 Or PmoOpsQCount(*WS, M) = 0 Or PmoOpsQCount(*YZ, 1) <> 1
+      ProcedureReturn PmoEmitNsFail(*Node, "x_scale, y_scale and y_zero_point must be one value each, w_scale one value or one per output channel.")
+    EndIf
+    If PmoOpsTypeOk(*Node, *YZ, "y_zero_point", 16 | 32) = 0 : ProcedureReturn #False : EndIf
+    If *Bias And (*Bias\ElementType <> 6 Or PmoEmitRank(*Bias) <> 1 Or *Bias\Elements <> M) : ProcedureReturn PmoEmitNsFail(*Node, "B must be INT32 with one value per output channel.") : EndIf
+    Kind = *YZ\ElementType
+  EndIf
+  AutoPad = PmoEmitAttrS(*Node, "auto_pad", "NOTSET")
+  If AutoPad <> "NOTSET" And AutoPad <> "SAME_UPPER" And AutoPad <> "SAME_LOWER" And AutoPad <> "VALID"
+    ProcedureReturn PmoEmitNsFail(*Node, "attribute auto_pad = " + AutoPad + " is not a padding mode; NOTSET, SAME_UPPER, SAME_LOWER and VALID are.")
+  EndIf
+  If AutoPad <> "NOTSET" And PmoEmitAttrListCount(*Node, "pads") > 0
+    ProcedureReturn PmoEmitNsFail(*Node, "attribute pads is given with auto_pad = " + AutoPad + "; the specification allows explicit pads only with NOTSET.")
+  EndIf
+  If *Y = 0 Or *Y\ElementType <> Kind Or PmoEmitRank(*Y) <> s + 2 Or PmoEmitDim(*Y, 0) <> PmoEmitDim(*X, 0) Or PmoEmitDim(*Y, 1) <> M
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be " + PmoEmitNsTypeName(Kind) + " [N, " + Str(M) + ", spatial ...].")
+  EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(s))
+  PmoEmitLine(File, "  PmOpI(1) = " + Str(PmoEmitDim(*X, 0)))
+  PmoEmitLine(File, "  PmOpI(2) = " + Str(C))
+  PmoEmitLine(File, "  PmOpI(3) = " + Str(M))
+  PmoEmitLine(File, "  PmOpI(4) = " + Str(Group))
+  For d = 0 To s - 1
+    Kernel = PmoEmitDim(*W, 2 + d)
+    Stride = PmoEmitAttrListI(*Node, "strides", d, 1)
+    Dilation = PmoEmitAttrListI(*Node, "dilations", d, 1)
+    Begin\q = PmoEmitAttrListI(*Node, "pads", d, 0)
+    EndPad\q = PmoEmitAttrListI(*Node, "pads", d + s, 0)
+    If Kernel < 1 Or Stride < 1 Or Dilation < 1 Or Begin\q < 0 Or EndPad\q < 0
+      ProcedureReturn PmoEmitNsFail(*Node, "the kernel, strides and dilations must be positive and pads not negative on spatial axis " + Str(d) + ".")
+    EndIf
+    Out = PmoOpsPoolExtent(PmoEmitDim(*X, 2 + d), Kernel, Stride, Dilation, AutoPad, 0, @Begin, @EndPad)
+    If Out < 1 : ProcedureReturn PmoEmitNsFail(*Node, "the kernel on spatial axis " + Str(d) + " is larger than the padded input.") : EndIf
+    If Out <> PmoEmitDim(*Y, 2 + d)
+      ProcedureReturn PmoEmitNsFail(*Node, "the declared output extent on spatial axis " + Str(d) + " is " + Str(PmoEmitDim(*Y, 2 + d)) + "; the convolution shape rule gives " + Str(Out) + ".")
+    EndIf
+    PmoEmitLine(File, "  PmOpI(" + Str(8 + d) + ") = " + Str(PmoEmitDim(*X, 2 + d)))
+    PmoEmitLine(File, "  PmOpI(" + Str(12 + d) + ") = " + Str(Out))
+    PmoEmitLine(File, "  PmOpI(" + Str(16 + d) + ") = " + Str(Kernel))
+    PmoEmitLine(File, "  PmOpI(" + Str(20 + d) + ") = " + Str(Stride))
+    PmoEmitLine(File, "  PmOpI(" + Str(24 + d) + ") = " + Str(Dilation))
+    PmoEmitLine(File, "  PmOpI(" + Str(28 + d) + ") = " + Str(Begin\q))
+  Next
+  PmoEmitLine(File, "  PmOpI(40) = " + Str(*X\ElementType))
+  PmoEmitLine(File, "  PmOpI(41) = " + Str(*W\ElementType))
+  PmoEmitLine(File, "  PmOpI(42) = " + Str(Bool(*XZ <> 0)))
+  PmoEmitLine(File, "  PmOpI(43) = " + Str(WZMode))
+  PmoEmitLine(File, "  PmOpI(44) = " + Str(Bool(*Bias <> 0)))
+  PmoEmitLine(File, "  PmOpI(45) = " + Str(Mode))
+  If Mode
+    PmoEmitLine(File, "  PmOpI(46) = " + Str(Bool(PmoOpsQCount(*WS, M) = 2 And M > 1)))
+    PmoEmitLine(File, "  PmOpI(47) = " + Str(Kind))
+    PmoEmitLine(File, "  PmOpQConv(*i0, *i3, *i2, *i5, " + PmoOpsIn(*Node, 8) + ", *o0, *i1, *i4, *i6, *i7)")
+  Else
+    PmoEmitLine(File, "  PmOpI(46) = 0")
+    PmoEmitLine(File, "  PmOpI(47) = 0")
+    PmoEmitLine(File, "  PmOpQConv(*i0, *i1, " + PmoOpsIn(*Node, 2) + ", " + PmoOpsIn(*Node, 3) + ", 0, *o0, 0, 0, 0, 0)")
+  EndIf
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
 ; GridSample's mode and padding codes (PmOpGridSample) for a node, or the
 ; sentence that refuses it; Spatial is the input rank less two, 0 when the
 ; rank is not yet known (the runtime-dimension wrapper checks it then).
@@ -1627,6 +1921,10 @@ Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
     Case "RNN", "GRU" : Done = PmoEmitOpsRecurrent(File, *Ir, *Node, ProcName, Opset)
     Case "RoiAlign" : Done = PmoEmitOpsRoiAlign(File, *Ir, *Node, ProcName, Opset)
     Case "GridSample" : Done = PmoEmitOpsGridSample(File, *Ir, *Node, ProcName, Opset)
+    Case "QuantizeLinear", "DequantizeLinear" : Done = PmoEmitOpsQuantizeLinear(File, *Ir, *Node, ProcName, Opset)
+    Case "DynamicQuantizeLinear" : Done = PmoEmitOpsDynQuantize(File, *Ir, *Node, ProcName, Opset)
+    Case "MatMulInteger", "QLinearMatMul" : Done = PmoEmitOpsQMatMul(File, *Ir, *Node, ProcName, Opset)
+    Case "ConvInteger", "QLinearConv" : Done = PmoEmitOpsQConv(File, *Ir, *Node, ProcName, Opset)
     Case "NonMaxSuppression" : ProcedureReturn PmoEmitNsFail(*Node, "its output size depends on the scores, which the fixed-shape path cannot plan.")
     Case "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp"
       Done = PmoEmitOpsReduce(File, *Ir, *Node, ProcName, Opset)

@@ -555,7 +555,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   ForEach model\Graph\Initializers()
     If ListSize(model\Graph\Initializers()\Dims())>8 : PmoDynamicError="Initializer rank exceeds the reusable backend's eight-axis limit." : Goto Failed : EndIf
     Select model\Graph\Initializers()\DataType
-      Case 1,6,7,9
+      Case 1,2,3,6,7,9
       Default : PmoDynamicError="Reusable FP32 emission does not implement this initializer element type." : Goto Failed
     EndSelect
     id+1 : ids(model\Graph\Initializers()\Name)=id : known(Str(id))=1 : persistent(Str(id))=1

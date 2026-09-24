@@ -171,6 +171,9 @@ Procedure.s PmoEmitGet(ElementType.i, Pointer.s, Index.s)
     Case 1 : ProcedureReturn "PmTensorGet(" + Pointer + ", " + Index + ")"
     Case 7 : ProcedureReturn "PmTensorGetI64(" + Pointer + ", " + Index + ")"
     Case 9 : ProcedureReturn "PmTensorGetBool(" + Pointer + ", " + Index + ")"
+    Case 2 : ProcedureReturn "(PeekA(" + Pointer + " + " + Index + ") & 255)"
+    Case 3 : ProcedureReturn "(((PeekA(" + Pointer + " + " + Index + ") & 255) ! 128) - 128)"
+    Case 6 : ProcedureReturn "PeekL(" + Pointer + " + (" + Index + ") * 4)"
   EndSelect
   PmoEmitFail("no generated load for ONNX tensor type " + Str(ElementType))
   ProcedureReturn "0"
@@ -181,6 +184,8 @@ Procedure.s PmoEmitPut(ElementType.i, Pointer.s, Index.s, Value.s)
     Case 1 : ProcedureReturn "PmTensorPut(" + Pointer + ", " + Index + ", " + Value + ")"
     Case 7 : ProcedureReturn "PmTensorPutI64(" + Pointer + ", " + Index + ", " + Value + ")"
     Case 9 : ProcedureReturn "PmTensorPutBool(" + Pointer + ", " + Index + ", " + Value + ")"
+    Case 2, 3 : ProcedureReturn "PokeA(" + Pointer + " + " + Index + ", (" + Value + ") & 255)"
+    Case 6 : ProcedureReturn "PokeL(" + Pointer + " + (" + Index + ") * 4, " + Value + ")"
   EndSelect
   PmoEmitFail("no generated store for ONNX tensor type " + Str(ElementType))
   ProcedureReturn ""
@@ -554,12 +559,13 @@ Procedure.i PmoEmitCastHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Cal
   PmoEmitLine(File, "  While i < " + Str(*Out\Elements))
   If *Src\ElementType = 1
     PmoEmitLine(File, "    fv = " + PmoEmitGet(1, "*src", "i"))
-    If *Out\ElementType = 7
+    If *Out\ElementType = 7 Or *Out\ElementType = 2 Or *Out\ElementType = 3 Or *Out\ElementType = 6
       ; Float to integer converts toward zero (the ONNX reference and ONNX
       ; Runtime). The bare-metal dialect's assignment already truncates; the
       ; host language's assignment rounds, so it truncates explicitly (forum 860).
+      ; UINT8, INT8 and INT32 keep the low bits, as numpy's conversion does.
       If HostDialect : PmoEmitLine(File, "    iv = Int(fv)") : Else : PmoEmitLine(File, "    iv = fv") : EndIf
-      PmoEmitLine(File, "    " + PmoEmitPut(7, "*dst", "i", "iv"))
+      PmoEmitLine(File, "    " + PmoEmitPut(*Out\ElementType, "*dst", "i", "iv"))
     ElseIf *Out\ElementType = 9
       PmoEmitLine(File, "    " + PmoEmitPut(9, "*dst", "i", "Bool(fv <> 0.0)"))
     Else
@@ -572,7 +578,7 @@ Procedure.i PmoEmitCastHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Cal
     ElseIf *Out\ElementType = 9
       PmoEmitLine(File, "    " + PmoEmitPut(9, "*dst", "i", "Bool(iv <> 0)"))
     Else
-      PmoEmitLine(File, "    " + PmoEmitPut(7, "*dst", "i", "iv"))
+      PmoEmitLine(File, "    " + PmoEmitPut(*Out\ElementType, "*dst", "i", "iv"))
     EndIf
   EndIf
   PmoEmitLine(File, "    i = i + 1") : PmoEmitLine(File, "  Wend")

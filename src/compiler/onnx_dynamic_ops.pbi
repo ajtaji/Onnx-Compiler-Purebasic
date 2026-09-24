@@ -60,6 +60,15 @@ Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
     Case "NonMaxSuppression" : ProcedureReturn "|center_point_box|"
     Case "Upsample" : ProcedureReturn "|mode|scales|"  ; so its own refusal, not an attribute's, is the sentence
     Case "GridSample" : ProcedureReturn "|align_corners|mode|padding_mode|"
+    Case "QuantizeLinear"
+      If Opset >= 19 : ProcedureReturn "|axis|saturate|" : EndIf
+      If Opset >= 13 : ProcedureReturn "|axis|" : EndIf
+      ProcedureReturn "|"
+    Case "DequantizeLinear"
+      If Opset >= 13 : ProcedureReturn "|axis|" : EndIf
+      ProcedureReturn "|"
+    Case "DynamicQuantizeLinear", "MatMulInteger", "QLinearMatMul" : ProcedureReturn "|"
+    Case "ConvInteger", "QLinearConv" : ProcedureReturn "|auto_pad|dilations|group|kernel_shape|pads|strides|"
     Case "RoiAlign"
       If Opset >= 16 : ProcedureReturn "|coordinate_transformation_mode|mode|output_height|output_width|sampling_ratio|spatial_scale|" : EndIf
       ProcedureReturn "|mode|output_height|output_width|sampling_ratio|spatial_scale|"
@@ -218,6 +227,25 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
           k = 1 + Bool(Text = "bidirectional")
           Reason = PmoOpsRecurrentActivations(*Node, k, Codes())
         EndIf
+      Case "QuantizeLinear"
+        Reason = PmdNsTypeReason(*Node, 0, "x", "|1|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "y_scale", "|1|") : EndIf
+        If Reason = "" And PmdNsInputPresent(*Node, 2) : Reason = PmdNsTypeReason(*Node, 2, "y_zero_point", "|2|3|") : EndIf
+      Case "DequantizeLinear"
+        Reason = PmdNsTypeReason(*Node, 0, "x", "|2|3|6|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "x_scale", "|1|") : EndIf
+      Case "DynamicQuantizeLinear"
+        Reason = PmdNsTypeReason(*Node, 0, "x", "|1|")
+        If Reason = "" And PmdNsNamedOutputs(*Node) <> 3 : Reason = "outputs y, y_scale and y_zero_point are all required." : EndIf
+      Case "MatMulInteger", "ConvInteger"
+        Reason = PmdNsTypeReason(*Node, 0, "the first input", "|2|3|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "the second input", "|2|3|") : EndIf
+      Case "QLinearMatMul", "QLinearConv"
+        Reason = PmdNsTypeReason(*Node, 0, "the first input", "|2|3|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 3, "the second input", "|2|3|") : EndIf
+        For k = 0 To 7
+          If Reason = "" And PmdNsInputPresent(*Node, k) = 0 : Reason = "inputs 0 to 7 (both operands, their scales and zero points, y_scale and y_zero_point) are required." : EndIf
+        Next
       Case "GridSample"
         Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "grid", "|1|") : EndIf
@@ -304,6 +332,10 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
   If Reason = ""
     Select Op
       Case "Split"
+      Case "DynamicQuantizeLinear"
+        If ListSize(*Node\Outputs()) <> 3 Or PmdNsNamedOutputs(*Node) <> 3
+          Reason = "it declares " + Str(PmdNsNamedOutputs(*Node)) + " named outputs; DynamicQuantizeLinear has three (y, y_scale, y_zero_point)."
+        EndIf
       Case "MaxPool", "Dropout", "RNN", "GRU"
         If ListSize(*Node\Outputs()) < 1 Or ListSize(*Node\Outputs()) > 2
           Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; " + Op + " has one or two."
@@ -383,6 +415,36 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
             Str(PmoEmitAttrI(*Node, "sampling_ratio", 0)) + " : PmOpI(8)=" + Str(Bool(PmoEmitAttrS(*Node, "mode", "avg") = "max")) + " : PmOpI(9)=" +
             Str(Bool(Text = "half_pixel")) + " : PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "spatial_scale", 1.0)) + ") : "
       Call = Pre + "DOpRoiAlign(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + ")"
+    Case "QuantizeLinear", "DequantizeLinear"
+      Call = "DOpQuantize(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + "," + Str(PmoEmitAttrI(*Node, "axis", 1)) + "," +
+             Str(Bool(Op = "QuantizeLinear")) + "," + Str(Bool(PmdNsOpset >= 13)) + ")"
+    Case "DynamicQuantizeLinear"
+      Call = "DOpDynQuantize(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 1)) + "," +
+             PmdNsId(Ids(), PmoEmitOutput(*Node, 2)) + "," + a(0) + ")"
+    Case "MatMulInteger"
+      Call = "DOpQMatMul(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + "," + a(3) + ",0,0,0,0,0)"
+    Case "QLinearMatMul"
+      Call = "DOpQMatMul(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(3) + "," + a(2) + "," + a(5) + "," + a(1) + "," +
+             a(4) + "," + a(6) + "," + a(7) + ",1)"
+    Case "ConvInteger", "QLinearConv"
+      Text = PmoEmitAttrS(*Node, "auto_pad", "NOTSET")
+      Code = 0
+      If Text = "SAME_UPPER" : Code = 1 : ElseIf Text = "SAME_LOWER" : Code = 2 : ElseIf Text = "VALID" : Code = 3 : EndIf
+      Pre = "PmOpT(1)=" + Str(Code) + " : PmOpT(2)=" + Str(PmoEmitAttrI(*Node, "group", 1)) + " : "
+      Pre + "PmOpT(3)=" + Str(PmoEmitAttrListCount(*Node, "strides")) + " : PmOpT(4)=" + Str(PmoEmitAttrListCount(*Node, "dilations")) + " : "
+      Pre + "PmOpT(5)=" + Str(PmoEmitAttrListCount(*Node, "pads")) + " : PmOpT(6)=" + Str(PmoEmitAttrListCount(*Node, "kernel_shape")) + " : "
+      For d = 0 To 2
+        Pre + "PmOpT(" + Str(8 + d) + ")=" + Str(PmoEmitAttrListI(*Node, "strides", d, 1)) + " : "
+        Pre + "PmOpT(" + Str(12 + d) + ")=" + Str(PmoEmitAttrListI(*Node, "dilations", d, 1)) + " : "
+        Pre + "PmOpT(" + Str(24 + d) + ")=" + Str(PmoEmitAttrListI(*Node, "kernel_shape", d, 0)) + " : "
+      Next
+      For d = 0 To 5 : Pre + "PmOpT(" + Str(16 + d) + ")=" + Str(PmoEmitAttrListI(*Node, "pads", d, 0)) + " : " : Next
+      If Op = "ConvInteger"
+        Call = Pre + "DOpQConv(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + a(2) + "," + a(3) + ",0,0,0,0,0,0)"
+      Else
+        Call = Pre + "DOpQConv(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(3) + "," + a(2) + "," + a(5) + "," +
+               PmdNsId(Ids(), PmoEmitInput(*Node, 8)) + "," + a(1) + "," + a(4) + "," + a(6) + "," + a(7) + ",1)"
+      EndIf
     Case "GridSample"
       PmoOpsGridSampleForm(*Node, PmdNsOpset, 0, @Labels, @Kept)
       Call = "DOpGridSample(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + Str(Labels\i) + "," + Str(Kept\i) + "," +

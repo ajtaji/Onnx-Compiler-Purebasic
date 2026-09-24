@@ -128,12 +128,9 @@ Procedure.s PmoFormRefusal(*Node.PmoOnnxNode, FixedShape.i)
           Case 17, 18, 19, 20
             ; saturate only changes a cast to one of these four types.
             Reason = "to = " + Str(Value) + " is a float8 element type, which " + Path + " does not implement; saturate applies only to float8 casts and is accepted with any value for the element types that are implemented."
-          Case 1, 7, 9
-          Case 6
-            If FixedShape : Reason = "to = 6 (INT32) is not implemented by " + Path + "; it casts to FLOAT (1), INT64 (7) and BOOL (9)." : EndIf
+          Case 1, 2, 3, 6, 7, 9
           Default
-            Text = "FLOAT (1), INT32 (6), INT64 (7) and BOOL (9)"
-            If FixedShape : Text = "FLOAT (1), INT64 (7) and BOOL (9)" : EndIf
+            Text = "FLOAT (1), UINT8 (2), INT8 (3), INT32 (6), INT64 (7) and BOOL (9)"
             Reason = "to = " + Str(Value) + " is not implemented by " + Path + "; it casts to " + Text + "."
         EndSelect
       EndIf

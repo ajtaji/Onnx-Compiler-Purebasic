@@ -1622,3 +1622,533 @@ Procedure DOpGridSample(Y.i, X.i, G.i, Mode.i, Pad.i, Align.i, NDim.i)
   EndIf
   PmOpGridSample(Dt(X)\Data, Dt(G)\Data, Dt(Y)\Data)
 EndProcedure
+
+; ----------------------------------------------------------------------
+; QuantizeLinear (Quant 1) and DequantizeLinear (0), opsets 10 to 20: a
+; scale and zero point of one value, or (PerAxis 1, opset 13 on) one per
+; element of Axis.
+; ----------------------------------------------------------------------
+Procedure DOpQuantize(Y.i, X.i, S.i, Z.i, Axis.i, Quant.i, PerAxis.i)
+  Protected rank.i
+  Protected per.i
+  Protected kind.i
+  Protected d.i
+  Protected outer.i
+  Protected inner.i
+  Protected zAddr.i
+  If X = 0 Or S = 0
+    DFail("A quantize operator requires its input and scale.")
+    ProcedureReturn
+  EndIf
+  kind = Dt(X)\Kind
+  If Quant <> 0
+    If kind <> 1
+      DFail("QuantizeLinear quantizes FLOAT x only.")
+      ProcedureReturn
+    EndIf
+  ElseIf kind <> 2 And kind <> 3 And kind <> 6
+    DFail("DequantizeLinear takes UINT8, INT8 or INT32 x.")
+    ProcedureReturn
+  EndIf
+  If Dt(S)\Kind <> 1 Or Dt(S)\Rank > 1
+    DFail("The scale must be FLOAT, one value or a 1-D tensor.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(X)\Rank
+  If Axis < 0
+    Axis = Axis + rank
+  EndIf
+  per = 0
+  If Dt(S)\Count <> 1
+    If PerAxis = 0
+      DFail("The scale holds more than one value; before opset 13 it is one value.")
+      ProcedureReturn
+    EndIf
+    If Axis < 0 Or Axis >= rank
+      DFail("The quantization axis is outside the input rank.")
+      ProcedureReturn
+    EndIf
+    If Dt(S)\Count <> DOpDim(X, Axis)
+      DFail("The scale must hold one value per element of the quantization axis.")
+      ProcedureReturn
+    EndIf
+    per = 1
+  EndIf
+  zAddr = 0
+  If Z <> 0
+    If Dt(Z)\Count <> Dt(S)\Count
+      DFail("The zero point must hold as many values as the scale.")
+      ProcedureReturn
+    EndIf
+    If Quant <> 0
+      If Dt(Z)\Kind <> 2 And Dt(Z)\Kind <> 3
+        DFail("QuantizeLinear's zero point must be UINT8 or INT8.")
+        ProcedureReturn
+      EndIf
+    ElseIf Dt(Z)\Kind <> kind
+      DFail("DequantizeLinear's zero point must have the element type of x.")
+      ProcedureReturn
+    EndIf
+    zAddr = Dt(Z)\Data
+  EndIf
+  outer = Dt(X)\Count
+  inner = 1
+  PmOpI(1) = 1
+  If per <> 0
+    outer = 1
+    d = 0
+    While d < Axis
+      outer = outer * DOpDim(X, d)
+      d = d + 1
+    Wend
+    d = Axis + 1
+    While d < rank
+      inner = inner * DOpDim(X, d)
+      d = d + 1
+    Wend
+    PmOpI(1) = DOpDim(X, Axis)
+  EndIf
+  PmOpI(0) = outer
+  PmOpI(2) = inner
+  PmOpI(3) = per
+  If Quant <> 0
+    PmOpI(4) = 0
+    PmOpI(5) = 2
+    If Z <> 0
+      PmOpI(4) = Dt(Z)\Kind
+      PmOpI(5) = Dt(Z)\Kind
+    EndIf
+    If DLike(Y, X, PmOpI(5)) = 0
+      ProcedureReturn
+    EndIf
+    PmOpQuantize(Dt(X)\Data, Dt(S)\Data, zAddr, Dt(Y)\Data)
+  Else
+    PmOpI(4) = kind
+    PmOpI(5) = 0
+    If Z <> 0
+      PmOpI(5) = 1
+    EndIf
+    If DLike(Y, X, 1) = 0
+      ProcedureReturn
+    EndIf
+    PmOpDequantize(Dt(X)\Data, Dt(S)\Data, zAddr, Dt(Y)\Data)
+  EndIf
+EndProcedure
+
+; DynamicQuantizeLinear-11.
+Procedure DOpDynQuantize(Y.i, YS.i, YZ.i, X.i)
+  If X = 0 Or Y = 0 Or YS = 0 Or YZ = 0
+    DFail("DynamicQuantizeLinear requires its input and all three outputs.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1
+    DFail("DynamicQuantizeLinear quantizes FLOAT x only.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, X, 2) = 0
+    ProcedureReturn
+  EndIf
+  If DShape(YS, 1, 0, 0, 0, 0, 0) = 0
+    ProcedureReturn
+  EndIf
+  If DShape(YZ, 2, 0, 0, 0, 0, 0) = 0
+    ProcedureReturn
+  EndIf
+  If PmOpDynQuantize(Dt(X)\Data, Dt(Y)\Data, Dt(YS)\Data, Dt(YZ)\Data, Dt(X)\Count) <> 0
+    DFail("DynamicQuantizeLinear input holds a NaN or an infinity; its scale is not defined then.")
+  EndIf
+EndProcedure
+
+; One value (1), or one per element of Extent in a 1-D tensor (2); 0 otherwise.
+Procedure.i DOpQCount(V.i, Extent.i)
+  If Dt(V)\Count = 1 And Dt(V)\Rank <= 1
+    ProcedureReturn 1
+  EndIf
+  If Dt(V)\Rank = 1 And Dt(V)\Count = Extent
+    ProcedureReturn 2
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DOpQKind(V.i)
+  If Dt(V)\Kind = 2 Or Dt(V)\Kind = 3
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; MatMulInteger (Mode 0) and QLinearMatMul (1).
+Procedure DOpQMatMul(Y.i, A.i, B.i, AZ.i, BZ.i, SA.i, SB.i, SY.i, YZ.i, Mode.i)
+  Protected Dim dims.i(8)
+  Protected ra.i
+  Protected rb.i
+  Protected r.i
+  Protected d.i
+  Protected ea.i
+  Protected eb.i
+  Protected m.i
+  Protected k.i
+  Protected n.i
+  Protected kb.i
+  Protected kind.i
+  Protected bzMode.i
+  Protected yr.i
+  Protected azA.i
+  Protected bzA.i
+  If A = 0 Or B = 0
+    DFail("A quantized matrix product requires both operands.")
+    ProcedureReturn
+  EndIf
+  If DOpQKind(A) = 0 Or DOpQKind(B) = 0
+    DFail("A quantized matrix product takes UINT8 or INT8 operands.")
+    ProcedureReturn
+  EndIf
+  ra = Dt(A)\Rank
+  rb = Dt(B)\Rank
+  If ra < 1 Or rb < 1
+    DFail("A quantized matrix product takes operands of rank one or more.")
+    ProcedureReturn
+  EndIf
+  If ra = 1
+    m = 1
+    k = DOpDim(A, 0)
+  Else
+    m = DOpDim(A, ra - 2)
+    k = DOpDim(A, ra - 1)
+  EndIf
+  If rb = 1
+    kb = DOpDim(B, 0)
+    n = 1
+  Else
+    kb = DOpDim(B, rb - 2)
+    n = DOpDim(B, rb - 1)
+  EndIf
+  If k <> kb
+    DFail("The operands' inner extents differ.")
+    ProcedureReturn
+  EndIf
+  r = 0
+  If ra > 2
+    r = ra - 2
+  EndIf
+  If rb > 2
+    If rb - 2 > r
+      r = rb - 2
+    EndIf
+  EndIf
+  If r > 6
+    DFail("A quantized matrix product takes at most six batch axes.")
+    ProcedureReturn
+  EndIf
+  d = 0
+  While d < r
+    ea = 1
+    eb = 1
+    If ra - 2 - r + d >= 0
+      ea = DOpDim(A, ra - 2 - r + d)
+    EndIf
+    If rb - 2 - r + d >= 0
+      eb = DOpDim(B, rb - 2 - r + d)
+    EndIf
+    If ea <> eb And ea <> 1 And eb <> 1
+      DFail("The operands' batch axes do not broadcast.")
+      ProcedureReturn
+    EndIf
+    PmOpDA(d) = ea
+    PmOpDB(d) = eb
+    PmOpDY(d) = ea
+    If ea = 1
+      PmOpDY(d) = eb
+    EndIf
+    dims(d) = PmOpDY(d)
+    d = d + 1
+  Wend
+  yr = r
+  If ra > 1
+    dims(yr) = m
+    yr = yr + 1
+  EndIf
+  If rb > 1
+    dims(yr) = n
+    yr = yr + 1
+  EndIf
+  azA = 0
+  If AZ <> 0
+    If Dt(AZ)\Kind <> Dt(A)\Kind Or DOpQCount(AZ, 1) <> 1
+      DFail("The zero point of A must be one value of A's element type.")
+      ProcedureReturn
+    EndIf
+    azA = Dt(AZ)\Data
+  EndIf
+  bzMode = 0
+  bzA = 0
+  If BZ <> 0
+    bzMode = DOpQCount(BZ, n)
+    If n = 1 And bzMode = 2
+      bzMode = 1
+    EndIf
+    If Dt(BZ)\Kind <> Dt(B)\Kind Or bzMode = 0
+      DFail("The zero point of B must be of B's element type, one value or one per column.")
+      ProcedureReturn
+    EndIf
+    bzA = Dt(BZ)\Data
+  EndIf
+  kind = 6
+  PmOpI(9) = 0
+  PmOpI(10) = 0
+  If Mode <> 0
+    If SA = 0 Or SB = 0 Or SY = 0 Or YZ = 0 Or AZ = 0 Or BZ = 0
+      DFail("QLinearMatMul requires all eight inputs.")
+      ProcedureReturn
+    EndIf
+    If Dt(SA)\Kind <> 1 Or Dt(SB)\Kind <> 1 Or Dt(SY)\Kind <> 1
+      DFail("QLinearMatMul's scales must be FLOAT.")
+      ProcedureReturn
+    EndIf
+    If DOpQCount(SA, 1) <> 1 Or DOpQCount(SY, 1) <> 1 Or DOpQCount(SB, n) = 0
+      DFail("QLinearMatMul's a_scale and y_scale must be one value, b_scale one value or one per column.")
+      ProcedureReturn
+    EndIf
+    If DOpQKind(YZ) = 0 Or DOpQCount(YZ, 1) <> 1
+      DFail("QLinearMatMul's y_zero_point must be one UINT8 or INT8 value.")
+      ProcedureReturn
+    EndIf
+    kind = Dt(YZ)\Kind
+    PmOpI(10) = kind
+    If DOpQCount(SB, n) = 2 And n > 1
+      PmOpI(9) = 1
+    EndIf
+  EndIf
+  If DAlloc(Y, kind, yr, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = r
+  PmOpI(1) = m
+  PmOpI(2) = k
+  PmOpI(3) = n
+  PmOpI(4) = Dt(A)\Kind
+  PmOpI(5) = Dt(B)\Kind
+  PmOpI(6) = 0
+  If AZ <> 0
+    PmOpI(6) = 1
+  EndIf
+  PmOpI(7) = bzMode
+  PmOpI(8) = Mode
+  If Mode <> 0
+    PmOpQMatMul(Dt(A)\Data, Dt(B)\Data, azA, bzA, Dt(Y)\Data, Dt(SA)\Data, Dt(SB)\Data, Dt(SY)\Data, Dt(YZ)\Data)
+  Else
+    PmOpQMatMul(Dt(A)\Data, Dt(B)\Data, azA, bzA, Dt(Y)\Data, 0, 0, 0, 0)
+  EndIf
+EndProcedure
+
+; ConvInteger (Mode 0) and QLinearConv (1). The call has set PmOpT: (1)
+; auto_pad (0 NOTSET, 1 SAME_UPPER, 2 SAME_LOWER, 3 VALID), (2) group, (3 .. 6)
+; the numbers of strides, dilations, pads and kernel_shape entries, (8 + d)
+; strides, (12 + d) dilations, (16 ..) pads, (24 + d) kernel_shape.
+Procedure DOpQConv(Y.i, X.i, W.i, XZ.i, WZ.i, Bias.i, XS.i, WS.i, YS.i, YZ.i, Mode.i)
+  Protected Dim dims.i(8)
+  Protected s.i
+  Protected d.i
+  Protected c.i
+  Protected m.i
+  Protected g.i
+  Protected ext.i
+  Protected k.i
+  Protected st.i
+  Protected dl.i
+  Protected b.i
+  Protected e.i
+  Protected span.i
+  Protected out.i
+  Protected total.i
+  Protected kind.i
+  Protected wzMode.i
+  Protected xzA.i
+  Protected wzA.i
+  Protected biasA.i
+  Protected bad.i
+  If X = 0 Or W = 0
+    DFail("A quantized convolution requires x and w.")
+    ProcedureReturn
+  EndIf
+  If DOpQKind(X) = 0 Or DOpQKind(W) = 0
+    DFail("A quantized convolution takes UINT8 or INT8 x and w.")
+    ProcedureReturn
+  EndIf
+  s = Dt(X)\Rank - 2
+  If s < 1 Or s > 3 Or Dt(W)\Rank <> s + 2
+    DFail("A quantized convolution takes N x C x D1 ... Ds with one to three spatial axes, and w of the same rank.")
+    ProcedureReturn
+  EndIf
+  bad = 0
+  If PmOpT(3) <> 0 And PmOpT(3) <> s
+    bad = 1
+  EndIf
+  If PmOpT(4) <> 0 And PmOpT(4) <> s
+    bad = 1
+  EndIf
+  If PmOpT(5) <> 0 And PmOpT(5) <> 2 * s
+    bad = 1
+  EndIf
+  If PmOpT(6) <> 0 And PmOpT(6) <> s
+    bad = 1
+  EndIf
+  If bad <> 0
+    DFail("strides, dilations, pads or kernel_shape do not match the input's spatial rank.")
+    ProcedureReturn
+  EndIf
+  g = PmOpT(2)
+  c = DOpDim(X, 1)
+  m = DOpDim(W, 0)
+  If g < 1
+    DFail("group must be positive.")
+    ProcedureReturn
+  EndIf
+  If c <> g * DOpDim(W, 1) Or m % g <> 0
+    DFail("group does not divide x's channels and w's filters as w's shape requires.")
+    ProcedureReturn
+  EndIf
+  xzA = 0
+  If XZ <> 0
+    If Dt(XZ)\Kind <> Dt(X)\Kind Or DOpQCount(XZ, 1) <> 1
+      DFail("The zero point of x must be one value of x's element type.")
+      ProcedureReturn
+    EndIf
+    xzA = Dt(XZ)\Data
+  EndIf
+  wzMode = 0
+  wzA = 0
+  If WZ <> 0
+    wzMode = DOpQCount(WZ, m)
+    If m = 1 And wzMode = 2
+      wzMode = 1
+    EndIf
+    If Dt(WZ)\Kind <> Dt(W)\Kind Or wzMode = 0
+      DFail("The zero point of w must be of w's element type, one value or one per output channel.")
+      ProcedureReturn
+    EndIf
+    wzA = Dt(WZ)\Data
+  EndIf
+  kind = 6
+  biasA = 0
+  PmOpI(46) = 0
+  PmOpI(47) = 0
+  If Mode <> 0
+    If XS = 0 Or WS = 0 Or YS = 0 Or YZ = 0 Or XZ = 0 Or WZ = 0
+      DFail("QLinearConv requires inputs 0 to 7.")
+      ProcedureReturn
+    EndIf
+    If Dt(XS)\Kind <> 1 Or Dt(WS)\Kind <> 1 Or Dt(YS)\Kind <> 1
+      DFail("QLinearConv's scales must be FLOAT.")
+      ProcedureReturn
+    EndIf
+    If DOpQCount(XS, 1) <> 1 Or DOpQCount(YS, 1) <> 1 Or DOpQCount(WS, m) = 0
+      DFail("QLinearConv's x_scale and y_scale must be one value, w_scale one value or one per output channel.")
+      ProcedureReturn
+    EndIf
+    If DOpQKind(YZ) = 0 Or DOpQCount(YZ, 1) <> 1
+      DFail("QLinearConv's y_zero_point must be one UINT8 or INT8 value.")
+      ProcedureReturn
+    EndIf
+    If Bias <> 0
+      If Dt(Bias)\Kind <> 6 Or Dt(Bias)\Rank <> 1 Or Dt(Bias)\Count <> m
+        DFail("QLinearConv's B must be INT32 with one value per output channel.")
+        ProcedureReturn
+      EndIf
+      biasA = Dt(Bias)\Data
+    EndIf
+    kind = Dt(YZ)\Kind
+    PmOpI(47) = kind
+    If DOpQCount(WS, m) = 2 And m > 1
+      PmOpI(46) = 1
+    EndIf
+  EndIf
+  dims(0) = DOpDim(X, 0)
+  dims(1) = m
+  d = 0
+  While d < s
+    ext = DOpDim(X, 2 + d)
+    k = DOpDim(W, 2 + d)
+    If PmOpT(6) <> 0 And PmOpT(24 + d) <> k
+      DFail("kernel_shape does not match w's spatial extents.")
+      ProcedureReturn
+    EndIf
+    st = 1
+    dl = 1
+    b = 0
+    e = 0
+    If PmOpT(3) <> 0
+      st = PmOpT(8 + d)
+    EndIf
+    If PmOpT(4) <> 0
+      dl = PmOpT(12 + d)
+    EndIf
+    If PmOpT(5) <> 0
+      b = PmOpT(16 + d)
+      e = PmOpT(16 + s + d)
+    EndIf
+    If st < 1 Or dl < 1 Or b < 0 Or e < 0
+      DFail("strides and dilations must be positive and pads not negative.")
+      ProcedureReturn
+    EndIf
+    span = (k - 1) * dl + 1
+    If PmOpT(1) = 1 Or PmOpT(1) = 2
+      out = (ext + st - 1) / st
+      total = (out - 1) * st + span - ext
+      If total < 0
+        total = 0
+      EndIf
+      If PmOpT(1) = 1
+        b = total / 2
+      Else
+        b = total - total / 2
+      EndIf
+    Else
+      If PmOpT(1) = 3
+        b = 0
+        e = 0
+      EndIf
+      out = 0
+      If ext + b + e >= span
+        out = (ext + b + e - span) / st + 1
+      EndIf
+    EndIf
+    If out < 1
+      DFail("The kernel is larger than the padded input.")
+      ProcedureReturn
+    EndIf
+    PmOpI(8 + d) = ext
+    PmOpI(12 + d) = out
+    PmOpI(16 + d) = k
+    PmOpI(20 + d) = st
+    PmOpI(24 + d) = dl
+    PmOpI(28 + d) = b
+    dims(2 + d) = out
+    d = d + 1
+  Wend
+  If DAlloc(Y, kind, s + 2, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpI(0) = s
+  PmOpI(1) = DOpDim(X, 0)
+  PmOpI(2) = c
+  PmOpI(3) = m
+  PmOpI(4) = g
+  PmOpI(40) = Dt(X)\Kind
+  PmOpI(41) = Dt(W)\Kind
+  PmOpI(42) = 0
+  If XZ <> 0
+    PmOpI(42) = 1
+  EndIf
+  PmOpI(43) = wzMode
+  PmOpI(44) = 0
+  If biasA <> 0
+    PmOpI(44) = 1
+  EndIf
+  PmOpI(45) = Mode
+  If Mode <> 0
+    PmOpQConv(Dt(X)\Data, Dt(W)\Data, xzA, wzA, biasA, Dt(Y)\Data, Dt(XS)\Data, Dt(WS)\Data, Dt(YS)\Data, Dt(YZ)\Data)
+  Else
+    PmOpQConv(Dt(X)\Data, Dt(W)\Data, xzA, wzA, 0, Dt(Y)\Data, 0, 0, 0, 0)
+  EndIf
+EndProcedure

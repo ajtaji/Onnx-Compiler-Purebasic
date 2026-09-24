@@ -54,6 +54,8 @@ Normalization   Softmax  LogSoftmax  LayerNormalization  BatchNormalization
                 InstanceNormalization  GroupNormalization  LpNormalization
                 MeanVarianceNormalization  LRN
 Detection       NonMaxSuppression  RoiAlign
+Quantized       QuantizeLinear  DequantizeLinear  DynamicQuantizeLinear
+                MatMulInteger  QLinearMatMul  ConvInteger  QLinearConv
 Pooling         MaxPool  AveragePool  LpPool  GlobalMaxPool  GlobalAveragePool
                 GlobalLpPool
 Reductions      ReduceMean  ReduceSum  ReduceMax  ReduceMin  ReduceProd  ReduceL1
@@ -85,9 +87,16 @@ The operators added in September 2026 - from Mod to Dropout in the list,
 and in a second group the trigonometric and hyperbolic functions from Tan,
 the bitwise operators, Hardmax, RNN, GRU, Det, the normalizations after
 InstanceNormalization, NonMaxSuppression, RoiAlign, Upsample, Compress,
-ReverseSequence and EyeLike, and after them GridSample - share one kernel source for every target (`runtime/tensor_ops.pmi`), so
+ReverseSequence and EyeLike, and after them GridSample and the quantized
+operators - share one kernel source for every target (`runtime/tensor_ops.pmi`), so
 they give the same bits on Windows, the Pi 4, the UNO Q, the Pico and the
 Pico 2; chapter 8 says how that is checked.
+
+@NOTE The quantized operators are the ONNX operators a model that was
+quantized before export already contains; they carry UINT8, INT8 and INT32
+tensors, which Cast also converts to and from. They are not the
+`--precision int8` mode later in this chapter, which quantizes an FP32
+model's weights itself.
 
 @TRAP Being on the list is necessary, not sufficient. An operator is
 supported for the attribute combinations, ranks and element types that

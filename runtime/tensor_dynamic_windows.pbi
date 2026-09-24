@@ -88,7 +88,7 @@ Procedure.i DSize(Kind.i)
   Select Kind
     Case 1,6 : ProcedureReturn 4
     Case 7 : ProcedureReturn 8
-    Case 3,9 : ProcedureReturn 1
+    Case 2,3,9 : ProcedureReturn 1
   EndSelect
   ProcedureReturn 0
 EndProcedure
@@ -163,6 +163,8 @@ Procedure.d DGet(Id.i, Index.i=0)
     Case 7 : ProcedureReturn PeekQ(Dt(Id)\Data+Index*8)
     Case 6 : ProcedureReturn PeekL(Dt(Id)\Data+Index*4)
     Case 9 : ProcedureReturn PeekA(Dt(Id)\Data+Index)
+    Case 2 : ProcedureReturn PeekA(Dt(Id)\Data+Index)
+    Case 3 : ProcedureReturn PeekB(Dt(Id)\Data+Index)
   EndSelect
 EndProcedure
 
@@ -180,6 +182,7 @@ Procedure DPut(Id.i, Index.i, Value.d)
     Case 7 : PokeQ(Dt(Id)\Data+Index*8,IntQ(Value))
     Case 6 : PokeL(Dt(Id)\Data+Index*4,IntQ(Value))
     Case 9 : PokeA(Dt(Id)\Data+Index,Bool(Value<>0))
+    Case 2,3 : PokeA(Dt(Id)\Data+Index,IntQ(Value) & 255)
   EndSelect
 EndProcedure
 

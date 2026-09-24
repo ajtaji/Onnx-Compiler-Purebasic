@@ -480,7 +480,12 @@ file as fixed sequences of such statements (erf follows fdlibm's s_erff.c;
 sqrt is the integer square root of the significand, correctly rounded; tan
 reduces its argument by pi/2 in integer arithmetic against 288 bits of
 2/pi, so a large argument keeps its quadrant), not taken from each
-target's library.
+target's library. The one step the reference takes in binary64 - the
+quantized operators' INT32 accumulator times a binary32 multiplier, plus a
+zero point, rounded half to even - is reproduced exactly in integer
+arithmetic: the product formed in 12-bit digits, rounded to 53 bits as
+binary64 rounds it, and the sum's own rounding applied where it can move
+the result, near a half.
 
 **Decide NaN on the bits.** The host compiler's float comparisons do not
 order a NaN the way IEEE 754 does - a NaN compares below and equal to
@@ -492,20 +497,20 @@ invalid operation such as infinity times zero.
 
 **A definition to be held to.** `ops_scheme.py` in the compiler
 repository's `tools/onnx/tests/Diagnostics` writes every kernel out in numpy
-one binary32 operation per line. `ops_kernel_check.py` runs 310 cases -
+one binary32 operation per line. `ops_kernel_check.py` runs 386 cases -
 the math functions over tables of special values and branch boundaries,
 every operator's kernel, and the awkward cases - on Windows and, in the
 unicorn instruction emulator, on the Pi 4, Pico and Pico 2 builds, and
 requires every output to equal the definition bit for bit; with
-`--mutants` it plants 32 defects and requires each to be caught:
+`--mutants` it plants 40 defects and requires each to be caught:
 
 @FRAG
 py -3.12 ops_kernel_check.py --pbcompiler <pbcompiler.exe> --compiler PureMetalForge.exe --runtime <ONNX repository>\runtime --mutants
-windows 310 of 310 cases as the definition
-pi4     310 of 310 cases as the definition
-pico    310 of 310 cases as the definition
-pico2   310 of 310 cases as the definition
-mutants: 32 of 32 killed
+windows 386 of 386 cases as the definition
+pi4     386 of 386 cases as the definition
+pico    386 of 386 cases as the definition
+pico2   386 of 386 cases as the definition
+mutants: 40 of 40 killed
 @ENDFRAG
 
 That says the kernels compute what they were written to compute. Whether

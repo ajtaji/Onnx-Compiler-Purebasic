@@ -343,7 +343,11 @@ Procedure.i PmoCompileValidate(*Ir.PmoIrModel)
         ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " output " + Name + " has no concrete type/shape")
       EndIf
       *Value = *Ir\ValueByName()
-      If *Value\ElementType <> 1 And *Value\ElementType <> 7 And *Value\ElementType <> 9
+      ; UINT8, INT8 and INT32 values are produced by the quantized operators,
+      ; by Cast, and passed on unchanged by the operators that only rename
+      If *Value\ElementType <> 1 And *Value\ElementType <> 7 And *Value\ElementType <> 9 And
+         Not ((*Value\ElementType = 2 Or *Value\ElementType = 3 Or *Value\ElementType = 6) And
+              FindString("|QuantizeLinear|DequantizeLinear|DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|Cast|Identity|Reshape|Flatten|Squeeze|Unsqueeze|", "|" + *Ir\Nodes()\Node\Operation + "|"))
         ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " output " + Name + " uses unsupported runtime type " + Str(*Value\ElementType))
       EndIf
       Produced(Name) = #True
@@ -544,7 +548,7 @@ Procedure.i PmoCompileValidateTargetIntegers(*Ir.PmoIrModel, *Profile.PmoTargetP
         FirstElement(*Ir\Nodes()\Node\Inputs())
         If FindMapElement(*Ir\ValueByName(), *Ir\Nodes()\Node\Inputs())
           *Input = *Ir\ValueByName()
-          If *Input\ElementType <> 9
+          If *Input\ElementType <> 9 And *Input\ElementType <> 2 And *Input\ElementType <> 3 And *Input\ElementType <> 6
             ProcedureReturn PmoCompileFail("target " + *Profile\Id + " cannot prove that Cast output " +
                                           OutputName + " stays in its checked signed 32-bit INT64 range. Nothing was emitted.")
           EndIf

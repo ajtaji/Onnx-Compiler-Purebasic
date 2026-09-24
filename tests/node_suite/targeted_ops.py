@@ -64,7 +64,7 @@ OPS = ("erf", "reciprocal", "ceil", "sign", "softplus", "softsign", "elu", "selu
        "bitwise_xor", "hardmax", "lpnormalization", "l1normalization", "l2normalization", "mvn", "lrn", "eyelike", "det",
        "compress", "reversesequence", "upsample", "rnn", "simple_rnn", "gru", "nonmaxsuppression", "roialign",
        # after the second group
-       "gridsample")
+       "gridsample", "quantizelinear", "dequantizelinear", "qlinearmatmul")
 
 # re-imported official cases of a form that is refused, and the sentence that
 # must refuse them
@@ -584,6 +584,106 @@ def cases() -> list[Case]:
     c.append(Case("scatter_default_axis_int64_opset9", [N("Scatter", ["d", "i", "u"], ["y"])],
                   [("d", I64, [3, 4]), ("i", I32, [1, 4]), ("u", I64, [1, 4])], [("y", I64, [3, 4])],
                   {"d": sdi, "i": si2, "u": RNG.integers(-9, 9, (1, 4)).astype(np.int64)}, opset=9, oracle=scatter_oracle(0)))
+
+    # ---- the quantized operators and the UINT8, INT8 and INT32 tensors -------
+    U8, S8 = TensorProto.UINT8, TensorProto.INT8
+
+    def at_opset(node_op, ins, attrs, opset, consts):
+        # the reference evaluator implements DequantizeLinear from opset 19;
+        # the same node there (the definition is unchanged for these types)
+        def run(feeds):
+            node = helper.make_node(node_op, [n for n, _ in ins], ["y"], **attrs)
+            g = helper.make_graph([node], "g", [helper.make_tensor_value_info(n, t, None) for n, t in ins],
+                                  [helper.make_tensor_value_info("y", TensorProto.UNDEFINED, None)])
+            return ReferenceEvaluator(helper.make_model(g, opset_imports=[helper.make_opsetid("", opset)])).run(None, {**feeds, **consts})
+        return run
+
+    qx = (RNG.standard_normal((3, 4, 5)) * 40).astype(np.float32)
+    qx.flat[:6] = np.array([2.5, -3.5, 0.5, -0.5, 1000.0, -1000.0], np.float32)
+    c.append(Case("quantize_per_tensor_uint8", [N("QuantizeLinear", ["x", "s", "z"], ["y"])], [("x", F, [3, 4, 5])],
+                  [("y", U8, [3, 4, 5])], {"x": qx}, [init("s", np.array(0.5, np.float32)), init("z", np.array(128, np.uint8))], opset=10))
+    c.append(Case("quantize_no_zero_point", [N("QuantizeLinear", ["x", "s"], ["y"])], [("x", F, [3, 4, 5])],
+                  [("y", U8, [3, 4, 5])], {"x": np.abs(qx)}, [init("s", np.array(2.0, np.float32))], opset=13))
+    c.append(Case("quantize_per_axis_int8", [N("QuantizeLinear", ["x", "s", "z"], ["y"], axis=1)], [("x", F, [3, 4, 5])],
+                  [("y", S8, [3, 4, 5])], {"x": qx},
+                  [init("s", np.array([0.25, 1.0, 3.0, 0.5], np.float32)), init("z", np.array([-10, 0, 5, 100], np.int8))], opset=13))
+    c.append(Case("quantize_opset19_saturate", [N("QuantizeLinear", ["x", "s", "z"], ["y"], axis=-1, saturate=1)], [("x", F, [3, 4, 5])],
+                  [("y", S8, [3, 4, 5])], {"x": qx},
+                  [init("s", np.array([0.3, 0.6, 0.9, 1.2, 1.5], np.float32)), init("z", np.array([1, 2, 3, 4, 5], np.int8))], opset=19))
+    dq = RNG.integers(0, 256, (3, 4, 5)).astype(np.uint8)
+    c.append(Case("dequantize_per_tensor_uint8", [N("DequantizeLinear", ["x", "s", "z"], ["y"])], [("x", U8, [3, 4, 5])],
+                  [("y", F, [3, 4, 5])], {"x": dq}, [init("s", np.array(0.02, np.float32)), init("z", np.array(100, np.uint8))], opset=10,
+                  oracle=at_opset("DequantizeLinear", [("x", U8), ("s", F), ("z", U8)], {}, 19,
+                                  {"s": np.array(0.02, np.float32), "z": np.array(100, np.uint8)})))
+    dqi = RNG.integers(-128, 128, (3, 4, 5)).astype(np.int8)
+    dqs, dqz = np.array([0.5, 0.25, 2.0], np.float32), np.array([-3, 0, 7], np.int8)
+    c.append(Case("dequantize_per_axis_int8", [N("DequantizeLinear", ["x", "s", "z"], ["y"], axis=0)], [("x", S8, [3, 4, 5])],
+                  [("y", F, [3, 4, 5])], {"x": dqi}, [init("s", dqs), init("z", dqz)], opset=13,
+                  oracle=at_opset("DequantizeLinear", [("x", S8), ("s", F), ("z", S8)], {"axis": 0}, 19, {"s": dqs, "z": dqz})))
+    dq32 = RNG.integers(-2 ** 30, 2 ** 30, (3, 4, 5)).astype(np.int32)
+    c.append(Case("dequantize_int32", [N("DequantizeLinear", ["x", "s"], ["y"])], [("x", I32, [3, 4, 5])],
+                  [("y", F, [3, 4, 5])], {"x": dq32}, [init("s", np.array(1e-4, np.float32))], opset=13,
+                  oracle=at_opset("DequantizeLinear", [("x", I32), ("s", F)], {}, 19, {"s": np.array(1e-4, np.float32)})))
+    dqx = (RNG.standard_normal((4, 6)) * 3).astype(np.float32)
+    c.append(Case("dynamic_quantize", [N("DynamicQuantizeLinear", ["x"], ["y", "ys", "yz"])], [("x", F, [4, 6])],
+                  [("y", U8, [4, 6]), ("ys", F, []), ("yz", U8, [])], {"x": dqx}, opset=11))
+    c.append(Case("dynamic_quantize_positive", [N("DynamicQuantizeLinear", ["x"], ["y", "ys", "yz"])], [("x", F, [4, 6])],
+                  [("y", U8, [4, 6]), ("ys", F, []), ("yz", U8, [])], {"x": np.abs(dqx) + 1}, opset=11))
+    ma = RNG.integers(0, 256, (2, 3, 4)).astype(np.uint8)
+    mb = RNG.integers(0, 256, (4, 5)).astype(np.uint8)
+    c.append(Case("matmulinteger_uint8", [N("MatMulInteger", ["a", "b", "az", "bz"], ["y"])], [("a", U8, [2, 3, 4]), ("b", U8, [4, 5])],
+                  [("y", I32, [2, 3, 5])], {"a": ma, "b": mb}, [init("az", np.array(12, np.uint8)), init("bz", np.array(130, np.uint8))], opset=10))
+    mbi = RNG.integers(-128, 128, (2, 4, 5)).astype(np.int8)
+    c.append(Case("matmulinteger_per_column_batch", [N("MatMulInteger", ["a", "b", "az", "bz"], ["y"])],
+                  [("a", U8, [3, 4]), ("b", S8, [2, 4, 5])], [("y", I32, [2, 3, 5])], {"a": ma[0], "b": mbi},
+                  [init("az", np.array([3], np.uint8)), init("bz", np.array([1, -2, 3, -4, 5], np.int8))], opset=10))
+    c.append(Case("matmulinteger_no_zero_points_1d", [N("MatMulInteger", ["a", "b"], ["y"])], [("a", S8, [4]), ("b", S8, [4, 5])],
+                  [("y", I32, [5])], {"a": RNG.integers(-128, 128, 4).astype(np.int8), "b": mbi[0]}, opset=10))
+    c.append(Case("qlinearmatmul_uint8", [N("QLinearMatMul", ["a", "as", "az", "b", "bs", "bz", "ys", "yz"], ["y"])],
+                  [("a", U8, [2, 3, 4]), ("b", U8, [4, 5])], [("y", U8, [2, 3, 5])], {"a": ma, "b": mb},
+                  [init("as", np.array(0.02, np.float32)), init("az", np.array(120, np.uint8)), init("bs", np.array(0.03, np.float32)),
+                   init("bz", np.array(130, np.uint8)), init("ys", np.array(0.9, np.float32)), init("yz", np.array(110, np.uint8))], opset=10))
+    c.append(Case("qlinearmatmul_int8_per_column", [N("QLinearMatMul", ["a", "as", "az", "b", "bs", "bz", "ys", "yz"], ["y"])],
+                  [("a", S8, [3, 4]), ("b", S8, [4, 5])], [("y", S8, [3, 5])],
+                  {"a": RNG.integers(-128, 128, (3, 4)).astype(np.int8), "b": mbi[1]},
+                  [init("as", np.array(0.05, np.float32)), init("az", np.array(-2, np.int8)),
+                   init("bs", np.array([0.01, 0.02, 0.03, 0.04, 0.05], np.float32)), init("bz", np.array([0, 1, 2, 3, 4], np.int8)),
+                   init("ys", np.array(0.7, np.float32)), init("yz", np.array(-5, np.int8))], opset=10))
+    cx = RNG.integers(0, 256, (1, 4, 5, 6)).astype(np.uint8)
+    cw = RNG.integers(0, 256, (6, 2, 3, 3)).astype(np.uint8)
+    c.append(Case("convinteger_group_pads", [N("ConvInteger", ["x", "w", "xz", "wz"], ["y"], group=2, pads=[1, 0, 1, 2], strides=[1, 2])],
+                  [("x", U8, [1, 4, 5, 6]), ("w", U8, [6, 2, 3, 3])], [("y", I32, [1, 6, 5, 3])], {"x": cx, "w": cw},
+                  [init("xz", np.array(7, np.uint8)), init("wz", np.array(9, np.uint8))], opset=10))
+    c.append(Case("convinteger_same_upper", [N("ConvInteger", ["x", "w"], ["y"], auto_pad="SAME_UPPER", strides=[2, 2])],
+                  [("x", U8, [1, 4, 5, 6]), ("w", U8, [3, 4, 2, 3])], [("y", I32, [1, 3, 3, 3])], {"x": cx, "w": cw[:3, :, :2, :].repeat(2, axis=1)},
+                  opset=10))
+    c.append(Case("qlinearconv_bias_per_channel", [N("QLinearConv", ["x", "xs", "xz", "w", "ws", "wz", "ys", "yz", "b"], ["y"],
+                                                       pads=[1, 1, 1, 1], dilations=[1, 2])],
+                  [("x", U8, [1, 4, 5, 6]), ("w", U8, [3, 4, 3, 2])], [("y", U8, [1, 3, 5, 6])], {"x": cx, "w": cw[:3].reshape(3, 2, 3, 3)[:, :, :, :2].repeat(2, axis=1)},
+                  [init("xs", np.array(0.03, np.float32)), init("xz", np.array(128, np.uint8)),
+                   init("ws", np.array([0.004, 0.006, 0.008], np.float32)), init("wz", np.array([120, 128, 136], np.uint8)),
+                   init("ys", np.array(0.2, np.float32)), init("yz", np.array(100, np.uint8)), init("b", np.array([-300, 0, 500], np.int32))],
+                  opset=10))
+    c.append(Case("qlinearconv_int8_1d", [N("QLinearConv", ["x", "xs", "xz", "w", "ws", "wz", "ys", "yz"], ["y"], strides=[2])],
+                  [("x", S8, [2, 3, 9]), ("w", S8, [4, 3, 3])], [("y", S8, [2, 4, 4])],
+                  {"x": RNG.integers(-128, 128, (2, 3, 9)).astype(np.int8), "w": RNG.integers(-128, 128, (4, 3, 3)).astype(np.int8)},
+                  [init("xs", np.array(0.05, np.float32)), init("xz", np.array(3, np.int8)), init("ws", np.array(0.01, np.float32)),
+                   init("wz", np.array(-1, np.int8)), init("ys", np.array(0.5, np.float32)), init("yz", np.array(0, np.int8))], opset=10))
+    # Cast to and from UINT8, INT8 and INT32
+    for name, src, dst, feed in (("cast_uint8_to_float", U8, F, dq[0]), ("cast_int8_to_int64", S8, I64, dqi[0]),
+                                 ("cast_int32_to_float", I32, F, dq32[0]), ("cast_float_to_int32", F, I32, (qx[0] * 3).astype(np.float32)),
+                                 ("cast_int64_to_uint8", I64, U8, RNG.integers(-1000, 1000, (4, 5)).astype(np.int64)),
+                                 ("cast_bool_to_int8", B, S8, RNG.integers(0, 2, (4, 5)).astype(bool)),
+                                 ("cast_uint8_to_int8", U8, S8, dq[1])):
+        c.append(Case(name, [N("Cast", ["x"], ["y"], to=dst)], [("x", src, list(feed.shape))], [("y", dst, list(feed.shape))],
+                      {"x": feed}, opset=13))
+    c.append(Case("refuse_quantize_int32_input", [N("QuantizeLinear", ["x", "s", "z"], ["y"])], [("x", I32, [4])], [("y", U8, [4])],
+                  {"x": np.arange(4, dtype=np.int32)}, [init("s", np.array(0.5, np.float32)), init("z", np.array(0, np.uint8))], opset=13,
+                  refuse="INT32"))
+    c.append(Case("refuse_matmulinteger_per_row_zero_point", [N("MatMulInteger", ["a", "b", "az"], ["y"])],
+                  [("a", U8, [3, 4]), ("b", U8, [4, 5])], [("y", I32, [3, 5])], {"a": ma[0], "b": mb},
+                  [init("az", np.array([1, 2, 3], np.uint8))], opset=10, symbolic_axes=(), dynamic=False,
+                  refuse="per-row zero point is not implemented"))
     return c
 
 

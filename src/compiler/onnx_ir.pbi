@@ -271,6 +271,10 @@ Procedure.i PmoIrMaterializeTensor(*Tensor.PmoOnnxTensor, *Constant.PmoIrConstan
     Case 6
       If ListSize(*Tensor\Int32Data()) <> *Constant\Elements : Goto PmoIrMaterializeMismatch : EndIf
       Index = 0 : ForEach *Tensor\Int32Data() : PokeL(*Constant\Data + Index * 4, *Tensor\Int32Data()) : Index + 1 : Next
+    Case 2, 3
+      ; UINT8 and INT8 in int32_data, one value per entry
+      If ListSize(*Tensor\Int32Data()) <> *Constant\Elements : Goto PmoIrMaterializeMismatch : EndIf
+      Index = 0 : ForEach *Tensor\Int32Data() : PokeA(*Constant\Data + Index, *Tensor\Int32Data() & 255) : Index + 1 : Next
     Case 7
       If ListSize(*Tensor\Int64Data()) <> *Constant\Elements : Goto PmoIrMaterializeMismatch : EndIf
       Index = 0 : ForEach *Tensor\Int64Data() : PokeQ(*Constant\Data + Index * 8, *Tensor\Int64Data()) : Index + 1 : Next
