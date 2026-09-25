@@ -227,6 +227,40 @@ Procedure.i PmOpIsNan(x.f)
   ProcedureReturn 0
 EndProcedure
 
+; IEEE 754 ordered comparisons: false when either side is NaN. The host
+; compiler's own answer for a NaN depends on the operand order and on
+; literals (forums 995, 998), so a comparison that can meet a NaN is written
+; with these.
+Procedure.i PmOpGt(a.f, b.f)
+  If PmOpIsNan(a) <> 0 Or PmOpIsNan(b) <> 0
+    ProcedureReturn 0
+  EndIf
+  If a > b
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PmOpLt(a.f, b.f)
+  If PmOpIsNan(a) <> 0 Or PmOpIsNan(b) <> 0
+    ProcedureReturn 0
+  EndIf
+  If a < b
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PmOpLe(a.f, b.f)
+  If PmOpIsNan(a) <> 0 Or PmOpIsNan(b) <> 0
+    ProcedureReturn 0
+  EndIf
+  If a <= b
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.f PmOpNaN()
   ProcedureReturn PmOpFromBits($7FC00000)
 EndProcedure
@@ -3584,28 +3618,28 @@ Procedure.i PmOpNmsSuppress(boxes.i, i1.i, i2.i, center.i)
   If center = 0
     ax1 = PmTensorGet(boxes, i1 * 4 + 1)
     ax2 = PmTensorGet(boxes, i1 * 4 + 3)
-    If ax1 > ax2
+    If PmOpGt(ax1, ax2) <> 0
       t = ax1
       ax1 = ax2
       ax2 = t
     EndIf
     bx1 = PmTensorGet(boxes, i2 * 4 + 1)
     bx2 = PmTensorGet(boxes, i2 * 4 + 3)
-    If bx1 > bx2
+    If PmOpGt(bx1, bx2) <> 0
       t = bx1
       bx1 = bx2
       bx2 = t
     EndIf
     ay1 = PmTensorGet(boxes, i1 * 4)
     ay2 = PmTensorGet(boxes, i1 * 4 + 2)
-    If ay1 > ay2
+    If PmOpGt(ay1, ay2) <> 0
       t = ay1
       ay1 = ay2
       ay2 = t
     EndIf
     by1 = PmTensorGet(boxes, i2 * 4)
     by2 = PmTensorGet(boxes, i2 * 4 + 2)
-    If by1 > by2
+    If PmOpGt(by1, by2) <> 0
       t = by1
       by1 = by2
       by2 = t
@@ -3625,31 +3659,31 @@ Procedure.i PmOpNmsSuppress(boxes.i, i1.i, i2.i, center.i)
     by2 = PmTensorGet(boxes, i2 * 4 + 1) + t
   EndIf
   ix1 = ax1
-  If bx1 > ix1
+  If PmOpGt(bx1, ix1) <> 0
     ix1 = bx1
   EndIf
   ix2 = ax2
-  If bx2 < ix2
+  If PmOpLt(bx2, ix2) <> 0
     ix2 = bx2
   EndIf
-  If ix2 <= ix1
+  If PmOpLe(ix2, ix1) <> 0
     ProcedureReturn 0
   EndIf
   iy1 = ay1
-  If by1 > iy1
+  If PmOpGt(by1, iy1) <> 0
     iy1 = by1
   EndIf
   iy2 = ay2
-  If by2 < iy2
+  If PmOpLt(by2, iy2) <> 0
     iy2 = by2
   EndIf
-  If iy2 <= iy1
+  If PmOpLe(iy2, iy1) <> 0
     ProcedureReturn 0
   EndIf
   t = ix2 - ix1
   inter = iy2 - iy1
   inter = t * inter
-  If inter <= 0.0
+  If PmOpLe(inter, 0.0) <> 0
     ProcedureReturn 0
   EndIf
   t = ax2 - ax1
@@ -3660,11 +3694,11 @@ Procedure.i PmOpNmsSuppress(boxes.i, i1.i, i2.i, center.i)
   area2 = t * area2
   uni = area1 + area2
   uni = uni - inter
-  If area1 <= 0.0 Or area2 <= 0.0 Or uni <= 0.0
+  If PmOpLe(area1, 0.0) <> 0 Or PmOpLe(area2, 0.0) <> 0 Or PmOpLe(uni, 0.0) <> 0
     ProcedureReturn 0
   EndIf
   iou = inter / uni
-  If iou > PmOpF(0)
+  If PmOpGt(iou, PmOpF(0)) <> 0
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0
@@ -3831,6 +3865,10 @@ Procedure.f PmOpRoiSample(plane.i, height.i, width.i, y.f, x.f, mode.i)
   Protected t.f
   fy = height
   fx = width
+  ; a NaN coordinate samples nothing
+  If PmOpIsNan(y) <> 0 Or PmOpIsNan(x) <> 0
+    ProcedureReturn 0.0
+  EndIf
   If y < PmOpNeg(PmOpOne) Or y > fy Or x < PmOpNeg(PmOpOne) Or x > fx
     ProcedureReturn 0.0
   EndIf
@@ -3877,13 +3915,13 @@ Procedure.f PmOpRoiSample(plane.i, height.i, width.i, y.f, x.f, mode.i)
     ProcedureReturn t
   EndIf
   t = v1
-  If v2 > t
+  If PmOpGt(v2, t) <> 0
     t = v2
   EndIf
-  If v3 > t
+  If PmOpGt(v3, t) <> 0
     t = v3
   EndIf
-  If v4 > t
+  If PmOpGt(v4, t) <> 0
     t = v4
   EndIf
   ProcedureReturn t
@@ -4009,7 +4047,7 @@ Procedure.i PmOpRoiAlign(x.i, rois.i, idx.i, y.i)
               v = PmOpRoiSample(plane, height, width, yy, xx, PmOpI(8))
               If PmOpI(8) = 0
                 acc = acc + v
-              ElseIf first <> 0 Or v > acc
+              ElseIf first <> 0 Or PmOpGt(v, acc) <> 0
                 acc = v
               EndIf
               first = 0
@@ -6504,7 +6542,7 @@ Procedure.f PmOpMnMax(x.i, b.i, classes.i)
   k = 1
   While k < classes
     v = PmTensorGet(x, b * classes + k)
-    If v > mx
+    If PmOpGt(v, mx) <> 0
       mx = v
     EndIf
     k = k + 1
@@ -6536,7 +6574,7 @@ Procedure PmOpMultinomial(x.i, y.i, batch.i, classes.i, samples.i, kind.i)
       v = PmTensorGet(x, b * classes + k)
       v = v - mx
       w = PmOpExp(v)
-      If w > 0.0
+      If PmOpGt(w, 0.0) <> 0
         last = k
       EndIf
       total = total + w
@@ -6555,7 +6593,7 @@ Procedure PmOpMultinomial(x.i, y.i, batch.i, classes.i, samples.i, kind.i)
       v = v - mx
       w = PmOpExp(v)
       run = run + w
-      If t < run
+      If PmOpLt(t, run) <> 0
         pick = k
       EndIf
       k = k + 1

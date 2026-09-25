@@ -202,11 +202,12 @@ Procedure DScatterReduce(Y.i,A.i,Indices.i,Updates.i,Reduction.i)
         ElseIf Reduction=2
           f=f*g
         ElseIf Reduction=3
-          If g>f
+          ; numpy.maximum: a NaN on either side wins (forum 998)
+          If PmTensorIsNan(g)<>0 Or (PmTensorIsNan(f)=0 And g>f)
             f=g
           EndIf
         Else
-          If g<f
+          If PmTensorIsNan(g)<>0 Or (PmTensorIsNan(f)=0 And g<f)
             f=g
           EndIf
         EndIf

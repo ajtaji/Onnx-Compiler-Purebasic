@@ -74,6 +74,20 @@ Macro PmTensorPut(base, index, value)
   PokeF((base) + (index) * 4, (value))
 EndMacro
 
+; NaN and the host compiler (forums 995, 997, 998). A float comparison whose
+; operand may be NaN is guarded by a test on the float's bits: the host
+; compiler answers a NaN comparison by the operand order and by whether a side
+; is a literal (v < 0.0 and v <= 0.0 true, a > b, a >= b and a = b true, a <> b
+; false), so no comparison of a possible NaN is trusted to IEEE 754.
+Procedure.i PmTensorIsNan(v.f)
+  ProcedureReturn Bool((PeekL(@v) & $7FFFFFFF) > $7F800000)
+EndProcedure
+
+; The element at index of a FLOAT tensor is a NaN.
+Macro PmTensorNanAt(base, index)
+  Bool((PeekL((base) + (index) * 4) & $7FFFFFFF) > $7F800000)
+EndMacro
+
 ; Runtime shape/index tensors use signed ONNX INT64 on 64-bit backends.
 ; A future 32-bit target profile must provide an equivalent pair or reject
 ; models whose data path actually contains INT64 values.
@@ -222,7 +236,9 @@ Procedure PmTensorReluSerial(*src, *dst, count.i)
   i = 0 : ps = *src : pd = *dst
   While i < count
     v = PeekF(ps)
-    If v < 0.0 : v = 0.0 : EndIf
+    If (PeekL(ps) & $7FFFFFFF) <= $7F800000
+      If v < 0.0 : v = 0.0 : EndIf
+    EndIf
     PokeF(pd, v)
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend
@@ -254,6 +270,7 @@ EndProcedure
 
 Procedure.f PmTensorTanhValue(value.f)
   Protected e.f
+  If PmTensorIsNan(value) <> 0 : ProcedureReturn value : EndIf
   If value > 10.0 : ProcedureReturn 1.0 : EndIf
   If value < -10.0 : ProcedureReturn -1.0 : EndIf
   e = Exp(value + value)
@@ -390,11 +407,16 @@ Procedure PmTensorFloorSerial(*src, *dst, count.i)
   i = 0
   While i < count
     value = PmTensorGet(*src, i)
-    n = Int(value)
-    whole = n
-    If value < 0.0 And whole <> value : n = n - 1 : EndIf
-    whole = n
-    PmTensorPut(*dst, i, whole)
+    If (PeekL(*src + i * 4) & $7FFFFFFF) >= $4B000000
+      ; |value| >= 2^23, an infinity or a NaN: already its own floor
+      PmTensorPut(*dst, i, value)
+    Else
+      n = Int(value)
+      whole = n
+      If value < 0.0 And whole <> value : n = n - 1 : EndIf
+      whole = n
+      PmTensorPut(*dst, i, whole)
+    EndIf
     i = i + 1
   Wend
 EndProcedure
@@ -410,19 +432,24 @@ Procedure PmTensorRoundEvenSerial(*src, *dst, count.i)
   i = 0
   While i < count
     value = PmTensorGet(*src, i)
-    base = Int(value)
-    whole = base
-    If value < 0.0 And whole <> value : base = base - 1 : EndIf
-    whole = base
-    fraction = value - whole
-    result = base
-    If fraction > 0.5
-      result = base + 1
-    ElseIf fraction = 0.5 And (base & 1) <> 0
-      result = base + 1
+    If (PeekL(*src + i * 4) & $7FFFFFFF) >= $4B000000
+      ; |value| >= 2^23, an infinity or a NaN: already an integer
+      PmTensorPut(*dst, i, value)
+    Else
+      base = Int(value)
+      whole = base
+      If value < 0.0 And whole <> value : base = base - 1 : EndIf
+      whole = base
+      fraction = value - whole
+      result = base
+      If fraction > 0.5
+        result = base + 1
+      ElseIf fraction = 0.5 And (base & 1) <> 0
+        result = base + 1
+      EndIf
+      whole = result
+      PmTensorPut(*dst, i, whole)
     EndIf
-    whole = result
-    PmTensorPut(*dst, i, whole)
     i = i + 1
   Wend
 EndProcedure
@@ -463,8 +490,11 @@ Procedure PmTensorClipSerial(*src, *dst, count.i, lo.f, hi.f)
   i = 0 : ps = *src : pd = *dst
   While i < count
     v = PeekF(ps)
-    If v < lo : v = lo : EndIf
-    If v > hi : v = hi : EndIf
+    ; a NaN passes through (forum 997)
+    If (PeekL(ps) & $7FFFFFFF) <= $7F800000
+      If v < lo : v = lo : EndIf
+      If v > hi : v = hi : EndIf
+    EndIf
     PokeF(pd, v)
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend

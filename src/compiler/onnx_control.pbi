@@ -489,7 +489,16 @@ EndProcedure
 Procedure.i PmcAdaptAxes(*Graph.PmoOnnxGraph, *Node.PmoOnnxNode, *Scope.PmcScope, Map Taken.i())
   Protected *Attribute.PmoOnnxAttribute
   Protected Name.s
-  If PmcOpset >= 13 Or (*Node\Operation <> "Squeeze" And *Node\Operation <> "Unsqueeze") : ProcedureReturn #True : EndIf
+  ; The axes attribute becomes the axes input the later definition takes:
+  ; Squeeze and Unsqueeze before 13, ReduceSum before 13, ReduceMean before 18
+  Select *Node\Operation
+    Case "Squeeze", "Unsqueeze", "ReduceSum"
+      If PmcOpset >= 13 : ProcedureReturn #True : EndIf
+    Case "ReduceMean"
+      If PmcOpset >= 18 : ProcedureReturn #True : EndIf
+    Default
+      ProcedureReturn #True
+  EndSelect
   *Attribute = PmcAttribute(*Node, "axes")
   If *Attribute = 0 Or ListSize(*Node\Inputs()) <> 1 : ProcedureReturn #True : EndIf
   Name = PmcUniqueName("axes", Taken())

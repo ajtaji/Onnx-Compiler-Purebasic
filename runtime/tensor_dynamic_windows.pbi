@@ -241,7 +241,8 @@ Procedure DPut(Id.i, Index.i, Value.d)
     ; plain assignment here would round to nearest (forum 860).
     Case 7 : PokeQ(Dt(Id)\Data+Index*8,IntQ(Value))
     Case 6 : PokeL(Dt(Id)\Data+Index*4,IntQ(Value))
-    Case 9 : PokeA(Dt(Id)\Data+Index,Bool(Value<>0))
+    ; a NaN is true (forum 998): the host's <> answers false for it
+    Case 9 : PokeA(Dt(Id)\Data+Index,Bool(Value<>0 Or (PeekQ(@Value) & $7FFFFFFFFFFFFFFF) > $7FF0000000000000))
     Case 2,3 : PokeA(Dt(Id)\Data+Index,IntQ(Value) & 255)
   EndSelect
 EndProcedure
@@ -353,10 +354,10 @@ Procedure DIndexTask(*j.DIndexJob,task.i,worker.i)
           Case 2 : v=av*bv
           Case 3 : v=av/bv
           Case 4 : v=Pow(av,bv)
-          Case 5 : v=Bool(av=bv)
-          Case 6 : v=Bool(av>bv)
-          Case 7 : v=Bool(av<bv)
-          Case 8 : v=Bool(av>=bv)
+          Case 5 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av=bv)
+          Case 6 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>bv)
+          Case 7 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av<bv)
+          Case 8 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>=bv)
           Case 9 : v=Bool(av<>0 And bv<>0)
         EndSelect
         DPut(Y,i,v)
@@ -413,7 +414,8 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
   Protected av.f,bv.f,v.f,ia.i,ib.i,iv.i
   Protected width.i,row.i,astep.i,bstep.i
   If Op=4 And Dt(A)\Kind=1 And Dt(B)\Kind=1 And Dt(B)\Count=1
-    If PeekF(Dt(B)\Data)=2 : B=A : Op=2 : EndIf
+    ; the exponent's bits are exactly 2.0 (a NaN exponent is not; forum 998)
+    If PeekL(Dt(B)\Data)=$40000000 : B=A : Op=2 : EndIf
   EndIf
   If Op>=5 : kind=9 : EndIf
   ; Every path below writes every element of Y (or fails the request).
@@ -459,10 +461,10 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
         Case 2 : v=av*bv
         Case 3 : v=av/bv
         Case 4 : v=Pow(av,bv)
-        Case 5 : v=Bool(av=bv)
-        Case 6 : v=Bool(av>bv)
-        Case 7 : v=Bool(av<bv)
-        Case 8 : v=Bool(av>=bv)
+        Case 5 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av=bv)
+        Case 6 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>bv)
+        Case 7 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av<bv)
+        Case 8 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>=bv)
         Case 9 : v=Bool(av<>0 And bv<>0)
       EndSelect
       DPut(Y,i,v)
@@ -700,6 +702,9 @@ EndProcedure
 
 Procedure DRange(Y.i,A.i,B.i,C.i)
   Protected start.d=DGet(A),stop.d=DGet(B),stepv.d=DGet(C),n.i,i.i,extent.d
+  If (PeekQ(@start) & $7FFFFFFFFFFFFFFF) > $7FF0000000000000 Or (PeekQ(@stop) & $7FFFFFFFFFFFFFFF) > $7FF0000000000000 Or (PeekQ(@stepv) & $7FFFFFFFFFFFFFFF) > $7FF0000000000000
+    DFail("Range start, limit and delta must be numbers; a NaN gives no element count.") : ProcedureReturn
+  EndIf
   If stepv=0 : DFail("Range step is zero.") : ProcedureReturn : EndIf
   extent=(stop-start)/stepv
   If (PeekQ(@extent) & $7FF0000000000000)=$7FF0000000000000 Or extent>DLimit/DSize(Dt(A)\Kind) : DFail("Range exceeds finite memory bounds.") : ProcedureReturn : EndIf
@@ -731,12 +736,18 @@ Procedure DWhere(Y.i,Cond.i,A.i,B.i)
   DIndexRun(@job,#PMELEM_CHEAP/8)
 EndProcedure
 
+; An element other than zero; a NaN is one (forum 998).
+Procedure.i DNonZeroAt(A.i,i.i)
+  If Dt(A)\Kind=1 : ProcedureReturn Bool((PeekL(Dt(A)\Data+i*4) & $7FFFFFFF)<>0) : EndIf
+  ProcedureReturn Bool(DGet(A,i)<>0)
+EndProcedure
+
 Procedure DNonZero(Y.i,A.i)
   Protected i.i,j.i,count.i,n.i,col.i,c.i
-  For i=0 To Dt(A)\Count-1 : If DGet(A,i)<>0 : count+1 : EndIf : Next
+  For i=0 To Dt(A)\Count-1 : If DNonZeroAt(A,i) : count+1 : EndIf : Next
   If DShape(Y,7,2,Dt(A)\Rank,count)=0 : ProcedureReturn : EndIf
   For i=0 To Dt(A)\Count-1
-    If DGet(A,i)<>0
+    If DNonZeroAt(A,i)
       n=i
       For j=Dt(A)\Rank-1 To 0 Step -1
         c=n % Dt(A)\D[j] : n/Dt(A)\D[j] : PokeQ(Dt(Y)\Data+(j*count+col)*8,c)

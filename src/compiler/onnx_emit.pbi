@@ -571,7 +571,8 @@ Procedure.i PmoEmitCastHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Cal
       If HostDialect : PmoEmitLine(File, "    iv = Int(fv)") : Else : PmoEmitLine(File, "    iv = fv") : EndIf
       PmoEmitLine(File, "    " + PmoEmitPut(*Out\ElementType, "*dst", "i", "iv"))
     ElseIf *Out\ElementType = 9
-      PmoEmitLine(File, "    " + PmoEmitPut(9, "*dst", "i", "Bool(fv <> 0.0)"))
+      ; a NaN is true (forum 998)
+      PmoEmitLine(File, "    " + PmoEmitPut(9, "*dst", "i", "Bool(fv <> 0.0 Or PmTensorIsNan(fv) <> 0)"))
     Else
       PmoEmitLine(File, "    " + PmoEmitPut(1, "*dst", "i", "fv"))
     EndIf
@@ -612,6 +613,11 @@ Procedure.i PmoEmitCompareHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map 
   EndSelect
   If *Node\Operation = "And"
     Condition = "(" + PmoEmitGet(*A\ElementType, "*a", IA) + " <> 0) And (" + PmoEmitGet(*B\ElementType, "*b", IB) + " <> 0)"
+  ElseIf *A\ElementType = 1
+    ; FLOAT (forum 995): false whenever a NaN takes part, tested on the bits;
+    ; the host compiler's own answer for a NaN depends on the operand order
+    Condition = "PmTensorNanAt(*a, " + IA + ") = 0 And PmTensorNanAt(*b, " + IB + ") = 0 And " +
+                PmoEmitGet(1, "*a", IA) + Symbol + PmoEmitGet(1, "*b", IB)
   Else
     Condition = PmoEmitGet(*A\ElementType, "*a", IA) + Symbol + PmoEmitGet(*B\ElementType, "*b", IB)
   EndIf
@@ -676,7 +682,7 @@ Procedure.i PmoEmitRangeHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Ca
     PmoEmitLine(File, "  first = PmTensorGet(*firstValue, 0)")
     PmoEmitLine(File, "  delta = PmTensorGet(*deltaValue, 0)")
     PmoEmitLine(File, "  boundary = PmTensorGet(*limitValue, 0)")
-    PmoEmitLine(File, "  If delta = 0.0")
+    PmoEmitLine(File, "  If delta = 0.0 Or PmTensorIsNan(first) <> 0 Or PmTensorIsNan(delta) <> 0 Or PmTensorIsNan(boundary) <> 0")
     PmoEmitLine(File, "    PmOnnxRuntimeOk = 0")
     PmoEmitLine(File, "    ProcedureReturn")
     PmoEmitLine(File, "  EndIf")
@@ -739,7 +745,8 @@ Procedure.i PmoEmitNonZeroHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map 
   PmoEmitLine(File, "  While i < " + Str(*Src\Elements))
   PmoEmitLine(File, "    value = 0")
   If *Src\ElementType = 1
-    PmoEmitLine(File, "    If PmTensorGet(*src, i) <> 0.0 : value = 1 : EndIf")
+    ; a NaN is not zero (forum 998): the bits, not the host's <>
+    PmoEmitLine(File, "    If (PeekL(*src + i * 4) & $7FFFFFFF) <> 0 : value = 1 : EndIf")
   ElseIf *Src\ElementType = 7
     PmoEmitLine(File, "    If PmTensorGetI64(*src, i) <> 0 : value = 1 : EndIf")
   Else
@@ -811,8 +818,19 @@ Procedure.i PmoEmitScatterHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map 
     Select Reduction
       Case "add" : PmoEmitLine(File, "      current = current + update")
       Case "mul" : PmoEmitLine(File, "      current = current * update")
-      Case "max" : PmoEmitLine(File, "      If update > current : current = update : EndIf")
-      Case "min" : PmoEmitLine(File, "      If update < current : current = update : EndIf")
+      ; numpy.maximum and numpy.minimum: a NaN on either side wins (forum 998)
+      Case "max"
+        If *Data\ElementType = 1
+          PmoEmitLine(File, "      If PmTensorIsNan(update) <> 0 Or (PmTensorIsNan(current) = 0 And update > current) : current = update : EndIf")
+        Else
+          PmoEmitLine(File, "      If update > current : current = update : EndIf")
+        EndIf
+      Case "min"
+        If *Data\ElementType = 1
+          PmoEmitLine(File, "      If PmTensorIsNan(update) <> 0 Or (PmTensorIsNan(current) = 0 And update < current) : current = update : EndIf")
+        Else
+          PmoEmitLine(File, "      If update < current : current = update : EndIf")
+        EndIf
       Default : ProcedureReturn PmoEmitFail("ScatterND reduction " + Reduction + " reached the emitter unvalidated")
     EndSelect
     PmoEmitLine(File, "      " + PmoEmitPut(*Data\ElementType, "*dst", "base + inner", "current"))

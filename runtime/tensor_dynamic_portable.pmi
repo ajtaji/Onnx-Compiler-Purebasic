@@ -450,7 +450,8 @@ Procedure DPut(Id.i,Index.i,Value.f)
     Case 6
       PokeL(Dt(Id)\Data+Index*4,Int(Value))
     Case 9
-      PokeA(Dt(Id)\Data+Index,Bool(Value<>0.0))
+      ; a NaN is true (forum 998)
+      PokeA(Dt(Id)\Data+Index,Bool(Value<>0.0 Or PmTensorIsNan(Value)<>0))
     Case 2
       PokeA(Dt(Id)\Data+Index,Int(Value) & 255)
     Case 3
@@ -921,7 +922,7 @@ EndProcedure
 ; returns the NaN from its own second early exit, on the scalar path below.
 Procedure.i DPowWholeExponent(y.f)
   Protected k.i=0
-  If y<>y
+  If PmTensorIsNan(y) <> 0
     ProcedureReturn 0
   EndIf
   If y < -64.0
@@ -1066,13 +1067,13 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
         Case 4
           v=Pow(av,bv)
         Case 5
-          v=DFloat(Bool(av=bv))
+          v=DFloat(Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av=bv))
         Case 6
-          v=DFloat(Bool(av>bv))
+          v=DFloat(Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>bv))
         Case 7
-          v=DFloat(Bool(av<bv))
+          v=DFloat(Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av<bv))
         Case 8
-          v=DFloat(Bool(av>=bv))
+          v=DFloat(Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>=bv))
         Case 9
           v=DFloat(Bool(av<>0 And bv<>0))
       EndSelect
@@ -1629,6 +1630,10 @@ Procedure DRange(Y.i,A.i,B.i,C.i)
   Protected n.i=0
   Protected i.i=0
   Protected extent.f=0.0
+  If PmTensorIsNan(start) <> 0 Or PmTensorIsNan(stop) <> 0 Or PmTensorIsNan(stepv) <> 0
+    DFail("Range start, limit and delta must be numbers; a NaN gives no element count.")
+    ProcedureReturn
+  EndIf
   If Dt(A)\Kind<>Dt(B)\Kind Or Dt(A)\Kind<>Dt(C)\Kind Or Dt(A)\Count<>1 Or Dt(B)\Count<>1 Or Dt(C)\Count<>1
     DFail("Range requires three scalars of the same type.")
     ProcedureReturn
@@ -1751,6 +1756,20 @@ Procedure DWhere(Y.i,Cond.i,A.i,B.i)
   Next
 EndProcedure
 
+; An element other than zero; a NaN is one (forum 998).
+Procedure.i DNonZeroAt(A.i,i.i)
+  If Dt(A)\Kind=1
+    If (PeekL(Dt(A)\Data+i*4) & $7FFFFFFF)<>0
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If DGet(A,i)<>0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
 Procedure DNonZero(Y.i,A.i)
   Protected i.i=0
   Protected j.i=0
@@ -1759,7 +1778,7 @@ Procedure DNonZero(Y.i,A.i)
   Protected col.i=0
   Protected c.i=0
   For i=0 To Dt(A)\Count-1
-    If DGet(A,i)<>0
+    If DNonZeroAt(A,i)
       count+1
     EndIf
   Next
@@ -1767,7 +1786,7 @@ Procedure DNonZero(Y.i,A.i)
     ProcedureReturn
   EndIf
   For i=0 To Dt(A)\Count-1
-    If DGet(A,i)<>0
+    If DNonZeroAt(A,i)
       n=i
       For j=Dt(A)\Rank-1 To 0 Step -1
         c=n % DDims((A)*8+(j))

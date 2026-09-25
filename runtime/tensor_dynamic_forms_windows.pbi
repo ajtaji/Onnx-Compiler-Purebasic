@@ -80,8 +80,9 @@ Procedure DScatterReduce(Y.i,A.i,Indices.i,Updates.i,Reduction.i)
         Select Reduction
           Case 1 : f=f+g
           Case 2 : f=f*g
-          Case 3 : If g>f : f=g : EndIf
-          Case 4 : If g<f : f=g : EndIf
+          ; numpy.maximum and numpy.minimum: a NaN on either side wins (forum 998)
+          Case 3 : If PmTensorIsNan(g)<>0 Or (PmTensorIsNan(f)=0 And g>f) : f=g : EndIf
+          Case 4 : If PmTensorIsNan(g)<>0 Or (PmTensorIsNan(f)=0 And g<f) : f=g : EndIf
         EndSelect
         PokeF(Dt(Y)\Data+dst*4,f)
       Else

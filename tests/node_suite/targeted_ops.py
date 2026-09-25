@@ -1150,6 +1150,63 @@ def cases() -> list[Case]:
         c.append(Case("%s_%s" % (op.lower(), np.dtype(dt).name), [N(op, ["x"], ["y"])], [("x", et, [2, 3])], [("y", et, [2, 3])], {"x": xv}, opset=13))
     c.append(Case("refuse_input_float16_runtime", [N("Abs", ["x"], ["y"])], [("x", TensorProto.FLOAT16, [3])], [("y", TensorProto.FLOAT16, [3])],
                   {"x": np.ones(3, np.float16)}, opset=20, fixed=False, refuse="Graph input 'x' has element type FLOAT16 (10); runtime-dimension emission binds"))
+    # comparisons with NaN, signed zeros and infinities on both paths: false
+    # wherever a NaN takes part (forum 995)
+    na = np.array([[np.nan, 1.0, -0.0, np.inf, 2.0, np.nan], [3.0, np.nan, 0.0, -np.inf, 2.0, -1.0]], np.float32)
+    nb = np.array([1.0, np.nan, 0.0, np.inf, 2.0, np.nan], np.float32)
+    for op in ("Equal", "Greater", "GreaterOrEqual", "Less", "LessOrEqual"):
+        c.append(Case("compare_nan_%s" % op.lower(), [N(op, ["a", "b"], ["y"])], [("a", F, [2, 6]), ("b", F, [6])], [("y", B, [2, 6])],
+                      {"a": na, "b": nb}, opset=16))
+    # NaN through every kernel of the base runtime both paths run (forums 995
+    # and 997): the ONNX reference decides alone (ONNX Runtime propagates NaN
+    # differently in several reductions)
+    nx = np.array([[np.nan, 1.5, -2.5, np.inf, -0.0, 0.5], [3.0, -np.inf, np.nan, 0.0, -1.5, 2.5]], np.float32)
+    for op in ("Exp", "Log", "Sqrt", "Abs", "Neg", "Sin", "Cos", "Atan", "Sigmoid", "Tanh", "Floor", "Round", "Relu"):
+        c.append(Case("nan_%s" % op.lower(), [N(op, ["x"], ["y"])], [("x", F, [2, 6])], [("y", F, [2, 6])], {"x": nx}, opset=13, oracle="ref"))
+    for name, node, oshape, extra, inits in (
+            ("leakyrelu", N("LeakyRelu", ["x"], ["y"], alpha=0.1), [2, 6], [], []),
+            ("softmax", N("Softmax", ["x"], ["y"], axis=-1), [2, 6], [], []),
+            ("clip", N("Clip", ["x", "lo", "hi"], ["y"]), [2, 6], [], [init("lo", np.array(-1.0, np.float32)), init("hi", np.array(2.0, np.float32))]),
+            ("reducemax", N("ReduceMax", ["x"], ["y"], axes=[1], keepdims=0), [2], [], []),
+            ("reducesum", N("ReduceSum", ["x", "ax"], ["y"], keepdims=0), [2], [], [init("ax", np.array([1], np.int64))]),
+            ("reducemean", N("ReduceMean", ["x"], ["y"], axes=[1], keepdims=0), [2], [], []),
+            ("reduceprod", N("ReduceProd", ["x"], ["y"], axes=[1], keepdims=0), [2], [], []),
+            ("cumsum", N("CumSum", ["x", "ax"], ["y"]), [2, 6], [], [init("ax", np.array(1, np.int64))]),
+            ("cast_bool", N("Cast", ["x"], ["y"], to=B), [2, 6], [], []),
+            ("pow_nan_exponent", N("Pow", ["e", "x"], ["y"]), [2, 6], [("e", F, [2, 6])], []),
+            ("pow_scalar_nan", N("Pow", ["x", "s"], ["y"]), [2, 6], [], [init("s", np.array([np.nan], np.float32))]),
+            ("layernorm", N("LayerNormalization", ["x", "g", "b"], ["y"], axis=-1), [2, 6], [], [init("g", f32(6)), init("b", f32(6))]),
+            ("topk", N("TopK", ["x", "k"], ["y", "i"]), [2, 3], [], [init("k", np.array([3], np.int64))]),
+            ("scatternd_max", N("ScatterND", ["x", "ix", "u"], ["y"], reduction="max"), [2, 6], [], [
+                init("ix", np.array([[0, 1], [1, 2], [0, 4], [1, 0]], np.int64)), init("u", np.array([np.nan, 1.0, 7.0, np.nan], np.float32))]),
+            ("scatternd_min", N("ScatterND", ["x", "ix", "u"], ["y"], reduction="min"), [2, 6], [], [
+                init("ix", np.array([[0, 1], [1, 2], [0, 4], [1, 0]], np.int64)), init("u", np.array([np.nan, 1.0, -7.0, np.nan], np.float32))])):
+        outs = [("y", B if name == "cast_bool" else F, oshape)]
+        if name == "topk":
+            outs.append(("i", I64, oshape))
+        feeds = {"x": nx}
+        if extra:
+            feeds["e"] = np.full((2, 6), 2.0, np.float32)
+        oracle = "ref"
+        if name.startswith("scatternd"):
+            # the reference indexes max and min with the index row as a list;
+            # numpy's maximum and minimum, update by update, are its intent
+            def oracle(feeds, name=name, inits=inits):
+                y = feeds["x"].copy()
+                ix = numpy_helper.to_array(inits[0])
+                u = numpy_helper.to_array(inits[1])
+                for k in range(len(ix)):
+                    y[tuple(ix[k])] = (np.maximum if name.endswith("max") else np.minimum)(y[tuple(ix[k])], u[k])
+                return [y]
+        c.append(Case("nan_%s" % name, [node], [("x", F, [2, 6])] + extra, outs, feeds, inits, opset=18 if name.startswith("scatternd") else (17 if name == "layernorm" else 13),
+                      oracle=("own", oracle) if callable(oracle) else oracle))
+    # the axes attribute of ReduceMean before 18 and ReduceSum before 13 on
+    # the runtime-dimension path (the axes input the later definitions take)
+    rx3 = f32(2, 3, 4)
+    for name, node, opset, oshape in (("reducemean_axes_attr", N("ReduceMean", ["x"], ["y"], axes=[1, -1], keepdims=1), 13, [2, 1, 1]),
+                                      ("reducesum_axes_attr", N("ReduceSum", ["x"], ["y"], axes=[0], keepdims=0), 11, [3, 4])):
+        c.append(Case(name, [node], [("x", F, [2, 3, 4])], [("y", F, oshape)], {"x": rx3}, opset=opset, symbolic_axes=(2,), fixed=False))
+    c.append(Case("nan_nonzero", [N("NonZero", ["x"], ["y"])], [("x", F, [2, 6])], [("y", I64, [2, None])], {"x": nx}, opset=13, oracle="ref", fixed=False))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]
