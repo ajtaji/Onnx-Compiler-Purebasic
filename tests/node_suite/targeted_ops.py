@@ -1060,6 +1060,32 @@ def cases() -> list[Case]:
     c.append(Case("refuse_attention_softmax_precision", [N("Attention", ["q", "k", "v"], ["y"], softmax_precision=11)],
                   [("q", F, [1, 2, 3, 4]), ("k", F, [1, 2, 4, 4]), ("v", F, [1, 2, 4, 4])], [("y", F, [1, 2, 3, 4])],
                   {"q": f32(1, 2, 3, 4), "k": f32(1, 2, 4, 4), "v": f32(1, 2, 4, 4)}, opset=23, refuse="softmax is FLOAT"))
+    # CausalConvWithState and LinearAttention (opset 27)
+    c.append(Case("causalconv_bias_past_silu", [N("CausalConvWithState", ["x", "w", "b", "p"], ["y", "s"], activation="silu")],
+                  [("x", F, [2, 3, 5]), ("w", F, [3, 1, 4]), ("b", F, [3]), ("p", F, [2, 3, 3])], [("y", F, [2, 3, 5]), ("s", F, [2, 3, 3])],
+                  {"x": f32(2, 3, 5), "w": f32(3, 1, 4), "b": f32(3), "p": f32(2, 3, 3)}, opset=27))
+    c.append(Case("causalconv_plain", [N("CausalConvWithState", ["x", "w"], ["y", "s"])], [("x", F, [1, 4, 6]), ("w", F, [4, 1, 3])],
+                  [("y", F, [1, 4, 6]), ("s", F, [1, 4, 2])],
+                  {"x": f32(1, 4, 6), "w": f32(4, 1, 3)}, opset=27))
+    c.append(Case("refuse_causalconv_activation", [N("CausalConvWithState", ["x", "w"], ["y", "s"], activation="gelu")], [("x", F, [1, 4, 6]), ("w", F, [4, 1, 3])],
+                  [("y", F, [1, 4, 6]), ("s", F, [1, 4, 2])], {"x": f32(1, 4, 6), "w": f32(4, 1, 3)}, opset=27, refuse="none, silu and swish"))
+    lq, lk, lv = f32(2, 3, 12), f32(2, 3, 6, scale=0.5), f32(2, 3, 4)
+    for rule, extra, ins in (("linear", {}, ["q", "k", "v"]), ("gated", {"g": RNG.uniform(-1, 0, (2, 3, 6)).astype(np.float32)}, ["q", "k", "v", "", "g"]),
+                             ("delta", {"bt": RNG.uniform(0, 1, (2, 3, 2)).astype(np.float32)}, ["q", "k", "v", "", "", "bt"]),
+                             ("gated_delta", {"g": RNG.uniform(-1, 0, (2, 3, 2)).astype(np.float32), "bt": RNG.uniform(0, 1, (2, 3, 1)).astype(np.float32)},
+                              ["q", "k", "v", "", "g", "bt"])):
+        decl = [("q", F, [2, 3, 12]), ("k", F, [2, 3, 6]), ("v", F, [2, 3, 4])] + [(n, F, list(a.shape)) for n, a in extra.items()]
+        feeds = {"q": lq, "k": lk, "v": lv}
+        feeds.update(extra)
+        c.append(Case("linearattention_%s" % rule, [N("LinearAttention", ins, ["y", "s"], q_num_heads=4, kv_num_heads=2, update_rule=rule)],
+                      decl, [("y", F, [2, 3, 8]), ("s", F, [2, 2, 3, 2])], feeds, opset=27))
+    c.append(Case("linearattention_past_scale", [N("LinearAttention", ["q", "k", "v", "p", "g", "bt"], ["y", "s"], q_num_heads=2, kv_num_heads=2, scale=0.4)],
+                  [("q", F, [1, 2, 6]), ("k", F, [1, 2, 6]), ("v", F, [1, 2, 4]), ("p", F, [1, 2, 3, 2]), ("g", F, [1, 2, 2]), ("bt", F, [1, 2, 2])],
+                  [("y", F, [1, 2, 4]), ("s", F, [1, 2, 3, 2])], {"q": f32(1, 2, 6), "k": f32(1, 2, 6, scale=0.5), "v": f32(1, 2, 4), "p": f32(1, 2, 3, 2, scale=0.3),
+                                          "g": RNG.uniform(-1, 0, (1, 2, 2)).astype(np.float32), "bt": RNG.uniform(0, 1, (1, 2, 2)).astype(np.float32)}, opset=27))
+    c.append(Case("refuse_linearattention_rule", [N("LinearAttention", ["q", "k", "v"], ["y", "s"], q_num_heads=2, kv_num_heads=2, update_rule="rwkv")],
+                  [("q", F, [1, 2, 6]), ("k", F, [1, 2, 6]), ("v", F, [1, 2, 4])], [("y", F, [1, 2, 4]), ("s", F, [1, 2, 3, 2])],
+                  {"q": f32(1, 2, 6), "k": f32(1, 2, 6), "v": f32(1, 2, 4)}, opset=27, refuse="linear, gated, delta and gated_delta"))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

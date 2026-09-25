@@ -87,6 +87,8 @@ Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
     Case "RotaryEmbedding" : ProcedureReturn "|interleaved|num_heads|rotary_embedding_dim|"
     Case "TensorScatter" : ProcedureReturn "|axis|mode|"
     Case "Attention" : ProcedureReturn "|is_causal|kv_num_heads|q_num_heads|qk_matmul_output_mode|scale|softcap|softmax_precision|"
+    Case "CausalConvWithState" : ProcedureReturn "|activation|"
+    Case "LinearAttention" : ProcedureReturn "|chunk_size|kv_num_heads|q_num_heads|scale|update_rule|"
     Case "DeformConv" : ProcedureReturn "|dilations|group|kernel_shape|offset_group|pads|strides|"
     Case "RoiAlign"
       If Opset >= 16 : ProcedureReturn "|coordinate_transformation_mode|mode|output_height|output_width|sampling_ratio|spatial_scale|" : EndIf
@@ -302,6 +304,15 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "cos_cache", "|1|") : EndIf
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 2, "sin_cache", "|1|") : EndIf
         If Reason = "" And PmdNsInputPresent(*Node, 3) : Reason = PmdNsTypeReason(*Node, 3, "position_ids", "|7|") : EndIf
+      Case "CausalConvWithState"
+        Reason = PmdNsTypeReason(*Node, 0, "input", "|1|")
+        Text = PmoEmitAttrS(*Node, "activation", "none")
+        If Reason = "" And Text <> "none" And Text <> "silu" And Text <> "swish" : Reason = "attribute activation = " + Text + "; none, silu and swish are defined." : EndIf
+      Case "LinearAttention"
+        Reason = PmdNsTypeReason(*Node, 0, "query", "|1|")
+        Text = PmoEmitAttrS(*Node, "update_rule", "gated_delta")
+        If Reason = "" And Text <> "linear" And Text <> "gated" And Text <> "delta" And Text <> "gated_delta" : Reason = "attribute update_rule = " + Text + "; linear, gated, delta and gated_delta are defined." : EndIf
+        If Reason = "" And (PmoEmitAttrI(*Node, "q_num_heads", 0) < 1 Or PmoEmitAttrI(*Node, "kv_num_heads", 0) < 1) : Reason = "q_num_heads and kv_num_heads are required." : EndIf
       Case "Attention"
         Reason = PmdNsTypeReason(*Node, 0, "Q", "|1|")
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "K", "|1|") : EndIf
@@ -430,6 +441,10 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         If ListSize(*Node\Outputs()) <> 3 Or PmdNsNamedOutputs(*Node) <> 3
           Reason = "it declares " + Str(PmdNsNamedOutputs(*Node)) + " named outputs; DynamicQuantizeLinear has three (y, y_scale, y_zero_point)."
         EndIf
+      Case "CausalConvWithState", "LinearAttention"
+        If ListSize(*Node\Outputs()) < 1 Or ListSize(*Node\Outputs()) > 2 Or PmoEmitOutput(*Node, 0) = ""
+          Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; " + Op + " has one or two (the output first, then the present state)."
+        EndIf
       Case "Attention"
         If ListSize(*Node\Outputs()) < 1 Or ListSize(*Node\Outputs()) > 4 Or PmoEmitOutput(*Node, 0) = ""
           Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; Attention has one to four (Y, present_key, present_value, qk_matmul_output), Y first."
@@ -467,6 +482,16 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
     Case "RMSNormalization"
       Call = "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "epsilon", 0.00001)) + ") : DOpRmsNorm(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," +
              Str(PmoEmitAttrI(*Node, "axis", -1)) + ")"
+    Case "CausalConvWithState"
+      Call = "DOpCausalConv(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 1)) + "," + a(0) + "," + a(1) + "," + a(2) + "," + a(3) + "," +
+             Str(Bool(PmoEmitAttrS(*Node, "activation", "none") <> "none")) + ")"
+    Case "LinearAttention"
+      Text = PmoEmitAttrS(*Node, "update_rule", "gated_delta")
+      Code = 3
+      If Text = "linear" : Code = 0 : ElseIf Text = "gated" : Code = 1 : ElseIf Text = "delta" : Code = 2 : EndIf
+      Call = "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "scale", 0.0)) + ") : DOpLinearAttention(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," +
+             PmdNsId(Ids(), PmoEmitOutput(*Node, 1)) + "," + a(0) + "," + a(1) + "," + a(2) + "," + a(3) + "," + a(4) + "," + a(5) + "," +
+             Str(PmoEmitAttrI(*Node, "q_num_heads", 0)) + "," + Str(PmoEmitAttrI(*Node, "kv_num_heads", 0)) + "," + Str(Code) + "," + Str(Bool(PmoEmitAttrF(*Node, "scale", 0.0) <> 0.0)) + ")"
     Case "Attention"
       Pre = "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "scale", 1.0)) + ") : PmOpSetBits(@PmOpF(1)," + PmoOpsBits(PmoEmitAttrF(*Node, "softcap", 0.0)) + ") : "
       Call = Pre + "DOpAttention(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 1)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 2)) + "," +

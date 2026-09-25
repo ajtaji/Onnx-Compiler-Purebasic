@@ -7024,3 +7024,215 @@ Procedure PmOpAttention(q.i, k.i, v.i, mask.i, pastK.i, pastV.i, nonpad.i, y.i, 
     b = b + 1
   Wend
 EndProcedure
+
+; ----------------------------------------------------------------------
+; CausalConvWithState-27. x [B, C, L], w [C, 1, K], optional bias [C] and
+; past [B, C, K-1] (zeros when absent). y[b, c, t] = sum over i of
+; w[c, i] * padded[b, c, t + i] in order, plus the bias, where padded is
+; the past followed by x; silu (act 1) makes it y / (1 + exp(-y)). The
+; present state (when pres is not 0) is padded's last K-1 positions.
+; ----------------------------------------------------------------------
+Procedure.f PmOpCcPadded(x.i, past.i, b.i, c.i, pos.i, cn.i, ln.i, kn.i)
+  Protected v.f
+  If pos < kn - 1
+    v = 0.0
+    If past <> 0
+      v = PmTensorGet(past, (b * cn + c) * (kn - 1) + pos)
+    EndIf
+  Else
+    v = PmTensorGet(x, (b * cn + c) * ln + pos - (kn - 1))
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+Procedure PmOpCausalConv(x.i, w.i, bias.i, past.i, y.i, pres.i, bn.i, cn.i, ln.i, kn.i, act.i)
+  Protected b.i
+  Protected c.i
+  Protected t.i
+  Protected i.i
+  Protected acc.f
+  Protected v.f
+  Protected e.f
+  PmOpInit()
+  b = 0
+  While b < bn
+    c = 0
+    While c < cn
+      t = 0
+      While t < ln
+        acc = 0.0
+        i = 0
+        While i < kn
+          v = PmOpCcPadded(x, past, b, c, t + i, cn, ln, kn)
+          v = PmTensorGet(w, c * kn + i) * v
+          acc = acc + v
+          i = i + 1
+        Wend
+        If bias <> 0
+          acc = acc + PmTensorGet(bias, c)
+        EndIf
+        If act <> 0
+          e = PmOpNeg(acc)
+          e = PmOpExp(e)
+          e = PmOpOne + e
+          acc = acc / e
+        EndIf
+        PmOpStoreF(y, (b * cn + c) * ln + t, acc)
+        t = t + 1
+      Wend
+      If pres <> 0
+        i = 0
+        While i < kn - 1
+          v = PmOpCcPadded(x, past, b, c, ln + i, cn, ln, kn)
+          PmOpStoreF(pres, (b * cn + c) * (kn - 1) + i, v)
+          i = i + 1
+        Wend
+      EndIf
+      c = c + 1
+    Wend
+    b = b + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; LinearAttention-27. q [B, T, Hq*dk], k [B, T, Hkv*dk], v [B, T, Hkv*dv];
+; past (the state on entry, zeros when 0); state (B*Hkv*dk*dv FLOATs, the
+; present on exit) and ret (dv FLOATs of scratch). PmOpI: 0 B, 1 T, 2 Hq,
+; 3 Hkv, 4 dk, 5 dv, 6 gating, 7 delta, 8 decay per key dimension (else
+; per head), 9 beta per head (else one per token), 10 a scale given
+; (PmOpF(0); else 1/sqrt(dk)). Per
+; token: the state times exp(decay); the value less the state's read of
+; the key, times beta; the key's outer product with it added; the query's
+; read of the (shared) state, times the scale. Each step one binary32
+; operation, sums in order.
+; ----------------------------------------------------------------------
+Procedure PmOpLinearAttention(q.i, k.i, v.i, past.i, decay.i, beta.i, state.i, ret.i, y.i)
+  Protected bn.i
+  Protected tn.i
+  Protected hq.i
+  Protected hkv.i
+  Protected dk.i
+  Protected dv.i
+  Protected b.i
+  Protected t.i
+  Protected h.i
+  Protected g.i
+  Protected d.i
+  Protected m.i
+  Protected at.i
+  Protected acc.f
+  Protected x.f
+  Protected z.f
+  Protected bt.f
+  Protected sc.f
+  PmOpInit()
+  bn = PmOpI(0)
+  tn = PmOpI(1)
+  hq = PmOpI(2)
+  hkv = PmOpI(3)
+  dk = PmOpI(4)
+  dv = PmOpI(5)
+  If PmOpI(10) <> 0
+    sc = PmOpF(0)
+  Else
+    sc = PmOpIntToF(dk)
+    sc = PmOpSqrt(sc)
+    sc = PmOpOne / sc
+  EndIf
+  at = 0
+  While at < bn * hkv * dk * dv
+    If past <> 0
+      PokeL(state + at * 4, PeekL(past + at * 4))
+    Else
+      PokeL(state + at * 4, 0)
+    EndIf
+    at = at + 1
+  Wend
+  b = 0
+  While b < bn
+    t = 0
+    While t < tn
+      g = 0
+      While g < hkv
+        at = (b * hkv + g) * dk * dv
+        If PmOpI(6) <> 0
+          d = 0
+          While d < dk
+            If PmOpI(8) <> 0
+              z = PmTensorGet(decay, (b * tn + t) * hkv * dk + g * dk + d)
+            Else
+              z = PmTensorGet(decay, (b * tn + t) * hkv + g)
+            EndIf
+            z = PmOpExp(z)
+            m = 0
+            While m < dv
+              x = PmTensorGet(state, at + d * dv + m)
+              x = x * z
+              PmTensorPut(state, at + d * dv + m, x)
+              m = m + 1
+            Wend
+            d = d + 1
+          Wend
+        EndIf
+        m = 0
+        While m < dv
+          x = PmTensorGet(v, (b * tn + t) * hkv * dv + g * dv + m)
+          If PmOpI(7) <> 0
+            acc = 0.0
+            d = 0
+            While d < dk
+              z = PmTensorGet(state, at + d * dv + m)
+              z = z * PmTensorGet(k, (b * tn + t) * hkv * dk + g * dk + d)
+              acc = acc + z
+              d = d + 1
+            Wend
+            x = x - acc
+            If PmOpI(9) <> 0
+              bt = PmTensorGet(beta, (b * tn + t) * hkv + g)
+            Else
+              bt = PmTensorGet(beta, b * tn + t)
+            EndIf
+            x = bt * x
+          EndIf
+          PmTensorPut(ret, m, x)
+          m = m + 1
+        Wend
+        d = 0
+        While d < dk
+          z = PmTensorGet(k, (b * tn + t) * hkv * dk + g * dk + d)
+          m = 0
+          While m < dv
+            x = z * PmTensorGet(ret, m)
+            x = PmTensorGet(state, at + d * dv + m) + x
+            PmTensorPut(state, at + d * dv + m, x)
+            m = m + 1
+          Wend
+          d = d + 1
+        Wend
+        g = g + 1
+      Wend
+      h = 0
+      While h < hq
+        g = h / (hq / hkv)
+        at = (b * hkv + g) * dk * dv
+        m = 0
+        While m < dv
+          acc = 0.0
+          d = 0
+          While d < dk
+            x = PmTensorGet(q, (b * tn + t) * hq * dk + h * dk + d)
+            x = x * PmTensorGet(state, at + d * dv + m)
+            acc = acc + x
+            d = d + 1
+          Wend
+          acc = sc * acc
+          PmOpStoreF(y, (b * tn + t) * hq * dv + h * dv + m, acc)
+          m = m + 1
+        Wend
+        h = h + 1
+      Wend
+      t = t + 1
+    Wend
+    b = b + 1
+  Wend
+EndProcedure

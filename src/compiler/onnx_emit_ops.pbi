@@ -25,7 +25,7 @@ Procedure.i PmoOpsOwns(Operation.s)
                                   "RNN|GRU|NonMaxSuppression|RoiAlign|GridSample|QuantizeLinear|DequantizeLinear|" +
                                   "DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|HannWindow|HammingWindow|" +
                                   "BlackmanWindow|DFT|MelWeightMatrix|NegativeLogLikelihoodLoss|SoftmaxCrossEntropyLoss|Col2Im|" +
-                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|Unique|Swish|RMSNormalization|CumProd|BitCast|RotaryEmbedding|TensorScatter|Attention|", "|" + Operation + "|"))
+                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|Unique|Swish|RMSNormalization|CumProd|BitCast|RotaryEmbedding|TensorScatter|Attention|CausalConvWithState|LinearAttention|", "|" + Operation + "|"))
 EndProcedure
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
@@ -62,6 +62,7 @@ Procedure.i PmoOpsFloor(Operation.s)
     Case "CumProd" : ProcedureReturn 26
     Case "RotaryEmbedding" : ProcedureReturn 23
     Case "Attention" : ProcedureReturn 23
+    Case "CausalConvWithState", "LinearAttention" : ProcedureReturn 27
     Case "TensorScatter" : ProcedureReturn 24
     Case "BitCast" : ProcedureReturn 26
     Case "QuantizeLinear", "DequantizeLinear", "MatMulInteger", "QLinearMatMul", "ConvInteger", "QLinearConv" : ProcedureReturn 10
@@ -399,6 +400,11 @@ Procedure.q PmoOpsNodeScratch(*Ir.PmoIrModel, *Node.PmoOnnxNode)
       ProcedureReturn N * N * 4
     Case "Attention"
       ProcedureReturn (PmoOpsAttentionTotal(*Ir, *Node) + 1) * 4
+    Case "LinearAttention"
+      *W = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+      H = PmoEmitAttrI(*Node, "kv_num_heads", 1) : N = PmoEmitAttrI(*Node, "q_num_heads", 1)
+      If *W = 0 Or H < 1 Or N < 1 Or PmoEmitRank(*X) <> 3 Or PmoEmitRank(*W) <> 3 : ProcedureReturn 0 : EndIf
+      ProcedureReturn (PmoEmitDim(*X, 0) * H * (PmoEmitDim(*X, 2) / N) * (PmoEmitDim(*W, 2) / H) + PmoEmitDim(*W, 2) / H + 1) * 4
     Case "SoftmaxCrossEntropyLoss"
       If PmoEmitOutput(*Node, 1) = "" : ProcedureReturn *X\Elements * 4 : EndIf
     Case "RNN", "GRU"
@@ -1547,6 +1553,103 @@ Procedure.i PmoEmitOpsAttention(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcN
   ProcedureReturn #True
 EndProcedure
 
+; CausalConvWithState-27.
+Procedure.i PmoEmitOpsCausalConv(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *W.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *B.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+  Protected *P.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 3))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Act.s, Kn.q
+  If PmoEmitNsAttributesAllowed(*Node, "|activation|", Opset) = 0 : ProcedureReturn #False : EndIf
+  Act = PmoEmitAttrS(*Node, "activation", "none")
+  If Act <> "none" And Act <> "silu" And Act <> "swish" : ProcedureReturn PmoEmitNsFail(*Node, "attribute activation = " + Act + "; none, silu and swish are defined.") : EndIf
+  If PmoOpsTypeOk(*Node, *X, "input", 1) = 0 Or PmoOpsTypeOk(*Node, *W, "weight", 1) = 0 : ProcedureReturn #False : EndIf
+  If PmoEmitRank(*X) <> 3 Or PmoEmitRank(*W) <> 3 Or PmoEmitDim(*W, 0) <> PmoEmitDim(*X, 1) Or PmoEmitDim(*W, 1) <> 1
+    ProcedureReturn PmoEmitNsFail(*Node, "input must be [B, C, L] and weight [C, 1, K].")
+  EndIf
+  Kn = PmoEmitDim(*W, 2)
+  If PmoEmitInput(*Node, 2) <> "" And (PmoOpsTypeOk(*Node, *B, "bias", 1) = 0 Or *B\Elements <> PmoEmitDim(*X, 1)) : ProcedureReturn PmoEmitNsFail(*Node, "bias must hold one FLOAT per channel.") : EndIf
+  If PmoEmitInput(*Node, 3) <> ""
+    If PmoOpsTypeOk(*Node, *P, "past_state", 1) = 0 Or PmoEmitRank(*P) <> 3 Or PmoEmitDim(*P, 0) <> PmoEmitDim(*X, 0) Or PmoEmitDim(*P, 1) <> PmoEmitDim(*X, 1) Or PmoEmitDim(*P, 2) <> Kn - 1
+      ProcedureReturn PmoEmitNsFail(*Node, "past_state must be FLOAT [B, C, K-1].")
+    EndIf
+  EndIf
+  If PmoOpsSameShape(*Node, *X, *Y, 1) = 0 : ProcedureReturn #False : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpCausalConv(*i0, *i1, " + PmoOpsIn(*Node, 2) + ", " + PmoOpsIn(*Node, 3) + ", *o0, " + PmoOpsOut(*Node, 1) + ", " + Str(PmoEmitDim(*X, 0)) + ", " +
+                    Str(PmoEmitDim(*X, 1)) + ", " + Str(PmoEmitDim(*X, 2)) + ", " + Str(Kn) + ", " + Str(Bool(Act <> "none")) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
+; LinearAttention-27.
+Procedure.i PmoOpsLinearRule(*Node.PmoOnnxNode)
+  Select PmoEmitAttrS(*Node, "update_rule", "gated_delta")
+    Case "linear" : ProcedureReturn 0
+    Case "gated" : ProcedureReturn 1
+    Case "delta" : ProcedureReturn 2
+    Case "gated_delta" : ProcedureReturn 3
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i PmoEmitOpsLinearAttention(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *Q.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *K.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 1))
+  Protected *V.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 2))
+  Protected *P.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 3))
+  Protected *G.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 4))
+  Protected *Bt.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 5))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Rule.i, Hq.q, Hkv.q, Bn.q, Tn.q, Dk.q, Dv.q, Gated.i, Delta.i, PerKey.i, PerHead.i, State.s, Scale.f
+  If PmoEmitNsAttributesAllowed(*Node, "|chunk_size|kv_num_heads|q_num_heads|scale|update_rule|", Opset) = 0 : ProcedureReturn #False : EndIf
+  Rule = PmoOpsLinearRule(*Node)
+  If Rule < 0 : ProcedureReturn PmoEmitNsFail(*Node, "attribute update_rule = " + PmoEmitAttrS(*Node, "update_rule", "") + "; linear, gated, delta and gated_delta are defined.") : EndIf
+  If PmoOpsTypeOk(*Node, *Q, "query", 1) = 0 Or PmoOpsTypeOk(*Node, *K, "key", 1) = 0 Or PmoOpsTypeOk(*Node, *V, "value", 1) = 0 : ProcedureReturn #False : EndIf
+  Hq = PmoEmitAttrI(*Node, "q_num_heads", 0) : Hkv = PmoEmitAttrI(*Node, "kv_num_heads", 0)
+  If Hq < 1 Or Hkv < 1 Or Hq % Hkv <> 0 : ProcedureReturn PmoEmitNsFail(*Node, "q_num_heads and kv_num_heads are required, q_num_heads a multiple of kv_num_heads.") : EndIf
+  If PmoEmitRank(*Q) <> 3 Or PmoEmitRank(*K) <> 3 Or PmoEmitRank(*V) <> 3 : ProcedureReturn PmoEmitNsFail(*Node, "query, key and value must be rank 3 [B, T, heads x size].") : EndIf
+  Bn = PmoEmitDim(*Q, 0) : Tn = PmoEmitDim(*Q, 1)
+  If PmoEmitDim(*Q, 2) % Hq <> 0 Or PmoEmitDim(*V, 2) % Hkv <> 0 : ProcedureReturn PmoEmitNsFail(*Node, "the head counts must divide the packed extents.") : EndIf
+  Dk = PmoEmitDim(*Q, 2) / Hq : Dv = PmoEmitDim(*V, 2) / Hkv
+  If PmoEmitDim(*K, 0) <> Bn Or PmoEmitDim(*K, 1) <> Tn Or PmoEmitDim(*K, 2) <> Hkv * Dk Or PmoEmitDim(*V, 0) <> Bn Or PmoEmitDim(*V, 1) <> Tn
+    ProcedureReturn PmoEmitNsFail(*Node, "key and value must match the query's batch, length and head size.")
+  EndIf
+  Gated = Bool(Rule = 1 Or Rule = 3) : Delta = Bool(Rule = 2 Or Rule = 3)
+  If Bool(PmoEmitInput(*Node, 4) <> "") <> Gated Or Bool(PmoEmitInput(*Node, 5) <> "") <> Delta
+    ProcedureReturn PmoEmitNsFail(*Node, "update_rule " + PmoEmitAttrS(*Node, "update_rule", "gated_delta") + " needs decay exactly when gated and beta exactly for the delta rules.")
+  EndIf
+  If Gated
+    If PmoOpsTypeOk(*Node, *G, "decay", 1) = 0 Or PmoEmitRank(*G) <> 3 Or PmoEmitDim(*G, 0) <> Bn Or PmoEmitDim(*G, 1) <> Tn Or (PmoEmitDim(*G, 2) <> Hkv And PmoEmitDim(*G, 2) <> Hkv * Dk)
+      ProcedureReturn PmoEmitNsFail(*Node, "decay must be FLOAT [B, T, kv_num_heads] or [B, T, kv_num_heads x d_k].")
+    EndIf
+    PerKey = Bool(PmoEmitDim(*G, 2) = Hkv * Dk And Dk <> 1)
+  EndIf
+  If Delta
+    If PmoOpsTypeOk(*Node, *Bt, "beta", 1) = 0 Or PmoEmitRank(*Bt) <> 3 Or PmoEmitDim(*Bt, 0) <> Bn Or PmoEmitDim(*Bt, 1) <> Tn Or (PmoEmitDim(*Bt, 2) <> Hkv And PmoEmitDim(*Bt, 2) <> 1)
+      ProcedureReturn PmoEmitNsFail(*Node, "beta must be FLOAT [B, T, kv_num_heads] or [B, T, 1].")
+    EndIf
+    PerHead = Bool(PmoEmitDim(*Bt, 2) = Hkv And Hkv <> 1)
+  EndIf
+  If PmoEmitInput(*Node, 3) <> ""
+    If PmoOpsTypeOk(*Node, *P, "past_state", 1) = 0 Or *P\Elements <> Bn * Hkv * Dk * Dv Or PmoEmitRank(*P) <> 4
+      ProcedureReturn PmoEmitNsFail(*Node, "past_state must be FLOAT [B, kv_num_heads, d_k, d_v].")
+    EndIf
+  EndIf
+  If *Y = 0 Or *Y\ElementType <> 1 Or PmoEmitRank(*Y) <> 3 Or PmoEmitDim(*Y, 2) <> Hq * Dv : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [B, T, q_num_heads x d_v].") : EndIf
+  Scale = PmoEmitAttrF(*Node, "scale", 0.0)
+  If PmoEmitOutput(*Node, 1) <> "" : State = "*o1" : Else : State = "PmOnnxArenaBase + " + Str(*Ir\OpsScratchOffset) : EndIf
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpI(0) = " + Str(Bn) + " : PmOpI(1) = " + Str(Tn) + " : PmOpI(2) = " + Str(Hq) + " : PmOpI(3) = " + Str(Hkv) + " : PmOpI(4) = " + Str(Dk) + " : PmOpI(5) = " + Str(Dv))
+  PmoEmitLine(File, "  PmOpI(6) = " + Str(Gated) + " : PmOpI(7) = " + Str(Delta) + " : PmOpI(8) = " + Str(PerKey) + " : PmOpI(9) = " + Str(PerHead) + " : PmOpI(10) = " + Str(Bool(Scale <> 0.0)))
+  PmoEmitLine(File, "  PmOpSetBits(@PmOpF(0), " + PmoOpsBits(Scale) + ")")
+  PmoEmitLine(File, "  PmOpLinearAttention(*i0, *i1, *i2, " + PmoOpsIn(*Node, 3) + ", " + PmoOpsIn(*Node, 4) + ", " + PmoOpsIn(*Node, 5) + ", " + State + ", PmOnnxArenaBase + " +
+                    Str(*Ir\OpsScratchOffset + Bn * Hkv * Dk * Dv * 4) + ", *o0)")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
 Procedure.i PmoEmitOpsEyeLike(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
   Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
   Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
@@ -2581,6 +2684,8 @@ Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
     Case "CumProd" : Done = PmoEmitOpsCumProd(File, *Ir, *Node, ProcName, Opset)
     Case "BitCast" : Done = PmoEmitOpsBitCast(File, *Ir, *Node, ProcName, Opset)
     Case "Attention" : Done = PmoEmitOpsAttention(File, *Ir, *Node, ProcName, Opset)
+    Case "CausalConvWithState" : Done = PmoEmitOpsCausalConv(File, *Ir, *Node, ProcName, Opset)
+    Case "LinearAttention" : Done = PmoEmitOpsLinearAttention(File, *Ir, *Node, ProcName, Opset)
     Case "RotaryEmbedding" : Done = PmoEmitOpsRotary(File, *Ir, *Node, ProcName, Opset)
     Case "TensorScatter" : Done = PmoEmitOpsTensorScatter(File, *Ir, *Node, ProcName, Opset)
     Case "Erf", "Reciprocal", "Ceil", "Sign", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish", "Gelu", "Swish",

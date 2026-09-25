@@ -950,6 +950,26 @@ without one.
 | Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `14b8423` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
 | Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
 
+## Above opset 20, fourth batch: LinearAttention and CausalConvWithState — September 24, 2026
+
+LinearAttention and CausalConvWithState (opset 27, the newest onnx 1.22.0
+defines) compile on both paths for every target. That completes the nine
+operators onnx defines only above opset 20.
+
+| Operator | Computed as |
+|---|---|
+| CausalConvWithState | depthwise over `[B, C, L]` with weight `[C, 1, K]`: the past state (zeros without one) followed by the input, each output the products with its window summed in order, the bias added; `silu` and its alias `swish` as `y / (1 + exp(-y))`; the present state the window's last `K-1` positions |
+| LinearAttention | the four update rules (`linear`, `gated`, `delta`, `gated_delta`), token by token as the operator defines the recurrence: the state times `exp(decay)` (per head or per key dimension), the value less the state's read of the key times `beta` (per head or one per token), the key's outer product added, the query's read of the state times the scale (default `1/sqrt(d_k)`); grouped-query heads share their KV head's state; the past state or zeros on entry, the present state out. `chunk_size` is a tuning hint and changes nothing |
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 589 cases - the 580 before; CausalConvWithState with and without bias, past and silu, K of 1, 3 and 4; LinearAttention under all four rules, grouped heads, decay per head and per key, beta per head and per token, with and without a past, with a scale | Windows, Pi 4, Pico and Pico 2: 589 of 589 bit-identical to the definition; `--mutants` 68 of 68 caught (three new: the present state's offset, the delta rule's sign, the grouped head's state) |
+| `tests/node_suite/targeted_ops.py`: 927 cases - the 909 before; CausalConvWithState with bias, past and silu, and plain; LinearAttention under each rule with grouped heads and both outputs, and with a past and a scale; an unknown activation and an unknown rule refused | 927 of 927 as expected |
+| `ops_targets_gate.py`: the new builds on the Pi 4, Pico and Pico 2 in unicorn | 14 builds, 42 runs: 42 of 42 bit-identical to the Windows program |
+| Official node tests at opset 27 or lower, this change against the previous compiler | 952 PASS against 928: the 24 that change are the 11 CausalConvWithState and 13 LinearAttention cases in FP32, refused before and passing now; their FP16 cases stay refused for their element type and their function-expanded forms for their folded tensors; nothing else changes |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `b26ea37` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
+| Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

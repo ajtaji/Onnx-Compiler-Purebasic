@@ -3332,3 +3332,155 @@ Procedure DOpAttention(Y.i, PK.i, PV.i, QK.i, Q.i, K.i, V.i, M.i, PastK.i, PastV
   PmOpAttention(Dt(Q)\Data, Dt(K)\Data, Dt(V)\Data, DOpDataOrZero(M), DOpDataOrZero(PastK), DOpDataOrZero(PastV), DOpDataOrZero(NP), yA, pkA, pvA, qkA, scratch)
   DNsScratchFree(scratch, tt * 4 + 4)
 EndProcedure
+
+; ----------------------------------------------------------------------
+; CausalConvWithState-27: X [B, C, L], W [C, 1, K], optional Bias [C] and
+; Past [B, C, K-1]; outputs Y and the present state PS (0 when absent).
+; ----------------------------------------------------------------------
+Procedure DOpCausalConv(Y.i, PS.i, X.i, W.i, Bias.i, Past.i, Act.i)
+  Protected Dim dims.i(8)
+  Protected kn.i
+  Protected psA.i
+  If X = 0 Or W = 0
+    DFail("CausalConvWithState requires input and weight.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(W)\Kind <> 1 Or Dt(X)\Rank <> 3 Or Dt(W)\Rank <> 3
+    DFail("CausalConvWithState takes FLOAT input [B, C, L] and weight [C, 1, K].")
+    ProcedureReturn
+  EndIf
+  kn = DOpDim(W, 2)
+  If DOpDim(W, 0) <> DOpDim(X, 1) Or DOpDim(W, 1) <> 1 Or kn < 1
+    DFail("CausalConvWithState's weight must be [channels, 1, K].")
+    ProcedureReturn
+  EndIf
+  If Bias <> 0
+    If Dt(Bias)\Kind <> 1 Or Dt(Bias)\Count <> DOpDim(X, 1)
+      DFail("CausalConvWithState's bias holds one FLOAT per channel.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  If Past <> 0
+    If Dt(Past)\Kind <> 1 Or Dt(Past)\Rank <> 3 Or DOpDim(Past, 0) <> DOpDim(X, 0) Or DOpDim(Past, 1) <> DOpDim(X, 1) Or DOpDim(Past, 2) <> kn - 1
+      DFail("CausalConvWithState's past_state must be FLOAT [B, C, K-1].")
+      ProcedureReturn
+    EndIf
+  EndIf
+  If DLike(Y, X, 0) = 0
+    ProcedureReturn
+  EndIf
+  psA = 0
+  If PS <> 0
+    dims(0) = DOpDim(X, 0)
+    dims(1) = DOpDim(X, 1)
+    dims(2) = kn - 1
+    If DAlloc(PS, 1, 3, @dims(0)) = 0
+      ProcedureReturn
+    EndIf
+    psA = Dt(PS)\Data
+  EndIf
+  PmOpCausalConv(Dt(X)\Data, Dt(W)\Data, DOpDataOrZero(Bias), DOpDataOrZero(Past), Dt(Y)\Data, psA, DOpDim(X, 0), DOpDim(X, 1), DOpDim(X, 2), kn, Act)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; LinearAttention-27: Q [B, T, Hq*dk], K [B, T, Hkv*dk], V [B, T, Hkv*dv],
+; optional Past [B, Hkv, dk, dv], Decay, Beta; Rule 0 linear, 1 gated,
+; 2 delta, 3 gated_delta; the scale in PmOpF(0) when HasScale.
+; Outputs Y and the present state PS (0 when absent).
+; ----------------------------------------------------------------------
+Procedure DOpLinearAttention(Y.i, PS.i, Q.i, K.i, V.i, Past.i, Decay.i, Beta.i, Hq.i, Hkv.i, Rule.i, HasScale.i)
+  Protected Dim dims.i(8)
+  Protected bn.i
+  Protected tn.i
+  Protected dk.i
+  Protected dv.i
+  Protected gating.i
+  Protected delta.i
+  Protected n.i
+  Protected state.i
+  Protected scratch.i
+  Protected bytes.i
+  If Q = 0 Or K = 0 Or V = 0
+    DFail("LinearAttention requires query, key and value.")
+    ProcedureReturn
+  EndIf
+  If Dt(Q)\Kind <> 1 Or Dt(K)\Kind <> 1 Or Dt(V)\Kind <> 1 Or Dt(Q)\Rank <> 3 Or Dt(K)\Rank <> 3 Or Dt(V)\Rank <> 3
+    DFail("LinearAttention takes FLOAT query, key and value of rank 3.")
+    ProcedureReturn
+  EndIf
+  If Hq < 1 Or Hkv < 1 Or Hq % Hkv <> 0 Or DOpDim(Q, 2) % Hq <> 0 Or DOpDim(V, 2) % Hkv <> 0
+    DFail("LinearAttention's q_num_heads must be a multiple of kv_num_heads and divide the query's last extent.")
+    ProcedureReturn
+  EndIf
+  bn = DOpDim(Q, 0)
+  tn = DOpDim(Q, 1)
+  dk = DOpDim(Q, 2) / Hq
+  dv = DOpDim(V, 2) / Hkv
+  If DOpDim(K, 0) <> bn Or DOpDim(K, 1) <> tn Or DOpDim(K, 2) <> Hkv * dk Or DOpDim(V, 0) <> bn Or DOpDim(V, 1) <> tn
+    DFail("LinearAttention's key and value must match the query's batch, length and head size.")
+    ProcedureReturn
+  EndIf
+  gating = Bool(Rule = 1 Or Rule = 3)
+  delta = Bool(Rule = 2 Or Rule = 3)
+  If Bool(Decay <> 0) <> gating Or Bool(Beta <> 0) <> delta
+    DFail("LinearAttention's update rule needs decay exactly when gated and beta exactly for the delta rules.")
+    ProcedureReturn
+  EndIf
+  PmOpI(8) = 0
+  If Decay <> 0
+    If Dt(Decay)\Kind <> 1 Or Dt(Decay)\Rank <> 3 Or DOpDim(Decay, 0) <> bn Or DOpDim(Decay, 1) <> tn Or (DOpDim(Decay, 2) <> Hkv And DOpDim(Decay, 2) <> Hkv * dk)
+      DFail("LinearAttention's decay must be FLOAT [B, T, kv_num_heads] or [B, T, kv_num_heads * d_k].")
+      ProcedureReturn
+    EndIf
+    PmOpI(8) = Bool(DOpDim(Decay, 2) = Hkv * dk And Hkv * dk <> Hkv)
+  EndIf
+  PmOpI(9) = 0
+  If Beta <> 0
+    If Dt(Beta)\Kind <> 1 Or Dt(Beta)\Rank <> 3 Or DOpDim(Beta, 0) <> bn Or DOpDim(Beta, 1) <> tn Or (DOpDim(Beta, 2) <> Hkv And DOpDim(Beta, 2) <> 1)
+      DFail("LinearAttention's beta must be FLOAT [B, T, kv_num_heads] or [B, T, 1].")
+      ProcedureReturn
+    EndIf
+    PmOpI(9) = Bool(DOpDim(Beta, 2) = Hkv And Hkv <> 1)
+  EndIf
+  n = bn * Hkv * dk * dv
+  If Past <> 0
+    If Dt(Past)\Kind <> 1 Or Dt(Past)\Count <> n Or Dt(Past)\Rank <> 4
+      DFail("LinearAttention's past_state must be FLOAT [B, kv_num_heads, d_k, d_v].")
+      ProcedureReturn
+    EndIf
+  EndIf
+  dims(0) = bn
+  dims(1) = tn
+  dims(2) = Hq * dv
+  If DAlloc(Y, 1, 3, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  bytes = (n + dv + 1) * 4
+  scratch = DNsScratch(bytes)
+  If scratch = 0
+    ProcedureReturn
+  EndIf
+  state = scratch
+  If PS <> 0
+    dims(0) = bn
+    dims(1) = Hkv
+    dims(2) = dk
+    dims(3) = dv
+    If DAlloc(PS, 1, 4, @dims(0)) = 0
+      DNsScratchFree(scratch, bytes)
+      ProcedureReturn
+    EndIf
+    state = Dt(PS)\Data
+  EndIf
+  PmOpI(0) = bn
+  PmOpI(1) = tn
+  PmOpI(2) = Hq
+  PmOpI(3) = Hkv
+  PmOpI(4) = dk
+  PmOpI(5) = dv
+  PmOpI(6) = gating
+  PmOpI(7) = delta
+  PmOpI(10) = HasScale
+  PmOpLinearAttention(Dt(Q)\Data, Dt(K)\Data, Dt(V)\Data, DOpDataOrZero(Past), DOpDataOrZero(Decay), DOpDataOrZero(Beta), state, scratch + n * 4, Dt(Y)\Data)
+  DNsScratchFree(scratch, bytes)
+EndProcedure
