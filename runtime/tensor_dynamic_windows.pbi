@@ -711,13 +711,22 @@ EndProcedure
 
 Procedure DWhere(Y.i,Cond.i,A.i,B.i)
   Protected job.DIndexJob
-  Protected i.i,src.i,index.i,size.i=DSize(Dt(A)\Kind),ax.i
-  If DBroadcast(Y,A,B)=0 : ProcedureReturn : EndIf
-  If Dt(Cond)\Rank>Dt(Y)\Rank : DFail("Where condition expands beyond the data shape.") : ProcedureReturn : EndIf
-  For i=0 To Dt(Cond)\Rank-1
-    ax=i+Dt(Y)\Rank-Dt(Cond)\Rank
-    If Dt(Cond)\D[i]<>1 And Dt(Cond)\D[i]<>Dt(Y)\D[ax] : DFail("Where condition broadcast mismatch.") : ProcedureReturn : EndIf
+  Protected i.i,size.i=DSize(Dt(A)\Kind),rank.i=DMax(DMax(Dt(A)\Rank,Dt(B)\Rank),Dt(Cond)\Rank),k.i,t.i,d.i,e.i
+  Protected Dim dims.i(7)
+  ; The condition, X and Y broadcast together (Where-16).
+  For i=0 To rank-1
+    e=1
+    For k=0 To 2
+      t=B : If k=0 : t=Cond : ElseIf k=1 : t=A : EndIf
+      d=1 : If i-rank+Dt(t)\Rank>=0 : d=Dt(t)\D[i-rank+Dt(t)\Rank] : EndIf
+      If d<>1
+        If e<>1 And e<>d : DFail("Incompatible broadcast dimensions.") : ProcedureReturn : EndIf
+        e=d
+      EndIf
+    Next
+    dims(i)=e
   Next
+  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0 : ProcedureReturn : EndIf
   job\Kind=6 : job\Y=Y : job\A=A : job\B=B : job\C=Cond : job\Size=size : job\Count=Dt(Y)\Count
   DIndexRun(@job,#PMELEM_CHEAP/8)
 EndProcedure
