@@ -1006,12 +1006,12 @@ each had their own wrong answer (forum 998). Floor and Round also failed on
 infinities and on values of magnitude 2^23 and above, which Int() overflowed.
 All were filed before any change and reproduce on the released CLI.
 
-**The cause, which matters to anyone writing a kernel.** The host compiler
-(PureBasic 6.x, x64) does not answer a float comparison with a NaN operand
-the way IEEE 754 does, and its answer depends on the operand order and on
-whether a side is a literal. A probe with v = NaN gives:
+**Two causes.** Most were the host compiler. PureBasic 6.21 (Windows x64) does
+not answer a float comparison with a NaN operand the way IEEE 754 does, and
+its answer depends on the operand order and on whether a side is a literal;
+PureBasic 6.41 answers every one as IEEE 754 does. A probe with v = NaN:
 
-| Comparison | Host answer | IEEE 754 |
+| Comparison | 6.21 | 6.41 and IEEE 754 |
 |---|---|---|
 | `a > b`, `a >= b`, `a = b` (variables) | true | false |
 | `a <> b` (variables) | false | true |
@@ -1019,28 +1019,49 @@ whether a side is a literal. A probe with v = NaN gives:
 | `v < 0.0`, `v <= 0.0`, `v < -10.0` (literal on the right) | true | false |
 | `v > 10.0`, `0.0 <= v` | false | false |
 
-No comparison that can meet a NaN is therefore trusted to the host: each is
-guarded by a test on the float's bits (`(bits & $7FFFFFFF) > $7F800000`), an
-integer comparison every compiler answers correctly. The runtime gains
-`PmTensorIsNan` and `PmTensorNanAt`; the operator-set lane, which already
-tested NaN on the bits in most kernels, gains `PmOpGt`, `PmOpLt` and `PmOpLe`,
-IEEE 754's ordered comparisons. PureMetal's own float comparisons on the Pi 4,
-Pico and Pico 2 turned out NaN-correct (a mutant writing Equal back as a plain
-`=` in the portable runtime survived on all three); the portable code carries
-the same guards so that every dialect reads the same.
+Built with 6.41, the compiler before this change already passes the
+comparisons, Clip, Relu, Tanh, Cast to BOOL, NonZero and the Pow shortcut.
+The rest were logic that no compiler fixes: Floor and Round overflowed Int()
+on NaN, infinities and large values, and ScatterND's max and min dropped a
+NaN update and overwrote a NaN already in the data, where numpy.maximum and
+numpy.minimum let a NaN win.
+
+**The fix: guards only where a compiler needs them.** A program built from our
+source may be built with an older PureBasic, so the Windows runtime keeps a
+test on the float's bits in front of every comparison whose NaN answer
+matters, but compiles it only when the compiler needs it:
+`tensor_fp32_windows.pbi` sets `#PMO_HOST_NAN_BUG` to 1 when
+`#PB_Compiler_Version` is below 641, and each guarded comparison is a
+`CompilerIf #PMO_HOST_NAN_BUG = 1` with the guarded form, else the plain one.
+With 6.41 the plain comparison is compiled and the guard costs nothing. The
+portable runtime (Pi 4, UNO Q, Pico, Pico 2) sets the constant to 0 and
+carries no guard: PureMetal's float comparisons answer a NaN as IEEE 754 does.
+The source the fixed-shape emitter writes selects the same way, and so do the
+operator-set lane's `PmOpGt`, `PmOpLt` and `PmOpLe` (IEEE 754's ordered
+comparisons, used by NonMaxSuppression, RoiAlign and Multinomial). What ONNX
+requires of a NaN or an infinity is kept on every path, as exact tests on the
+bits: Floor and Round, ScatterND's max and min, Range, NonZero, Cast to BOOL,
+the Pow shortcut and RoiAlign's sample coordinate.
+
+What the guards cost where they are compiled, measured with 6.41 on 16M
+elements (the Windows serial kernels, best of seven): Relu 2%, Clip 2 to 4%,
+Tanh 3%, Greater 35%, Equal 114%. That is why they are compiled only for an
+old compiler. Cast to BOOL, written on the bits, is twice as fast as before
+(20 ms against 39 ms); Floor's test for 2^23 and above costs 3%, the price of
+a right answer. Kokoro-82M on Windows, this change against the compiler before it, both built with 6.41 (15 requests each, interleaved): FP32 1,260.6 ms median against 1,254.2, INT8 1,003.7 against 1,001.8, within the run-to-run spread, the same output bits.
 
 | Kernel | Now |
 |---|---|
-| Equal, Greater, GreaterOrEqual, Less, LessOrEqual (both paths) | false whenever a NaN takes part |
-| Cast FLOAT to BOOL (both paths) | a NaN is true, as numpy's |
-| Clip (both paths) | a NaN passes through |
+| Equal, Greater, GreaterOrEqual, Less, LessOrEqual (both paths) | false whenever a NaN takes part (guarded below 6.41) |
+| Clip, Relu, Tanh (both paths) | a NaN passes through (guarded below 6.41) |
+| Cast FLOAT to BOOL (both paths) | a NaN is true, as numpy's: the bits, on every compiler |
 | Floor, Round (both paths) | a NaN, an infinity and any value of magnitude 2^23 or more pass through unchanged (they are already integers) |
-| Relu (both paths), Tanh (both paths) | a NaN passes through |
 | ScatterND reduction max and min (both paths) | numpy.maximum and numpy.minimum: a NaN on either side wins |
-| NonZero (runtime-dimension) | a NaN is not zero |
+| NonZero (runtime-dimension; fixed-shape emitted) | a NaN is not zero: the bits |
 | Pow with a one-element exponent (runtime-dimension, Windows) | the square shortcut is taken only for an exponent whose bits are exactly 2.0 |
+| Pow with an integer base (fixed-shape emitted) | a NaN exponent is refused at run time (guarded below 6.41) |
 | Range (both paths) | a NaN start, limit or delta is refused at run time with a sentence |
-| NonMaxSuppression, RoiAlign, Multinomial (operator-set lane) | every comparison IEEE 754's ordered one; a NaN RoiAlign sample coordinate samples nothing, as for DeformConv |
+| NonMaxSuppression, RoiAlign, Multinomial (operator-set lane) | IEEE 754's ordered comparisons (guarded below 6.41); a NaN RoiAlign sample coordinate samples nothing, as for DeformConv |
 | ReduceMean before opset 18, ReduceSum before 13 (runtime-dimension) | the axes attribute is now implemented, lowered to the axes input the later definitions take |
 
 **Reviewed and left alone.** Loop bounds and every integer comparison; the
@@ -1056,15 +1077,21 @@ data; the LSTM's NEON activations, whose inputs the LSTM refuses when they are
 not finite. The compile-time checks of attribute values inside the compiler
 itself were not part of this audit.
 
+**Both branches are gated.** The gates run on 6.41, which compiles the plain
+branch; they also build the guarded branch by forcing `#PMO_HOST_NAN_BUG` to
+1 (the kernel check's `windows-hostbug` target, and `runtime_mutants.py`'s
+`force` entries), so the code an older compiler builds is checked and
+mutated too.
+
 | Check | Result |
 |---|---|
-| `ops_kernel_check.py`: 604 cases - the 597 before; NonMaxSuppression with NaN and infinite box coordinates, RoiAlign with a NaN feature and a NaN region corner in both modes | Windows, Pi 4, Pico and Pico 2: 604 of 604 bit-identical to the definition; `--mutants` 74 of 74 caught (four new: the NaN IoU, the NaN RoiAlign coordinate, RoiAlign's maximum, Multinomial's maximum) |
-| `runtime_mutants.py`: every rewrite in the runtimes and the emitter undone, one at a time | 20 of 20 caught: DWhere in each runtime; in the Windows runtime every NaN guard (DBinary, Relu, Clip, Tanh, Floor, Round, Cast to BOOL, NonZero, the Pow square shortcut, ScatterND); in the portable runtime, whose comparisons are already NaN-correct, the rewrites' own logic (Equal's operand order, Floor and Round above 2^23, ScatterND min); in the emitter the compare guard, Cast to BOOL and ScatterND max; ReduceMean's axes attribute |
+| `ops_kernel_check.py`: 604 cases - the 597 before; NonMaxSuppression with NaN and infinite box coordinates, RoiAlign with a NaN feature and a NaN region corner in both modes, Multinomial with a NaN after the largest logit | Windows (both branches), Pi 4, Pico and Pico 2: 604 of 604 bit-identical to the definition on each; `--mutants` 72 of 72 caught (new: the RoiAlign NaN coordinate, on the Pi 4, and `PmOpGt`'s guard inverted, on the forced branch) |
+| `runtime_mutants.py`: the guarded branch forced and every NaN case run on it; each guard inverted on the forced branch; the plain branch and every semantic rewrite mutated | 23 of 23 as required: the forced branch passes every NaN case; each guard inverted on it is caught (Relu, Clip, Tanh, DBinary, the emitted comparison); the plain comparisons, Floor and Round above 2^23 in both runtimes, the exact-bits tests (Cast to BOOL in both runtimes and the emitter, NonZero, the Pow shortcut), ScatterND in both runtimes and the emitter, DWhere and ReduceMean's axes attribute are each caught on the path that compiles them |
 | `tests/node_suite/targeted_ops.py`: 1,059 cases - the 990 before; every comparison with NaN, signed zeros and infinities; 33 kernels given NaN and infinities on both paths (the ONNX reference decides; numpy for ScatterND's max and min, whose reference indexes wrongly); ReduceMean-13 and ReduceSum-11 with their axes attribute | 1,059 of 1,059 as expected |
-| `ops_targets_gate.py`: those cases on the Pi 4, Pico and Pico 2 | 87 builds, 261 runs: 195 bit-identical to the Windows program; 66 within the node-suite tolerance but not bit-identical, each named with its reason in `TOLERANCE_ONLY` (the 18 BatchNormalization runs, and 48 runs of the base runtime's Abs, Neg, Cos, Log, Sqrt, Sin, Atan and Sigmoid on NaN, infinities and signed zeros: see the limitations). Every comparison, Clip, Floor, Round, Relu, Tanh, ScatterND, Cast, NonZero and Pow NaN case is bit-identical |
-| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,219 of 1,750 before, 1,239 after: the 20 function-expanded LayerNormalization and MeanVarianceNormalization cases, which reduce with ReduceMean's axes attribute; no case that passed fails. Every case: [`tests/node_suite/results/2026-09-24m-onnx-1.22.0.md`](../tests/node_suite/results/2026-09-24m-onnx-1.22.0.md) and `.json`, measured with `--from-commit` at `d127e6b` |
-| Models that use none of these forms (four models, fp32/fp16/bf16/int4, five targets), this change against `c0d7c5b` | 80 of 80 emitted sources, packs and manifests byte-identical and the 16 runtime-dimension sources build. 16 of the 32 fixed-shape Pico and Pico 2 images differ, because they link the changed `tensor_fp32.pmi` procedures; the support files that differ are those in the table below. Output bits on data without NaN: `output_identity_check.py` finds the four models' Windows outputs byte-identical, and all 30 outputs of their Pi 4, Pico and Pico 2 programs (`ops_targets_gate.py`, both compilers) byte-identical too |
-| Kokoro-82M, FP32 and INT8, for Windows | FP32 and INT8: source and pack byte-identical; the support files `tensor_dynamic_windows.pbi`, `tensor_dynamic_forms_windows.pbi` and `tensor_fp32_windows.pbi` differ (the table below); the output for the reference request byte-identical (`out0.f32`) |
+| `ops_targets_gate.py`: those cases, and the Cast, Clip, Floor, Round and Tanh cases, on the Pi 4, Pico and Pico 2 | 101 builds, 303 runs: 243 bit-identical to the Windows program; 60 within the node-suite tolerance, each named with its reason in `TOLERANCE_ONLY` (the 18 BatchNormalization runs, and 42 of the base runtime's Neg, Cos, Log, Sqrt, Sin, Atan and Sigmoid on NaN and signed zeros: see the limitations) |
+| Official node tests at opset 27 or lower, this change against the previous compiler, both built with 6.41 | PASS 1,219 of 1,750 before, 1,239 after, the same as with 6.21: the 20 function-expanded LayerNormalization and MeanVarianceNormalization cases, which reduce with ReduceMean's axes attribute; no case that passed fails |
+| Models that use none of these forms (four models, fp32/fp16/bf16/int4, five targets), this change against `c0d7c5b`, both built with 6.41 | 80 of 80 emitted sources, packs and manifests byte-identical; the 16 runtime-dimension sources build; 16 of the 32 fixed-shape Pico and Pico 2 images differ, because they link the changed `tensor_fp32.pmi` procedures. Output bits without NaN: the four models' Windows outputs byte-identical (`output_identity_check.py`), and all 30 outputs of their Pi 4, Pico and Pico 2 programs byte-identical |
+| Kokoro-82M, FP32 and INT8, for Windows, against `c0d7c5b`, both built with 6.41 | Source and pack byte-identical; `tensor_dynamic_windows.pbi`, `tensor_dynamic_forms_windows.pbi` and `tensor_fp32_windows.pbi` differ (the table below); the output for the reference request byte-identical, FP32 and INT8 |
 
 Every support-file procedure this change touches (the emitted text changes only for FLOAT comparisons, Cast to BOOL, NonZero, ScatterND max and min, Range and Pow with an integer base):
 
@@ -1072,10 +1099,8 @@ Every support-file procedure this change touches (the emitted text changes only 
 |---|---|---|
 | `tensor_dynamic_forms_portable.pmi` | `DScatterReduce` | changed |
 | `tensor_dynamic_forms_windows.pbi` | `DScatterReduce` | changed |
-| `tensor_dynamic_portable.pmi` | `DBinary` | changed |
 | `tensor_dynamic_portable.pmi` | `DNonZero` | changed |
 | `tensor_dynamic_portable.pmi` | `DNonZeroAt` | added |
-| `tensor_dynamic_portable.pmi` | `DPowWholeExponent` | changed |
 | `tensor_dynamic_portable.pmi` | `DPut` | changed |
 | `tensor_dynamic_portable.pmi` | `DRange` | changed |
 | `tensor_dynamic_windows.pbi` | `DBinary` | changed |
@@ -1084,13 +1109,10 @@ Every support-file procedure this change touches (the emitted text changes only 
 | `tensor_dynamic_windows.pbi` | `DNonZeroAt` | added |
 | `tensor_dynamic_windows.pbi` | `DPut` | changed |
 | `tensor_dynamic_windows.pbi` | `DRange` | changed |
-| `tensor_fp32.pmi` | `PmTensorClip` | changed |
 | `tensor_fp32.pmi` | `PmTensorFloor` | changed |
 | `tensor_fp32.pmi` | `PmTensorIsNan` | added |
 | `tensor_fp32.pmi` | `PmTensorNanAt` | added |
-| `tensor_fp32.pmi` | `PmTensorRelu` | changed |
 | `tensor_fp32.pmi` | `PmTensorRoundEven` | changed |
-| `tensor_fp32.pmi` | `PmTensorTanhValue` | changed |
 | `tensor_fp32_windows.pbi` | `PmTensorClipSerial` | changed |
 | `tensor_fp32_windows.pbi` | `PmTensorFloorSerial` | changed |
 | `tensor_fp32_windows.pbi` | `PmTensorIsNan` | added |
@@ -1099,8 +1121,6 @@ Every support-file procedure this change touches (the emitted text changes only 
 | `tensor_fp32_windows.pbi` | `PmTensorRoundEvenSerial` | changed |
 | `tensor_fp32_windows.pbi` | `PmTensorTanhValue` | changed |
 | `tensor_ops.pmi` | `PmOpGt` | added |
-| `tensor_ops.pmi` | `PmOpLe` | added |
-| `tensor_ops.pmi` | `PmOpLt` | added |
 | `tensor_ops.pmi` | `PmOpMnMax` | changed |
 | `tensor_ops.pmi` | `PmOpMultinomial` | changed |
 | `tensor_ops.pmi` | `PmOpNmsSuppress` | changed |
@@ -1119,24 +1139,27 @@ Every support-file procedure this change touches (the emitted text changes only 
   No accepted form is currently known to compute a wrong answer; see
   [node-test coverage](#node-test-coverage--september-16-2026) and, for NaN,
   [NaN on every path](#nan-on-every-path-the-host-compilers-float-comparisons--september-24-2026).
-- The host compiler answers a float comparison with a NaN operand by the
-  operand order and by literals, not as IEEE 754 does; every comparison that
-  can meet a NaN is written with an explicit test on the float's bits
-  (`PmTensorIsNan`, `PmOpIsNan`). A kernel written without one is wrong on
-  Windows for NaN, whatever it does on the other targets.
+- PureBasic before 6.41 answers a float comparison with a NaN operand by the
+  operand order and by literals, not as IEEE 754 does; 6.41 answers as IEEE
+  754 does. The Windows runtime and the source the compiler writes carry a
+  test on the float's bits in front of every comparison whose NaN answer
+  matters, compiled only when the compiler is older than 6.41
+  (`#PMO_HOST_NAN_BUG`), so a program built with either is right and one
+  built with 6.41 pays nothing for it. A kernel written with a plain
+  comparison is wrong for NaN on Windows when built with an older compiler.
 - Some kernels of the base runtime (not of the operator-set lane) match the
   Windows program on the Pi 4, Pico and Pico 2 within the node-suite
   tolerance but not bit for bit. `ops_targets_gate.py` names each in
   `TOLERANCE_ONLY` with its reason and still holds it to the tolerance:
   BatchNormalization on both paths (the host compiler keeps its
-  intermediates wider than binary32); Abs, Neg, Cos, Log, Sqrt and Sin of a
-  NaN or of an invalid argument (Windows writes x86's default NaN,
-  `FFC00000`, the targets `7FC00000`); Log, Sqrt, Sin, Atan and Sigmoid, one
-  unit in the last place on some arguments, where Windows is the correctly
-  rounded side; and Sin(-0) on the Pico and Pico 2 and Atan(-0) on all three
-  targets, which give +0. Binary32 base kernels used by both paths, with NaN
-  written as `7FC00000` as the operator-set lane writes it, are the next
-  change, and will empty the list.
+  intermediates wider than binary32); Neg, Cos, Log, Sqrt and Sin of a NaN
+  or of an invalid argument (Windows writes x86's default NaN, `FFC00000`,
+  the targets `7FC00000`); Log, Sqrt, Sin, Atan and Sigmoid, one unit in the
+  last place on some arguments, where Windows is the correctly rounded side;
+  and Sin(-0) on the Pico and Pico 2 and Atan(-0) on all three targets,
+  which give +0. Binary32 base kernels used by both paths, with NaN written
+  as `7FC00000` as the operator-set lane writes it, are the next change, and
+  will empty the list.
 - Windows x64 is the verified host. Linux/macOS hosting, other PureBasic
   versions, and alternate PureBasic backends are not certified by this export.
 - Five-target **generation** does not establish downstream bare-metal builds,

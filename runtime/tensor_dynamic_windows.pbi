@@ -241,8 +241,8 @@ Procedure DPut(Id.i, Index.i, Value.d)
     ; plain assignment here would round to nearest (forum 860).
     Case 7 : PokeQ(Dt(Id)\Data+Index*8,IntQ(Value))
     Case 6 : PokeL(Dt(Id)\Data+Index*4,IntQ(Value))
-    ; a NaN is true (forum 998): the host's <> answers false for it
-    Case 9 : PokeA(Dt(Id)\Data+Index,Bool(Value<>0 Or (PeekQ(@Value) & $7FFFFFFFFFFFFFFF) > $7FF0000000000000))
+    ; not zero, a NaN included (forum 998): the bits, exact on every compiler
+    Case 9 : PokeA(Dt(Id)\Data+Index,Bool((PeekQ(@Value) & $7FFFFFFFFFFFFFFF)<>0))
     Case 2,3 : PokeA(Dt(Id)\Data+Index,IntQ(Value) & 255)
   EndSelect
 EndProcedure
@@ -354,10 +354,17 @@ Procedure DIndexTask(*j.DIndexJob,task.i,worker.i)
           Case 2 : v=av*bv
           Case 3 : v=av/bv
           Case 4 : v=Pow(av,bv)
+          CompilerIf #PMO_HOST_NAN_BUG = 1
           Case 5 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av=bv)
           Case 6 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>bv)
           Case 7 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av<bv)
           Case 8 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>=bv)
+          CompilerElse
+          Case 5 : v=Bool(av=bv)
+          Case 6 : v=Bool(av>bv)
+          Case 7 : v=Bool(av<bv)
+          Case 8 : v=Bool(av>=bv)
+          CompilerEndIf
           Case 9 : v=Bool(av<>0 And bv<>0)
         EndSelect
         DPut(Y,i,v)
@@ -461,10 +468,17 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
         Case 2 : v=av*bv
         Case 3 : v=av/bv
         Case 4 : v=Pow(av,bv)
+        CompilerIf #PMO_HOST_NAN_BUG = 1
         Case 5 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av=bv)
         Case 6 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>bv)
         Case 7 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av<bv)
         Case 8 : v=Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>=bv)
+        CompilerElse
+        Case 5 : v=Bool(av=bv)
+        Case 6 : v=Bool(av>bv)
+        Case 7 : v=Bool(av<bv)
+        Case 8 : v=Bool(av>=bv)
+        CompilerEndIf
         Case 9 : v=Bool(av<>0 And bv<>0)
       EndSelect
       DPut(Y,i,v)

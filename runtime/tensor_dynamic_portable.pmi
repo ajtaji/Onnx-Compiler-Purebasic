@@ -450,8 +450,8 @@ Procedure DPut(Id.i,Index.i,Value.f)
     Case 6
       PokeL(Dt(Id)\Data+Index*4,Int(Value))
     Case 9
-      ; a NaN is true (forum 998)
-      PokeA(Dt(Id)\Data+Index,Bool(Value<>0.0 Or PmTensorIsNan(Value)<>0))
+      ; not zero, a NaN included (forum 998): the bits, exact on every compiler
+      PokeA(Dt(Id)\Data+Index,Bool((PeekL(@Value) & $7FFFFFFF)<>0))
     Case 2
       PokeA(Dt(Id)\Data+Index,Int(Value) & 255)
     Case 3
@@ -922,7 +922,7 @@ EndProcedure
 ; returns the NaN from its own second early exit, on the scalar path below.
 Procedure.i DPowWholeExponent(y.f)
   Protected k.i=0
-  If PmTensorIsNan(y) <> 0
+  If y<>y
     ProcedureReturn 0
   EndIf
   If y < -64.0
@@ -1067,13 +1067,13 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
         Case 4
           v=Pow(av,bv)
         Case 5
-          v=DFloat(Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av=bv))
+          v=DFloat(Bool(av=bv))
         Case 6
-          v=DFloat(Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>bv))
+          v=DFloat(Bool(av>bv))
         Case 7
-          v=DFloat(Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av<bv))
+          v=DFloat(Bool(av<bv))
         Case 8
-          v=DFloat(Bool(PmTensorIsNan(av)=0 And PmTensorIsNan(bv)=0 And av>=bv))
+          v=DFloat(Bool(av>=bv))
         Case 9
           v=DFloat(Bool(av<>0 And bv<>0))
       EndSelect

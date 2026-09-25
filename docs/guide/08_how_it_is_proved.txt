@@ -492,12 +492,15 @@ binary64 rounds it, and the sum's own rounding applied where it can move
 the result, near a half.
 
 **Decide NaN on the bits.** The host compiler's float comparisons do not
-order a NaN the way IEEE 754 does, and the answer depends on the operand
-order and on literals: with v a NaN, `a > b`, `a >= b` and `a = b` are true,
-`a <> b` is false, and `v < 0.0` and `v <= 0.0` are true while `v > 10.0` is
-false. It also adds -0 and -0 to +0. Every kernel, in the operator-set
-lane and in the base runtime alike, therefore tests for NaN on the bits
-before it compares (`PmOpIsNan`, `PmTensorIsNan`), adds through a helper where a negative
+order a NaN the way IEEE 754 does before version 6.41, and the answer
+depends on the operand order and on literals: with v a NaN, `a > b`,
+`a >= b` and `a = b` are true, `a <> b` is false, and `v < 0.0` and
+`v <= 0.0` are true while `v > 10.0` is false. 6.41 answers as IEEE 754
+does. The host compiler also adds -0 and -0 to +0. Every kernel therefore decides
+NaN on the bits (`PmOpIsNan`, `PmTensorIsNan`) wherever the answer
+depends on it - compiled only for an older compiler where it merely
+corrects the comparison (`#PMO_HOST_NAN_BUG`, set from
+`#PB_Compiler_Version`), always where ONNX itself asks for it - adds through a helper where a negative
 zero can arise, and writes every NaN it produces as one quiet NaN,
 `$7FC00000`, because the x87 and the Arm cores make different NaNs for an
 invalid operation such as infinity times zero.
@@ -508,16 +511,19 @@ one binary32 operation per line. `ops_kernel_check.py` runs 604 cases -
 the math functions over tables of special values and branch boundaries,
 every operator's kernel, and the awkward cases - on Windows and, in the
 unicorn instruction emulator, on the Pi 4, Pico and Pico 2 builds, and
+once more on Windows with the branch an older host compiler builds
+(`windows-hostbug`, `#PMO_HOST_NAN_BUG` forced to 1), and
 requires every output to equal the definition bit for bit; with
-`--mutants` it plants 74 defects and requires each to be caught:
+`--mutants` it plants 72 defects and requires each to be caught:
 
 @FRAG
 py -3.12 ops_kernel_check.py --pbcompiler <pbcompiler.exe> --compiler PureMetalForge.exe --runtime <ONNX repository>\runtime --mutants
 windows 604 of 604 cases as the definition
+windows-hostbug 604 of 604 cases as the definition
 pi4     604 of 604 cases as the definition
 pico    604 of 604 cases as the definition
 pico2   604 of 604 cases as the definition
-mutants: 74 of 74 killed
+mutants: 72 of 72 killed
 @ENDFRAG
 
 That says the kernels compute what they were written to compute. Whether

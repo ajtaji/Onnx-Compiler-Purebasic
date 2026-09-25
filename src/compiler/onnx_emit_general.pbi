@@ -266,7 +266,11 @@ Procedure.i PmoEmitPowHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
   Else
     If *B\ElementType = 1
       PmoEmitLine(File, "    e = 0")
+      PmoEmitLine(File, "    CompilerIf #PMO_HOST_NAN_BUG = 1")
       PmoEmitLine(File, "    If PmTensorIsNan(ef) = 0 And ef >= -2147483647.0 And ef <= 2147483647.0")
+      PmoEmitLine(File, "    CompilerElse")
+      PmoEmitLine(File, "    If ef >= -2147483647.0 And ef <= 2147483647.0")
+      PmoEmitLine(File, "    CompilerEndIf")
       PmoEmitLine(File, "      e = Int(ef)")
       PmoEmitLine(File, "      back = e")
       PmoEmitLine(File, "      If back <> ef : PmOnnxRuntimeOk = 0 : EndIf")

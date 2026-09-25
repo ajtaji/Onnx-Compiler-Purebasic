@@ -571,8 +571,8 @@ Procedure.i PmoEmitCastHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Cal
       If HostDialect : PmoEmitLine(File, "    iv = Int(fv)") : Else : PmoEmitLine(File, "    iv = fv") : EndIf
       PmoEmitLine(File, "    " + PmoEmitPut(*Out\ElementType, "*dst", "i", "iv"))
     ElseIf *Out\ElementType = 9
-      ; a NaN is true (forum 998)
-      PmoEmitLine(File, "    " + PmoEmitPut(9, "*dst", "i", "Bool(fv <> 0.0 Or PmTensorIsNan(fv) <> 0)"))
+      ; not zero, a NaN included (forum 998): the bits, exact on every compiler
+      PmoEmitLine(File, "    " + PmoEmitPut(9, "*dst", "i", "Bool((PeekL(*src + i * 4) & $7FFFFFFF) <> 0)"))
     Else
       PmoEmitLine(File, "    " + PmoEmitPut(1, "*dst", "i", "fv"))
     EndIf
@@ -613,11 +613,6 @@ Procedure.i PmoEmitCompareHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map 
   EndSelect
   If *Node\Operation = "And"
     Condition = "(" + PmoEmitGet(*A\ElementType, "*a", IA) + " <> 0) And (" + PmoEmitGet(*B\ElementType, "*b", IB) + " <> 0)"
-  ElseIf *A\ElementType = 1
-    ; FLOAT (forum 995): false whenever a NaN takes part, tested on the bits;
-    ; the host compiler's own answer for a NaN depends on the operand order
-    Condition = "PmTensorNanAt(*a, " + IA + ") = 0 And PmTensorNanAt(*b, " + IB + ") = 0 And " +
-                PmoEmitGet(1, "*a", IA) + Symbol + PmoEmitGet(1, "*b", IB)
   Else
     Condition = PmoEmitGet(*A\ElementType, "*a", IA) + Symbol + PmoEmitGet(*B\ElementType, "*b", IB)
   EndIf
@@ -625,7 +620,18 @@ Procedure.i PmoEmitCompareHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map 
   PmoEmitLine(File, "Procedure " + ProcName + "(*a, *b, *dst)")
   PmoEmitLine(File, "  Protected i.i") : PmoEmitLine(File, "  i = 0")
   PmoEmitLine(File, "  While i < " + Str(*Out\Elements))
-  PmoEmitLine(File, "    PmTensorPutBool(*dst, i, " + Condition + ")")
+  If *A\ElementType = 1 And *Node\Operation <> "And"
+    ; FLOAT (forum 995): with a host compiler older than 6.41 a NaN operand
+    ; is tested on the bits first (#PMO_HOST_NAN_BUG, the runtime sets it)
+    PmoEmitLine(File, "    CompilerIf #PMO_HOST_NAN_BUG = 1")
+    PmoEmitLine(File, "    PmTensorPutBool(*dst, i, Bool(PmTensorNanAt(*a, " + IA + ") = 0 And PmTensorNanAt(*b, " + IB + ") = 0 And " +
+                      PmoEmitGet(1, "*a", IA) + Symbol + PmoEmitGet(1, "*b", IB) + "))")
+    PmoEmitLine(File, "    CompilerElse")
+    PmoEmitLine(File, "    PmTensorPutBool(*dst, i, " + Condition + ")")
+    PmoEmitLine(File, "    CompilerEndIf")
+  Else
+    PmoEmitLine(File, "    PmTensorPutBool(*dst, i, " + Condition + ")")
+  EndIf
   PmoEmitLine(File, "    i = i + 1") : PmoEmitLine(File, "  Wend")
   PmoEmitLine(File, "EndProcedure") : PmoEmitLine(File)
   Calls(Str(*Ref\Index)) = ProcName

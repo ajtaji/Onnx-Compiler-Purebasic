@@ -227,35 +227,19 @@ Procedure.i PmOpIsNan(x.f)
   ProcedureReturn 0
 EndProcedure
 
-; IEEE 754 ordered comparisons: false when either side is NaN. The host
-; compiler's own answer for a NaN depends on the operand order and on
-; literals (forums 995, 998), so a comparison that can meet a NaN is written
-; with these.
+; a > b as IEEE 754 orders it: false when either side is NaN. A host compiler
+; older than 6.41 answers a > b true for a NaN (forums 995, 998), so there it
+; first tests the bits (#PMO_HOST_NAN_BUG, set by the runtime included before
+; this file); with a correct compiler it is the plain comparison. (< and <=
+; between two variables were right even on the old compiler, and are written
+; plainly.)
 Procedure.i PmOpGt(a.f, b.f)
-  If PmOpIsNan(a) <> 0 Or PmOpIsNan(b) <> 0
-    ProcedureReturn 0
-  EndIf
+  CompilerIf #PMO_HOST_NAN_BUG = 1
+    If PmOpIsNan(a) <> 0 Or PmOpIsNan(b) <> 0
+      ProcedureReturn 0
+    EndIf
+  CompilerEndIf
   If a > b
-    ProcedureReturn 1
-  EndIf
-  ProcedureReturn 0
-EndProcedure
-
-Procedure.i PmOpLt(a.f, b.f)
-  If PmOpIsNan(a) <> 0 Or PmOpIsNan(b) <> 0
-    ProcedureReturn 0
-  EndIf
-  If a < b
-    ProcedureReturn 1
-  EndIf
-  ProcedureReturn 0
-EndProcedure
-
-Procedure.i PmOpLe(a.f, b.f)
-  If PmOpIsNan(a) <> 0 Or PmOpIsNan(b) <> 0
-    ProcedureReturn 0
-  EndIf
-  If a <= b
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0
@@ -3663,10 +3647,10 @@ Procedure.i PmOpNmsSuppress(boxes.i, i1.i, i2.i, center.i)
     ix1 = bx1
   EndIf
   ix2 = ax2
-  If PmOpLt(bx2, ix2) <> 0
+  If bx2 < ix2
     ix2 = bx2
   EndIf
-  If PmOpLe(ix2, ix1) <> 0
+  If ix2 <= ix1
     ProcedureReturn 0
   EndIf
   iy1 = ay1
@@ -3674,16 +3658,16 @@ Procedure.i PmOpNmsSuppress(boxes.i, i1.i, i2.i, center.i)
     iy1 = by1
   EndIf
   iy2 = ay2
-  If PmOpLt(by2, iy2) <> 0
+  If by2 < iy2
     iy2 = by2
   EndIf
-  If PmOpLe(iy2, iy1) <> 0
+  If iy2 <= iy1
     ProcedureReturn 0
   EndIf
   t = ix2 - ix1
   inter = iy2 - iy1
   inter = t * inter
-  If PmOpLe(inter, 0.0) <> 0
+  If inter <= 0.0
     ProcedureReturn 0
   EndIf
   t = ax2 - ax1
@@ -3694,7 +3678,7 @@ Procedure.i PmOpNmsSuppress(boxes.i, i1.i, i2.i, center.i)
   area2 = t * area2
   uni = area1 + area2
   uni = uni - inter
-  If PmOpLe(area1, 0.0) <> 0 Or PmOpLe(area2, 0.0) <> 0 Or PmOpLe(uni, 0.0) <> 0
+  If area1 <= 0.0 Or area2 <= 0.0 Or uni <= 0.0
     ProcedureReturn 0
   EndIf
   iou = inter / uni
@@ -6593,7 +6577,7 @@ Procedure PmOpMultinomial(x.i, y.i, batch.i, classes.i, samples.i, kind.i)
       v = v - mx
       w = PmOpExp(v)
       run = run + w
-      If PmOpLt(t, run) <> 0
+      If t < run
         pick = k
       EndIf
       k = k + 1

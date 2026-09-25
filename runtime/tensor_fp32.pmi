@@ -102,11 +102,12 @@ Procedure PmTensorPut(*base.i, index.i, value.f)
   *p.f = value
 EndProcedure
 
-; NaN and the host compiler (forums 995, 997, 998). A float comparison whose
-; operand may be NaN is guarded by a test on the float's bits: the host
-; compiler answers a NaN comparison by the operand order and by whether a side
-; is a literal (v < 0.0 and v <= 0.0 true, a > b, a >= b and a = b true, a <> b
-; false), so no comparison of a possible NaN is trusted to IEEE 754.
+; NaN (forums 995, 997, 998). PureMetal's float comparisons answer a NaN as
+; IEEE 754 does, so no kernel here guards a comparison against the host
+; compiler's old NaN answers (tensor_fp32_windows.pbi, #PMO_HOST_NAN_BUG); the
+; operator-set lane reads the constant.
+#PMO_HOST_NAN_BUG = 0
+
 Procedure.i PmTensorIsNan(v.f)
   If (PeekL(@v) & $7FFFFFFF) > $7F800000
     ProcedureReturn 1
@@ -300,9 +301,7 @@ Procedure PmTensorRelu(*src.i, *dst.i, count.i)
   i = 0 : ps = *src : pd = *dst
   While i < count
     v = *ps.f
-    If (PeekL(ps) & $7FFFFFFF) <= $7F800000
-      If v < 0.0 : v = 0.0 : EndIf
-    EndIf
+    If v < 0.0 : v = 0.0 : EndIf
     *pd.f = v
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend
@@ -334,7 +333,6 @@ EndProcedure
 
 Procedure.f PmTensorTanhValue(value.f)
   Protected e.f
-  If PmTensorIsNan(value) <> 0 : ProcedureReturn value : EndIf
   If value > 10.0 : ProcedureReturn 1.0 : EndIf
   If value < -10.0 : ProcedureReturn -1.0 : EndIf
   e = Exp(value + value)
@@ -562,11 +560,8 @@ Procedure PmTensorClip(*src.i, *dst.i, count.i, lo.f, hi.f)
   i = 0 : ps = *src : pd = *dst
   While i < count
     v = *ps.f
-    ; a NaN passes through (forum 997)
-    If (PeekL(ps) & $7FFFFFFF) <= $7F800000
-      If v < lo : v = lo : EndIf
-      If v > hi : v = hi : EndIf
-    EndIf
+    If v < lo : v = lo : EndIf
+    If v > hi : v = hi : EndIf
     *pd.f = v
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend

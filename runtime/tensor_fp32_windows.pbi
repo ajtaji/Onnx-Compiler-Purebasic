@@ -74,11 +74,22 @@ Macro PmTensorPut(base, index, value)
   PokeF((base) + (index) * 4, (value))
 EndMacro
 
-; NaN and the host compiler (forums 995, 997, 998). A float comparison whose
-; operand may be NaN is guarded by a test on the float's bits: the host
-; compiler answers a NaN comparison by the operand order and by whether a side
-; is a literal (v < 0.0 and v <= 0.0 true, a > b, a >= b and a = b true, a <> b
-; false), so no comparison of a possible NaN is trusted to IEEE 754.
+; NaN and the host compiler (forums 995, 997, 998). PureBasic before 6.41
+; answers a float comparison with a NaN operand by the operand order and by
+; whether a side is a literal (v < 0.0 and v <= 0.0 true, a > b, a >= b and
+; a = b true, a <> b false); 6.41 answers as IEEE 754 does. Where a kernel's
+; answer for a NaN rests on a comparison, #PMO_HOST_NAN_BUG = 1 compiles a test
+; on the float's bits in front of it; with a correct compiler the plain
+; comparison is compiled and costs nothing more. A program may define the
+; constant itself first, to force either branch (the gates force 1).
+CompilerIf Defined(PMO_HOST_NAN_BUG, #PB_Constant) = 0
+  CompilerIf #PB_Compiler_Version < 641
+    #PMO_HOST_NAN_BUG = 1
+  CompilerElse
+    #PMO_HOST_NAN_BUG = 0
+  CompilerEndIf
+CompilerEndIf
+
 Procedure.i PmTensorIsNan(v.f)
   ProcedureReturn Bool((PeekL(@v) & $7FFFFFFF) > $7F800000)
 EndProcedure
@@ -236,9 +247,13 @@ Procedure PmTensorReluSerial(*src, *dst, count.i)
   i = 0 : ps = *src : pd = *dst
   While i < count
     v = PeekF(ps)
-    If (PeekL(ps) & $7FFFFFFF) <= $7F800000
+    CompilerIf #PMO_HOST_NAN_BUG = 1
+      If (PeekL(ps) & $7FFFFFFF) <= $7F800000
+        If v < 0.0 : v = 0.0 : EndIf
+      EndIf
+    CompilerElse
       If v < 0.0 : v = 0.0 : EndIf
-    EndIf
+    CompilerEndIf
     PokeF(pd, v)
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend
@@ -270,7 +285,9 @@ EndProcedure
 
 Procedure.f PmTensorTanhValue(value.f)
   Protected e.f
-  If PmTensorIsNan(value) <> 0 : ProcedureReturn value : EndIf
+  CompilerIf #PMO_HOST_NAN_BUG = 1
+    If PmTensorIsNan(value) <> 0 : ProcedureReturn value : EndIf
+  CompilerEndIf
   If value > 10.0 : ProcedureReturn 1.0 : EndIf
   If value < -10.0 : ProcedureReturn -1.0 : EndIf
   e = Exp(value + value)
@@ -491,10 +508,15 @@ Procedure PmTensorClipSerial(*src, *dst, count.i, lo.f, hi.f)
   While i < count
     v = PeekF(ps)
     ; a NaN passes through (forum 997)
-    If (PeekL(ps) & $7FFFFFFF) <= $7F800000
+    CompilerIf #PMO_HOST_NAN_BUG = 1
+      If (PeekL(ps) & $7FFFFFFF) <= $7F800000
+        If v < lo : v = lo : EndIf
+        If v > hi : v = hi : EndIf
+      EndIf
+    CompilerElse
       If v < lo : v = lo : EndIf
       If v > hi : v = hi : EndIf
-    EndIf
+    CompilerEndIf
     PokeF(pd, v)
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend
