@@ -76,7 +76,7 @@ An emitted application uses its exported runtime, not files from this checkout.
 
 | File | Responsibility |
 |---|---|
-| [tensor_fp32.pmi](../runtime/tensor_fp32.pmi) | Portable tensor foundation and scalar kernels, and the INT8 scheme: its portable definition and the AArch64 Advanced SIMD bodies that compute the same bits. |
+| [tensor_fp32.pmi](../runtime/tensor_fp32.pmi) | Portable tensor foundation and scalar kernels, and the INT8 scheme: its portable definition and the AArch64 Advanced SIMD bodies that compute the same bits. Its square root is correctly rounded on every target (fsqrt, vsqrt.f32, or the integer root on the Pico): the same bits as the Windows program. |
 | [tensor_pool_windows.pbi](../runtime/tensor_pool_windows.pbi) | The Windows worker pool: taken when a model is bound and parked (blocked, running nothing) when it is unbound, never ended; how many processors the process may use (affinity mask, processor groups, default CPU set), lowered by `--threads` or the run-time setting; tasks over disjoint output ranges, the caller's floating-point environment in every worker, no nesting. |
 | [tensor_fp32_windows.pbi](../runtime/tensor_fp32_windows.pbi) | Windows-native tensor foundation and host execution support; its operators split across the pool by output elements, rows or channels, each output computed exactly as on one thread. |
 | [tensor_simd_windows.pbi](../runtime/tensor_simd_windows.pbi) | Native x64 SSE2/AVX kernels: dense products split by row and column blocks, convolution by position blocks and output-row groups, recurrent steps by units, reductions by rows, all on the pool. No inference DLL. |

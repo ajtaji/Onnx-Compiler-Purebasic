@@ -1207,6 +1207,19 @@ def cases() -> list[Case]:
                                       ("reducesum_axes_attr", N("ReduceSum", ["x"], ["y"], axes=[0], keepdims=0), 11, [3, 4])):
         c.append(Case(name, [node], [("x", F, [2, 3, 4])], [("y", F, oshape)], {"x": rx3}, opset=opset, symbolic_axes=(2,), fixed=False))
     c.append(Case("nan_nonzero", [N("NonZero", ["x"], ["y"])], [("x", F, [2, 6])], [("y", I64, [2, None])], {"x": nx}, opset=13, oracle="ref", fixed=False))
+    # the square root, abs and negate on every special value (C6c-1): the
+    # correctly rounded root; x86's NaN (a NaN argument quieted, FFC00000 for
+    # a negative one), which is numpy's on x86; the sign bit alone for abs and
+    # negate. The target gate holds every target to the Windows program's bits.
+    spec = np.array([0x7FC00000, 0xFFC00000, 0x7FC01234, 0xFFC01234, 0x7F800001, 0xFF800001, 0x7FBFFFFF, 0x00000000,
+                     0x80000000, 0x80000001, 0x00000001, 0x007FFFFF, 0x00800000, 0xBF800000, 0xFF800000, 0x7F800000,
+                     0x3F800000, 0x40800000, 0x3FC00000, 0x40400000, 0x4B000001, 0x7F7FFFFF, 0x3F800001, 0x3E000001], np.uint32).view(np.float32)
+    spec = np.concatenate([spec, np.abs(f32(40)) * 7])
+    for op in ("Sqrt", "Abs", "Neg"):
+        with np.errstate(all="ignore"):
+            want = {"Sqrt": np.sqrt, "Abs": np.abs, "Neg": np.negative}[op](spec)
+        c.append(Case("%s_specials" % op.lower(), [N(op, ["x"], ["y"])], [("x", F, [spec.size])], [("y", F, [spec.size])],
+                      {"x": spec}, opset=13, oracle=("own", lambda feeds, w=want: [w])))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

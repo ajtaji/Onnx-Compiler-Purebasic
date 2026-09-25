@@ -90,6 +90,17 @@ CompilerIf Defined(PMO_HOST_NAN_BUG, #PB_Constant) = 0
   CompilerEndIf
 CompilerEndIf
 
+; Square root, correctly rounded (C6c-1): binary32 sqrt computed through
+; binary64 and rounded once is correctly rounded, so Sqr() assigned to a
+; binary32 variable is. Its NaN is x86's (a NaN argument quieted, FFC00000
+; for a negative one), the definition every target reproduces.
+Procedure.f PmTensorSqrtF(x.f)
+  ; Correctly rounded (C6c-1): binary32 sqrt computed through binary64 and
+  ; rounded once is. Its NaN is x86's - the argument quieted, or FFC00000 for
+  ; a negative one - which is the definition every target reproduces.
+  ProcedureReturn Sqr(x)
+EndProcedure
+
 Procedure.i PmTensorIsNan(v.f)
   ProcedureReturn Bool((PeekL(@v) & $7FFFFFFF) > $7F800000)
 EndProcedure
@@ -353,31 +364,36 @@ Global PmTensorTrigOk.i
 ; once, before the loop, because a per-element test can only ever be a slower
 ; way to get the same answer.
 Procedure PmTensorUnaryMathSerial(*src, *dst, count.i, op.i)
+  ; the op is decided once, outside the loop
   Protected i.i
-  Protected ps.i
-  Protected pd.i
   Protected v.f
+  Protected mask.q = $7FFFFFFF7FFFFFFF
+  Protected flip.q = $8000000080000000
   If op < 0 Or op > 4
     PmTensorUnaryMathOk = 0
     ProcedureReturn
   EndIf
-  i = 0 : ps = *src : pd = *dst
-  While i < count
-    v = PeekF(ps)
-    If op = 0
-      PokeF(pd, Exp(v))
-    ElseIf op = 1
-      PokeF(pd, Log(v))
-    ElseIf op = 2
-      PokeF(pd, Sqr(v))
-    ElseIf op = 3
-      If v < 0.0 : v = 0.0 - v : EndIf
-      PokeF(pd, v)
-    Else
-      PokeF(pd, 0.0 - v)
-    EndIf
-    ps = ps + 4 : pd = pd + 4 : i = i + 1
-  Wend
+  i = 0
+  Select op
+    Case 0
+      While i < count : PokeF(*dst + i * 4, Exp(PeekF(*src + i * 4))) : i = i + 1 : Wend
+    Case 1
+      While i < count : PokeF(*dst + i * 4, Log(PeekF(*src + i * 4))) : i = i + 1 : Wend
+    Case 2
+      ; correctly rounded (C6c-1); the NaN of an invalid argument is x86's,
+      ; which is the definition every target reproduces
+      While i < count : PokeF(*dst + i * 4, Sqr(PeekF(*src + i * 4))) : i = i + 1 : Wend
+    Case 3, 4
+      ; IEEE 754 abs and negate: the sign bit alone (-0 has abs +0, a NaN
+      ; keeps its payload), as numpy computes them; eight bytes at a time
+      If op = 3
+        While i + 2 <= count : PokeQ(*dst + i * 4, PeekQ(*src + i * 4) & mask) : i = i + 2 : Wend
+        If i < count : PokeL(*dst + i * 4, PeekL(*src + i * 4) & $7FFFFFFF) : EndIf
+      Else
+        While i + 2 <= count : PokeQ(*dst + i * 4, PeekQ(*src + i * 4) ! flip) : i = i + 2 : Wend
+        If i < count : PokeL(*dst + i * 4, PeekL(*src + i * 4) ! $80000000) : EndIf
+      EndIf
+  EndSelect
 EndProcedure
 
 ; Transcendentals used by synthesis and signal-processing graphs.
@@ -2020,24 +2036,45 @@ CompilerIf #PMO_USE_BATCHNORM = 1
 ; Planes [first, last) of the N x C planes, plane = bn * C + ch, each
 ; normalised by the statements the whole-tensor loop used.
 Procedure PmTensorBatchNormPlanes(*g.PmTensorBatchNormArgs, first.i, last.i)
+  ; one binary32 operation per expression, the square root correctly rounded
+  ; (C6c-1): the same bits as every target. The host evaluates an expression
+  ; wider than binary32 and rounds once where it is stored, which is the
+  ; correctly rounded binary32 result for ONE operation; x * mul + add in one
+  ; expression would round once for two.
   Protected bn.i
   Protected ch.i
   Protected s.i
   Protected idx.i
   Protected plane.i
+  Protected ps.i
+  Protected pd.i
+  Protected pe.i
   Protected mul.f
   Protected add.f
+  Protected t.f
+  Protected v.f
   plane = first
   While plane < last
     bn = plane / *g\C
     ch = plane % *g\C
-    mul = PmTensorGet(*g\Scale, ch) / Sqr(PmTensorGet(*g\Variance, ch) + *g\Epsilon)
-    add = PmTensorGet(*g\Bias, ch) - PmTensorGet(*g\Mean, ch) * mul
-    s = 0
-    While s < *g\Spatial
-      idx = (bn * *g\C + ch) * *g\Spatial + s
-      PmTensorPut(*g\Dst, idx, PmTensorGet(*g\Src, idx) * mul + add)
-      s = s + 1
+    t = PmTensorGet(*g\Variance, ch)
+    t = t + *g\Epsilon
+    t = PmTensorSqrtF(t)
+    mul = PmTensorGet(*g\Scale, ch)
+    mul = mul / t
+    add = PmTensorGet(*g\Mean, ch)
+    add = add * mul
+    t = PmTensorGet(*g\Bias, ch)
+    add = t - add
+    ; the plane's elements are contiguous: walk them by address
+    idx = (bn * *g\C + ch) * *g\Spatial * 4
+    ps = *g\Src + idx
+    pd = *g\Dst + idx
+    pe = ps + *g\Spatial * 4
+    While ps < pe
+      v = PeekF(ps) * mul
+      PokeF(pd, v + add)
+      ps = ps + 4 : pd = pd + 4
     Wend
     plane = plane + 1
   Wend
@@ -2061,10 +2098,15 @@ EndProcedure
 ; Mean and Variance hold input_mean and input_var.
 ; Channels [first, last): each channel's statistics are summed whole by one task.
 Procedure PmTensorBatchNormTrainingChannels(*g.PmTensorBatchNormArgs, first.i, last.i)
+  ; one binary32 operation per statement, the square root correctly rounded
+  ; (C6c-1): the same bits on every target
   Protected bn.i
   Protected ch.i
   Protected s.i
   Protected idx.i
+  Protected ps.i
+  Protected pd.i
+  Protected pe.i
   Protected mean.f
   Protected variance.f
   Protected v.f
@@ -2072,20 +2114,25 @@ Procedure PmTensorBatchNormTrainingChannels(*g.PmTensorBatchNormArgs, first.i, l
   Protected add.f
   Protected divisor.f
   Protected keep.f
+  Protected t.f
+  Protected u.f
   If *g\N * *g\Spatial <= 0
     ProcedureReturn
   EndIf
   divisor = *g\N * *g\Spatial
-  keep = 1.0 - *g\Momentum
+  keep = 1.0
+  keep = keep - *g\Momentum
   ch = first
   While ch < last
+    ; each (batch, channel) plane is contiguous: walk it by address
     mean = 0.0
     bn = 0
     While bn < *g\N
-      s = 0
-      While s < *g\Spatial
-        mean = mean + PmTensorGet(*g\Src, (bn * *g\C + ch) * *g\Spatial + s)
-        s = s + 1
+      ps = *g\Src + (bn * *g\C + ch) * *g\Spatial * 4
+      pe = ps + *g\Spatial * 4
+      While ps < pe
+        mean = mean + PeekF(ps)
+        ps = ps + 4
       Wend
       bn = bn + 1
     Wend
@@ -2093,26 +2140,47 @@ Procedure PmTensorBatchNormTrainingChannels(*g.PmTensorBatchNormArgs, first.i, l
     variance = 0.0
     bn = 0
     While bn < *g\N
-      s = 0
-      While s < *g\Spatial
-        v = PmTensorGet(*g\Src, (bn * *g\C + ch) * *g\Spatial + s) - mean
-        variance = variance + v * v
-        s = s + 1
+      ps = *g\Src + (bn * *g\C + ch) * *g\Spatial * 4
+      pe = ps + *g\Spatial * 4
+      While ps < pe
+        v = PeekF(ps) - mean
+        v = v * v
+        variance = variance + v
+        ps = ps + 4
       Wend
       bn = bn + 1
     Wend
     variance = variance / divisor
-    mul = PmTensorGet(*g\Scale, ch) / Sqr(variance + *g\Epsilon)
+    t = variance + *g\Epsilon
+    t = PmTensorSqrtF(t)
+    mul = PmTensorGet(*g\Scale, ch)
+    mul = mul / t
     add = PmTensorGet(*g\Bias, ch)
-    If *g\RunningMean <> 0 : PmTensorPut(*g\RunningMean, ch, PmTensorGet(*g\Mean, ch) * *g\Momentum + mean * keep) : EndIf
-    If *g\RunningVariance <> 0 : PmTensorPut(*g\RunningVariance, ch, PmTensorGet(*g\Variance, ch) * *g\Momentum + variance * keep) : EndIf
+    If *g\RunningMean <> 0
+      t = PmTensorGet(*g\Mean, ch)
+      t = t * *g\Momentum
+      u = mean * keep
+      t = t + u
+      PmTensorPut(*g\RunningMean, ch, t)
+    EndIf
+    If *g\RunningVariance <> 0
+      t = PmTensorGet(*g\Variance, ch)
+      t = t * *g\Momentum
+      u = variance * keep
+      t = t + u
+      PmTensorPut(*g\RunningVariance, ch, t)
+    EndIf
     bn = 0
     While bn < *g\N
-      s = 0
-      While s < *g\Spatial
-        idx = (bn * *g\C + ch) * *g\Spatial + s
-        PmTensorPut(*g\Dst, idx, (PmTensorGet(*g\Src, idx) - mean) * mul + add)
-        s = s + 1
+      idx = (bn * *g\C + ch) * *g\Spatial * 4
+      ps = *g\Src + idx
+      pd = *g\Dst + idx
+      pe = ps + *g\Spatial * 4
+      While ps < pe
+        v = PeekF(ps) - mean
+        v = v * mul
+        PokeF(pd, v + add)
+        ps = ps + 4 : pd = pd + 4
       Wend
       bn = bn + 1
     Wend

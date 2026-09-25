@@ -1128,6 +1128,111 @@ Every support-file procedure this change touches (the emitted text changes only 
 | `tensor_ops.pmi` | `PmOpRoiSample` | changed |
 
 
+## The same bits on every target, first stage: square root, abs, negate and BatchNormalization — September 25, 2026
+
+The Pi 4, Pico and Pico 2 computed some base-runtime kernels to within the
+node-suite tolerance of the Windows program but not to its bits. A survey of
+8,192 arguments per function across every target, against the correctly
+rounded result, showed where the difference lies: on Windows, Exp, Log, Sqrt,
+Sin, Cos and Atan were correctly rounded for every argument sampled, while the
+targets' maths libraries missed on about a quarter of them (1.2 to 2.3 units
+in the last place). The targets agree with one another almost exactly. So the
+definition is the correctly rounded result - unique, and therefore the same
+on every target that reaches it - and the targets move to it, in four stages.
+This is the first.
+
+**The Windows host, proved.** `host_cr_proof.pb`, beside the kernel check,
+evaluates the host's binary32 function, as the runtime calls it, at every one
+of the 2^32 arguments. It compares the result with the host's binary64
+function rounded once, and flags every argument whose binary64 value lies
+within 8 binary64 units of a binary32 rounding midpoint; `host_cr_settle.py`
+then decides each flagged argument exactly with 200-bit arithmetic. The
+result, with PureBasic 6.41 (which links its maths into the program, so this
+holds on every Windows machine):
+
+| Function | Arguments | Flagged | Not correctly rounded |
+|---|---|---|---|
+| Sqrt | 2,139,095,042 | 254 | 0 |
+| Exp | 4,278,190,082 | 21 | 0 |
+| Log | 2,139,095,042 | 77 | 5 |
+| Sin | 4,278,190,080 | 90 | 2 |
+| Cos | 4,278,190,080 | 88 | 4 |
+| Atan | 4,278,190,082 | 32 | 2 |
+
+Sqrt and Exp are correctly rounded everywhere; Log, Sin, Cos and Atan miss
+at thirteen arguments in all, which the later stages settle.
+
+| Kernel | Now |
+|---|---|
+| Sqrt (both paths) | Correctly rounded on every target: the host's `Sqr` on Windows, provably so; the FPU's `fsqrt` on the Pi 4 and UNO Q, scalar and four lanes at a time in NEON; `vsqrt.f32` on the Pico 2; the integer square root of the significand on the Pico, which has no FPU. The NaN of an invalid argument is x86's: a NaN argument comes back quieted with its payload and sign, a negative one gives `FFC00000`. That is what the Windows program computes for nothing, and what numpy (and so the ONNX reference) gives on x86; the ARM targets, whose own default NaN is `7FC00000`, decide those two cases on the argument's bits. Every portable call of `Sqr` (LayerNormalization, InstanceNormalization, BatchNormalization) now uses it. |
+| Abs, Neg (both paths) | IEEE 754's abs and negate: the sign bit alone, as numpy computes them. Abs(-0) was -0 and Neg(+0) was +0 everywhere; both are now right. |
+| BatchNormalization (both paths, inference and training) | One binary32 operation per expression, the square root correctly rounded. The Windows program evaluated `x * mul + add` as one binary64 expression rounded once; PureBasic evaluates an expression wider than binary32 and rounds where it is stored, which is exact for one operation and not for two. The plane is walked by address. |
+
+**The NaN definition.** A function whose result is a NaN gives x86's NaN,
+on every target: a NaN argument comes back quieted (its payload and sign
+kept), and an argument outside the function's domain gives `FFC00000`. That
+is what the Windows program computes at no cost, and what numpy - and so the
+ONNX reference - gives on x86; the ARM targets, whose own default NaN is
+`7FC00000`, decide those cases on the argument's bits. Sqrt follows it from
+this stage; Log, Sin and Cos follow it from theirs. Abs and Neg keep the sign
+bit alone.
+
+**Speed.** On every target each changed kernel is as fast as before or
+faster. Instructions per element in unicorn (8,192 elements; the kernel
+alone, the runner's constant cost per element subtracted, where it matters):
+
+| Kernel | Pi 4 | Pico | Pico 2 |
+|---|---|---|---|
+| Sqrt, fixed shape (whole request) | 17,627 → 448 (−97.5%) | 2,924 → 1,041 (−64%) | 364 → 265 (−27%) |
+| Sqrt, runtime dimensions (whole request) | 155 → 134 (−14%) | 2,953 → 1,069 (−64%) | 392 → 293 (−25%) |
+| Neg, Abs (whole request) | 0% and −3% | −17% and −24% | −0.5% and −5% |
+| BatchNormalization inference (kernel) | 176 → 92 (−48%) | 316 → 329 (+4%) | 72 → 48 (−33%) |
+| BatchNormalization training (kernel) | 358 → 276 (−23%) | 1,123 → 1,095 (−2%) | 219 → 156 (−29%) |
+| InstanceNormalization, LayerNormalization (whole request) | 0% and −8% | 0% and −0.5% | 0% and 0% |
+
+The Pico's BatchNormalization inference, +4%, is the one increase: its
+soft-float operations dominate, and the rewrite adds a store per element.
+On Windows, wall clock of the serial kernels over 16M elements (best of
+seven): Sqrt 274 → 272 ms on mixed-sign data and 40 → 33 ms on positive data;
+Abs 125 → 10 ms; Neg 33 → 10 ms; BatchNormalization 34 → 23 ms, training 150 →
+143 ms. Kokoro-82M on Windows: FP32 1,253.2 ms median against 1,259.0, INT8
+999.1 against 1,004.0 (15 requests each, interleaved), the same output bits.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: the 604 cases | Windows (both branches), Pi 4, Pico and Pico 2: 604 of 604 bit-identical to the definition; `--mutants` 72 of 72 caught |
+| `runtime_mutants.py`: the 23 before, and one per change: Sqrt's negative-argument NaN, the NEON lane fix, the integer root's rounding, Abs on eight bytes, Neg by subtraction, BatchNormalization fused into one expression on Windows, its square root nudged on the targets | 30 of 30 as required |
+| `tests/node_suite/targeted_ops.py`: 1,065 cases - the 1,059 before; Sqrt, Abs and Neg on 24 special values (NaN payloads, signalling NaNs, both zeros, subnormals, infinities, negatives, exact squares, values a unit either side of them) on both paths | 1,065 of 1,065 as expected |
+| `ops_targets_gate.py`: those cases, BatchNormalization, and the NaN, comparison, Clip, Floor, Round and Tanh cases, on the Pi 4, Pico and Pico 2 | 115 builds, 345 runs: 315 bit-identical to the Windows program; 30 within the tolerance and named in `TOLERANCE_ONLY` (Log, Sin, Cos, Atan and Sigmoid, the later stages). BatchNormalization, Sqrt and Neg left the list |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,239 both |
+| Models that use none of these forms (four models, fp32/fp16/bf16/int4, five targets), this change against `50dcb85` | 80 of 80 emitted sources, packs and manifests byte-identical; the 16 runtime-dimension sources build; 16 of the 32 fixed-shape Pico and Pico 2 images differ, because they link the changed `tensor_fp32.pmi` procedures. Output bits: the four models' Windows outputs byte-identical, and all 30 outputs of their Pi 4, Pico and Pico 2 programs byte-identical |
+| Kokoro-82M, FP32 and INT8, for Windows | Source and pack byte-identical; `tensor_fp32_windows.pbi` differs (the table below); the output for the reference request byte-identical, FP32 and INT8 |
+
+Output bits that change: on Windows, BatchNormalization's (now binary32 per
+operation), Abs of -0 and Neg of +0 (now right); on the Pi 4, Pico and Pico
+2, every result that goes through a square root - Sqrt, BatchNormalization,
+InstanceNormalization and LayerNormalization - now correctly rounded, and
+the NaN of an invalid square root, now x86's.
+
+Every support-file procedure this change touches (the emitted source does not change):
+
+| Support file | Procedure | |
+|---|---|---|
+| `tensor_fp32.pmi` | `PmTensorBatchNorm` | changed |
+| `tensor_fp32.pmi` | `PmTensorBatchNormTraining` | changed |
+| `tensor_fp32.pmi` | `PmTensorLayerNorm` | changed |
+| `tensor_fp32.pmi` | `PmTensorSqrtBits` | added |
+| `tensor_fp32.pmi` | `PmTensorSqrtF` | added |
+| `tensor_fp32.pmi` | `PmTensorUnaryMath` | changed |
+| `tensor_fp32_neon.pmi` | `PmTensorSqrtFp32Neon` | changed |
+| `tensor_fp32_neon.pmi` | `PmTensorSqrtFp32NeonRun` | changed |
+| `tensor_fp32_windows.pbi` | `PmTensorBatchNormPlanes` | changed |
+| `tensor_fp32_windows.pbi` | `PmTensorBatchNormTrainingChannels` | changed |
+| `tensor_fp32_windows.pbi` | `PmTensorSqrtF` | added |
+| `tensor_fp32_windows.pbi` | `PmTensorUnaryMathSerial` | changed |
+| `tensor_norm_small.pmi` | `PmTensorInstanceNormStats` | changed |
+
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.
@@ -1150,16 +1255,17 @@ Every support-file procedure this change touches (the emitted text changes only 
 - Some kernels of the base runtime (not of the operator-set lane) match the
   Windows program on the Pi 4, Pico and Pico 2 within the node-suite
   tolerance but not bit for bit. `ops_targets_gate.py` names each in
-  `TOLERANCE_ONLY` with its reason and still holds it to the tolerance:
-  BatchNormalization on both paths (the host compiler keeps its
-  intermediates wider than binary32); Neg, Cos, Log, Sqrt and Sin of a NaN
-  or of an invalid argument (Windows writes x86's default NaN, `FFC00000`,
-  the targets `7FC00000`); Log, Sqrt, Sin, Atan and Sigmoid, one unit in the
-  last place on some arguments, where Windows is the correctly rounded side;
-  and Sin(-0) on the Pico and Pico 2 and Atan(-0) on all three targets,
-  which give +0. Binary32 base kernels used by both paths, with NaN written
-  as `7FC00000` as the operator-set lane writes it, are the next change, and
-  will empty the list.
+  `TOLERANCE_ONLY` with its reason and still holds it to the tolerance: Log,
+  Sin, Cos, Atan and Sigmoid, whose target libraries miss the correctly
+  rounded result by one or two units in the last place on some arguments
+  (Windows is correctly rounded but for thirteen arguments in all), and
+  whose NaN from an invalid argument is x86's `FFC00000` on Windows and
+  `7FC00000` on the targets; Sin(-0) on the Pico and Pico 2 and Atan(-0) on
+  all three targets give +0. The later stages of
+  [the same bits on every target](#the-same-bits-on-every-target-first-stage-square-root-abs-negate-and-batchnormalization--september-25-2026)
+  move them to the correctly rounded result and empty the list.
+  LayerNormalization, Softmax and the other composite kernels are not yet
+  covered by the target gate.
 - Windows x64 is the verified host. Linux/macOS hosting, other PureBasic
   versions, and alternate PureBasic backends are not certified by this export.
 - Five-target **generation** does not establish downstream bare-metal builds,

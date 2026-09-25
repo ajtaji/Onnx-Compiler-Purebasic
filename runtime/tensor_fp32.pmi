@@ -108,6 +108,107 @@ EndProcedure
 ; operator-set lane reads the constant.
 #PMO_HOST_NAN_BUG = 0
 
+; Square root, correctly rounded (C6c-1), so every target gives the same bits
+; as the Windows program, whose binary32 square root taken through binary64 is
+; correctly rounded too. The Pi 4 and the UNO Q use the FPU's fsqrt and the
+; Pico 2 its vsqrt.f32; the Pico, which has no FPU, takes the integer square
+; root of the significand (fdlibm's e_sqrtf.c, as the operator-set lane's
+; PmOpSqrt), in steps that fit 32-bit integers. The NaN of an invalid
+; argument is x86's: a NaN argument comes back quieted (its payload and sign
+; kept), a negative one gives FFC00000 - the Windows program's result, and
+; numpy's on x86.
+CompilerIf #PMO_INT8_BACKEND = 1
+Procedure.i PmTensorSqrtBits(bits.i)
+  ASM
+    fmov s0, w0
+    fsqrt s0, s0
+    fmov w0, s0
+  EndASM
+EndProcedure
+CompilerElseIf #PMO_INT8_BACKEND = 3
+Procedure.i PmTensorSqrtBits(bits.i)
+  ; the Cortex-M33's FPU: vsqrt.f32 is correctly rounded
+  ASM
+    vmov s0, r0
+    vsqrt.f32 s0, s0
+    vmov r0, s0
+  EndASM
+EndProcedure
+CompilerElse
+Procedure.i PmTensorSqrtBits(bits.i)
+  Protected ix.i
+  Protected m.i
+  Protected i.i
+  Protected q.i
+  Protected s.i
+  Protected r.i
+  Protected t.i
+  ; every test on the bits, so a 32-bit integer's sign never enters it
+  ix = bits
+  If (ix & $7FFFFFFF) = 0
+    ProcedureReturn ix
+  EndIf
+  If (ix & $7FFFFFFF) > $7F800000
+    ProcedureReturn $7FC00000
+  EndIf
+  If (ix & $80000000) <> 0
+    ProcedureReturn $7FC00000
+  EndIf
+  If ix = $7F800000
+    ProcedureReturn ix
+  EndIf
+  m = (ix >> 23) & $FF
+  If m = 0
+    i = 0
+    While (ix & $800000) = 0
+      ix = ix << 1
+      i = i + 1
+    Wend
+    m = m - (i - 1)
+  EndIf
+  m = m - 127
+  ix = (ix & $7FFFFF) | $800000
+  If (m & 1) <> 0
+    ix = ix + ix
+  EndIf
+  m = m >> 1
+  ix = ix + ix
+  q = 0
+  s = 0
+  r = $1000000
+  While r <> 0
+    t = s + r
+    If t <= ix
+      s = t + r
+      ix = ix - t
+      q = q + r
+    EndIf
+    ix = ix + ix
+    r = r >> 1
+  Wend
+  If ix <> 0
+    q = q + (q & 1)
+  EndIf
+  ix = (q >> 1) + $3F000000
+  ProcedureReturn ix + (m << 23)
+EndProcedure
+CompilerEndIf
+
+Procedure.f PmTensorSqrtF(x.f)
+  Protected b.i
+  Protected r.f
+  b = PeekL(@x)
+  If (b & $7FFFFFFF) > $7F800000
+    b = b | $400000
+  ElseIf (b & $80000000) <> 0 And (b & $7FFFFFFF) <> 0
+    b = -4194304
+  Else
+    b = PmTensorSqrtBits(b)
+  EndIf
+  PokeL(@r, b)
+  ProcedureReturn r
+EndProcedure
+
 Procedure.i PmTensorIsNan(v.f)
   If (PeekL(@v) & $7FFFFFFF) > $7F800000
     ProcedureReturn 1
@@ -408,12 +509,13 @@ Procedure PmTensorUnaryMath(*src.i, *dst.i, count.i, op.i)
     ElseIf op = 1
       *pd.f = Log(v)
     ElseIf op = 2
-      *pd.f = Sqr(v)
+      *pd.f = PmTensorSqrtF(v)
     ElseIf op = 3
-      If v < 0.0 : v = 0.0 - v : EndIf
-      *pd.f = v
+      ; IEEE 754 abs and negate: the sign bit alone (-0 has abs +0, a NaN
+      ; keeps its payload), as numpy computes them
+      PokeL(pd, PeekL(ps) & $7FFFFFFF)
     Else
-      *pd.f = 0.0 - v
+      PokeL(pd, PeekL(ps) ! $80000000)
     EndIf
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend
@@ -2447,7 +2549,7 @@ Procedure PmTensorLayerNorm(*g.PmTensorLayerNormArgs)
       variance = variance + v * v
       j = j + 1
     Wend
-    inv = 1.0 / Sqr(variance / divisor + epsilon)
+    inv = 1.0 / PmTensorSqrtF(variance / divisor + epsilon)
     If *g\Mean <> 0 : PmTensorPut(*g\Mean, o, mean) : EndIf
     If *g\InvStdDev <> 0 : PmTensorPut(*g\InvStdDev, o, inv) : EndIf
     j = 0
@@ -2495,23 +2597,41 @@ EndStructure
 
 CompilerIf #PMO_USE_BATCHNORM = 1
 Procedure PmTensorBatchNorm(*g.PmTensorBatchNormArgs)
+  ; one binary32 operation per expression, the square root correctly rounded
+  ; (C6c-1): the same bits on every target
   Protected bn.i
   Protected ch.i
   Protected s.i
   Protected idx.i
+  Protected ps.i
+  Protected pd.i
+  Protected pe.i
   Protected mul.f
   Protected add.f
+  Protected t.f
+  Protected v.f
   bn = 0
   While bn < *g\N
     ch = 0
     While ch < *g\C
-      mul = PmTensorGet(*g\Scale, ch) / Sqr(PmTensorGet(*g\Variance, ch) + *g\Epsilon)
-      add = PmTensorGet(*g\Bias, ch) - PmTensorGet(*g\Mean, ch) * mul
-      s = 0
-      While s < *g\Spatial
-        idx = (bn * *g\C + ch) * *g\Spatial + s
-        PmTensorPut(*g\Dst, idx, PmTensorGet(*g\Src, idx) * mul + add)
-        s = s + 1
+      t = PmTensorGet(*g\Variance, ch)
+      t = t + *g\Epsilon
+      t = PmTensorSqrtF(t)
+      mul = PmTensorGet(*g\Scale, ch)
+      mul = mul / t
+      add = PmTensorGet(*g\Mean, ch)
+      add = add * mul
+      t = PmTensorGet(*g\Bias, ch)
+      add = t - add
+      idx = (bn * *g\C + ch) * *g\Spatial * 4
+      ps = *g\Src + idx
+      pd = *g\Dst + idx
+      pe = ps + *g\Spatial * 4
+      While ps < pe
+        v = PmTensorGet(ps, 0) * mul
+        PmTensorPut(pd, 0, v + add)
+        ps = ps + 4
+        pd = pd + 4
       Wend
       ch = ch + 1
     Wend
@@ -2529,10 +2649,15 @@ EndProcedure
 ;   running_var  = input_var * momentum + current_var * (1 - momentum).
 ; Mean and Variance hold input_mean and input_var.
 Procedure PmTensorBatchNormTraining(*g.PmTensorBatchNormArgs)
+  ; one binary32 operation per expression, the square root correctly rounded
+  ; (C6c-1): the same bits on every target
   Protected bn.i
   Protected ch.i
   Protected s.i
   Protected idx.i
+  Protected ps.i
+  Protected pd.i
+  Protected pe.i
   Protected mean.f
   Protected variance.f
   Protected v.f
@@ -2540,20 +2665,24 @@ Procedure PmTensorBatchNormTraining(*g.PmTensorBatchNormArgs)
   Protected add.f
   Protected divisor.f
   Protected keep.f
+  Protected t.f
+  Protected u.f
   If *g\N * *g\Spatial <= 0
     ProcedureReturn
   EndIf
   divisor = *g\N * *g\Spatial
-  keep = 1.0 - *g\Momentum
+  keep = 1.0
+  keep = keep - *g\Momentum
   ch = 0
   While ch < *g\C
     mean = 0.0
     bn = 0
     While bn < *g\N
-      s = 0
-      While s < *g\Spatial
-        mean = mean + PmTensorGet(*g\Src, (bn * *g\C + ch) * *g\Spatial + s)
-        s = s + 1
+      ps = *g\Src + (bn * *g\C + ch) * *g\Spatial * 4
+      pe = ps + *g\Spatial * 4
+      While ps < pe
+        mean = mean + PmTensorGet(ps, 0)
+        ps = ps + 4
       Wend
       bn = bn + 1
     Wend
@@ -2561,26 +2690,48 @@ Procedure PmTensorBatchNormTraining(*g.PmTensorBatchNormArgs)
     variance = 0.0
     bn = 0
     While bn < *g\N
-      s = 0
-      While s < *g\Spatial
-        v = PmTensorGet(*g\Src, (bn * *g\C + ch) * *g\Spatial + s) - mean
-        variance = variance + v * v
-        s = s + 1
+      ps = *g\Src + (bn * *g\C + ch) * *g\Spatial * 4
+      pe = ps + *g\Spatial * 4
+      While ps < pe
+        v = PmTensorGet(ps, 0) - mean
+        v = v * v
+        variance = variance + v
+        ps = ps + 4
       Wend
       bn = bn + 1
     Wend
     variance = variance / divisor
-    mul = PmTensorGet(*g\Scale, ch) / Sqr(variance + *g\Epsilon)
+    t = variance + *g\Epsilon
+    t = PmTensorSqrtF(t)
+    mul = PmTensorGet(*g\Scale, ch)
+    mul = mul / t
     add = PmTensorGet(*g\Bias, ch)
-    If *g\RunningMean <> 0 : PmTensorPut(*g\RunningMean, ch, PmTensorGet(*g\Mean, ch) * *g\Momentum + mean * keep) : EndIf
-    If *g\RunningVariance <> 0 : PmTensorPut(*g\RunningVariance, ch, PmTensorGet(*g\Variance, ch) * *g\Momentum + variance * keep) : EndIf
+    If *g\RunningMean <> 0
+      t = PmTensorGet(*g\Mean, ch)
+      t = t * *g\Momentum
+      u = mean * keep
+      t = t + u
+      PmTensorPut(*g\RunningMean, ch, t)
+    EndIf
+    If *g\RunningVariance <> 0
+      t = PmTensorGet(*g\Variance, ch)
+      t = t * *g\Momentum
+      u = variance * keep
+      t = t + u
+      PmTensorPut(*g\RunningVariance, ch, t)
+    EndIf
     bn = 0
     While bn < *g\N
-      s = 0
-      While s < *g\Spatial
-        idx = (bn * *g\C + ch) * *g\Spatial + s
-        PmTensorPut(*g\Dst, idx, (PmTensorGet(*g\Src, idx) - mean) * mul + add)
-        s = s + 1
+      idx = (bn * *g\C + ch) * *g\Spatial * 4
+      ps = *g\Src + idx
+      pd = *g\Dst + idx
+      pe = ps + *g\Spatial * 4
+      While ps < pe
+        v = PmTensorGet(ps, 0) - mean
+        v = v * mul
+        PmTensorPut(pd, 0, v + add)
+        ps = ps + 4
+        pd = pd + 4
       Wend
       bn = bn + 1
     Wend

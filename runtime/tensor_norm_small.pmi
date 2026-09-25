@@ -150,11 +150,7 @@ Procedure PmTensorInstanceNormStats(*work.PmTensorInstanceNormWork, stage.i)
     *work\Mean = a
   Else
     a = a + *work\Epsilon
-    CompilerIf #PMO_INT8_BACKEND = 1
-    PokeL(@*work\Den, PmNsSqrtBits(PeekL(@a) & $FFFFFFFF))
-    CompilerElse
-    *work\Den = Sqr(a)
-    CompilerEndIf
+    *work\Den = PmTensorSqrtF(a)
   EndIf
 EndProcedure
 
