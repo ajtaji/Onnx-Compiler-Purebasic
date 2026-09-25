@@ -34,9 +34,10 @@ before you copy a model somewhere and wonder why it stopped working.
 
 @SECTION The operator subset, in full
 
-This is the complete list the fixed-shape validator implements; the
-runtime-dimension path adds Shape, ConstantOfShape and Constant, and
-the control-flow and sequence operators marked below. There is no long tail
+This is the complete list the fixed-shape validator implements, with
+Constant, which both paths turn into an initializer before planning; the
+runtime-dimension path adds Shape and ConstantOfShape, and the control-flow
+and sequence operators marked below. There is no long tail
 and no partial support hiding behind a flag - an operator is on this list
 or it is refused.
 
@@ -281,6 +282,14 @@ persistent state from each request's temporary tensors.
 
 `twice.onnx` from chapter 3 is `[1,N]`, so it is the second kind, and that
 is what let one bind serve requests of 3, 6 and 9 values.
+
+A graph with all-number inputs also takes the runtime-dimension path when a
+node's output is not declared at all, with no type and no shape - the
+intermediates of a function-expanded graph are like that. The fixed-shape
+planner needs every value's size up front, and the runtime-dimension path
+works it out as the program runs. A value that IS declared, with a name for
+an extent, is a different matter; the next section shows how that one is
+refused.
 
 @SECTION Pinning a dimension with --shape
 

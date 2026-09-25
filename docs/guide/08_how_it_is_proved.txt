@@ -501,20 +501,20 @@ invalid operation such as infinity times zero.
 
 **A definition to be held to.** `ops_scheme.py` in the compiler
 repository's `tools/onnx/tests/Diagnostics` writes every kernel out in numpy
-one binary32 operation per line. `ops_kernel_check.py` runs 589 cases -
+one binary32 operation per line. `ops_kernel_check.py` runs 597 cases -
 the math functions over tables of special values and branch boundaries,
 every operator's kernel, and the awkward cases - on Windows and, in the
 unicorn instruction emulator, on the Pi 4, Pico and Pico 2 builds, and
 requires every output to equal the definition bit for bit; with
-`--mutants` it plants 68 defects and requires each to be caught:
+`--mutants` it plants 70 defects and requires each to be caught:
 
 @FRAG
 py -3.12 ops_kernel_check.py --pbcompiler <pbcompiler.exe> --compiler PureMetalForge.exe --runtime <ONNX repository>\runtime --mutants
-windows 589 of 589 cases as the definition
-pi4     589 of 589 cases as the definition
-pico    589 of 589 cases as the definition
-pico2   589 of 589 cases as the definition
-mutants: 68 of 68 killed
+windows 597 of 597 cases as the definition
+pi4     597 of 597 cases as the definition
+pico    597 of 597 cases as the definition
+pico2   597 of 597 cases as the definition
+mutants: 70 of 70 killed
 @ENDFRAG
 
 That says the kernels compute what they were written to compute. Whether
@@ -537,6 +537,11 @@ default, is run at 16 with the old mode spelled out.
 check, then compiles the same cases for the Pi 4, Pico and Pico 2, runs the
 generated programs in the emulator, and requires their outputs to pass the
 same comparison and to equal the Windows program's bits.
+The runtime-dimension support files, which every such program carries,
+have a gate of their own: `runtime_mutants.py` plants a defect in a copy of
+them, builds the compiler from that copy, and requires the cases that cover
+the procedure to fail - on Windows for the Windows runtime, and in the
+emulator on the Pi 4, Pico and Pico 2 for the portable one.
 
 @SECTION Threads on Windows: the same bits at every count
 

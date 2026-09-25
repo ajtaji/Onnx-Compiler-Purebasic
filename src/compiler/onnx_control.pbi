@@ -140,7 +140,9 @@ Procedure.i PmcOperatorFloor(Operation.s)
   Select Operation
     Case "Shape", "Transpose", "MatMul" : ProcedureReturn 1
     Case "Reshape" : ProcedureReturn 5
-    Case "Exp", "Log", "Sqrt", "Abs", "Neg", "Floor", "Sigmoid", "Tanh", "LeakyRelu", "Cast" : ProcedureReturn 6
+    Case "Flatten" : ProcedureReturn 1
+    Case "Exp", "Log", "Sqrt", "Abs", "Neg", "Floor", "Sigmoid", "Tanh", "LeakyRelu", "Cast", "Relu" : ProcedureReturn 6
+    Case "BatchNormalization" : ProcedureReturn 9
     Case "Add", "Sub", "Mul", "Div", "Pow", "Equal", "Greater", "Less", "And", "Sin", "Cos", "Atan", "LSTM" : ProcedureReturn 7
     Case "Expand" : ProcedureReturn 8
     Case "Scan" : ProcedureReturn 9
@@ -150,7 +152,7 @@ Procedure.i PmcOperatorFloor(Operation.s)
     Case "Gather", "Concat", "Range", "Round", "CumSum", "ScatterND", "Squeeze", "Unsqueeze", "Clip", "Resize", "Gemm",
          "ReduceMean", "ReduceSum", "If", "Loop", "SequenceEmpty", "SequenceConstruct", "SequenceInsert", "SequenceAt",
          "SequenceLength", "SequenceErase", "SplitToSequence", "ConcatFromSequence" : ProcedureReturn 11
-    Case "GreaterOrEqual" : ProcedureReturn 12
+    Case "GreaterOrEqual", "LessOrEqual" : ProcedureReturn 12
     Case "Softmax" : ProcedureReturn 13
     Case "Bernoulli" : ProcedureReturn 15
     Case "LayerNormalization", "STFT", "SequenceMap" : ProcedureReturn 17
@@ -231,6 +233,160 @@ EndProcedure
 ; Stage 1a: Constant lowering and the opset-11 axes spelling
 ; ---------------------------------------------------------------------------
 
+; Count elements of *Tensor, each Width bytes, into *Buffer, from its raw data
+; or its typed lists. #False when the data does not hold that many.
+Procedure.i PmcTensorElements(*Tensor.PmoOnnxTensor, *Buffer, Count.q, Width.i)
+  Protected Index.q
+  If *Tensor\Raw\Bytes > 0
+    If *Tensor\Raw\Bytes <> Count * Width : ProcedureReturn #False : EndIf
+    CopyMemory(*Tensor\Raw\Data, *Buffer, Count * Width)
+    ProcedureReturn #True
+  EndIf
+  Select *Tensor\DataType
+    Case 1
+      If ListSize(*Tensor\FloatData()) <> Count : ProcedureReturn #False : EndIf
+      ForEach *Tensor\FloatData() : PokeF(*Buffer + Index * 4, *Tensor\FloatData()) : Index + 1 : Next
+    Case 2, 3, 9
+      If ListSize(*Tensor\Int32Data()) <> Count : ProcedureReturn #False : EndIf
+      ForEach *Tensor\Int32Data()
+        If *Tensor\DataType = 9
+          PokeA(*Buffer + Index, Bool(*Tensor\Int32Data() <> 0))
+        Else
+          PokeA(*Buffer + Index, *Tensor\Int32Data() & 255)
+        EndIf
+        Index + 1
+      Next
+    Case 6
+      If ListSize(*Tensor\Int32Data()) <> Count : ProcedureReturn #False : EndIf
+      ForEach *Tensor\Int32Data() : PokeL(*Buffer + Index * 4, *Tensor\Int32Data()) : Index + 1 : Next
+    Case 7
+      If ListSize(*Tensor\Int64Data()) <> Count : ProcedureReturn #False : EndIf
+      ForEach *Tensor\Int64Data() : PokeQ(*Buffer + Index * 8, *Tensor\Int64Data()) : Index + 1 : Next
+    Case 11
+      If ListSize(*Tensor\DoubleData()) <> Count : ProcedureReturn #False : EndIf
+      ForEach *Tensor\DoubleData() : PokeD(*Buffer + Index * 8, *Tensor\DoubleData()) : Index + 1 : Next
+    Case 13
+      If ListSize(*Tensor\UInt64Data()) <> Count : ProcedureReturn #False : EndIf
+      ForEach *Tensor\UInt64Data() : PokeQ(*Buffer + Index * 8, *Tensor\UInt64Data()) : Index + 1 : Next
+    Default
+      ProcedureReturn Bool(Count = 0)
+  EndSelect
+  ProcedureReturn #True
+EndProcedure
+
+; Constant's sparse_value (Constant-11): the dense tensor of the attribute's
+; shape, zero everywhere but at its indices, which hold its values
+; (https://onnx.ai/onnx/api/classes.html#sparsetensorproto). The indices are
+; either [NNZ] linear positions or [NNZ, rank] coordinates.
+Procedure.i PmcDensify(*Node.PmoOnnxNode, *Attribute.PmoOnnxAttribute, *Tensor.PmoOnnxTensor)
+  Protected Width.i
+  Protected Elements.q = 1
+  Protected Count.q = 1
+  Protected Rank.i
+  Protected Linear.i
+  Protected k.q
+  Protected d.i
+  Protected At.q
+  Protected Coordinate.q
+  Protected *Buffer
+  Protected *Values
+  Protected *Indices
+  If *Attribute\HasSparse = 0
+    ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value holds no sparse tensor.")
+  EndIf
+  Width = PmoIrElementBytes(*Attribute\SparseValues\DataType)
+  If Width = 0
+    ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value holds ONNX element type " + Str(*Attribute\SparseValues\DataType) + ", which this compiler does not carry.")
+  EndIf
+  Rank = ListSize(*Attribute\SparseDims())
+  Dim Stride.q(Rank)
+  ForEach *Attribute\SparseDims()
+    If *Attribute\SparseDims() < 0 Or *Attribute\SparseDims() > $7FFFFFFF
+      ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value has a dimension outside 0 to 2147483647.")
+    EndIf
+    Elements * *Attribute\SparseDims()
+    If Elements > $7FFFFFFF : ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value is too large to hold densely.") : EndIf
+  Next
+  If ListSize(*Attribute\SparseValues\Dims()) <> 1
+    ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value's values are not one-dimensional.")
+  EndIf
+  FirstElement(*Attribute\SparseValues\Dims()) : Count = *Attribute\SparseValues\Dims()
+  If Count < 0 Or Count > Elements
+    ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value holds more values than its shape has elements.")
+  EndIf
+  If *Attribute\SparseIndices\DataType <> 7
+    ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value's indices are not INT64.")
+  EndIf
+  If ListSize(*Attribute\SparseIndices\Dims()) = 1
+    Linear = #True
+    FirstElement(*Attribute\SparseIndices\Dims())
+    If *Attribute\SparseIndices\Dims() <> Count : Goto PmcDensifyShape : EndIf
+  ElseIf ListSize(*Attribute\SparseIndices\Dims()) = 2
+    FirstElement(*Attribute\SparseIndices\Dims())
+    If *Attribute\SparseIndices\Dims() <> Count : Goto PmcDensifyShape : EndIf
+    NextElement(*Attribute\SparseIndices\Dims())
+    If *Attribute\SparseIndices\Dims() <> Rank : Goto PmcDensifyShape : EndIf
+  Else
+    Goto PmcDensifyShape
+  EndIf
+  d = Rank - 1 : At = 1
+  While d >= 0
+    Stride(d) = At
+    SelectElement(*Attribute\SparseDims(), d) : At * *Attribute\SparseDims()
+    d - 1
+  Wend
+  If Elements > 0
+    *Buffer = AllocateMemory(Elements * Width)
+    If *Buffer = 0 : ProcedureReturn PmcFail("Cannot allocate the value of " + PmcLabel(*Node) + ".") : EndIf
+    LastElement(PmcBuffers()) : AddElement(PmcBuffers()) : PmcBuffers() = *Buffer
+  EndIf
+  If Count > 0
+    *Values = AllocateMemory(Count * Width)
+    *Indices = AllocateMemory(Count * 8 * (1 + Bool(Linear = 0) * (Rank - 1)) + 8)
+    If *Values = 0 Or *Indices = 0
+      If *Values : FreeMemory(*Values) : EndIf
+      If *Indices : FreeMemory(*Indices) : EndIf
+      ProcedureReturn PmcFail("Cannot allocate the value of " + PmcLabel(*Node) + ".")
+    EndIf
+    If PmcTensorElements(@*Attribute\SparseValues, *Values, Count, Width) = 0 Or
+       PmcTensorElements(@*Attribute\SparseIndices, *Indices, Count * (1 + Bool(Linear = 0) * (Rank - 1)), 8) = 0
+      FreeMemory(*Values) : FreeMemory(*Indices)
+      ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value's data does not match its shape.")
+    EndIf
+    k = 0
+    While k < Count
+      If Linear
+        At = PeekQ(*Indices + k * 8)
+      Else
+        At = 0 : d = 0
+        While d < Rank
+          Coordinate = PeekQ(*Indices + (k * Rank + d) * 8)
+          SelectElement(*Attribute\SparseDims(), d)
+          If Coordinate < 0 Or Coordinate >= *Attribute\SparseDims() : At = -1 : Break : EndIf
+          At + Coordinate * Stride(d)
+          d + 1
+        Wend
+      EndIf
+      If At < 0 Or At >= Elements
+        FreeMemory(*Values) : FreeMemory(*Indices)
+        ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value has an index outside its shape.")
+      EndIf
+      CopyMemory(*Values + k * Width, *Buffer + At * Width, Width)
+      k + 1
+    Wend
+    FreeMemory(*Values) : FreeMemory(*Indices)
+  EndIf
+  *Tensor\DataType = *Attribute\SparseValues\DataType
+  ForEach *Attribute\SparseDims()
+    AddElement(*Tensor\Dims()) : *Tensor\Dims() = *Attribute\SparseDims()
+  Next
+  *Tensor\Raw\Data = *Buffer : *Tensor\Raw\Bytes = Elements * Width
+  ProcedureReturn #True
+
+  PmcDensifyShape:
+  ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value's indices are neither [NNZ] nor [NNZ, rank].")
+EndProcedure
+
 Procedure.i PmcLowerConstant(*Graph.PmoOnnxGraph, *Node.PmoOnnxNode)
   Protected Name.s
   Protected *Attribute.PmoOnnxAttribute
@@ -292,10 +448,29 @@ Procedure.i PmcLowerConstant(*Graph.PmoOnnxGraph, *Node.PmoOnnxNode)
       ForEach *Attribute\Integers()
         AddElement(*Tensor\Int64Data()) : *Tensor\Int64Data() = *Attribute\Integers()
       Next
+    Case "sparse_value"
+      If PmcDensify(*Node, *Attribute, *Tensor) = 0 : ProcedureReturn #False : EndIf
+      *Tensor\Name = Name
+    Case "value_string", "value_strings"
+      ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute " + *Attribute\Name + " holds text; this compiler carries no STRING tensors.")
     Default
-      ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute " + *Attribute\Name + " is not implemented: string and sparse constants are not carried by this compiler.")
+      ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute " + *Attribute\Name + " is not one of value, sparse_value, value_float, value_floats, value_int or value_ints.")
   EndSelect
   ProcedureReturn #True
+EndProcedure
+
+; The fixed-shape path's Constant lowering (the runtime-dimension path lowers
+; in PmcResolveGraph): every top-level ai.onnx Constant node becomes the
+; initializer it names, before anything is planned. "" or the refusal.
+Procedure.s PmcLowerFixedConstants(*Graph.PmoOnnxGraph)
+  PmcError = ""
+  ForEach *Graph\Nodes()
+    If *Graph\Nodes()\Operation = "Constant" And (*Graph\Nodes()\Domain = "" Or *Graph\Nodes()\Domain = "ai.onnx")
+      If PmcLowerConstant(*Graph, @*Graph\Nodes()) = 0 : ProcedureReturn PmcError : EndIf
+      DeleteElement(*Graph\Nodes())
+    EndIf
+  Next
+  ProcedureReturn ""
 EndProcedure
 
 Procedure.s PmcUniqueName(Base.s, Map Taken.i())

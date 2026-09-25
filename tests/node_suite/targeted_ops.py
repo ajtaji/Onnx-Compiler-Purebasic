@@ -78,10 +78,12 @@ R20_REFUSED = {"r20_test_gru_batchwise": "attribute layout = 1 (batch first) is 
 
 class Case:
     def __init__(self, name, nodes, inputs, outputs, feeds, initializers=(), opset=20, dynamic=True, fixed=True,
-                 refuse=None, symbolic_axes=(0,), oracle=None):
+                 refuse=None, symbolic_axes=(0,), oracle=None, infer=True):
         self.name, self.nodes, self.inputs, self.outputs, self.feeds = name, nodes, inputs, outputs, feeds
         self.initializers, self.opset, self.dynamic, self.fixed, self.refuse = list(initializers), opset, dynamic, fixed, refuse
-        self.symbolic_axes, self.oracle = symbolic_axes, oracle
+        # infer=False: the intermediates carry no value_info, as in a
+        # function-expanded graph
+        self.symbolic_axes, self.oracle, self.infer = symbolic_axes, oracle, infer
 
 
 def model_for(case: Case, symbolic: bool) -> onnx.ModelProto:
@@ -95,7 +97,7 @@ def model_for(case: Case, symbolic: bool) -> onnx.ModelProto:
     g = helper.make_graph(case.nodes, case.name, ins, outs, case.initializers)
     m = helper.make_model(g, opset_imports=[helper.make_opsetid("", case.opset)])
     m.ir_version = 8
-    if len(case.nodes) > 1 and not symbolic:
+    if len(case.nodes) > 1 and not symbolic and case.infer:
         # the intermediate values' shapes, as an exporter writes them
         m = onnx.shape_inference.infer_shapes(m)
     return m
@@ -944,7 +946,7 @@ def cases() -> list[Case]:
                   [("x", F, [6, 3])], [("y", F, [None, 3])], {"x": f32(6, 3)},
                   [init("l", np.array([1, 2, 2, 1], np.int64)), init("p", np.array(-3, np.int64))], opset=11))
     c.append(Case("refuse_unique_int16", [N("Unique", ["x"], ["y"])], [("x", TensorProto.INT16, [5])], [("y", TensorProto.INT16, [None])],
-                  {"x": np.array([3, 1, 3, 2, 1], np.int16)}, opset=11, refuse="implements Unique for FLOAT, UINT8, INT8, INT32, INT64 and BOOL"))
+                  {"x": np.array([3, 1, 3, 2, 1], np.int16)}, opset=11, refuse="Graph input 'x' has element type INT16 (5); runtime-dimension emission binds"))
     # Scan and SequenceMap between tensors, so every target runs the Loop
     # they are rewritten into (the reference implements neither form here)
     sb = helper.make_graph([N("Add", ["acc", "a"], ["acc2"]), N("Mul", ["a", "b"], ["prod"]), N("Identity", ["acc2"], ["run"])], "scan_body",
@@ -1086,6 +1088,68 @@ def cases() -> list[Case]:
     c.append(Case("refuse_linearattention_rule", [N("LinearAttention", ["q", "k", "v"], ["y", "s"], q_num_heads=2, kv_num_heads=2, update_rule="rwkv")],
                   [("q", F, [1, 2, 6]), ("k", F, [1, 2, 6]), ("v", F, [1, 2, 4])], [("y", F, [1, 2, 4]), ("s", F, [1, 2, 3, 2])],
                   {"q": f32(1, 2, 6), "k": f32(1, 2, 6), "v": f32(1, 2, 4)}, opset=27, refuse="linear, gated, delta and gated_delta"))
+    # Constant on both paths, every value form (Constant-13), sparse_value
+    # checked against onnxruntime (the reference evaluator returns it sparse)
+    cx = f32(2, 3)
+    for name, attrs in (("value", {"value": numpy_helper.from_array(f32(2, 3), "v")}), ("value_float", {"value_float": 2.5}),
+                        ("value_floats", {"value_floats": [1.0, -2.0, 3.5]})):
+        c.append(Case("constant_%s" % name, [N("Constant", [], ["k"], **attrs), N("Add", ["x", "k"], ["y"])], [("x", F, [2, 3])],
+                      [("y", F, [2, 3])], {"x": cx}, opset=13))
+    for name, attrs in (("value_int", {"value_int": 3}), ("value_ints", {"value_ints": [1, -2, 7]})):
+        c.append(Case("constant_%s" % name, [N("Constant", [], ["k"], **attrs), N("Add", ["x", "k"], ["y"])], [("x", I64, [2, 3])],
+                      [("y", I64, [2, 3])], {"x": np.arange(6, dtype=np.int64).reshape(2, 3)}, opset=13))
+    c.append(Case("constant_bool", [N("Constant", [], ["k"], value=helper.make_tensor("v", B, [2, 3], [1, 0, 1, 0, 0, 1])),
+                                    N("And", ["x", "k"], ["y"])], [("x", B, [2, 3])], [("y", B, [2, 3])],
+                  {"x": np.array([[True, True, False], [True, False, True]])}, opset=13))
+    c.append(Case("constant_feeds_shape", [N("Constant", [], ["s"], value_ints=[3, 2]), N("Reshape", ["x", "s"], ["y"])], [("x", F, [2, 3])],
+                  [("y", F, [3, 2])], {"x": cx}, opset=13))
+    for name, idx in (("linear", np.array([1, 4], np.int64)), ("coordinates", np.array([[0, 1], [1, 2]], np.int64))):
+        sp = helper.make_sparse_tensor(numpy_helper.from_array(np.array([5.0, -6.0], np.float32), "v"), numpy_helper.from_array(idx, "i"), [2, 3])
+        c.append(Case("constant_sparse_%s" % name, [N("Constant", [], ["k"], sparse_value=sp), N("Add", ["x", "k"], ["y"])],
+                      [("x", F, [2, 3])], [("y", F, [2, 3])], {"x": cx}, opset=13, oracle="ort"))
+    sp = helper.make_sparse_tensor(numpy_helper.from_array(np.array([2, 9], np.int64), "v"), numpy_helper.from_array(np.array([0, 5], np.int64), "i"), [6])
+    c.append(Case("constant_sparse_int64", [N("Constant", [], ["k"], sparse_value=sp), N("Add", ["x", "k"], ["y"])],
+                  [("x", I64, [6])], [("y", I64, [6])], {"x": np.arange(6, dtype=np.int64)}, opset=13, oracle="ort"))
+    c.append(Case("refuse_constant_string", [N("Constant", [], ["k"], value_string="text"), N("Identity", ["x"], ["y"])], [("x", F, [2])],
+                  [("y", F, [2])], {"x": f32(2)}, opset=13, refuse="attribute value_string holds text"))
+    # a graph whose intermediates carry no value_info (as a function-expanded
+    # one): the runtime-dimension path computes it
+    c.append(Case("undeclared_intermediates", [N("Shape", ["x"], ["s"]), N("Constant", [], ["i"], value_ints=[1]), N("Gather", ["s", "i"], ["g"]),
+                                               N("Cast", ["g"], ["gf"], to=F), N("Mul", ["x", "gf"], ["m"]), N("Relu", ["m"], ["y"])],
+                  [("x", F, [2, 3])], [("y", F, [2, 3])], {"x": cx}, opset=13, infer=False))
+    # Where whose condition is larger than X and Y (forum 993)
+    for name, cs, xs, ys in (("cond_higher_rank", [2, 3, 4], [4], [3, 4]), ("cond_wider", [2, 3, 4], [2, 1, 4], [1, 1, 4]),
+                             ("each_widens", [1, 3, 1], [2, 1, 1], [1, 1, 4])):
+        c.append(Case("where_%s" % name, [N("Where", ["c", "x", "y"], ["z"])], [("c", B, cs), ("x", F, xs), ("y", F, ys)],
+                      [("z", F, [2, 3, 4])], {"c": RNG.uniform(size=cs) > 0.5, "x": f32(*xs), "y": f32(*ys)}, opset=16))
+    # Relu, Flatten, LessOrEqual and BatchNormalization on both paths
+    rx = f32(2, 3, 4)
+    c.append(Case("relu", [N("Relu", ["x"], ["y"])], [("x", F, [2, 3, 4])], [("y", F, [2, 3, 4])], {"x": rx}, opset=14))
+    for axis in (0, 1, 2, 3, -1):
+        fa = axis if axis >= 0 else axis + 3
+        c.append(Case("flatten_axis%s" % str(axis).replace("-", "m"), [N("Flatten", ["x"], ["y"], axis=axis)], [("x", F, [2, 3, 4])],
+                      [("y", F, [int(np.prod([2, 3, 4][:fa])), int(np.prod([2, 3, 4][fa:]))])], {"x": rx}, opset=13))
+    c.append(Case("flatten_int64_opset9", [N("Flatten", ["x"], ["y"])], [("x", I64, [2, 3, 2])], [("y", I64, [2, 6])],
+                  {"x": np.arange(12, dtype=np.int64).reshape(2, 3, 2)}, opset=9))
+    c.append(Case("lessorequal_broadcast", [N("LessOrEqual", ["a", "b"], ["y"])], [("a", F, [2, 3]), ("b", F, [3])], [("y", B, [2, 3])],
+                  {"a": np.array([[0, 1, 2], [3, np.nan, -1]], np.float32), "b": np.array([1, 1, -1], np.float32)}, opset=16))
+    c.append(Case("lessorequal_int64", [N("LessOrEqual", ["a", "b"], ["y"])], [("a", I64, [4]), ("b", I64, [4])], [("y", B, [4])],
+                  {"a": np.array([1, 2, 3, -4], np.int64), "b": np.array([2, 2, 2, -4], np.int64)}, opset=12))
+    bx = f32(2, 3, 2, 2)
+    bn_in = [init("s", f32(3)), init("bb", f32(3)), init("mu", f32(3)), init("var", np.abs(f32(3)) + 0.5)]
+    c.append(Case("batchnorm_inference", [N("BatchNormalization", ["x", "s", "bb", "mu", "var"], ["y"], epsilon=1e-3)],
+                  [("x", F, [2, 3, 2, 2])], [("y", F, [2, 3, 2, 2])], {"x": bx}, bn_in, opset=15))
+    c.append(Case("batchnorm_opset9", [N("BatchNormalization", ["x", "s", "bb", "mu", "var"], ["y"])],
+                  [("x", F, [2, 3, 2, 2])], [("y", F, [2, 3, 2, 2])], {"x": bx}, bn_in, opset=9, oracle="ort"))
+    c.append(Case("batchnorm_training", [N("BatchNormalization", ["x", "s", "bb", "mu", "var"], ["y", "rm", "rv"], training_mode=1, momentum=0.8)],
+                  [("x", F, [2, 3, 2, 2])], [("y", F, [2, 3, 2, 2]), ("rm", F, [3]), ("rv", F, [3])], {"x": bx}, bn_in, opset=15))
+    # Neg and Abs of integers (the runtime-dimension path runs the lane's
+    # integer kernel for an input declared INT32 or INT64)
+    for op, dt, et in (("Neg", np.int64, I64), ("Abs", np.int64, I64), ("Neg", np.int32, I32), ("Abs", np.int32, I32)):
+        xv = np.array([[3, -4, 0], [np.iinfo(np.int32).min + 1, 7, -9]], dt)
+        c.append(Case("%s_%s" % (op.lower(), np.dtype(dt).name), [N(op, ["x"], ["y"])], [("x", et, [2, 3])], [("y", et, [2, 3])], {"x": xv}, opset=13))
+    c.append(Case("refuse_input_float16_runtime", [N("Abs", ["x"], ["y"])], [("x", TensorProto.FLOAT16, [3])], [("y", TensorProto.FLOAT16, [3])],
+                  {"x": np.ones(3, np.float16)}, opset=20, fixed=False, refuse="Graph input 'x' has element type FLOAT16 (10); runtime-dimension emission binds"))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

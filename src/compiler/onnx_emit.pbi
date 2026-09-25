@@ -1090,6 +1090,12 @@ Procedure.i PmoEmitNode(File.i, *Ir.PmoIrModel, *Profile.PmoTargetProfile,
     Else
       PmoEmitLine(File, "  PmTensor" + Op + "(" + In(0) + ", " + Out(0) + ", " + Str(Count) + ")")
     EndIf
+  ElseIf PmoOpsIntegerUnary(*Ir, *Node)
+    ; Neg and Abs of INT32 and INT64 (forum 994): the lane's integer kernel
+    *A = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+    PmoEmitLine(File, "  PmOpStatus = 0")
+    PmoEmitLine(File, "  PmOpUnary(" + In(0) + ", " + Out(0) + ", " + Str(Count) + ", " + Str(PmoOpsIntegerUnary(*Ir, *Node)) + ", " + Str(*A\ElementType) + ")")
+    PmoEmitLine(File, "  If PmOpStatus <> 0 : PmOnnxRuntimeOk = 0 : EndIf")
   ElseIf Op = "Exp" Or Op = "Log" Or Op = "Sqrt" Or Op = "Abs" Or Op = "Neg"
     Select Op
       Case "Exp" : Axis = 0
@@ -1544,7 +1550,7 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
   ; The operator-set kernels, one source for every target, only where a node
   ; uses them, so every other model's source is unchanged by them.
   ForEach *Ir\Nodes()
-    If PmoOpsOwns(*Ir\Nodes()\Node\Operation) Or *Ir\Nodes()\Node\Operation = "Multinomial"
+    If PmoOpsOwns(*Ir\Nodes()\Node\Operation) Or *Ir\Nodes()\Node\Operation = "Multinomial" Or PmoOpsIntegerUnary(*Ir, *Ir\Nodes()\Node)
       RandomInclude = RuntimeInclude : If RandomInclude = "" : RandomInclude = *Profile\TensorInclude : EndIf
       PmoEmitLine(File, "#PMO_OPS_INT32 = " + Str(Bool(*Profile\NativeIntegerBytes = 4)))
       PmoEmitLine(File, "XIncludeFile " + Chr(34) + GetPathPart(RandomInclude) + "tensor_ops.pmi" + Chr(34))

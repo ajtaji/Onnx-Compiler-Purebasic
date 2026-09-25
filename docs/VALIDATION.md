@@ -970,6 +970,32 @@ operators onnx defines only above opset 20.
 | Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `b26ea37` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images byte-identical; the 16 runtime-dimension sources for the Pi 4 and the Pico build; no support file differs |
 | Kokoro-82M FP32 for Windows | source, pack and support files byte-identical |
 
+## Constant on both paths, function-expanded graphs, and the runtime-dimension gaps — September 24, 2026
+
+The node-test results showed four gaps in forms the compiler accepts
+elsewhere, and three wrong answers. Each wrong answer was filed in the
+forum's ONNX bugs area before it was fixed.
+
+| Change | What it does |
+|---|---|
+| Constant on the fixed-shape path | Every top-level `Constant` node becomes the initializer it names before anything is planned, as the runtime-dimension path already did: `value`, `value_float`, `value_floats`, `value_int`, `value_ints`, and now `sparse_value` on both paths. The reader keeps the SparseTensorProto, and the lowering writes it out densely: zero everywhere except at its indices, which may be `[NNZ]` linear positions or `[NNZ, rank]` coordinates. An index outside the shape is refused. `value_string` and `value_strings` are refused by name. |
+| Function-expanded graphs | A graph whose node outputs carry no declared type and shape, such as the intermediates of an expanded function, is computed by the runtime-dimension path, which works shapes out as the program runs. Before, the fixed-shape path refused it ("folded tensor ... has no graph value" or "has no concrete type/shape"), so no model that compiled before takes a different path now. A value declared with a named extent still gets the fixed-shape refusal ("still has a dynamic extent"), as `--shape` documents, and a model compiled with `--trace-input` keeps its traced shapes. |
+| Relu, Flatten, BatchNormalization and LessOrEqual on the runtime-dimension path | These four were the only operators the fixed-shape path accepts and the runtime-dimension emitter lacked. Relu and BatchNormalization run the fixed-shape path's own kernels (`PmTensorRelu`, `PmTensorBatchNorm`, `PmTensorBatchNormTraining`), and Flatten is a sized copy. They are wrappers in `runtime/tensor_dynamic_ops.pmi`, included only when a node uses them. BatchNormalization covers opsets 9 to 15, with training mode and its running statistics from 14. LessOrEqual is a new variadic-kernel code (12): its output is BOOL, and it is false whenever either FLOAT side is NaN. |
+| Runtime-dimension input types | A graph input whose element type the runtime-dimension runtime does not bind (FLOAT16, DOUBLE, INT16, the unsigned types above 8 bits and others) is refused when the model is compiled, naming the input and its type. Before, the program was generated and then failed when it received its first request. |
+| Where, forum 993 | On the runtime-dimension path the output is now sized by broadcasting the condition, X and Y together, as Where-16 requires. It had been sized from X and Y alone, so a condition with more dimensions, or larger ones, failed at run time. The fix changes only `DWhere` in `runtime/tensor_dynamic_portable.pmi` and `runtime/tensor_dynamic_windows.pbi`. |
+| Neg and Abs of integers, forum 994 | On the fixed-shape path, Neg and Abs of INT64 ran the FLOAT kernel on integer bits and gave wrong values, and INT32 was refused. On the runtime-dimension path both failed at run time. Both paths now run the operator-set lane's integer kernel (`PmOpUnary` codes 29 and 30), which wraps as two's complement, like numpy's int32 and int64. On the Pico targets an INT64 result outside INT32 trips the INT64 range check. |
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 597 cases - the 589 before; LessOrEqual on FLOAT (NaN on either side, signed zeros, infinities, ties), INT32, INT64 and INT64 beyond 32 bits; Neg and Abs of INT32 and INT64 including INT32's most negative value | Windows, Pi 4, Pico and Pico 2: 597 of 597 bit-identical to the definition; `--mutants` 70 of 70 caught (two new: LessOrEqual made strict, and Abs that negates) |
+| `runtime_mutants.py` (new, beside the kernel check): the runtime-dimension support files with a planted defect, rebuilt into the CLI and run through the cases that cover it | 2 of 2 caught: `DWhere` sized from X and Y alone, planted in the Windows runtime and caught by the Windows cases, and planted in the portable runtime and caught by the Pi 4, Pico and Pico 2 cases |
+| `tests/node_suite/targeted_ops.py`: 990 cases - the 927 before; every Constant value form on both paths, including sparse with linear and coordinate indices and an INT64 one (sparse checked against ONNX Runtime; the reference evaluator returns it still sparse); `value_string` refused; a graph with no value_info on its intermediates; Where with a condition of higher rank, a wider condition, and each input widening one axis; Relu; Flatten at every axis and on INT64 at opset 9; LessOrEqual with NaN and broadcasting, and on INT64; BatchNormalization at opset 15, at opset 9 (checked against ONNX Runtime; the reference evaluator's BatchNormalization-9 disagrees with it) and in training mode; Neg and Abs of INT32 and INT64; a FLOAT16 input refused on the runtime-dimension path | 990 of 990 as expected. Of the re-imported official cases, 141 pass, against 139 before: the two function-expanded ones without intermediate shapes now take the runtime-dimension path. `refuse_unique_int16` is now refused one step earlier, for its INT16 graph input |
+| `ops_targets_gate.py`: the new builds on the Pi 4, Pico and Pico 2 in unicorn | 60 builds, 180 runs. 156 are bit-identical to the Windows program. The 18 BatchNormalization runs pass the node-suite tolerance but do not match the Windows bits: both paths run the fixed-shape runtime's own kernel, and the host compiler keeps its intermediates wider than binary32. The gate now lists such cases by name (`TOLERANCE_ONLY`) and still requires the tolerance. 6 INT64 Constant forms are refused on the Pico and Pico 2, as the INT64 contract requires |
+| `tests/node_suite/pi4_control_gate.py` (Constant lowering and opset floors are shared with control flow) | 29 of 41, the same with this change as with the previous compiler. The other 12 are refusal cases, refused by both compilers with the same sentences |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 952 of 1,750 before, 1,219 after, with PASS_SHAPE going from 1 to 2 (test_bernoulli_seed_expanded). Of the 267 new passes, 266 are function-expanded cases, among them every expanded Attention, CausalConvWithState, LayerNormalization, RMSNormalization and NLLLoss case whose inputs are FLOAT. The other is a model with a Constant node. Ten cases that failed at run time are now refused when compiled, for their FLOAT16, BFLOAT16 or DOUBLE inputs on the runtime-dimension path; RUN_ERROR goes from 18 to 8. No case that passed fails |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `2c8bf02` | 80 of 80 emitted sources, packs and manifests and 32 of 32 fixed-shape images are byte-identical, and the 16 runtime-dimension sources for the Pi 4 and the Pico build. The only support files that differ are `tensor_dynamic_portable.pmi` and `tensor_dynamic_windows.pbi`, each in one hunk inside `DWhere` (`@@ -1706,21 +1706,40 @@` and `@@ -711,13 +711,22 @@`). Both CLIs were built from CRLF trees |
+| Kokoro-82M, FP32 and INT8, for Windows | FP32 and INT8: the source, the pack and every support file are byte-identical, except `tensor_dynamic_windows.pbi`, which differs only inside `DWhere` (`@@ -711,13 +711,22 @@`) |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.
@@ -978,7 +1004,9 @@ operators onnx defines only above opset 20.
   definition it implements through its ceiling, opset 27 at most
   ([opsets 21 to 27](#opsets-21-to-27--september-24-2026)); see
   [control flow and sequences](#control-flow-and-sequences--september-16-2026).
-  No accepted form is currently known to compute a wrong answer; see
+  One accepted form is known to compute a wrong answer: Equal, Greater and
+  GreaterOrEqual with a NaN operand answer true on both paths (forum 995,
+  the next change); see
   [node-test coverage](#node-test-coverage--september-16-2026).
 - Windows x64 is the verified host. Linux/macOS hosting, other PureBasic
   versions, and alternate PureBasic backends are not certified by this export.

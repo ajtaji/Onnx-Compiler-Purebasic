@@ -93,6 +93,18 @@ Procedure.i PmoOpsGraphUses(*Graph.PmoOnnxGraph)
   ProcedureReturn #False
 EndProcedure
 
+; Neg-13 and Abs-13 of an INT32 or INT64 tensor (forum 994): the lane's
+; integer kernel, PmOpUnary codes 29 and 30. 0 for any other node or type.
+Procedure.i PmoOpsIntegerUnary(*Ir.PmoIrModel, *Node.PmoOnnxNode)
+  Protected *X.PmoIrValue
+  If *Node\Operation <> "Neg" And *Node\Operation <> "Abs" : ProcedureReturn 0 : EndIf
+  *X = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  If *X = 0 : ProcedureReturn 0 : EndIf
+  If *X\ElementType <> 6 And *X\ElementType <> 7 : ProcedureReturn 0 : EndIf
+  If *Node\Operation = "Neg" : ProcedureReturn 29 : EndIf
+  ProcedureReturn 30
+EndProcedure
+
 ; Codes shared by both paths.
 Procedure.i PmoOpsUnaryCode(*Node.PmoOnnxNode)
   Select *Node\Operation

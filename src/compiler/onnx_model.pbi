@@ -74,6 +74,12 @@ Structure PmoOnnxAttribute
   List Floats.f()
   List Integers.q()
   List Strings.s()
+  ; A SPARSE_TENSOR attribute (Constant's sparse_value): its values, its
+  ; indices and the dense shape, as the SparseTensorProto holds them.
+  HasSparse.i
+  SparseValues.PmoOnnxTensor
+  SparseIndices.PmoOnnxTensor
+  List SparseDims.q()
 EndStructure
 
 Structure PmoOnnxNode
@@ -473,6 +479,7 @@ Procedure.i PmoOnnxParseAttribute(*Cursor.PmoWireCursor, *Attribute.PmoOnnxAttri
   Protected Bits.Long
   Protected Slice.PmoWireSlice
   Protected Sub.PmoWireCursor
+  Protected Inner.PmoWireCursor
   Protected Text.String
   While PmoWireRemaining(*Cursor) > 0
     If PmoWireReadKey(*Cursor, @Field, @Wire) = 0 : ProcedureReturn #False : EndIf
@@ -512,6 +519,36 @@ Procedure.i PmoOnnxParseAttribute(*Cursor.PmoWireCursor, *Attribute.PmoOnnxAttri
         EndIf
         *Attribute\Graph = PmoOnnxParseGraphAddress(@Sub)
         If *Attribute\Graph = 0 : ProcedureReturn #False : EndIf
+      Case 22 ; sparse_tensor - SparseTensorProto: values 1, indices 2, dims 3
+        If PmoWireRequire(*Cursor, Field\i, 2, Wire\i) = 0 Or PmoWireReadSubmessage(*Cursor, @Sub) = 0
+          ProcedureReturn #False
+        EndIf
+        *Attribute\HasSparse = #True
+        While PmoWireRemaining(@Sub) > 0
+          If PmoWireReadKey(@Sub, @Field, @Wire) = 0 : ProcedureReturn #False : EndIf
+          Select Field\i
+            Case 1, 2
+              If PmoWireRequire(@Sub, Field\i, 2, Wire\i) = 0 Or PmoWireReadSubmessage(@Sub, @Inner) = 0
+                ProcedureReturn #False
+              EndIf
+              If Field\i = 1
+                If PmoOnnxParseTensor(@Inner, @*Attribute\SparseValues) = 0 : ProcedureReturn #False : EndIf
+              Else
+                If PmoOnnxParseTensor(@Inner, @*Attribute\SparseIndices) = 0 : ProcedureReturn #False : EndIf
+              EndIf
+            Case 3
+              If Wire\i = 2
+                If PmoOnnxParsePackedVarints(@Sub, *Attribute\SparseDims()) = 0 : ProcedureReturn #False : EndIf
+              ElseIf Wire\i = 0
+                If PmoWireReadVarint(@Sub, @Number) = 0 : ProcedureReturn #False : EndIf
+                AddElement(*Attribute\SparseDims()) : *Attribute\SparseDims() = Number\q
+              Else
+                ProcedureReturn PmoWireFail("SparseTensorProto dims has the wrong wire type")
+              EndIf
+            Default
+              If PmoWireSkip(@Sub, Wire\i) = 0 : ProcedureReturn #False : EndIf
+          EndSelect
+        Wend
       Case 11 ; graphs - a LIST of subgraphs; no operator this reader accepts uses one
         ProcedureReturn PmoWireFail("AttributeProto graphs (a list of subgraphs) is not supported")
       Case 7 ; floats, normally packed fixed32

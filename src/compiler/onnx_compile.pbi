@@ -8,6 +8,7 @@
 Global PmoCompileError.s
 Global PmoDynamicError.s
 Declare.i PmoDynamicCommand(ModelPath.s)
+Declare.s PmcLowerFixedConstants(*Graph.PmoOnnxGraph)
 Declare.i PmdExportTargetRuntime(Folder.s,TargetIndex.i,Random.i=0,Ops.i=0)
 
 ; Decide BEFORE tracing: a sample execution may discover dimensions, but may
@@ -71,6 +72,33 @@ Procedure.s PmoCompileRuntimeDimensions(*Model.PmoOnnxModel)
     If Op = "Shape" Or Op = "Size" : Known = 1 : EndIf
     ForEach *Model\Graph\Nodes()\Outputs()
       Constants(*Model\Graph\Nodes()\Outputs()) = Known
+    Next
+  Next
+  ProcedureReturn ""
+EndProcedure
+
+; The fixed-shape path plans every value from its declared type and shape.
+; A node output the graph does not declare at all (the intermediates of a
+; function-expanded graph, which carry no value_info) is computed by the
+; runtime-dimension path, which learns shapes as the program runs. A value
+; declared with a named extent is not moved: the fixed-shape path refuses it by
+; name ("still has a dynamic extent"), as --shape documents. A Constant's output
+; needs no declaration: it becomes an initializer. "" when every value is declared.
+Procedure.s PmoCompileUndeclaredValue(*Model.PmoOnnxModel)
+  NewMap Declared.i()
+  ForEach *Model\Graph\Initializers() : Declared(*Model\Graph\Initializers()\Name) = 1 : Next
+  ForEach *Model\Graph\Values()
+    If *Model\Graph\Values()\HasTensorType And *Model\Graph\Values()\HasShape : Declared(*Model\Graph\Values()\Name) = 1 : EndIf
+  Next
+  ForEach *Model\Graph\Outputs()
+    If *Model\Graph\Outputs()\HasTensorType And *Model\Graph\Outputs()\HasShape : Declared(*Model\Graph\Outputs()\Name) = 1 : EndIf
+  Next
+  ForEach *Model\Graph\Nodes()
+    If *Model\Graph\Nodes()\Operation = "Constant" : Continue : EndIf
+    ForEach *Model\Graph\Nodes()\Outputs()
+      If *Model\Graph\Nodes()\Outputs() <> "" And FindMapElement(Declared(), *Model\Graph\Nodes()\Outputs()) = 0
+        ProcedureReturn "value " + *Model\Graph\Nodes()\Outputs() + " has no declared type and shape"
+      EndIf
     Next
   Next
   ProcedureReturn ""
@@ -458,7 +486,7 @@ Procedure.i PmoCompileValidate(*Ir.PmoIrModel)
       ; operators that only rename
       If *Value\ElementType <> 1 And *Value\ElementType <> 7 And *Value\ElementType <> 9 And
          Not ((*Value\ElementType = 2 Or *Value\ElementType = 3 Or *Value\ElementType = 6) And
-              FindString("|QuantizeLinear|DequantizeLinear|DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|Cast|Bernoulli|Multinomial|CumProd|BitCast|TensorScatter|Identity|Reshape|Flatten|Squeeze|Unsqueeze|", "|" + *Ir\Nodes()\Node\Operation + "|"))
+              FindString("|QuantizeLinear|DequantizeLinear|DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|Cast|Bernoulli|Multinomial|CumProd|BitCast|TensorScatter|Identity|Reshape|Flatten|Squeeze|Unsqueeze|Neg|Abs|", "|" + *Ir\Nodes()\Node\Operation + "|"))
         ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " output " + Name + " uses unsupported runtime type " + Str(*Value\ElementType))
       EndIf
       Produced(Name) = #True
@@ -470,6 +498,16 @@ Procedure.i PmoCompileValidate(*Ir.PmoIrModel)
     EndIf
   Next
   ProcedureReturn #True
+EndProcedure
+
+; Whether the fixed-shape program runs the operator-set kernels: an operator
+; the lane owns, or Neg and Abs of an integer tensor (forum 994).
+Procedure.i PmoCompileOpsUsed(*Model.PmoOnnxModel, *Ir.PmoIrModel)
+  If PmoOpsGraphUses(@*Model\Graph) : ProcedureReturn #True : EndIf
+  ForEach *Ir\Nodes()
+    If PmoOpsIntegerUnary(*Ir, *Ir\Nodes()\Node) : ProcedureReturn #True : EndIf
+  Next
+  ProcedureReturn #False
 EndProcedure
 
 Procedure.i PmoCompileAddCheckpoints(*Ir.PmoIrModel, List Requested.s())
@@ -952,11 +990,15 @@ Procedure.i PmoCompileCommand(ModelPath.s)
     Goto PmoCompileCommandFailed
   EndIf
   RuntimeReason = PmoCompileRuntimeDimensions(@Model)
+  ; A traced model gets its shapes from the trace (--trace-input).
+  If RuntimeReason = "" And ListSize(Specs()) = 0 : RuntimeReason = PmoCompileUndeclaredValue(@Model) : EndIf
   If RuntimeReason <> "" Or SpeechUi Or KokoroText
     PmoOnnxFree(@Model)
     If PmoDynamicCommand(ModelPath) = 0 : ProcedureReturn PmoCompileFail(PmoDynamicError) : EndIf
     ProcedureReturn #True
   EndIf
+  RuntimeReason = PmcLowerFixedConstants(@Model\Graph)
+  If RuntimeReason <> "" : PmoCompileFail(RuntimeReason) : Goto PmoCompileCommandFailed : EndIf
   PmoCompileNameAbsentOutputs(@Model, #True)
   PmoCompileRewriteCastLike(@Model)
   ; The attribute forms both paths share (onnx_forms.pbi): an attribute value
@@ -1006,7 +1048,7 @@ Procedure.i PmoCompileCommand(ModelPath.s)
       PmoCompileFail("external-memory address plan overflowed") : Goto PmoCompileCommandFailed
     EndIf
   EndIf
-  If PmdExportTargetRuntime(OutputPrefix+".runtime/",TargetIndex,Bool(RandomInputs=0 And PmoRandomCount(@Model)>0),PmoOpsGraphUses(@Model\Graph))=0 : PmoCompileFail(PmoDynamicError) : Goto PmoCompileCommandFailed : EndIf
+  If PmdExportTargetRuntime(OutputPrefix+".runtime/",TargetIndex,Bool(RandomInputs=0 And PmoRandomCount(@Model)>0),PmoCompileOpsUsed(@Model, @Ir))=0 : PmoCompileFail(PmoDynamicError) : Goto PmoCompileCommandFailed : EndIf
   CopyStructure(@PmoTargets(TargetIndex),@EmitProfile,PmoTargetProfile)
   If EmitProfile\SourceDialect = #PMO_SOURCE_HOST
     RuntimeInclude = GetFilePart(OutputPrefix)+".runtime/tensor_fp32_windows.pbi"

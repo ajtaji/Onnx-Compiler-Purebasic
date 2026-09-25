@@ -1525,7 +1525,7 @@ Procedure PmOpUnary(src.i, dst.i, count.i, op.i, kind.i)
     ProcedureReturn
   EndIf
   If kind <> 1
-    If op <> 3 And op <> 27
+    If op <> 3 And op <> 27 And op <> 29 And op <> 30
       PmOpStatus = 2
       ProcedureReturn
     EndIf
@@ -1536,6 +1536,13 @@ Procedure PmOpUnary(src.i, dst.i, count.i, op.i, kind.i)
         PokeL(dst + i * 8 + 4, PeekL(src + i * 8 + 4) ! $FFFFFFFF)
       ElseIf op = 27
         PokeL(dst + i * 4, PeekL(src + i * 4) ! $FFFFFFFF)
+      ElseIf op = 29 Or op = 30
+        ; Neg-13 and Abs-13 of INT32 and INT64
+        v = PmOpReadInt(src, i, kind)
+        If op = 29 Or v < 0
+          v = PmOpMulI(v, -1, kind)
+        EndIf
+        PmOpWriteInt(dst, i, kind, v)
       Else
         v = PmOpReadInt(src, i, kind)
         If v > 0
@@ -1625,6 +1632,9 @@ EndProcedure
 ;   op 7 Xor   BOOL
 ;   op 8 PRelu x > 0: x, else x * slope (ONNX Runtime's form); in0 is X
 ;   op 9, 10, 11  BitwiseAnd-18, BitwiseOr-18, BitwiseXor-18 (INT32, INT64)
+;   op 12 LessOrEqual-16 (two; FLOAT, INT32, INT64): BOOL out, and false
+;         when either FLOAT side is NaN (IEEE 754's ordered comparison,
+;         which not every host compiler's <= gives)
 ; A zero divisor in an integer Mod sets PmOpStatus = 4.
 ; ----------------------------------------------------------------------
 ; a + b as IEEE 754 defines it where the host compiler does not: a NaN
@@ -1782,7 +1792,23 @@ Procedure PmOpVariadic(dst.i, n.i, rank.i, op.i, kind.i)
   nf = n
   i = 0
   While i < count
-    If kind = 1
+    If op = 12
+      ia = 0
+      If kind = 1
+        fa = PmTensorGet(PmOpAddr(0), PmOpOffset(0))
+        fb = PmTensorGet(PmOpAddr(1), PmOpOffset(1))
+        If PmOpIsNan(fa) = 0 And PmOpIsNan(fb) = 0
+          If fa <= fb
+            ia = 1
+          EndIf
+        EndIf
+      Else
+        If PmOpReadInt(PmOpAddr(0), PmOpOffset(0), kind) <= PmOpReadInt(PmOpAddr(1), PmOpOffset(1), kind)
+          ia = 1
+        EndIf
+      EndIf
+      PmOpWriteInt(dst, i, 9, ia)
+    ElseIf kind = 1
       fa = PmTensorGet(PmOpAddr(0), PmOpOffset(0))
       k = 1
       While k < n

@@ -11,9 +11,46 @@
 ; PmoOpsFloor's (the path accepts opsets 11 to 20).
 ; ============================================================================
 
+; Operators the fixed-shape path emits itself and the runtime-dimension path
+; lowers through this lane (runtime/tensor_dynamic_ops.pmi).
+Procedure.i PmdOpsExtraOwns(Operation.s)
+  ProcedureReturn Bool(Operation = "Relu" Or Operation = "Flatten" Or Operation = "BatchNormalization" Or Operation = "LessOrEqual")
+EndProcedure
+
+; Neg and Abs of an input declared INT32 or INT64 (an initializer, a lowered
+; Constant, a graph input or a value_info): the lane's integer kernel.
+Procedure.i PmdOpsIntegerUnary(*Node.PmoOnnxNode)
+  Protected Kind.i
+  If *Node\Operation <> "Neg" And *Node\Operation <> "Abs" : ProcedureReturn 0 : EndIf
+  Kind = PmdNsDeclaredType(PmoEmitInput(*Node, 0))
+  If Kind <> 6 And Kind <> 7 : ProcedureReturn 0 : EndIf
+  If *Node\Operation = "Neg" : ProcedureReturn 29 : EndIf
+  ProcedureReturn 30
+EndProcedure
+
+; Whether a runtime-dimension model needs the lane's kernels and wrappers.
+Procedure.i PmdOpsGraphUses(*Graph.PmoOnnxGraph)
+  Protected *Sub.PmoOnnxGraph
+  If *Graph = 0 : ProcedureReturn #False : EndIf
+  If PmoOpsGraphUses(*Graph) : ProcedureReturn #True : EndIf
+  ForEach *Graph\Nodes()
+    If PmdOpsExtraOwns(*Graph\Nodes()\Operation) Or PmdOpsIntegerUnary(@*Graph\Nodes()) : ProcedureReturn #True : EndIf
+    ForEach *Graph\Nodes()\Attributes()
+      *Sub = *Graph\Nodes()\Attributes()\Graph
+      If *Sub And PmdOpsGraphUses(*Sub) : ProcedureReturn #True : EndIf
+    Next
+  Next
+  ProcedureReturn #False
+EndProcedure
+
 Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
   Protected Op.s = *Node\Operation
   Select Op
+    Case "Relu", "LessOrEqual" : ProcedureReturn "|"
+    Case "Flatten" : ProcedureReturn "|axis|"
+    Case "BatchNormalization"
+      If Opset >= 14 : ProcedureReturn "|epsilon|momentum|training_mode|" : EndIf
+      ProcedureReturn "|epsilon|momentum|"
     Case "Mod" : ProcedureReturn "|fmod|"
     Case "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp"
       If Opset >= 18 : ProcedureReturn "|keepdims|noop_with_empty_axes|" : EndIf
@@ -241,6 +278,32 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "B", "|6|7|") : EndIf
       Case "Upsample"
         Reason = "Upsample is implemented by fixed-shape emission only - declared extents and a constant scales input, opset 7 to 9 (from 10 it is deprecated for Resize)."
+      Case "Relu" : Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
+      Case "LessOrEqual"
+        Reason = PmdNsTypeReason(*Node, 0, "A", "|1|6|7|")
+        If Reason = "" And PmdNsInputPresent(*Node, 1) = 0 : Reason = "input B is required." : EndIf
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "B", "|1|6|7|") : EndIf
+      Case "Flatten" : Reason = PmdNsTypeReason(*Node, 0, "input", "|1|2|3|6|7|9|")
+      Case "BatchNormalization"
+        Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
+        For k = 1 To 4
+          If Reason = "" And PmdNsInputPresent(*Node, k) = 0 : Reason = "input " + StringField("scale|B|input_mean|input_var", k, "|") + " is required." : EndIf
+          If Reason = "" : Reason = PmdNsTypeReason(*Node, k, StringField("scale|B|input_mean|input_var", k, "|"), "|1|") : EndIf
+        Next
+        n = PmoEmitAttrI(*Node, "training_mode", 0)
+        If Reason = "" And n <> 0 And n <> 1 : Reason = "training_mode = " + Str(n) + " is not 0 or 1." : EndIf
+        If Reason = "" And PmoEmitOutput(*Node, 0) = "" : Reason = "output Y is required." : EndIf
+        If Reason = "" And PmdNsOpset < 14
+          For k = 1 To 4
+            If Reason = "" And PmoEmitOutput(*Node, k) <> ""
+              Reason = "output " + Str(k) + " (" + PmoEmitOutput(*Node, k) + ") is one of BatchNormalization-9's training statistics, which runtime-dimension emission does not compute; name Y only."
+            EndIf
+          Next
+        ElseIf Reason = "" And n = 0 And (PmoEmitOutput(*Node, 1) <> "" Or PmoEmitOutput(*Node, 2) <> "")
+          Reason = "training_mode = 0 names running_mean or running_var; the specification makes those outputs invalid outside training mode."
+        ElseIf Reason = "" And ListSize(*Node\Outputs()) > 3
+          Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; BatchNormalization has one to three (Y, running_mean, running_var)."
+        EndIf
       Case "GroupNormalization"
         Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
         If Reason = "" And PmoEmitNsAttributePresent(*Node, "num_groups") = 0 : Reason = "attribute num_groups is required." : EndIf
@@ -453,6 +516,8 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         If ListSize(*Node\Outputs()) < 1 Or ListSize(*Node\Outputs()) > 4 Or PmdNsNamedOutputs(*Node) < 1
           Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; Unique has one to four (Y, indices, inverse_indices, counts)."
         EndIf
+      Case "BatchNormalization"
+        ; its outputs were checked with its form above
       Case "MaxPool", "Dropout", "RNN", "GRU", "SoftmaxCrossEntropyLoss"
         If ListSize(*Node\Outputs()) < 1 Or ListSize(*Node\Outputs()) > 2
           Reason = "it declares " + Str(ListSize(*Node\Outputs())) + " outputs; " + Op + " has one or two."
@@ -479,6 +544,16 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
   NewList Lines.s()
   For i = 0 To 7 : a(i) = PmdNsId(Ids(), PmoEmitInput(*Node, i)) : Next
   Select Op
+    Case "Relu"
+      Call = "DOpRelu(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + ")"
+    Case "LessOrEqual"
+      Call = "PmOpN(0)=" + a(0) + " : PmOpN(1)=" + a(1) + " : DOpVariadic(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + ",2,12,7)"
+    Case "Flatten"
+      Call = "DOpFlatten(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + Str(PmoEmitAttrI(*Node, "axis", 1)) + ")"
+    Case "BatchNormalization"
+      Call = "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "epsilon", 0.00001)) + ") : PmOpSetBits(@PmOpF(1)," + PmoOpsBits(PmoEmitAttrF(*Node, "momentum", 0.9)) + ") : " +
+             "DOpBatchNorm(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 1)) + "," + PmdNsId(Ids(), PmoEmitOutput(*Node, 2)) + "," +
+             a(0) + "," + a(1) + "," + a(2) + "," + a(3) + "," + a(4) + "," + Str(Bool(PmdNsOpset >= 14 And PmoEmitAttrI(*Node, "training_mode", 0) = 1)) + ")"
     Case "RMSNormalization"
       Call = "PmOpSetBits(@PmOpF(0)," + PmoOpsBits(PmoEmitAttrF(*Node, "epsilon", 0.00001)) + ") : DOpRmsNorm(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," +
              Str(PmoEmitAttrI(*Node, "axis", -1)) + ")"

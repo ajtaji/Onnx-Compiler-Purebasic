@@ -82,6 +82,11 @@ Procedure DOpUnary(Y.i, A.i, Op.i)
       DFail("BitwiseNot computes INT32 and INT64 tensors only.")
       ProcedureReturn
     EndIf
+  ElseIf Op = 29 Or Op = 30
+    If DOpKindOk(kind, 6) = 0
+      DFail("Neg and Abs were compiled for an INT32 or INT64 input and met another element type.")
+      ProcedureReturn
+    EndIf
   ElseIf kind <> 1
     DFail("This elementwise operator computes FLOAT tensors only.")
     ProcedureReturn
@@ -172,7 +177,12 @@ Procedure DOpVariadic(Y.i, N.i, Op.i, Allowed.i)
     PmOpDY(d) = e
     d = d + 1
   Wend
-  If DAlloc(Y, kind, rank, @dims(0)) = 0
+  ; LessOrEqual (op 12) writes BOOL
+  e = kind
+  If Op = 12
+    e = 9
+  EndIf
+  If DAlloc(Y, e, rank, @dims(0)) = 0
     ProcedureReturn
   EndIf
   k = 0
@@ -3483,4 +3493,110 @@ Procedure DOpLinearAttention(Y.i, PS.i, Q.i, K.i, V.i, Past.i, Decay.i, Beta.i, 
   PmOpI(10) = HasScale
   PmOpLinearAttention(Dt(Q)\Data, Dt(K)\Data, Dt(V)\Data, DOpDataOrZero(Past), DOpDataOrZero(Decay), DOpDataOrZero(Beta), state, scratch + n * 4, Dt(Y)\Data)
   DNsScratchFree(scratch, bytes)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Relu, Flatten and BatchNormalization on the runtime-dimension path. The
+; element work is the fixed-shape path's own kernels (PmTensorRelu,
+; PmTensorBatchNorm, PmTensorBatchNormTraining), so both paths compute the
+; same bits; these wrappers only check and size.
+; ----------------------------------------------------------------------
+Global DOpBn.PmTensorBatchNormArgs
+
+Procedure DOpRelu(Y.i, A.i)
+  If A = 0
+    DFail("Relu requires an input.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind <> 1
+    DFail("Relu takes a FLOAT input.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, A, 0) = 0
+    ProcedureReturn
+  EndIf
+  PmTensorRelu(Dt(A)\Data, Dt(Y)\Data, Dt(Y)\Count)
+EndProcedure
+
+; Flatten-13: [d0 * ... * d(axis-1), d(axis) * ... * d(r-1)], axis in [-r, r].
+Procedure DOpFlatten(Y.i, A.i, Axis.i)
+  Protected Dim dims.i(8)
+  Protected r.i
+  Protected ax.i
+  If A = 0
+    DFail("Flatten requires an input.")
+    ProcedureReturn
+  EndIf
+  r = Dt(A)\Rank
+  ax = Axis
+  If ax < 0
+    ax = ax + r
+  EndIf
+  If ax < 0 Or ax > r
+    DFail("Flatten axis is outside [-r, r] for its input's rank r.")
+    ProcedureReturn
+  EndIf
+  If DOpKindWidth(Dt(A)\Kind) = 0
+    DFail("Flatten takes FLOAT, UINT8, INT8, INT32, INT64 or BOOL input.")
+    ProcedureReturn
+  EndIf
+  dims(0) = DProduct(A, 0, ax - 1)
+  dims(1) = DProduct(A, ax, r - 1)
+  If DAlloc(Y, Dt(A)\Kind, 2, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpCopyBytes(Dt(A)\Data, Dt(Y)\Data, Dt(A)\Count * DOpKindWidth(Dt(A)\Kind))
+EndProcedure
+
+; BatchNormalization-9/14/15. PmOpF(0) is epsilon, PmOpF(1) momentum. With
+; Training (training_mode = 1) the batch's own statistics normalise X and the
+; running statistics RM and RV (0 when not named) are written.
+Procedure DOpBatchNorm(Y.i, RM.i, RV.i, X.i, S.i, B.i, M.i, V.i, Training.i)
+  Protected c.i
+  If X = 0 Or S = 0 Or B = 0 Or M = 0 Or V = 0
+    DFail("BatchNormalization requires X, scale, B, input_mean and input_var.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Kind <> 1 Or Dt(S)\Kind <> 1 Or Dt(B)\Kind <> 1 Or Dt(M)\Kind <> 1 Or Dt(V)\Kind <> 1 Or Dt(X)\Rank < 2
+    DFail("BatchNormalization takes FLOAT X (N x C x D1 ... Dn) and FLOAT scale, B, input_mean and input_var.")
+    ProcedureReturn
+  EndIf
+  c = DOpDim(X, 1)
+  If Dt(S)\Count <> c Or Dt(B)\Count <> c Or Dt(M)\Count <> c Or Dt(V)\Count <> c
+    DFail("BatchNormalization scale, B, input_mean and input_var hold one value per channel.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y, X, 0) = 0
+    ProcedureReturn
+  EndIf
+  DOpBn\Src = Dt(X)\Data
+  DOpBn\Scale = Dt(S)\Data
+  DOpBn\Bias = Dt(B)\Data
+  DOpBn\Mean = Dt(M)\Data
+  DOpBn\Variance = Dt(V)\Data
+  DOpBn\Dst = Dt(Y)\Data
+  DOpBn\N = DOpDim(X, 0)
+  DOpBn\C = c
+  DOpBn\Spatial = DProduct(X, 2, Dt(X)\Rank - 1)
+  DOpBn\Epsilon = PmOpF(0)
+  DOpBn\Momentum = PmOpF(1)
+  DOpBn\RunningMean = 0
+  DOpBn\RunningVariance = 0
+  If Training = 0
+    PmTensorBatchNorm(@DOpBn)
+    ProcedureReturn
+  EndIf
+  If RM <> 0
+    If DLike(RM, M, 0) = 0
+      ProcedureReturn
+    EndIf
+    DOpBn\RunningMean = Dt(RM)\Data
+  EndIf
+  If RV <> 0
+    If DLike(RV, V, 0) = 0
+      ProcedureReturn
+    EndIf
+    DOpBn\RunningVariance = Dt(RV)\Data
+  EndIf
+  PmTensorBatchNormTraining(@DOpBn)
 EndProcedure

@@ -244,7 +244,7 @@ Procedure.i PmdValidate(*Node.PmoOnnxNode)
   If PmdNsOwns(op)
     ProcedureReturn PmdNsValidate(*Node)
   EndIf
-  If PmoOpsOwns(op)
+  If PmoOpsOwns(op) Or PmdOpsExtraOwns(op)
     ProcedureReturn PmdOpsValidate(*Node)
   EndIf
   If PmoFormOwns(op)
@@ -325,6 +325,7 @@ Procedure.s PmdCall(*Node.PmoOnnxNode, Map Ids.i())
         Case "LeakyRelu":i=12
       EndSelect
       call="DUnary("+y(0)+","+a(0)+","+Str(i)+","+PmoEmitFloat(PmoEmitAttrF(*Node,"alpha",0.01))+")"
+      If PmdOpsIntegerUnary(*Node) : call="DOpUnary("+y(0)+","+a(0)+","+Str(PmdOpsIntegerUnary(*Node))+")" : EndIf
     Case "Cast"
       call="DCast("+y(0)+","+a(0)+","+Str(PmoEmitAttrI(*Node,"to",1))+")"
     Case "Shape"
@@ -458,7 +459,7 @@ Procedure.s PmdCall(*Node.PmoOnnxNode, Map Ids.i())
     Case "STFT"
       call="DStft("+y(0)+","+a(0)+","+a(1)+","+a(2)+","+a(3)+","+Str(PmoEmitAttrI(*Node,"onesided",1))+")"
     Default
-      If PmoOpsOwns(op)
+      If PmoOpsOwns(op) Or PmdOpsExtraOwns(op)
         call=PmdOpsCall(*Node,Ids())
       Else
         PmoDynamicError="Reusable source emission does not yet support "+op+"."
@@ -574,6 +575,9 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
     If model\Graph\Inputs()\ValueKind<>#PMO_VALUE_SEQUENCE And (model\Graph\Inputs()\HasShape=0 Or ListSize(model\Graph\Inputs()\Dims())>8)
       PmoDynamicError="Runtime-dimension inputs require a declared rank of at most eight. Check the model's input shape metadata." : Goto Failed
     EndIf
+    If model\Graph\Inputs()\ValueKind=#PMO_VALUE_TENSOR And FindString("|1|2|3|6|7|9|","|"+Str(model\Graph\Inputs()\ElementType)+"|")=0
+      PmoDynamicError="Graph input '"+model\Graph\Inputs()\Name+"' has element type "+PmdNsTypeName(model\Graph\Inputs()\ElementType)+" ("+Str(model\Graph\Inputs()\ElementType)+"); runtime-dimension emission binds FLOAT, UINT8, INT8, INT32, INT64 and BOOL inputs." : Goto Failed
+    EndIf
     If FindMapElement(ids(),model\Graph\Inputs()\Name)=0 : id+1 : ids(model\Graph\Inputs()\Name)=id : EndIf
   Next
   ForEach model\Graph\Nodes()
@@ -653,7 +657,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   If RenameFile(pending,prefix+".pmw")=0 : PmoDynamicError="Cannot publish packed weights." : Goto Failed : EndIf
   pending=""
   hash=LCase(FileFingerprint(prefix+".pmw",#PB_Cipher_SHA2,256))
-  If PmdExportRuntime(prefix+".runtime\",Bool(speech Or kokoroText),targetIndex,Bool(randomCount>0),PmoOpsGraphUses(@model\Graph))=0 : Goto Failed : EndIf
+  If PmdExportRuntime(prefix+".runtime\",Bool(speech Or kokoroText),targetIndex,Bool(randomCount>0),PmdOpsGraphUses(@model\Graph))=0 : Goto Failed : EndIf
   If PmcExportRuntime(prefix+".runtime\")=0 : Goto Failed : EndIf
   sourcePath=prefix+PmoTargets(targetIndex)\SourceSuffix
   file=CreateFile(#PB_Any,sourcePath)
@@ -695,7 +699,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
     EndIf
   EndIf
   ; The operator-set kernels and their wrappers, only where a node uses them.
-  If PmoOpsGraphUses(@model\Graph)
+  If PmdOpsGraphUses(@model\Graph)
     PmdLine(file,"#PMO_OPS_INT32 = "+Str(Bool(PmdPortable And PmoTargets(targetIndex)\NativeIntegerBytes=4)))
     PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_ops.pmi"+Chr(34))
     If PmdPortable
