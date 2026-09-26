@@ -1470,6 +1470,104 @@ Every support-file procedure this change touches (the emitted source does not ch
 | `tensor_trig_a64.pmi` | `PmTensorTrigA64` | changed |
 
 
+## The same bits on every target, fourth stage: Sigmoid, Tanh, Softmax and LayerNormalization — September 26, 2026
+
+The last of the four stages. Sigmoid, Tanh, Softmax and LayerNormalization
+are composites, not single functions, so they have no one correctly rounded
+answer; instead each is now **one binary32 formula on every target**: each
+operation rounded once and the same way everywhere, with the correctly
+rounded Exp of the second stage. The Windows
+program and the Pi 4, Pico and Pico 2 now give the same bits.
+
+- Sigmoid: x >= 0: 1 / (1 + e^-x); x < 0: e^x / (1 + e^x). Within 2.4 units
+  in the last place of the exact value on every argument.
+- Tanh: |x| < 2^-12: x (tanh x rounds to x there; the old (e - 1)/(e + 1)
+  gave 0 for a subnormal, now fixed); |x| > 10: ±1; otherwise the binary32
+  nearest (e - 1)/(e + 1), e = e^2|x| rounded to binary32, with the sign of
+  x. e - 1 and e + 1 are exact, so the quotient is rounded once: one binary64
+  division on Windows and the Pi 4, and exact long division on the Pico and
+  Pico 2. The old formula's accuracy is kept: within 4.9e-8 of tanh
+  everywhere, which near 2^-12 is up to about 1,000 units in the last place
+  (the rounding of e).
+- Softmax: each difference from the row's maximum rounded to binary32, then
+  the correctly rounded Exp; the sum in order; one division.
+- LayerNormalization: the mean, the variance, the square root (correctly
+  rounded, first stage), the reciprocal and the affine map, one operation
+  per statement. The Windows program had evaluated `variance + v * v` and
+  `1 / sqrt(variance / n + epsilon)` as one binary64 expression each.
+
+The LSTM's own gate activations are not these operators and are not
+changed: they keep their kernels (and Kokoro's LSTM its bits and its speed).
+
+**Checked on every argument.** Sigmoid and Tanh: every one of the 2^32
+binary32 arguments through the Windows kernels, in place too, hashed in
+4,096 blocks; the Pi 4's and Pico 2's builds of the runtime in the emulator
+against those hashes, every argument; the Pico's every 16th block and every
+block of special values or edges. The Pico 2's Tanh quotient is an estimate
+by the FPU's division corrected by the exact remainder, and the Pico's is
+long division, so matching the hashes shows the Windows program's binary64
+quotient is the correctly rounded one too. Softmax and LayerNormalization:
+the target gate.
+
+**Where the rule said no.** The Pi 4's runtime-dimension path computes
+Sigmoid and Tanh four lanes at a time in 14 and 15 instructions an element;
+the shared formula with the correctly rounded Exp costs over ten times that.
+Under the speed rule it keeps its vector kernels, held to the tolerance and
+named in `TOLERANCE_ONLY` (for the Pi 4 only). Every other path computes the
+formula.
+
+**Speed.** Every changed kernel is faster than before or within the rule on every
+target. Instructions for the whole request in unicorn (8,192 elements;
+Softmax, the 576-element specials case):
+
+| Kernel | Pi 4 | Pico | Pico 2 |
+|---|---|---|---|
+| Sigmoid | 7,006,573 → 4,538,965 (−35%) | 36,256,732 → 17,296,744 (−52%) | 4,025,845 → 3,128,621 (−22%) |
+| Tanh | 6,424,380 → 4,492,768 (−30%) | 32,511,683 → 15,335,598 (−53%) | 3,753,311 → 3,393,935 (−9.6%) |
+| Softmax | 1,479,321 → 526,143 (−64%) | 2,297,360 → 1,295,970 (−44%) | 404,913 → 347,203 (−14%) |
+| LayerNormalization | 6,212,297 → 6,278,089 (+1.1%) | 12,625,081 → 12,657,945 (+0.3%) | 3,730,305 → 3,763,169 (+0.9%) |
+
+On Windows, 8M normally distributed elements (σ 0.3, 1 and 3), best of
+nine: Sigmoid 97–101 → 74–77 ms (−24%), Tanh 63–66 → 54–56 ms (−15%),
+Softmax 67–68 → 69–71 ms, LayerNormalization 83–86 → 86–90 ms. Kokoro-82M
+on Windows, two runs of 15 requests each, old and new interleaved: FP32
+1,290.5 → 1,285.9 and 1,254.4 → 1,257.2 ms median, INT8 1,035.2 → 1,009.8
+and 997.5 → 998.2 - no measurable change. Its output against ONNX Runtime
+(FP32): the log-mel distance 0.294 → 0.293 dB for FP32 and 0.588 → 0.589
+dB for INT8, no duration changes.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: the 604 cases | Windows (both branches), Pi 4, Pico and Pico 2: 604 of 604 bit-identical to the definition; `--mutants` 72 of 72 caught |
+| `runtime_mutants.py`: the 44 before (the Windows Tanh guard now reached through the LSTM, the only caller of `PmTensorTanhValue`), and eight new: Sigmoid's and Softmax's operations fused on Windows, Tanh of a subnormal on the targets, Tanh's quotient in binary32 on Windows and on the Pi 4, the Pico 2's rounding, the Pico's remainder, and LayerNormalization's difference and product fused on Windows | 52 of 52 as required |
+| `tests/node_suite/targeted_ops.py`: 1,085 cases - the 1,075 before; Sigmoid, Tanh, Softmax and LayerNormalization on the special values, subnormals, the edges of Tanh's pieces and wide rows of mixed magnitude, and an LSTM with a NaN, on both paths | 1,085 of 1,085 as expected; `targeted_defaults`, `targeted_norm_small`, `targeted_control`, `targeted_optional_outputs` 148, 132, 41 and 14 as expected |
+| `ops_targets_gate.py`: those cases, the NaN, comparison, BatchNormalization, Clip, Floor, Round and Tanh cases, on the Pi 4, Pico and Pico 2 | 133 builds, 399 runs: 391 bit-identical to the Windows program; 8 within the tolerance and named in `TOLERANCE_ONLY` - Atan where the speed rule keeps the fast one (the Pico 2's four, the Pi 4's four-lane kernel's one) and the Pi 4's four-lane Sigmoid and Tanh (three). Sigmoid left the list everywhere else |
+| `pi4_control_gate.py` | 29 of 41, as before |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,239 both |
+| Models that use none of these operators' new code (four models, fp32/fp16/bf16/int4, five targets), this change against `da2b6e0` | All 80 emitted sources, packs and manifests byte-identical; 16 of 32 fixed-shape images byte-identical, the other 16 (Pico and Pico 2) differ only by the Softmax and LayerNormalization kernels they link; the four models' Windows outputs and all 30 outputs of their Pi 4, Pico and Pico 2 programs byte-identical |
+| Kokoro-82M, FP32 and INT8, for Windows | Source and pack byte-identical; `tensor_fp32_windows.pbi` differs; the output changes (its Sigmoid, Tanh, Softmax and LayerNormalization) |
+
+Output bits that change: Sigmoid, Tanh, Softmax and LayerNormalization on
+every target where the old evaluation differed - on Windows, the binary64
+evaluation of the old formulas; on the Pi 4, Pico and Pico 2, the maths
+libraries' Exp - and Tanh of a subnormal, now itself.
+
+Every support-file procedure this change touches (the emitted source changes only by the `#PMO_USE_EXPLOG` line, now 1 for a graph with Sigmoid, Tanh or Softmax):
+
+| Support file | Procedure | |
+|---|---|---|
+| `tensor_fp32.pmi` | `PmTensorLayerNorm` | changed |
+| `tensor_fp32.pmi` | `PmTensorSigmoid` | changed |
+| `tensor_fp32.pmi` | `PmTensorSigmoidF` | added |
+| `tensor_fp32.pmi` | `PmTensorSoftmaxLast` | changed |
+| `tensor_fp32.pmi` | `PmTensorTanh` | changed |
+| `tensor_fp32.pmi` | `PmTensorTanhF` | added |
+| `tensor_fp32.pmi` | `PmTensorTanhQuoBits` | added |
+| `tensor_fp32_windows.pbi` | `PmTensorLayerNormSerial` | changed |
+| `tensor_fp32_windows.pbi` | `PmTensorSigmoidSerial` | changed |
+| `tensor_fp32_windows.pbi` | `PmTensorSoftmaxLastSerial` | changed |
+| `tensor_fp32_windows.pbi` | `PmTensorTanhSerial` | changed |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.
@@ -1489,20 +1587,20 @@ Every support-file procedure this change touches (the emitted source does not ch
   (`#PMO_HOST_NAN_BUG`), so a program built with either is right and one
   built with 6.41 pays nothing for it. A kernel written with a plain
   comparison is wrong for NaN on Windows when built with an older compiler.
-- Some kernels of the base runtime (not of the operator-set lane) match the
-  Windows program on the Pi 4, Pico and Pico 2 within the node-suite
-  tolerance but not bit for bit. `ops_targets_gate.py` names each in
-  `TOLERANCE_ONLY` with its reason and still holds it to the tolerance
-  (a name may be limited to one target): Sigmoid, whose target libraries'
-  Exp misses the correctly rounded result on some arguments, until the last
-  stage of
-  [the same bits on every target](#the-same-bits-on-every-target-first-stage-square-root-abs-negate-and-batchnormalization--september-25-2026);
-  and, under the owner's speed rule (a correctly rounded function may cost a
-  target no more than about 10%), Atan on the Pico 2 and on the Pi 4's
-  runtime-dimension path, which keep their fast arctangents (within one or
-  two units in the last place; NaN `7FC00000`; Atan(-0) +0).
-  LayerNormalization, Softmax and the other composite kernels are not yet
-  covered by the target gate.
+- Under the owner's speed rule (a correctly rounded or shared formula may cost
+  a target no more than about 10% on a function), a few kernels keep their
+  fast versions and match the Windows program within the node-suite
+  tolerance but not bit for bit: Atan on the Pico 2 and on the Pi 4's
+  runtime-dimension path (within one or two units in the last place; NaN
+  `7FC00000`; Atan(-0) +0), and Sigmoid and Tanh on the Pi 4's
+  runtime-dimension path (its four-lane kernels). `ops_targets_gate.py` names
+  each in `TOLERANCE_ONLY`, for that target only, with its reason, and still
+  holds it to the tolerance; every other base-runtime kernel it runs gives
+  the Windows program's bits on every target
+  ([the same bits on every target](#the-same-bits-on-every-target-first-stage-square-root-abs-negate-and-batchnormalization--september-25-2026),
+  four stages). The LSTM's own gate activations are not these kernels and keep
+  their speed, so an LSTM matches the Windows program on the targets within
+  the tolerance, not bit for bit.
 - Windows x64 is the verified host. Linux/macOS hosting, other PureBasic
   versions, and alternate PureBasic backends are not certified by this export.
 - Five-target **generation** does not establish downstream bare-metal builds,

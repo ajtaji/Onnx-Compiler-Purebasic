@@ -3807,6 +3807,229 @@ Procedure PmTensorLeakyRelu(*src.i, *dst.i, count.i, alpha.f)
   Wend
 EndProcedure
 
+; Sigmoid and Tanh, the operators (C6c-4): one binary32 formula on every
+; target, each operation rounded once and the same way everywhere, with the
+; correctly rounded Exp, so the Windows program and the Pi 4, Pico and Pico 2
+; give the same bits. A NaN comes back quieted.
+;   Sigmoid: x >= 0: 1 / (1 + e^-x);  x < 0: e^x / (1 + e^x), one operation
+;   per statement.
+;   Tanh: |x| < 2^-12: x (tanh x rounds to x; the old (e - 1)/(e + 1) gave 0
+;   for a subnormal); |x| > 10: +-1; otherwise the binary32 nearest
+;   (e - 1) / (e + 1), e = e^2|x| rounded to binary32 (e - 1 and e + 1 are
+;   exact, so the quotient is rounded once); the sign of x.
+; The LSTM's activations (PmTensorSigmoidValue, PmTensorTanhValue) are not
+; these: they stay as they were.
+CompilerIf #PMO_USE_EXPLOG = 1
+; Tanh's quotient: the bits of e (1 < e < 2^29, a binary32) in, the bits of
+; the binary32 nearest (e - 1) / (e + 1) out (0 for e = 1). e - 1 and e + 1 are
+; exact in binary64 and in integers, so the quotient is rounded once: on the
+; Pi 4 by one binary64 division (53 bits, at least twice 24 + 2, so rounding it
+; again to binary32 is the same as rounding once, as the Windows program); on
+; the Pico 2 and the Pico by exact long division, 25 bits of the quotient and
+; the remainder, rounded to nearest-even.
+CompilerIf #PMO_INT8_BACKEND = 1
+Procedure.i PmTensorTanhQuoBits(eb.i)
+  ASM
+    fmov s0, w0
+    fcvt d0, s0
+    fmov d1, #1.0
+    fsub d2, d0, d1
+    fadd d1, d0, d1
+    fdiv d0, d2, d1
+    fcvt s0, d0
+    fmov w0, s0
+  EndASM
+EndProcedure
+CompilerElseIf #PMO_INT8_BACKEND = 3
+; The Cortex-M33: e = m 2^(k-23); n = e - 1 and d = e + 1 scaled to integers,
+; n shifted up to z places so that d <= n < 2d (the two CLZs written as their
+; encodings, which this assembler has no mnemonic for: clz r1, r3 = FAB3 F183;
+; clz r5, r4 = FAB4 F584). The FPU's binary32 division of the two gives Q
+; within 2 of n 2^23 / d; the exact remainder r = n 2^23 - Q d (UMULL) moves Q
+; until 0 <= r < d, and 2r against d rounds it to nearest-even.
+Procedure.i PmTensorTanhQuoBits(eb.i)
+  ASM
+    push {r5, r6}
+    ldr r1, =0x3F800000
+    cmp r0, r1
+    bls pmtq_zero
+    lsrs r1, r0, #23
+    subs r1, #127
+    lsls r2, r0, #9
+    lsrs r2, r2, #9
+    movs r3, #1
+    lsls r3, r3, #23
+    orrs r2, r3
+    cmp r1, #23
+    bgt pmtq_big
+    movs r3, #23
+    subs r3, r3, r1
+    movs r4, #1
+    lsls r4, r3
+    subs r3, r2, r4
+    adds r4, r2, r4
+    b pmtq_norm
+  pmtq_big:
+    subs r1, #23
+    lsls r2, r1
+    subs r3, r2, #1
+    adds r4, r2, #1
+  pmtq_norm:
+    .byte 179, 250, 131, 241
+    .byte 180, 250, 132, 245
+    subs r1, r1, r5
+    lsls r3, r1
+    cmp r3, r4
+    bhs pmtq_q
+    lsls r3, r3, #1
+    adds r1, #1
+  pmtq_q:
+    vmov s0, r3
+    vcvt.f32.u32 s0, s0
+    vmov s1, r4
+    vcvt.f32.u32 s1, s1
+    vdiv.f32 s0, s0, s1
+    vmov r2, s0
+    ldr r0, =0x3F000000
+    subs r2, r2, r0
+    lsrs r0, r3, #9
+    lsls r3, r3, #23
+    umull r5, r6, r2, r4
+    subs r3, r3, r5
+    sbcs r0, r6
+    movs r5, #0
+  pmtq_neg:
+    cmp r0, #0
+    bge pmtq_pos
+    subs r2, #1
+    adds r3, r3, r4
+    adcs r0, r5
+    b pmtq_neg
+  pmtq_pos:
+    cmp r3, r4
+    blo pmtq_rnd
+    subs r3, r3, r4
+    adds r2, #1
+    b pmtq_pos
+  pmtq_rnd:
+    lsls r3, r3, #1
+    cmp r3, r4
+    blo pmtq_pack
+    bhi pmtq_up
+    lsls r5, r2, #31
+    beq pmtq_pack
+  pmtq_up:
+    adds r2, #1
+  pmtq_pack:
+    movs r0, #127
+    subs r0, r0, r1
+    lsls r0, r0, #23
+    adds r0, r0, r2
+    movs r1, #1
+    lsls r1, r1, #23
+    subs r0, r0, r1
+    b pmtq_done
+  pmtq_zero:
+    movs r0, #0
+  pmtq_done:
+    pop {r5, r6}
+  EndASM
+EndProcedure
+CompilerElse
+; 32-bit words: long division, 25 bits of the quotient and the remainder.
+Procedure.l PmTensorTanhQuoBits(eb.l)
+  Protected k.l
+  Protected m.l
+  Protected n.l
+  Protected d.l
+  Protected q.l
+  Protected z.l
+  Protected i.l
+  If eb <= $3F800000
+    ProcedureReturn 0
+  EndIf
+  k = (eb >> 23) - 127
+  m = (eb & $7FFFFF) | $800000
+  If k <= 23
+    d = 1 << (23 - k)
+    n = m - d
+    d = m + d
+  Else
+    m = m << (k - 23)
+    n = m - 1
+    d = m + 1
+  EndIf
+  z = 127
+  While n < d
+    n = n << 1
+    z = z - 1
+  Wend
+  q = 0
+  i = 0
+  While i < 25
+    q = q << 1
+    If n >= d
+      n = n - d
+      q = q | 1
+    EndIf
+    n = n << 1
+    i = i + 1
+  Wend
+  i = q & 1
+  q = q >> 1
+  If i <> 0
+    If n <> 0 Or (q & 1) <> 0
+      q = q + 1
+    EndIf
+  EndIf
+  ProcedureReturn (z << 23) + q - $800000
+EndProcedure
+CompilerEndIf
+
+Procedure.f PmTensorSigmoidF(x.f)
+  Protected b.i
+  Protected e.f
+  Protected d.f
+  Protected y.f
+  b = PeekL(@x)
+  If (b & $7FFFFFFF) > $7F800000
+    PokeL(@y, b | $400000)
+    ProcedureReturn y
+  EndIf
+  If (b & $80000000) = 0
+    PokeL(@e, PmTensorExpBits(b | $80000000))
+    d = 1.0 + e
+    y = 1.0 / d
+  Else
+    PokeL(@e, PmTensorExpBits(b))
+    d = 1.0 + e
+    y = e / d
+  EndIf
+  ProcedureReturn y
+EndProcedure
+
+Procedure.f PmTensorTanhF(x.f)
+  Protected b.i
+  Protected a.i
+  Protected y.f
+  b = PeekL(@x)
+  a = b & $7FFFFFFF
+  If a > $7F800000
+    PokeL(@y, b | $400000)
+    ProcedureReturn y
+  EndIf
+  If a < $39800000
+    ProcedureReturn x
+  EndIf
+  If a > $41200000
+    PokeL(@y, (b & $80000000) | $3F800000)
+    ProcedureReturn y
+  EndIf
+  PokeL(@y, PmTensorTanhQuoBits(PmTensorExpBits(a + $800000)) | (b & $80000000))
+  ProcedureReturn y
+EndProcedure
+CompilerEndIf
+
 Procedure.f PmTensorSigmoidValue(value.f)
   Protected e.f
   If value >= 0.0
@@ -3833,7 +4056,11 @@ Procedure PmTensorSigmoid(*src.i, *dst.i, count.i)
   i = 0 : ps = *src : pd = *dst
   While i < count
     v = *ps.f
-    *pd.f = PmTensorSigmoidValue(v)
+    CompilerIf #PMO_USE_EXPLOG = 1
+      *pd.f = PmTensorSigmoidF(v)
+    CompilerElse
+      *pd.f = PmTensorSigmoidValue(v)
+    CompilerEndIf
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend
 EndProcedure
@@ -3846,7 +4073,11 @@ Procedure PmTensorTanh(*src.i, *dst.i, count.i)
   i = 0 : ps = *src : pd = *dst
   While i < count
     v = *ps.f
-    *pd.f = PmTensorTanhValue(v)
+    CompilerIf #PMO_USE_EXPLOG = 1
+      *pd.f = PmTensorTanhF(v)
+    CompilerElse
+      *pd.f = PmTensorTanhValue(v)
+    CompilerEndIf
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend
 EndProcedure
@@ -5783,7 +6014,13 @@ Procedure PmTensorSoftmaxLast(*src.i, *dst.i, outer.i, width.i)
     sum = 0.0
     j = 0
     While j < width
-      v = Exp(PmTensorGet(*src, base + j) - mx)
+      ; one binary32 difference, then the correctly rounded Exp (C6c-4)
+      v = PmTensorGet(*src, base + j) - mx
+      CompilerIf #PMO_USE_EXPLOG = 1
+        PokeL(@v, PmTensorExpBits(PeekL(@v)))
+      CompilerElse
+        v = Exp(v)
+      CompilerEndIf
       PmTensorPut(*dst, base + j, v)
       sum = sum + v
       j = j + 1
@@ -5951,15 +6188,21 @@ Procedure PmTensorLayerNorm(*g.PmTensorLayerNormArgs)
     j = 0
     While j < width
       v = PmTensorGet(*src, base + j) - mean
-      variance = variance + v * v
+      v = v * v
+      variance = variance + v
       j = j + 1
     Wend
-    inv = 1.0 / PmTensorSqrtF(variance / divisor + epsilon)
+    ; one binary32 operation per statement (C6c-4), as the Windows program
+    v = variance / divisor
+    v = v + epsilon
+    v = PmTensorSqrtF(v)
+    inv = 1.0 / v
     If *g\Mean <> 0 : PmTensorPut(*g\Mean, o, mean) : EndIf
     If *g\InvStdDev <> 0 : PmTensorPut(*g\InvStdDev, o, inv) : EndIf
     j = 0
     While j < width
-      v = (PmTensorGet(*src, base + j) - mean) * inv
+      v = PmTensorGet(*src, base + j) - mean
+      v = v * inv
       v = v * PmTensorGet(*scale, j)
       If *bias <> 0 : v = v + PmTensorGet(*bias, j) : EndIf
       PmTensorPut(*dst, base + j, v)

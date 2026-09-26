@@ -1261,6 +1261,39 @@ def cases() -> list[Case]:
             want = fn(x.astype(np.float64)).astype(np.float32)
         c.append(Case("%s_specials" % op.lower(), [N(op, ["x"], ["y"])], [("x", F, [x.size])], [("y", F, [x.size])],
                       {"x": x}, opset=13, oracle=("own", lambda feeds, w=want: [w])))
+    # Sigmoid, Tanh, Softmax and LayerNormalization as one binary32 formula on
+    # every target (C6c-4): the special values, subnormals (Tanh(x) = x there),
+    # the edges of Tanh's pieces (2^-12, 10), large arguments; Softmax and
+    # LayerNormalization over wide rows of mixed magnitude.
+    hard_act = np.array([0x00000001, 0x80000001, 0x007FFFFF, 0x39800000, 0x397FFFFF, 0xB9800000, 0x3F0CCCCD, 0x3F0CCCCC,
+                         0xBF0CCCCD, 0x41100000, 0x41100001, 0xC1100001, 0x41200000, 0xC2C80000, 0x42C80000, 0x3F800000,
+                         0xBF800000, 0x40000000, 0xC0000000, 0x3E800000, 0x41200001, 0xC1200001, 0x411FFFFF], np.uint32).view(np.float32)
+    rng_ac = np.random.default_rng(6464)  # its own stream: the cases after these keep their data
+    for op, fn in (("Sigmoid", lambda v: 1.0 / (1.0 + np.exp(-v))), ("Tanh", np.tanh)):
+        x = np.concatenate([spec[:24], hard_act, rng_ac.uniform(-12, 12, 40).astype(np.float32),
+                            rng_ac.uniform(-0.6, 0.6, 40).astype(np.float32)]).astype(np.float32)
+        with np.errstate(all="ignore"):
+            want = fn(x.astype(np.float64)).astype(np.float32)
+        c.append(Case("%s_specials" % op.lower(), [N(op, ["x"], ["y"])], [("x", F, [x.size])], [("y", F, [x.size])],
+                      {"x": x}, opset=13, oracle=("own", lambda feeds, w=want: [w])))
+    xs = (rng_ac.standard_normal((6, 96)) * np.array([[0.01], [1], [10], [40], [80], [3]])).astype(np.float32)
+    c.append(Case("softmax_specials", [N("Softmax", ["x"], ["y"], axis=-1)], [("x", F, [6, 96])], [("y", F, [6, 96])],
+                  {"x": xs}, opset=13, oracle="ref"))
+    xl = (rng_ac.standard_normal((6, 96)) * np.array([[0.001], [1], [100], [1e4], [3], [0.5]])).astype(np.float32)
+    gl = rng_ac.standard_normal(96).astype(np.float32)
+    bl = rng_ac.standard_normal(96).astype(np.float32)
+    c.append(Case("layernorm_specials", [N("LayerNormalization", ["x", "g", "b"], ["y"], axis=-1, epsilon=1e-5)],
+                  [("x", F, [6, 96]), ("g", F, [96]), ("b", F, [96])], [("y", F, [6, 96])],
+                  {"x": xl, "g": gl, "b": bl}, opset=17, oracle="ref"))
+    # the LSTM keeps its own activations (PmTensorSigmoidValue, PmTensorTanhValue);
+    # a NaN in one batch row's last step, the other row finite
+    lx = rng_ac.standard_normal((3, 2, 2)).astype(np.float32)
+    lx[2, 1, 0] = np.nan
+    lw = (rng_ac.standard_normal((1, 12, 2)) * 0.5).astype(np.float32)
+    lr = (rng_ac.standard_normal((1, 12, 3)) * 0.5).astype(np.float32)
+    c.append(Case("lstm_nan_guard", [N("LSTM", ["x", "w", "r"], ["y", "yh"], hidden_size=3)], [("x", F, [3, 2, 2])],
+                  [("y", F, [3, 1, 2, 3]), ("yh", F, [1, 2, 3])], {"x": lx},
+                  [numpy_helper.from_array(lw, "w"), numpy_helper.from_array(lr, "r")], opset=14, oracle="ref"))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

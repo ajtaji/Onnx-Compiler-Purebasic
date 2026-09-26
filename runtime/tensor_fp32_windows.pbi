@@ -305,15 +305,46 @@ Procedure.f PmTensorTanhValue(value.f)
   ProcedureReturn (e - 1.0) / (e + 1.0)
 EndProcedure
 
+; Sigmoid and Tanh, the operators (C6c-4): one binary32 formula on every
+; target, each operation rounded once and the same way everywhere, with the
+; correctly rounded Exp, so the Windows program and the Pi 4, Pico and Pico 2
+; give the same bits. A NaN comes back quieted.
+;   Sigmoid: x >= 0: 1 / (1 + e^-x);  x < 0: e^x / (1 + e^x), one operation
+;   per statement.
+;   Tanh: |x| < 2^-12: x (tanh x rounds to x; the old (e - 1)/(e + 1) gave 0
+;   for a subnormal); |x| > 10: +-1; otherwise the binary32 nearest
+;   (e - 1) / (e + 1), e = e^2|x| rounded to binary32 (e - 1 and e + 1 are
+;   exact, so the quotient is rounded once); the sign of x.
+; The LSTM's activations (PmTensorSigmoidValue, PmTensorTanhValue) are not
+; these: they stay as they were.
 Procedure PmTensorSigmoidSerial(*src, *dst, count.i)
   Protected i.i
   Protected ps.i
   Protected pd.i
-  Protected v.f
+  Protected b.l
+  Protected x.f
+  Protected n.f
+  Protected e.f
+  Protected d.f
+  Protected y.f
   i = 0 : ps = *src : pd = *dst
   While i < count
-    v = PeekF(ps)
-    PokeF(pd, PmTensorSigmoidValue(v))
+    b = PeekL(ps)
+    If (b & $7FFFFFFF) > $7F800000
+      PokeL(pd, b | $400000)
+    ElseIf (b & $80000000) = 0
+      PokeL(@n, b | $80000000)
+      e = Exp(n)
+      d = 1.0 + e
+      y = 1.0 / d
+      PokeF(pd, y)
+    Else
+      x = PeekF(ps)
+      e = Exp(x)
+      d = 1.0 + e
+      y = e / d
+      PokeF(pd, y)
+    EndIf
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend
 EndProcedure
@@ -322,11 +353,31 @@ Procedure PmTensorTanhSerial(*src, *dst, count.i)
   Protected i.i
   Protected ps.i
   Protected pd.i
-  Protected v.f
+  Protected b.l
+  Protected a.l
+  Protected t.f
+  Protected e.f
+  Protected y.f
   i = 0 : ps = *src : pd = *dst
   While i < count
-    v = PeekF(ps)
-    PokeF(pd, PmTensorTanhValue(v))
+    b = PeekL(ps)
+    a = b & $7FFFFFFF
+    If a < $39800000
+      PokeL(pd, b)
+    ElseIf a > $41200000
+      If a > $7F800000
+        PokeL(pd, b | $400000)
+      Else
+        PokeL(pd, (b & $80000000) | $3F800000)
+      EndIf
+    Else
+      ; e rounded to binary32; e - 1, e + 1 and their quotient in binary64
+      ; (exact, exact, and 53 bits, so the store rounds the quotient once)
+      PokeL(@t, a)
+      e = Exp(t + t)
+      y = (e - 1.0) / (e + 1.0)
+      PokeL(pd, PeekL(@y) | (b & $80000000))
+    EndIf
     ps = ps + 4 : pd = pd + 4 : i = i + 1
   Wend
 EndProcedure
@@ -1974,7 +2025,9 @@ Procedure PmTensorSoftmaxLastSerial(*src, *dst, outer.i, width.i)
     sum = 0.0
     j = 0
     While j < width
-      v = Exp(PmTensorGet(*src, base + j) - mx)
+      ; one binary32 difference, then Exp (correctly rounded) (C6c-4)
+      v = PmTensorGet(*src, base + j) - mx
+      v = Exp(v)
       PmTensorPut(*dst, base + j, v)
       sum = sum + v
       j = j + 1
@@ -2153,15 +2206,21 @@ Procedure PmTensorLayerNormSerial(*g.PmTensorLayerNormArgs)
     j = 0
     While j < width
       v = PmTensorGet(*src, base + j) - mean
-      variance = variance + v * v
+      v = v * v
+      variance = variance + v
       j = j + 1
     Wend
-    inv = 1.0 / Sqr(variance / divisor + epsilon)
+    ; one binary32 operation per statement (C6c-4): the targets' bits
+    v = variance / divisor
+    v = v + epsilon
+    v = Sqr(v)
+    inv = 1.0 / v
     If *g\Mean <> 0 : PmTensorPut(*g\Mean, o, mean) : EndIf
     If *g\InvStdDev <> 0 : PmTensorPut(*g\InvStdDev, o, inv) : EndIf
     j = 0
     While j < width
-      v = (PmTensorGet(*src, base + j) - mean) * inv
+      v = PmTensorGet(*src, base + j) - mean
+      v = v * inv
       v = v * PmTensorGet(*scale, j)
       If *bias <> 0 : v = v + PmTensorGet(*bias, j) : EndIf
       PmTensorPut(*dst, base + j, v)
