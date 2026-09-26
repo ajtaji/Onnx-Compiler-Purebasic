@@ -481,12 +481,16 @@ Procedure.i PmoCompileValidate(*Ir.PmoIrModel)
         ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " output " + Name + " has no concrete type/shape")
       EndIf
       *Value = *Ir\ValueByName()
+      ; BitShift of UINT16, UINT32 or UINT64 (C7): refused by name
+      If *Ir\Nodes()\Node\Operation = "BitShift" And (*Value\ElementType = 4 Or *Value\ElementType = 12 Or *Value\ElementType = 13)
+        ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " (BitShift): element type " + StringField("UINT16,UINT32,UINT64", 1 + Bool(*Value\ElementType = 12) + 2 * Bool(*Value\ElementType = 13), ",") + " is not implemented; BitShift is implemented for UINT8.")
+      EndIf
       ; UINT8, INT8 and INT32 values are produced by the quantized operators,
       ; by Cast, Bernoulli and Multinomial, and passed on unchanged by the
       ; operators that only rename
       If *Value\ElementType <> 1 And *Value\ElementType <> 7 And *Value\ElementType <> 9 And
          Not ((*Value\ElementType = 2 Or *Value\ElementType = 3 Or *Value\ElementType = 6) And
-              FindString("|QuantizeLinear|DequantizeLinear|DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|Cast|Bernoulli|Multinomial|CumProd|BitCast|TensorScatter|Identity|Reshape|Flatten|Squeeze|Unsqueeze|Neg|Abs|", "|" + *Ir\Nodes()\Node\Operation + "|"))
+              FindString("|QuantizeLinear|DequantizeLinear|DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|Cast|Bernoulli|Multinomial|CumProd|BitCast|TensorScatter|BitShift|Identity|Reshape|Flatten|Squeeze|Unsqueeze|Neg|Abs|", "|" + *Ir\Nodes()\Node\Operation + "|"))
         ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " output " + Name + " uses unsupported runtime type " + Str(*Value\ElementType))
       EndIf
       Produced(Name) = #True

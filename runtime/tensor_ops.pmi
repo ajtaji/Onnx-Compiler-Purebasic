@@ -1261,6 +1261,8 @@ Procedure PmOpWriteInt(address.i, index.i, kind.i, value.i)
     PmTensorPutI64(address, index, value)
   ElseIf kind = 6
     PokeL(address + index * 4, value)
+  ElseIf kind = 2 Or kind = 3
+    PokeA(address + index, value & 255)
   ElseIf value <> 0
     PokeA(address + index, 1)
   Else
@@ -1272,7 +1274,7 @@ Procedure.i PmOpKindBytes(kind.i)
   If kind = 7
     ProcedureReturn 8
   EndIf
-  If kind = 9
+  If kind = 9 Or kind = 2 Or kind = 3
     ProcedureReturn 1
   EndIf
   ProcedureReturn 4
@@ -1760,6 +1762,20 @@ Procedure.i PmOpIntFold(a.i, b.i, op.i, kind.i)
       ProcedureReturn a | b
     Case 11
       ProcedureReturn a ! b
+    Case 13
+      ; BitShift LEFT on UINT8: the bits shifted out of the byte are gone,
+      ; and a shift of 8 or more leaves 0 (numpy's left_shift)
+      If b < 0 Or b > 7
+        ProcedureReturn 0
+      EndIf
+      r = a << b
+      ProcedureReturn r & 255
+    Case 14
+      ; BitShift RIGHT on UINT8 (a is 0 to 255, so the shift is logical)
+      If b < 0 Or b > 7
+        ProcedureReturn 0
+      EndIf
+      ProcedureReturn a >> b
   EndSelect
   PmOpStatus = 2
   ProcedureReturn a
@@ -7282,5 +7298,130 @@ Procedure PmOpLinearAttention(q.i, k.i, v.i, past.i, decay.i, beta.i, state.i, r
       t = t + 1
     Wend
     b = b + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; TfIdfVectorizer-9 (C7). x INT32 or INT64 (kind 6 or 7), rows of width
+; elements; y FLOAT rows of outSize. table: the n-grams the compiler kept
+; (the pooled n-grams of length min to max, a repeated one at its last
+; index), as words: the count, then per n-gram its length n, its output
+; index and its n items as two words each (low, high). For every skip
+; distance d from 1 to skip + 1 and every start s, each n-gram of length n
+; at least the smallest counted (min, and 2 after the first distance when
+; min is 1: a unigram is counted once) that fits (s + (n - 1) d < width) and
+; equals x[s], x[s + d], ... is counted - which is what the reference's walk
+; of its n-gram trie counts, since a longer n-gram can only match where its
+; prefix does. Then TF (mode 0) keeps the counts, IDF (1) writes the weight
+; (or 1) where the count is not 0, TFIDF (2) multiplies by the weight (or
+; keeps the count), nw being the number of weights.
+; ----------------------------------------------------------------------
+Procedure.i PmOpTfIdfItem(x.i, index.i, kind.i, p.i)
+  Protected lo.i
+  Protected hi.i
+  If kind = 7
+    lo = PeekL(x + index * 8)
+    hi = PeekL(x + index * 8 + 4)
+  Else
+    lo = PeekL(x + index * 4)
+    hi = lo >> 31
+  EndIf
+  If lo = PeekL(p) And hi = PeekL(p + 4)
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure PmOpTfIdf(x.i, y.i, rows.i, width.i, kind.i, table.i, skip.i, minN.i, maxN.i, mode.i, outSize.i, weights.i, nw.i)
+  Protected total.i
+  Protected i.i
+  Protected r.i
+  Protected d.i
+  Protected s.i
+  Protected g.i
+  Protected n.i
+  Protected k.i
+  Protected p.i
+  Protected grams.i
+  Protected startN.i
+  Protected base.i
+  Protected hit.i
+  Protected more.i
+  Protected v.f
+  Protected w.f
+  total = rows * outSize
+  i = 0
+  While i < total
+    PmTensorPut(y, i, 0.0)
+    i = i + 1
+  Wend
+  grams = PeekL(table)
+  r = 0
+  While r < rows
+    base = r * width
+    startN = minN
+    more = 1
+    d = 1
+    While d <= skip + 1 And more = 1
+      s = 0
+      While s < width
+        If s + d * (startN - 1) >= width
+          s = width
+        Else
+          p = table + 4
+          g = 0
+          While g < grams
+            n = PeekL(p)
+            If n >= startN And s + d * (n - 1) < width
+              hit = 1
+              k = 0
+              While k < n And hit = 1
+                hit = PmOpTfIdfItem(x, base + s + k * d, kind, p + 8 + k * 8)
+                k = k + 1
+              Wend
+              If hit = 1
+                i = r * outSize + PeekL(p + 4)
+                v = PmTensorGet(y, i)
+                v = v + 1.0
+                PmTensorPut(y, i, v)
+              EndIf
+            EndIf
+            p = p + 8 + n * 8
+            g = g + 1
+          Wend
+          s = s + 1
+        EndIf
+      Wend
+      If startN = 1
+        startN = 2
+        If startN > maxN
+          more = 0
+        EndIf
+      EndIf
+      d = d + 1
+    Wend
+    r = r + 1
+  Wend
+  If mode = 0
+    ProcedureReturn
+  EndIf
+  i = 0
+  While i < total
+    v = PmTensorGet(y, i)
+    k = i % outSize
+    If mode = 1
+      If v > 0.0
+        If nw > 0
+          v = PmTensorGet(weights, k)
+        Else
+          v = 1.0
+        EndIf
+      EndIf
+    ElseIf nw > 0
+      w = PmTensorGet(weights, k)
+      v = w * v
+    EndIf
+    PmTensorPut(y, i, v)
+    i = i + 1
   Wend
 EndProcedure

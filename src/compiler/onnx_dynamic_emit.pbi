@@ -485,6 +485,7 @@ EndProcedure
 XIncludeFile "onnx_control_emit.pbi"
 
 Procedure.i PmoDynamicCommand(ModelPath.s)
+  ClearList(PmoOpsTableLines()) : PmoOpsTableCount = 0
   Protected model.PmoOnnxModel,ir.PmoIrModel,root.s=PmoCompileProjectRoot()
   Protected prefix.s,index.i=2,n.i,id.i,file.i,i.i,j.i,constantNode.i,pass.i,seq.i,chunk.i,args.s,name.s,call.s,outid.s,code.s,hash.s,speech.i,manifest.i,object.i,anvil.i,flags.i
   NewMap ids.i() : NewMap known.i() : NewMap persistent.i() : NewMap last.i()
@@ -937,6 +938,8 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   If PmdPortable : PmdLine(file,"  If PmTensorInt64Ok=0 : ProcedureReturn DFail("+Chr(34)+"An INT64 value exceeds this target's checked execution range."+Chr(34)+") : EndIf") : EndIf
   PmdLine(file,"  ProcedureReturn Bool(DError="+Chr(34)+Chr(34)+" And DCancel=0)")
   PmdLine(file,"EndProcedure")
+  ForEach PmoOpsTableLines() : PmoEmitLine(file,PmoOpsTableLines()) : Next
+  ClearList(PmoOpsTableLines())
   If PmoTargets(targetIndex)\Launch=#PMO_LAUNCH_EMBEDDED_WEIGHTS
     If PmoEmitEmbeddedWeights(file,prefix+".pmw")=0 : PmoDynamicError=PmoEmitError : Goto Failed : EndIf
   EndIf

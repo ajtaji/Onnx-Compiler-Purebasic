@@ -1294,6 +1294,56 @@ def cases() -> list[Case]:
     c.append(Case("lstm_nan_guard", [N("LSTM", ["x", "w", "r"], ["y", "yh"], hidden_size=3)], [("x", F, [3, 2, 2])],
                   [("y", F, [3, 1, 2, 3]), ("yh", F, [1, 2, 3])], {"x": lx},
                   [numpy_helper.from_array(lw, "w"), numpy_helper.from_array(lr, "r")], opset=14, oracle="ref"))
+    # TfIdfVectorizer (C7): INT64 and INT32 inputs, [C] and [B, C], unigrams,
+    # bigrams and trigrams, skips, TF, IDF and TFIDF with and without weights,
+    # a repeated n-gram (counted at its last index), pool values beyond 32 bits;
+    # a pool of strings refused by name. BitShift on UINT8 (LEFT and RIGHT,
+    # broadcast, shifts of 8 and more); UINT16 refused by name.
+    rng_c7 = np.random.default_rng(7777)  # its own stream: the cases after these keep their data
+    tf_pool = [2, 3, 5, 4, 5, 6, 7, 8, 6, 7, 5, 6, 2, 3, 4, 7, 8, 9]
+    tf_x64 = rng_c7.integers(2, 10, (3, 11)).astype(np.int64)
+    tf_x32 = rng_c7.integers(2, 10, (13,)).astype(np.int32)
+    for name, kw, x, xt in (
+            ("tfidf_tf_int64_batch", dict(max_gram_length=2, min_gram_length=1, max_skip_count=2, mode="TF", ngram_counts=[0, 4],
+                                          ngram_indexes=list(range(11)), pool_int64s=tf_pool[:18]), tf_x64, I64),
+            ("tfidf_idf_weights_int32", dict(max_gram_length=2, min_gram_length=2, max_skip_count=0, mode="IDF", ngram_counts=[0, 4],
+                                             ngram_indexes=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], pool_int64s=tf_pool[:18],
+                                             weights=[0.5, 1.5, 2.0, 0.25, 3.0, 1.0, 0.75, 2.5, 4.0, 0.1, 9.0]), tf_x32, I32),
+            ("tfidf_tfidf_trigrams", dict(max_gram_length=3, min_gram_length=2, max_skip_count=1, mode="TFIDF", ngram_counts=[0, 3, 7],
+                                          ngram_indexes=[0, 1, 2, 3, 4, 5, 6, 7], pool_int64s=[2, 3, 4, 5, 6, 7, 5, 6, 7, 3, 4, 5, 6, 7, 8],
+                                          weights=[1.0, 2.0, 0.5, 3.0, 0.25, 1.25, 8.0, 0.125]), tf_x64, I64),
+            ("tfidf_tfidf_noweights_wide", dict(max_gram_length=2, min_gram_length=1, max_skip_count=3, mode="TFIDF", ngram_counts=[0, 3],
+                                                ngram_indexes=[4, 0, 2, 1, 3, 3], pool_int64s=[5, 5000000000, -7, 5, 6, -7, 5, 6, 6]),
+             np.array([[5, 6, -7, 5, 6, 6, 5, 7], [6, 6, 5, 5, -7, -7, 6, 5]], np.int64), I64)):
+        rows = list(x.shape)
+        width = max(kw["ngram_indexes"]) + 1
+        oshape = [width] if x.ndim == 1 else [rows[0], width]
+        oracle = "ref"
+        if kw["mode"] == "TFIDF" and "weights" not in kw:
+            # the reference fails on TFIDF without weights (len(None)); the
+            # specification makes it the counts, which TF computes
+            def oracle(feeds, kw=kw, xt=xt, rows=rows, oshape=oshape):
+                g = helper.make_graph([N("TfIdfVectorizer", ["x"], ["y"], **dict(kw, mode="TF"))], "tf",
+                                      [helper.make_tensor_value_info("x", xt, rows)], [helper.make_tensor_value_info("y", F, oshape)])
+                m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 9)])
+                return [np.asarray(v) for v in ReferenceEvaluator(m).run(None, feeds)]
+            oracle = ("own", oracle)
+        c.append(Case(name, [N("TfIdfVectorizer", ["x"], ["y"], **kw)], [("x", xt, rows)], [("y", F, oshape)], {"x": x}, opset=9, oracle=oracle))
+    c.append(Case("refuse_tfidf_pool_strings", [N("TfIdfVectorizer", ["x"], ["y"], max_gram_length=1, min_gram_length=1, max_skip_count=0,
+                                                  mode="TF", ngram_counts=[0], ngram_indexes=[0, 1], pool_strings=["a", "b"])],
+                  [("x", I64, [4])], [("y", F, [2])], {"x": np.array([1, 2, 3, 4], np.int64)}, opset=9, refuse="pool_strings"))
+    U8b, U16b = TensorProto.UINT8, TensorProto.UINT16
+    bx = rng_c7.integers(0, 256, (3, 5)).astype(np.uint8)
+    by = np.array([0, 1, 3, 7, 8], np.uint8)
+    bz = np.array([[9, 2, 12, 0, 5], [1, 255, 7, 8, 3], [4, 4, 4, 4, 4]], np.uint8)
+    for d in ("LEFT", "RIGHT"):
+        c.append(Case("bitshift_%s_uint8_broadcast" % d.lower(), [N("BitShift", ["x", "y"], ["z"], direction=d)],
+                      [("x", U8b, [3, 5]), ("y", U8b, [5])], [("z", U8b, [3, 5])], {"x": bx, "y": by}, opset=11, oracle="ref"))
+        c.append(Case("bitshift_%s_uint8_wide_shifts" % d.lower(), [N("BitShift", ["x", "y"], ["z"], direction=d)],
+                      [("x", U8b, [3, 5]), ("y", U8b, [3, 5])], [("z", U8b, [3, 5])], {"x": bx, "y": bz}, opset=11, oracle="ref"))
+    c.append(Case("refuse_bitshift_uint16", [N("BitShift", ["x", "y"], ["z"], direction="LEFT")],
+                  [("x", U16b, [3]), ("y", U16b, [3])], [("z", U16b, [3])],
+                  {"x": np.array([1, 2, 3], np.uint16), "y": np.array([1, 2, 3], np.uint16)}, opset=11, refuse="UINT16"))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

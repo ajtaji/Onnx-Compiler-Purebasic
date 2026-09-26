@@ -33,7 +33,7 @@ Procedure DOpAlign(Slot.i, Id.i, Rank.i)
 EndProcedure
 
 Procedure.i DOpKindOk(Kind.i, Allowed.i)
-  ; Allowed: bit 0 FLOAT, bit 1 INT32, bit 2 INT64, bit 3 BOOL
+  ; Allowed: bit 0 FLOAT, bit 1 INT32, bit 2 INT64, bit 3 BOOL, bit 4 UINT8
   If Kind = 1 And (Allowed & 1) <> 0
     ProcedureReturn 1
   EndIf
@@ -46,7 +46,40 @@ Procedure.i DOpKindOk(Kind.i, Allowed.i)
   If Kind = 9 And (Allowed & 8) <> 0
     ProcedureReturn 1
   EndIf
+  If Kind = 2 And (Allowed & 16) <> 0
+    ProcedureReturn 1
+  EndIf
   ProcedureReturn 0
+EndProcedure
+
+; TfIdfVectorizer-9 (C7): X INT32 or INT64, [C] or [B, C]; Y FLOAT [OutSize]
+; or [B, OutSize]. Table and Weights are the node's n-gram table and weights,
+; which the compiler writes into the program (PmOpTfIdf).
+Procedure DOpTfIdf(Y.i, X.i, Table.i, Weights.i, NW.i, Skip.i, MinN.i, MaxN.i, Mode.i, OutSize.i)
+  Protected Dim dims.i(8)
+  Protected rows.i
+  Protected width.i
+  If Dt(X)\Kind <> 6 And Dt(X)\Kind <> 7
+    DFail("TfIdfVectorizer requires an INT32 or INT64 input.")
+    ProcedureReturn
+  EndIf
+  If Dt(X)\Rank = 1
+    rows = 1
+    width = DOpDim(X, 0)
+    dims(0) = OutSize
+  ElseIf Dt(X)\Rank = 2
+    rows = DOpDim(X, 0)
+    width = DOpDim(X, 1)
+    dims(0) = rows
+    dims(1) = OutSize
+  Else
+    DFail("TfIdfVectorizer takes an input of rank 1 or 2.")
+    ProcedureReturn
+  EndIf
+  If DAlloc(Y, 1, Dt(X)\Rank, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  PmOpTfIdf(Dt(X)\Data, Dt(Y)\Data, rows, width, Dt(X)\Kind, Table, Skip, MinN, MaxN, Mode, OutSize, Weights, NW)
 EndProcedure
 
 Procedure.i DOpStatus()

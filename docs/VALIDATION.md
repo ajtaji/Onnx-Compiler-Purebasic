@@ -1568,6 +1568,38 @@ Every support-file procedure this change touches (the emitted source changes onl
 | `tensor_fp32_windows.pbi` | `PmTensorSoftmaxLastSerial` | changed |
 | `tensor_fp32_windows.pbi` | `PmTensorTanhSerial` | changed |
 
+## TfIdfVectorizer and BitShift on UINT8 — September 26, 2026
+
+TfIdfVectorizer and BitShift compile on both paths for every target.
+
+| Operator | Computed as |
+|---|---|
+| TfIdfVectorizer (opset 9) | X is INT32 or INT64, `[C]` or `[B, C]`; Y is FLOAT `[OutSize]` or `[B, OutSize]`. The compiler writes the pooled n-grams of length `min_gram_length` to `max_gram_length` into the program as a table; an n-gram pooled twice counts at its last index, as the reference does. For every skip distance from 1 to `max_skip_count + 1` and every start, each pooled n-gram that fits is compared item by item and counted; a unigram is counted once, not once per distance. `TF` keeps the counts, `IDF` writes the weight (1 without weights) where the count is not 0, and `TFIDF` multiplies the count by the weight (the count without weights). INT64 items are compared as two 32-bit words, so values beyond 32 bits work on the Pico and Pico 2 too. `pool_strings` is refused by name |
+| BitShift (opset 11) on UINT8 | LEFT drops the bits shifted out of the byte; RIGHT is logical; a shift of 8 or more gives 0, as numpy does. Broadcasting as for the other two-input kernels. UINT16, UINT32 and UINT64 are refused by name ("element type UINT16 is not implemented; BitShift is implemented for UINT8") |
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: 633 cases - the 604 before; BitShift LEFT and RIGHT on every byte value by every shift from 0 to 9, and broadcast; TfIdfVectorizer in each mode on INT32 and INT64, one and several rows, unigrams, bigrams and trigrams, skips, a repeated n-gram, negative items and INT64 items beyond 32 bits, with and without weights. The definition was checked against the ONNX reference on 300 random forms | Windows (both branches), Pi 4, Pico and Pico 2: 633 of 633 bit-identical to the definition; `--mutants` 75 of 75 caught (three new: a unigram counted at every skip distance, INT32 items compared as unsigned, a RIGHT shift that drops the top bit) |
+| `runtime_mutants.py` | 52 of 52 as required |
+| `tests/node_suite/targeted_ops.py`: 1,105 cases - the 1,085 before; TfIdfVectorizer in TF, IDF and TFIDF, INT32 and INT64, `[C]` and `[B, C]`, trigrams, skips, TFIDF without weights (checked as TF, since the reference fails on it), pool values beyond 32 bits, on both paths; BitShift on UINT8 both ways, broadcast, shifts of 8 and more; a pool of strings and UINT16 refused by name | 1,105 of 1,105 as expected; `targeted_defaults`, `targeted_norm_small`, `targeted_control`, `targeted_optional_outputs` 148, 132, 41 and 14 as expected |
+| `ops_targets_gate.py`: those cases, and the NaN, specials, Where, Cast and ReduceMean/ReduceSum cases, on the Pi 4, Pico and Pico 2 | 119 builds, 357 runs: 349 bit-identical to the Windows program, every TfIdfVectorizer and BitShift run among them; 8 within the tolerance and named in `TOLERANCE_ONLY`, as before |
+| `pi4_control_gate.py` | 29 of 41, as before |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,239 of 1,750 before, 1,248 after: the seven TfIdfVectorizer cases and `test_bitshift_left_uint8` and `test_bitshift_right_uint8`, refused before; no case that passed fails. The other BitShift cases (UINT16, UINT32, UINT64) are refused by name |
+| Models that use none of these operators (four models, fp32/fp16/bf16/int4, five targets), this change against `afcd3d7` | All 80 emitted sources, packs and manifests and all 32 fixed-shape images byte-identical; the 16 runtime-dimension sources build; no support file these models carry differs; the four models' Windows outputs and all 30 outputs of their Pi 4, Pico and Pico 2 programs byte-identical |
+| Kokoro-82M, FP32 and INT8, for Windows | Source, pack and support files byte-identical; the output byte-identical; 15 requests each, interleaved: FP32 1,248.1 against 1,253.2 ms median, INT8 996.1 against 999.4 |
+
+Every support-file procedure this change touches (the emitted source changes only for these two operators, and a program with a TfIdfVectorizer carries its n-gram table in a DataSection at its end):
+
+| Support file | Procedure | |
+|---|---|---|
+| `tensor_ops.pmi` | `PmOpIntFold` | changed (BitShift, codes 13 and 14) |
+| `tensor_ops.pmi` | `PmOpKindBytes` | changed (UINT8 and INT8 are one byte) |
+| `tensor_ops.pmi` | `PmOpWriteInt` | changed (UINT8 and INT8 stored as bytes) |
+| `tensor_ops.pmi` | `PmOpTfIdf` | added |
+| `tensor_ops.pmi` | `PmOpTfIdfItem` | added |
+| `tensor_dynamic_ops.pmi` | `DOpKindOk` | changed (UINT8) |
+| `tensor_dynamic_ops.pmi` | `DOpTfIdf` | added |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

@@ -25,8 +25,14 @@ Procedure.i PmoOpsOwns(Operation.s)
                                   "RNN|GRU|NonMaxSuppression|RoiAlign|GridSample|QuantizeLinear|DequantizeLinear|" +
                                   "DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|HannWindow|HammingWindow|" +
                                   "BlackmanWindow|DFT|MelWeightMatrix|NegativeLogLikelihoodLoss|SoftmaxCrossEntropyLoss|Col2Im|" +
-                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|Unique|Swish|RMSNormalization|CumProd|BitCast|RotaryEmbedding|TensorScatter|Attention|CausalConvWithState|LinearAttention|", "|" + Operation + "|"))
+                                  "CenterCropPad|MaxUnpool|AffineGrid|MaxRoiPool|DeformConv|Unique|Swish|RMSNormalization|CumProd|BitCast|RotaryEmbedding|TensorScatter|Attention|CausalConvWithState|LinearAttention|" +
+                                  "BitShift|TfIdfVectorizer|", "|" + Operation + "|"))
 EndProcedure
+
+; The DataSection lines of TfIdfVectorizer's n-gram tables (C7), written at
+; the end of the generated program by whichever emitter made them.
+Global NewList PmoOpsTableLines.s()
+Global PmoOpsTableCount.i
 
 ; The oldest ai.onnx opset whose definition of an operator is one these
 ; kernels compute; later definitions add element types, or attributes whose
@@ -46,6 +52,8 @@ Procedure.i PmoOpsFloor(Operation.s)
          "EyeLike"
       ProcedureReturn 9
     Case "Mod", "ThresholdedRelu", "IsInf", "ReverseSequence", "NonMaxSuppression", "RoiAlign" : ProcedureReturn 10
+    Case "BitShift" : ProcedureReturn 11
+    Case "TfIdfVectorizer" : ProcedureReturn 9
     Case "GatherElements", "GatherND", "Det", "Compress" : ProcedureReturn 11
     Case "Celu", "Einsum" : ProcedureReturn 12
     Case "HardSwish", "Trilu" : ProcedureReturn 14
@@ -208,6 +216,7 @@ Procedure.i PmoOpsVariadicCode(*Node.PmoOnnxNode)
     Case "BitwiseAnd" : ProcedureReturn 9
     Case "BitwiseOr" : ProcedureReturn 10
     Case "BitwiseXor" : ProcedureReturn 11
+    Case "BitShift" : ProcedureReturn 13 + Bool(PmoEmitAttrS(*Node, "direction", "") = "RIGHT")
   EndSelect
   ProcedureReturn -1
 EndProcedure
@@ -223,6 +232,7 @@ Procedure.i PmoOpsVariadicKinds(*Node.PmoOnnxNode)
       ProcedureReturn 6
     Case "Or", "Xor" : ProcedureReturn 8
     Case "BitwiseAnd", "BitwiseOr", "BitwiseXor" : ProcedureReturn 6
+    Case "BitShift" : ProcedureReturn 16
   EndSelect
   ProcedureReturn 0
 EndProcedure
@@ -545,11 +555,17 @@ Procedure.i PmoEmitOpsVariadic(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcNa
   Protected *X.PmoIrValue, Rank.i, Count.i, k.i, d.i, Extent.q, Here.q, Kind.i, Code.i = PmoOpsVariadicCode(*Node)
   Protected Allowed.s = "|"
   If *Node\Operation = "Mod" : Allowed = "|fmod|" : EndIf
+  If *Node\Operation = "BitShift"
+    Allowed = "|direction|"
+    If PmoEmitAttrS(*Node, "direction", "") <> "LEFT" And PmoEmitAttrS(*Node, "direction", "") <> "RIGHT"
+      ProcedureReturn PmoEmitNsFail(*Node, "attribute direction = " + Chr(34) + PmoEmitAttrS(*Node, "direction", "") + Chr(34) + "; LEFT and RIGHT are defined.")
+    EndIf
+  EndIf
   If PmoEmitNsAttributesAllowed(*Node, Allowed, Opset) = 0 : ProcedureReturn #False : EndIf
   If *Y = 0 : ProcedureReturn PmoEmitNsFail(*Node, "the output needs a concrete shape.") : EndIf
   Count = ListSize(*Node\Inputs())
   If Count < 1 Or Count > 16 : ProcedureReturn PmoEmitNsFail(*Node, "it has " + Str(Count) + " inputs; one to sixteen are implemented.") : EndIf
-  If FindString("|Mod|PRelu|Or|Xor|BitwiseAnd|BitwiseOr|BitwiseXor|", "|" + *Node\Operation + "|") And Count <> 2
+  If FindString("|Mod|PRelu|Or|Xor|BitwiseAnd|BitwiseOr|BitwiseXor|BitShift|", "|" + *Node\Operation + "|") And Count <> 2
     ProcedureReturn PmoEmitNsFail(*Node, "it has " + Str(Count) + " inputs; the specification gives it two.")
   EndIf
   If *Node\Operation = "Mod" And PmoEmitAttrI(*Node, "fmod", 0) = 0
@@ -2687,6 +2703,160 @@ Procedure.i PmoEmitOpsGridSample(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, Proc
   ProcedureReturn #True
 EndProcedure
 
+; TfIdfVectorizer-9 (C7): its form, checked for both paths ("" when it is
+; one these kernels compute), its output extent, and its n-gram table.
+Procedure.i PmoOpsTfIdfWeights(*Node.PmoOnnxNode)
+  ForEach *Node\Attributes()
+    If *Node\Attributes()\Name = "weights" : ProcedureReturn ListSize(*Node\Attributes()\Floats()) : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.s PmoOpsTfIdfForm(*Node.PmoOnnxNode, *OutSize.Integer)
+  Protected Count.i, Pool.i, k.i, Last.q, Grams.i, Size.i, Start.q, Stop.q, Mode.s, MinN.q, MaxN.q, Out.q
+  If PmoEmitNsAttributePresent(*Node, "pool_strings")
+    ProcedureReturn "attribute pool_strings (a pool of strings) is not implemented; pool_int64s is."
+  EndIf
+  If PmoEmitNsAttributePresent(*Node, "pool_int64s") = 0 : ProcedureReturn "attribute pool_int64s is required (pool_strings is not implemented)." : EndIf
+  Mode = PmoEmitAttrS(*Node, "mode", "")
+  If Mode <> "TF" And Mode <> "IDF" And Mode <> "TFIDF"
+    ProcedureReturn "attribute mode = " + Chr(34) + Mode + Chr(34) + "; TF, IDF and TFIDF are defined."
+  EndIf
+  MinN = PmoEmitAttrI(*Node, "min_gram_length", 0) : MaxN = PmoEmitAttrI(*Node, "max_gram_length", 0)
+  If MinN < 1 Or MaxN < MinN : ProcedureReturn "attributes min_gram_length = " + Str(MinN) + " and max_gram_length = " + Str(MaxN) + "; 1 <= min <= max is required." : EndIf
+  If MaxN > 64 : ProcedureReturn "max_gram_length = " + Str(MaxN) + "; up to 64 is implemented." : EndIf
+  If PmoEmitAttrI(*Node, "max_skip_count", 0) < 0 : ProcedureReturn "attribute max_skip_count is negative." : EndIf
+  Pool = PmoEmitAttrListCount(*Node, "pool_int64s")
+  Count = PmoEmitAttrListCount(*Node, "ngram_counts")
+  If Count < 1 : ProcedureReturn "attribute ngram_counts is required." : EndIf
+  Last = 0 : Grams = 0
+  For k = 0 To Count - 1
+    Start = PmoEmitAttrListI(*Node, "ngram_counts", k, 0)
+    If k + 1 < Count : Stop = PmoEmitAttrListI(*Node, "ngram_counts", k + 1, 0) : Else : Stop = Pool : EndIf
+    If Start < Last Or Start > Pool Or Stop < Start Or Stop > Pool : ProcedureReturn "attribute ngram_counts is not a nondecreasing list of offsets into the pool." : EndIf
+    Last = Start
+    Grams + (Stop - Start) / (k + 1)
+  Next
+  If PmoEmitAttrListCount(*Node, "ngram_indexes") < Grams
+    ProcedureReturn "attribute ngram_indexes has " + Str(PmoEmitAttrListCount(*Node, "ngram_indexes")) + " entries for " + Str(Grams) + " n-grams."
+  EndIf
+  Out = 0
+  For k = 0 To PmoEmitAttrListCount(*Node, "ngram_indexes") - 1
+    If PmoEmitAttrListI(*Node, "ngram_indexes", k, 0) < 0 : ProcedureReturn "attribute ngram_indexes has a negative entry." : EndIf
+    If PmoEmitAttrListI(*Node, "ngram_indexes", k, 0) + 1 > Out : Out = PmoEmitAttrListI(*Node, "ngram_indexes", k, 0) + 1 : EndIf
+  Next
+  If Out < 1 : ProcedureReturn "attribute ngram_indexes is required." : EndIf
+  If Out > 16777216 : ProcedureReturn "the output extent " + Str(Out) + " exceeds 2^24." : EndIf
+  If PmoOpsTfIdfWeights(*Node) > 0 And PmoOpsTfIdfWeights(*Node) < Out
+    ProcedureReturn "attribute weights has " + Str(PmoOpsTfIdfWeights(*Node)) + " entries for an output extent of " + Str(Out) + "."
+  EndIf
+  *OutSize\i = Out
+  ProcedureReturn ""
+EndProcedure
+
+; Appends the node's DataSection (labels Label + "T" and Label + "W") to
+; PmoOpsTableLines: the n-grams of length min to max in pool order, a
+; repeated n-gram at its last index (the reference's trie keeps the last id).
+Procedure PmoOpsTfIdfData(*Node.PmoOnnxNode, Label.s)
+  Protected Pool.i = PmoEmitAttrListCount(*Node, "pool_int64s"), Count.i = PmoEmitAttrListCount(*Node, "ngram_counts")
+  Protected MinN.q = PmoEmitAttrI(*Node, "min_gram_length", 1), MaxN.q = PmoEmitAttrI(*Node, "max_gram_length", 1)
+  Protected k.i, g.i, j.i, n.i, Id.i, Start.q, Stop.q, Key.s, Line.s, Words.i, v.q, f.f
+  NewMap Where.i()
+  NewList Size.i() : NewList Index.q() : NewList Keys.s() : NewList First.q()
+  Id = 0
+  For k = 0 To Count - 1
+    n = k + 1
+    Start = PmoEmitAttrListI(*Node, "ngram_counts", k, 0)
+    If k + 1 < Count : Stop = PmoEmitAttrListI(*Node, "ngram_counts", k + 1, 0) : Else : Stop = Pool : EndIf
+    For g = 0 To (Stop - Start) / n - 1
+      If n >= MinN And n <= MaxN
+        Key = Str(n) + ":"
+        For j = 0 To n - 1 : Key + Str(PmoEmitAttrListI(*Node, "pool_int64s", Start + g * n + j, 0)) + "," : Next
+        If FindMapElement(Where(), Key)
+          SelectElement(Index(), Where()) : Index() = PmoEmitAttrListI(*Node, "ngram_indexes", Id, 0)
+        Else
+          Where(Key) = ListSize(Size())
+          LastElement(Size()) : AddElement(Size()) : Size() = n
+          LastElement(Index()) : AddElement(Index()) : Index() = PmoEmitAttrListI(*Node, "ngram_indexes", Id, 0)
+          LastElement(First()) : AddElement(First()) : First() = Start + g * n
+        EndIf
+      EndIf
+      Id + 1
+    Next
+  Next
+  AddElement(PmoOpsTableLines()) : PmoOpsTableLines() = "DataSection"
+  AddElement(PmoOpsTableLines()) : PmoOpsTableLines() = "  " + Label + "T:"
+  AddElement(PmoOpsTableLines()) : PmoOpsTableLines() = "  Data.l " + Str(ListSize(Size()))
+  FirstElement(Index()) : FirstElement(First())
+  ForEach Size()
+    Line = "  Data.l " + Str(Size()) + "," + Str(Index())
+    For j = 0 To Size() - 1
+      v = PmoEmitAttrListI(*Node, "pool_int64s", First() + j, 0)
+      Line + ",$" + RSet(Hex(v & $FFFFFFFF), 8, "0") + ",$" + RSet(Hex((v >> 32) & $FFFFFFFF), 8, "0")
+    Next
+    AddElement(PmoOpsTableLines()) : PmoOpsTableLines() = Line
+    NextElement(Index()) : NextElement(First())
+  Next
+  AddElement(PmoOpsTableLines()) : PmoOpsTableLines() = "  " + Label + "W:"
+  Line = "" : Words = 0
+  ForEach *Node\Attributes()
+    If *Node\Attributes()\Name = "weights"
+      ForEach *Node\Attributes()\Floats()
+        f = *Node\Attributes()\Floats()
+        If Words % 8 = 0
+          If Line <> "" : AddElement(PmoOpsTableLines()) : PmoOpsTableLines() = Line : EndIf
+          Line = "  Data.l "
+        Else
+          Line + ","
+        EndIf
+        Line + "$" + RSet(Hex(PeekL(@f) & $FFFFFFFF), 8, "0")
+        Words + 1
+      Next
+    EndIf
+  Next
+  If Line = "" : Line = "  Data.l 0" : EndIf
+  AddElement(PmoOpsTableLines()) : PmoOpsTableLines() = Line
+  AddElement(PmoOpsTableLines()) : PmoOpsTableLines() = "EndDataSection"
+EndProcedure
+
+; The call's arguments after y and x, for both paths.
+Procedure.s PmoOpsTfIdfArgs(*Node.PmoOnnxNode, Label.s, OutSize.i)
+  Protected Mode.i
+  Select PmoEmitAttrS(*Node, "mode", "")
+    Case "IDF" : Mode = 1
+    Case "TFIDF" : Mode = 2
+  EndSelect
+  ProcedureReturn Str(PmoEmitAttrI(*Node, "max_skip_count", 0)) + ", " + Str(PmoEmitAttrI(*Node, "min_gram_length", 1)) + ", " +
+                  Str(PmoEmitAttrI(*Node, "max_gram_length", 1)) + ", " + Str(Mode) + ", " + Str(OutSize) + ", ?" + Label + "W, " + Str(PmoOpsTfIdfWeights(*Node))
+EndProcedure
+
+Procedure.i PmoEmitOpsTfIdf(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcName.s, Opset.i)
+  Protected *X.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0))
+  Protected *Y.PmoIrValue = PmoEmitValue(*Ir, PmoEmitOutput(*Node, 0))
+  Protected Reason.s, OutSize.Integer, r.i, Rows.q, Width.q, Label.s = ProcName + "TfIdf"
+  If PmoEmitNsAttributesAllowed(*Node, "|max_gram_length|max_skip_count|min_gram_length|mode|ngram_counts|ngram_indexes|pool_int64s|pool_strings|weights|", Opset) = 0 : ProcedureReturn #False : EndIf
+  Reason = PmoOpsTfIdfForm(*Node, @OutSize)
+  If Reason <> "" : ProcedureReturn PmoEmitNsFail(*Node, Reason) : EndIf
+  If PmoOpsTypeOk(*Node, *X, "X", 2 | 4) = 0 : ProcedureReturn #False : EndIf
+  r = PmoEmitRank(*X)
+  If r = 1
+    Rows = 1 : Width = PmoEmitDim(*X, 0)
+  ElseIf r = 2
+    Rows = PmoEmitDim(*X, 0) : Width = PmoEmitDim(*X, 1)
+  Else
+    ProcedureReturn PmoEmitNsFail(*Node, "X has rank " + Str(r) + "; [C] and [B, C] are implemented.")
+  EndIf
+  If *Y = 0 Or *Y\ElementType <> 1 Or PmoEmitRank(*Y) <> r Or PmoEmitDim(*Y, r - 1) <> OutSize\i Or (r = 2 And PmoEmitDim(*Y, 0) <> Rows)
+    If r = 1 : ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [" + Str(OutSize\i) + "].") : EndIf
+    ProcedureReturn PmoEmitNsFail(*Node, "the declared output must be FLOAT [" + Str(Rows) + ", " + Str(OutSize\i) + "].")
+  EndIf
+  PmoOpsTfIdfData(*Node, Label)
+  PmoOpsHead(File, ProcName, *Node)
+  PmoEmitLine(File, "  PmOpTfIdf(*i0, *o0, " + Str(Rows) + ", " + Str(Width) + ", " + Str(*X\ElementType) + ", ?" + Label + "T, " + PmoOpsTfIdfArgs(*Node, Label, OutSize\i) + ")")
+  PmoOpsTail(File, #False)
+  ProcedureReturn #True
+EndProcedure
+
 ; One generated procedure for a node of these operators, registered in Calls.
 Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Calls.s())
   Protected ProcName.s = "PmOnnxNode" + Str(*Ref\Index), Opset.i = PmoEmitNsOpset(*Ir), Done.i, *Node.PmoOnnxNode = *Ref\Node
@@ -2703,8 +2873,9 @@ Procedure.i PmoEmitOpsHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
     Case "Erf", "Reciprocal", "Ceil", "Sign", "Softplus", "Softsign", "Elu", "Selu", "Celu", "HardSigmoid", "HardSwish", "Mish", "Gelu", "Swish",
          "ThresholdedRelu", "Shrink", "IsNaN", "IsInf", "Tan", "Asin", "Acos", "Sinh", "Cosh", "Asinh", "Acosh", "Atanh", "BitwiseNot"
       Done = PmoEmitOpsUnary(File, *Ir, *Node, ProcName, Opset)
-    Case "Min", "Max", "Sum", "Mean", "Mod", "PRelu", "Or", "Xor", "BitwiseAnd", "BitwiseOr", "BitwiseXor"
+    Case "Min", "Max", "Sum", "Mean", "Mod", "PRelu", "Or", "Xor", "BitwiseAnd", "BitwiseOr", "BitwiseXor", "BitShift"
       Done = PmoEmitOpsVariadic(File, *Ir, *Node, ProcName, Opset)
+    Case "TfIdfVectorizer" : Done = PmoEmitOpsTfIdf(File, *Ir, *Node, ProcName, Opset)
     Case "Hardmax", "LpNormalization" : Done = PmoEmitOpsAxisNorm(File, *Ir, *Node, ProcName, Opset)
     Case "MeanVarianceNormalization" : Done = PmoEmitOpsMvn(File, *Ir, *Node, ProcName, Opset)
     Case "LRN" : Done = PmoEmitOpsLrn(File, *Ir, *Node, ProcName, Opset)

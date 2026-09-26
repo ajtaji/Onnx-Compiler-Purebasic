@@ -52,6 +52,8 @@ Procedure.s PmdOpsAllowed(*Node.PmoOnnxNode, Opset.i)
       If Opset >= 14 : ProcedureReturn "|epsilon|momentum|training_mode|" : EndIf
       ProcedureReturn "|epsilon|momentum|"
     Case "Mod" : ProcedureReturn "|fmod|"
+    Case "BitShift" : ProcedureReturn "|direction|"
+    Case "TfIdfVectorizer" : ProcedureReturn "|max_gram_length|max_skip_count|min_gram_length|mode|ngram_counts|ngram_indexes|pool_int64s|pool_strings|weights|"
     Case "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare", "ReduceLogSum", "ReduceLogSumExp"
       If Opset >= 18 : ProcedureReturn "|keepdims|noop_with_empty_axes|" : EndIf
       ProcedureReturn "|axes|keepdims|"
@@ -276,6 +278,15 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
       Case "BitwiseAnd", "BitwiseOr", "BitwiseXor"
         Reason = PmdNsTypeReason(*Node, 0, "A", "|6|7|")
         If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "B", "|6|7|") : EndIf
+      Case "BitShift"
+        Reason = PmdNsTypeReason(*Node, 0, "X", "|2|")
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 1, "Y", "|2|") : EndIf
+        If Reason = "" And PmoEmitAttrS(*Node, "direction", "") <> "LEFT" And PmoEmitAttrS(*Node, "direction", "") <> "RIGHT"
+          Reason = "attribute direction = " + Chr(34) + PmoEmitAttrS(*Node, "direction", "") + Chr(34) + "; LEFT and RIGHT are defined."
+        EndIf
+      Case "TfIdfVectorizer"
+        Reason = PmoOpsTfIdfForm(*Node, @Labels)
+        If Reason = "" : Reason = PmdNsTypeReason(*Node, 0, "X", "|6|7|") : EndIf
       Case "Upsample"
         Reason = "Upsample is implemented by fixed-shape emission only - declared extents and a constant scales input, opset 7 to 9 (from 10 it is deprecated for Resize)."
       Case "Relu" : Reason = PmdNsTypeReason(*Node, 0, "X", "|1|")
@@ -729,7 +740,14 @@ Procedure.s PmdOpsCall(*Node.PmoOnnxNode, Map Ids.i())
       PmoOpsGridSampleForm(*Node, PmdNsOpset, 0, @Labels, @Kept)
       Call = "DOpGridSample(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + "," + a(1) + "," + Str(Labels\i) + "," + Str(Kept\i) + "," +
              Str(PmoEmitAttrI(*Node, "align_corners", 0)) + "," + Str(Bool(PmdNsOpset >= 20)) + ")"
-    Case "Min", "Max", "Sum", "Mean", "Mod", "PRelu", "Or", "Xor", "BitwiseAnd", "BitwiseOr", "BitwiseXor"
+    Case "TfIdfVectorizer"
+      PmoOpsTableCount + 1
+      PmoOpsTfIdfForm(*Node, @Labels)
+      PmoOpsTfIdfData(*Node, "PmdTfIdf" + Str(PmoOpsTableCount))
+      Call = "DOpTfIdf(" + PmdNsId(Ids(), PmoEmitOutput(*Node, 0)) + "," + a(0) + ",?PmdTfIdf" + Str(PmoOpsTableCount) + "T,?PmdTfIdf" + Str(PmoOpsTableCount) + "W," +
+             Str(PmoOpsTfIdfWeights(*Node)) + "," + Str(PmoEmitAttrI(*Node, "max_skip_count", 0)) + "," + Str(PmoEmitAttrI(*Node, "min_gram_length", 1)) + "," +
+             Str(PmoEmitAttrI(*Node, "max_gram_length", 1)) + "," + Str(Bool(PmoEmitAttrS(*Node, "mode", "") = "IDF") + 2 * Bool(PmoEmitAttrS(*Node, "mode", "") = "TFIDF")) + "," + Str(Labels\i) + ")"
+    Case "Min", "Max", "Sum", "Mean", "Mod", "PRelu", "Or", "Xor", "BitwiseAnd", "BitwiseOr", "BitwiseXor", "BitShift"
       n = ListSize(*Node\Inputs())
       For k = 0 To n - 1
         If k > 7

@@ -1511,6 +1511,7 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
   Protected PointerType.s = ".i"
   NewMap Calls.s()
   NewMap UsedOps.i()
+  ClearList(PmoOpsTableLines())
   Protected RandomNodes.i
   Protected RandomInclude.s
   PmoEmitError = ""
@@ -1753,6 +1754,8 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
   EndIf
   If RuntimeInclude <> "" : PmoEmitLine(File, "  PmPoolStop()") : EndIf
   PmoEmitLine(File, "EndProcedure")
+  ForEach PmoOpsTableLines() : PmoEmitLine(File, PmoOpsTableLines()) : Next
+  ClearList(PmoOpsTableLines())
   If *Profile\Launch = #PMO_LAUNCH_EMBEDDED_WEIGHTS
     If PmoEmitEmbeddedWeights(File, WeightsPath) = 0 : Goto PmoEmitSourceFailed : EndIf
   EndIf
