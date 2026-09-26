@@ -209,22 +209,11 @@ Procedure.f PmTensorSqrtF(x.f)
   ProcedureReturn r
 EndProcedure
 
-; Exp and Log, correctly rounded (C6c-2). Compiled when the program uses them
-; (#PMO_USE_EXPLOG, which a generated program sets from its graph): their
-; tables are some 6 KB, and a program without Exp or Log keeps its image.
-CompilerIf #PMO_USE_EXPLOG = 1
-; The binary32 nearest the exact result, so every target gives the Windows
-; program's bits. The Windows program's own Exp is correctly rounded for every
-; argument, and its Log is except at five, which tensor_fp32_windows.pbi
-; corrects. Each is one exact
-; integer method in two spellings with the same steps and truncations: 32-bit
-; words (the Pico, and the Pi 4's Log, whose .l arithmetic is the same) and
-; UMULL/UMAAL assembly (the Pico 2), plus 64-bit integers for the Pi 4's Exp.
-; Every spelling was run on every binary32 argument (the 32- and 64-bit ones
-; by the Windows compiler, and each target's build in the emulator) against a
-; correctly rounded result. NaN is x86's, as for the square root: a NaN
-; argument comes back quieted (its payload and sign kept), and Log of a
-; negative argument is FFC00000.
+; The 32-bit word helpers of the correctly rounded maths below (C6c): the
+; high word of an unsigned 32 x 32 product, and an unsigned compare. The Pi 4
+; multiplies in 64 bits; the Pico has MULS (the low word only), so four 16 x 16
+; products; the Pico 2's routines are assembly and need neither.
+CompilerIf #PMO_USE_EXPLOG = 1 Or #PMO_USE_TRIG = 1 Or #PMO_USE_ATAN = 1
 CompilerIf #PMO_INT8_BACKEND = 1
 ; The high word of the unsigned 64-bit product of two 32-bit words (a 64-bit
 ; multiply where .i is 64 bits).
@@ -249,185 +238,231 @@ Procedure.l PmTensorBelow32(a.l, b.l)
   EndIf
   ProcedureReturn 0
 EndProcedure
+CompilerElseIf #PMO_INT8_BACKEND = 2
+; The high word of the unsigned 64-bit product of two 32-bit words, on the
+; Cortex-M0+ (whose MULS keeps only the low word): four 16 x 16 products.
+Procedure.l PmTensorMulHi32(a.l, b.l)
+  ASM
+    uxth r2, r0
+    lsrs r0, r0, #16
+    uxth r3, r1
+    lsrs r1, r1, #16
+    movs r4, r0
+    muls r4, r1
+    muls r0, r3
+    muls r1, r2
+    muls r2, r3
+    lsrs r2, r2, #16
+    uxth r3, r1
+    adds r2, r2, r3
+    uxth r3, r0
+    adds r2, r2, r3
+    lsrs r1, r1, #16
+    adds r4, r4, r1
+    lsrs r0, r0, #16
+    adds r4, r4, r0
+    lsrs r2, r2, #16
+    adds r0, r4, r2
+  EndASM
+EndProcedure
 
-; exp, correctly rounded, in exact 64-bit integer arithmetic (the bits of x in,
-; the bits of the result out). x = (256 i + j) ln2/256 + r with 0 <= r < ln2/256
-; (r to 2^-64, from ln2/256 to 2^-96); e^r - 1 = r + r^2/2 + r^3 (1/6 + r/24 +
-; r^2/120) in Q64; the result 2^i * 2^(j/256) * e^r in Q62, rounded once to
-; nearest-even at its own 24 bits (a subnormal result at its own position).
+; 1 when the unsigned word a is below the unsigned word b (the borrow of a - b)
+Procedure.l PmTensorBelow32(a.l, b.l)
+  ASM
+    subs r0, r0, r1
+    sbcs r0, r0
+    negs r0, r0
+  EndASM
+EndProcedure
+CompilerEndIf
+CompilerEndIf
+
+; Exp and Log, correctly rounded (C6c-2). Compiled when the program uses them
+; (#PMO_USE_EXPLOG, which a generated program sets from its graph): their
+; tables are some 6 KB, and a program without Exp or Log keeps its image.
+CompilerIf #PMO_USE_EXPLOG = 1
+; The binary32 nearest the exact result, so every target gives the Windows
+; program's bits. The Windows program's own Exp is correctly rounded for every
+; argument, and its Log is except at five, which tensor_fp32_windows.pbi
+; corrects. Each is one exact
+; integer method in two spellings with the same steps and truncations: 32-bit
+; words (the Pico, and the Pi 4's Log, whose .l arithmetic is the same) and
+; UMULL/UMAAL assembly (the Pico 2), plus A64 assembly of the 64-bit method for
+; the Pi 4's Exp (C6c-3).
+; Every spelling was run on every binary32 argument (the 32- and 64-bit ones
+; by the Windows compiler, and each target's build in the emulator) against a
+; correctly rounded result. NaN is x86's, as for the square root: a NaN
+; argument comes back quieted (its payload and sign kept), and Log of a
+; negative argument is FFC00000.
+CompilerIf #PMO_INT8_BACKEND = 1
+; exp, correctly rounded, on the Pi 4 (A64): the 64-bit integer method of the
+; portable procedure (every step and every truncation the same), in assembly.
 ; Every binary32 argument was checked against a correctly rounded exp.
 Procedure.i PmTensorExpBits(b.i)
-  Protected a.i
-  Protected neg.i
-  Protected e.i
-  Protected m.i
-  Protected k.i
-  Protected sh.i
-  Protected xs.i
-  Protected kl0.i
-  Protected klh.i
-  Protected r.i
-  Protected rh.i
-  Protected rl.i
-  Protected r2.i
-  Protected v.i
-  Protected w.i
-  Protected q.i
-  Protected c.i
-  Protected t.i
-  Protected pp.i
-  Protected j.i
-  Protected i.i
-  Protected tt.i
-  Protected tl.i
-  Protected ph.i
-  Protected pl.i
-  Protected y.i
-  Protected p.i
-  Protected biased.i
-  Protected msk.i
-  Protected rem.i
-  Protected half.i
-  Protected mm.i
-  a = b & $7FFFFFFF
-  If a > $7F800000
-    ProcedureReturn (b | $400000) & $FFFFFFFF
-  EndIf
-  neg = 0
-  If (b & $80000000) <> 0
-    neg = 1
-  EndIf
-  If a = $7F800000
-    If neg = 0
-      ProcedureReturn $7F800000
-    EndIf
-    ProcedureReturn 0
-  EndIf
-  If a < $33000000
-    ProcedureReturn $3F800000
-  EndIf
-  If neg = 0 And a >= $42B17218
-    ProcedureReturn $7F800000
-  EndIf
-  If neg = 1 And a >= $42D00000
-    ProcedureReturn 0
-  EndIf
-  e = a >> 23
-  m = a & $7FFFFF
-  m = m | $800000
-  ; k = floor(|x| * 256/ln2), from 2^28/ln2 rounded down (up for a negative x,
-  ; whose k is one more), so r is never negative
-  If neg = 0
-    t = m * 387270501
-  Else
-    t = m * 387270502
-  EndIf
-  sh = 170 - e
-  k = 0
-  If sh < 53
-    k = t >> sh
-  EndIf
-  k = k + neg
-  ; |x| * 2^64 modulo 2^64, and k * ln2/256 in Q96 without its lowest word
-  sh = e - 86
-  xs = m << sh
-  kl0 = k * $ABC9E3B3
-  t = kl0 >> 32
-  kl0 = kl0 & $FFFFFFFF
-  klh = k * $00B17217F7D1CF79
-  klh = klh + t
-  ; r in Q64
-  If neg = 0
-    r = xs - klh
-    If kl0 <> 0
-      r = r - 1
-    EndIf
-  Else
-    r = klh - xs
-  EndIf
-  ; r^2/2 in Q64
-  rh = r >> 32
-  rl = r & $FFFFFFFF
-  r2 = rh * rh
-  r2 = r2 >> 1
-  t = rh * rl
-  t = t >> 32
-  r2 = r2 + t
-  ; v = r in Q40, w = r^2/2 in Q50, q = r^3 in Q57
-  v = r >> 24
-  w = r2 >> 14
-  q = w * v
-  q = q >> 32
-  q = q & $FFFFFFFF
-  ; c = 1/6 + r/24 + r^2/120 in Q32
-  c = v * 178956971
-  c = c >> 40
-  t = r2 >> 32
-  t = t * 71582788
-  t = t >> 32
-  c = c + t
-  c = c + 715827883
-  ; P = r + r^2/2 + r^3 c in Q64
-  t = q * c
-  t = t >> 25
-  pp = r + r2
-  pp = pp + t
-  ; 2^(j/256) in Q62, k = 256 i + j
-  If neg = 1
-    k = 0 - k
-  EndIf
-  j = k & 255
-  i = k >> 8
-  j = j << 3
-  tl = PeekL(?PmTensorExpTable + j)
-  tl = tl & $FFFFFFFF
-  tt = PeekL(?PmTensorExpTable + j + 4)
-  ; y = T + T P in Q62
-  ph = pp >> 32
-  pl = pp & $FFFFFFFF
-  y = tt << 32
-  y = y | tl
-  t = tt * ph
-  y = y + t
-  t = tt * pl
-  t = t >> 32
-  y = y + t
-  t = tl * ph
-  t = t >> 32
-  y = y + t
-  ; round once, at the result's own 24 bits
-  p = 61
-  If y >= $4000000000000000
-    p = 62
-  EndIf
-  biased = i + p
-  biased = biased + 65
-  If biased >= 255
-    ProcedureReturn $7F800000
-  EndIf
-  sh = p - 23
-  If biased <= 0
-    sh = sh + 1
-    sh = sh - biased
-  EndIf
-  If sh >= 64
-    ProcedureReturn 0
-  EndIf
-  mm = y >> sh
-  msk = 1 << sh
-  msk = msk - 1
-  rem = y & msk
-  t = sh - 1
-  half = 1 << t
-  If rem > half Or (rem = half And (mm & 1) <> 0)
-    mm = mm + 1
-  EndIf
-  If biased <= 0
-    ProcedureReturn mm
-  EndIf
-  t = biased << 23
-  mm = mm - $800000
-  ProcedureReturn t + mm
+  ASM
+    lsl w1, w0, #1
+    lsr w1, w1, #1
+    movz w2, #0x7F80, lsl #16
+    cmp w1, w2
+    b.hi pmexpa_nan
+    b.eq pmexpa_inf
+    movz w2, #0x3300, lsl #16
+    cmp w1, w2
+    b.lo pmexpa_one
+    lsr w3, w0, #31
+    cbnz w3, pmexpa_negchk
+    movz w2, #0x42B1, lsl #16
+    movk w2, #0x7218
+    cmp w1, w2
+    b.hs pmexpa_huge
+    b pmexpa_go
+pmexpa_negchk:
+    movz w2, #0x42D0, lsl #16
+    cmp w1, w2
+    b.hs pmexpa_zero
+pmexpa_go:
+    lsr w4, w1, #23
+    lsl w5, w1, #9
+    lsr w5, w5, #9
+    movz w2, #0x80, lsl #16
+    orr w5, w5, w2
+    movz x6, #0x1715, lsl #16
+    movk x6, #0x4765
+    add x6, x6, x3
+    mul x6, x5, x6
+    movz w7, #170
+    sub w7, w7, w4
+    lsr x6, x6, x7
+    cmp w7, #53
+    b.lo pmexpa_kok
+    movz x6, #0
+pmexpa_kok:
+    add x6, x6, x3
+    sub w7, w4, #86
+    lsl x8, x5, x7
+    movz x9, #0xABC9, lsl #16
+    movk x9, #0xE3B3
+    mul x9, x6, x9
+    lsr x10, x9, #32
+    lsl x9, x9, #32
+    lsr x9, x9, #32
+    movz x11, #0x00B1, lsl #48
+    movk x11, #0x7217, lsl #32
+    movk x11, #0xF7D1, lsl #16
+    movk x11, #0xCF79
+    madd x11, x6, x11, x10
+    cbnz w3, pmexpa_rneg
+    sub x12, x8, x11
+    movz x13, #0
+    cbz x9, pmexpa_b0
+    movz x13, #1
+pmexpa_b0:
+    sub x12, x12, x13
+    b pmexpa_rgo
+pmexpa_rneg:
+    sub x12, x11, x8
+    sub x6, xzr, x6
+pmexpa_rgo:
+    lsr x13, x12, #32
+    lsl x14, x12, #32
+    lsr x14, x14, #32
+    mul x15, x13, x13
+    lsr x15, x15, #1
+    mul x10, x13, x14
+    lsr x10, x10, #32
+    add x15, x15, x10
+    lsr x10, x12, #24
+    lsr x11, x15, #14
+    mul x11, x11, x10
+    lsr x11, x11, #32
+    movz x13, #0x0AAA, lsl #16
+    movk x13, #0xAAAB
+    mul x10, x10, x13
+    lsr x10, x10, #40
+    lsr x13, x15, #32
+    movz x14, #0x0444, lsl #16
+    movk x14, #0x4444
+    mul x13, x13, x14
+    lsr x13, x13, #32
+    add x10, x10, x13
+    movz x13, #0x2AAA, lsl #16
+    movk x13, #0xAAAB
+    add x10, x10, x13
+    mul x11, x11, x10
+    lsr x11, x11, #25
+    add x12, x12, x15
+    add x12, x12, x11
+    lsl x13, x6, #56
+    lsr x13, x13, #56
+    asr x6, x6, #8
+    adrp x9, pmtensorexptable
+    add x9, x9, #:lo12:pmtensorexptable
+    lsl x13, x13, #3
+    add x9, x9, x13
+    ldr x14, [x9]
+    lsr x15, x14, #32
+    lsl x9, x14, #32
+    lsr x9, x9, #32
+    lsr x10, x12, #32
+    lsl x11, x12, #32
+    lsr x11, x11, #32
+    mul x13, x15, x10
+    add x14, x14, x13
+    mul x13, x15, x11
+    lsr x13, x13, #32
+    add x14, x14, x13
+    mul x13, x9, x10
+    lsr x13, x13, #32
+    add x14, x14, x13
+    lsr x13, x14, #62
+    add x7, x13, #61
+    add x6, x6, x7
+    add x6, x6, #65
+    cmp x6, #255
+    b.ge pmexpa_huge
+    sub x8, x7, #23
+    cmp x6, #0
+    b.gt pmexpa_round
+    add x8, x8, #1
+    sub x8, x8, x6
+    movz x6, #1
+    cmp x8, #64
+    b.ge pmexpa_zero
+pmexpa_round:
+    sub x9, x8, #1
+    lsr x10, x14, x9
+    lsl x11, x10, #63
+    lsr x10, x10, #1
+    cbz x11, pmexpa_pack
+    movz x12, #64
+    sub x12, x12, x9
+    lsl x13, x14, x12
+    lsl x11, x10, #63
+    orr x13, x13, x11
+    cbz x13, pmexpa_pack
+    add x10, x10, #1
+pmexpa_pack:
+    sub x6, x6, #1
+    lsl x6, x6, #23
+    add x0, x6, x10
+    b pmexpa_done
+pmexpa_nan:
+    movz w1, #0x40, lsl #16
+    orr w0, w0, w1
+    b pmexpa_done
+pmexpa_inf:
+    lsr w3, w0, #31
+    cbnz w3, pmexpa_zero
+pmexpa_huge:
+    movz x0, #0x7F80, lsl #16
+    b pmexpa_done
+pmexpa_zero:
+    movz x0, #0
+    b pmexpa_done
+pmexpa_one:
+    movz x0, #0x3F80, lsl #16
+pmexpa_done:
+  EndASM
 EndProcedure
 
 ; log, correctly rounded, in exact 32-bit integer arithmetic (the bits of x in,
@@ -1151,55 +1186,6 @@ Procedure.i PmTensorLogBits(b.i)
   EndASM
 EndProcedure
 CompilerElse
-; The high word of the unsigned 64-bit product of two 32-bit words, from four
-; 16 x 16 products. Every value is a 32-bit pattern; each statement stores one
-; operation's result, so the bits are the same wherever .l is 32 bits.
-Procedure.l PmTensorMulHi32(a.l, b.l)
-  Protected alo.l
-  Protected ahi.l
-  Protected blo.l
-  Protected bhi.l
-  Protected p00.l
-  Protected p01.l
-  Protected p10.l
-  Protected p11.l
-  Protected mid.l
-  Protected t.l
-  Protected hi.l
-  alo = a & $FFFF
-  ahi = (a >> 16) & $FFFF
-  blo = b & $FFFF
-  bhi = (b >> 16) & $FFFF
-  p00 = alo * blo
-  p01 = alo * bhi
-  p10 = ahi * blo
-  p11 = ahi * bhi
-  mid = (p00 >> 16) & $FFFF
-  t = p01 & $FFFF
-  mid = mid + t
-  t = p10 & $FFFF
-  mid = mid + t
-  hi = (p01 >> 16) & $FFFF
-  t = (p10 >> 16) & $FFFF
-  hi = hi + t
-  t = mid >> 16
-  hi = hi + t
-  hi = hi + p11
-  ProcedureReturn hi
-EndProcedure
-
-; 1 when the unsigned word a is below the unsigned word b
-Procedure.l PmTensorBelow32(a.l, b.l)
-  Protected ua.l
-  Protected ub.l
-  ua = a ! $80000000
-  ub = b ! $80000000
-  If ua < ub
-    ProcedureReturn 1
-  EndIf
-  ProcedureReturn 0
-EndProcedure
-
 ; exp, correctly rounded, in exact 32-bit integer arithmetic (the bits of x in,
 ; the bits of the result out). x = (256 i + j) ln2/256 + r with 0 <= r < ln2/256
 ; (r to 2^-64, from ln2/256 to 2^-96); e^r - 1 = r + r^2/2 + r^3 (1/6 + r/24 +
@@ -2096,6 +2082,1518 @@ DataSection
 EndDataSection
 CompilerEndIf
 
+; Sin and Cos, correctly rounded (C6c-3), for a program that uses them
+; (#PMO_USE_TRIG): the same bits as the Windows program on every target (whose
+; own Sin and Cos are corrected at six arguments in tensor_fp32_windows.pbi).
+; One exact integer method: 32-bit words on the Pico and the Pi 4, UMULL/UMAAL
+; assembly on the Pico 2, run on every binary32 argument on each target.
+; NaN is x86's: a NaN argument comes back quieted, an infinity gives FFC00000.
+CompilerIf #PMO_USE_TRIG = 1
+CompilerIf #PMO_INT8_BACKEND = 3
+; sin (op 0) and cos (op 1), correctly rounded, on the Cortex-M33: the same
+; exact integer method as the 32-bit procedure (every step and every
+; truncation the same), written with UMULL/UMAAL; the quadrant as the sine's
+; of |x| + pi/2 for a cosine. A register shift by 32 or
+; more gives 0 on this core, which the window of 2/pi and the shifts of b rely
+; on. The two CLZs are written as their encodings (.byte), which this
+; assembler has no mnemonic for: clz r4, r3 = FAB3 F483; clz r1, r6 = FAB6 F186.
+; Every binary32 argument was checked against a correctly rounded sin and cos.
+Procedure.i PmTensorTrigBits(b.i, op.i)
+  ASM
+    push {r5, r6, r7}
+    sub sp, #56
+    lsls r2, r0, #1
+    lsrs r2, r2, #1
+    ldr r3, =0x7F800000
+    cmp r2, r3
+    bhi pmtrig_nan
+    beq pmtrig_inf
+    ldr r3, =0x39800000
+    cmp r2, r3
+    blo pmtrig_tiny
+    str r1, [sp, #0]
+    lsrs r3, r0, #31
+    str r3, [sp, #4]
+    lsrs r3, r2, #23
+    lsls r2, r2, #9
+    lsrs r2, r2, #9
+    movs r4, #1
+    lsls r4, r4, #23
+    orrs r2, r4
+    ldr r4, =334
+    subs r4, r4, r3
+    lsrs r6, r4, #5
+    lsls r6, r6, #2
+    ldr r5, =PmTensorTrigTable
+    adds r6, r6, r5
+    lsls r4, r4, #27
+    lsrs r4, r4, #27
+    movs r5, #32
+    subs r5, r5, r4
+    movs r7, #0
+    ldr r0, [r6, #4]
+    lsrs r0, r4
+    ldr r1, [r6, #8]
+    lsls r1, r5
+    orrs r0, r1
+    movs r1, #0
+    umaal r7, r1, r2, r0
+    str r7, [sp, #8]
+    movs r7, r1
+    ldr r0, [r6, #8]
+    lsrs r0, r4
+    ldr r1, [r6, #12]
+    lsls r1, r5
+    orrs r0, r1
+    movs r1, #0
+    umaal r7, r1, r2, r0
+    str r7, [sp, #12]
+    movs r7, r1
+    ldr r0, [r6, #12]
+    lsrs r0, r4
+    ldr r1, [r6, #16]
+    lsls r1, r5
+    orrs r0, r1
+    movs r1, #0
+    umaal r7, r1, r2, r0
+    str r7, [sp, #16]
+    movs r7, r1
+    ldr r0, [r6, #16]
+    lsrs r0, r4
+    ldr r1, [r6, #20]
+    lsls r1, r5
+    orrs r0, r1
+    movs r1, #0
+    umaal r7, r1, r2, r0
+    ldr r0, [sp, #8]
+    ldr r1, [sp, #12]
+    ldr r3, [sp, #16]
+    lsrs r4, r3, #31
+    str r4, [sp, #20]
+    adds r7, r7, r4
+    lsls r7, r7, #22
+    lsrs r7, r7, #22
+    str r7, [sp, #24]
+    negs r5, r4
+    eors r0, r5
+    eors r1, r5
+    eors r3, r5
+    movs r6, #0
+    adds r0, r0, r4
+    adcs r1, r6
+    adcs r3, r6
+    movs r7, #0
+    cmp r3, #0
+    bne pmtrig_n1
+    movs r7, #32
+    movs r3, r1
+    movs r1, r0
+    movs r0, #0
+    cmp r3, #0
+    bne pmtrig_n1
+    movs r7, #64
+    movs r3, r1
+    movs r1, #0
+    cmp r3, #0
+    beq pmtrig_n2
+  pmtrig_n1:
+    .byte 179, 250, 131, 244
+    adds r7, r7, r4
+    movs r5, #32
+    subs r5, r5, r4
+    lsls r3, r4
+    movs r6, r1
+    lsrs r6, r5
+    orrs r3, r6
+    lsls r1, r4
+    lsrs r0, r5
+    orrs r1, r0
+  pmtrig_n2:
+    str r7, [sp, #28]
+    ldr r4, =0x01921FB5
+    ldr r5, =0x4442D184
+    umull r6, r0, r3, r5
+    umull r5, r2, r1, r4
+    umull r6, r7, r3, r4
+    movs r1, #0
+    adds r6, r6, r0
+    adcs r7, r1
+    adds r6, r6, r2
+    adcs r7, r1
+    str r6, [sp, #32]
+    str r7, [sp, #36]
+    ldr r0, [sp, #28]
+    movs r1, r6
+    lsrs r1, r0
+    movs r2, #32
+    subs r2, r2, r0
+    movs r3, r7
+    lsls r3, r2
+    orrs r1, r3
+    movs r3, r0
+    subs r3, #32
+    movs r4, r7
+    lsrs r4, r3
+    orrs r1, r4
+    movs r2, r7
+    lsrs r2, r0
+    str r1, [sp, #8]
+    str r2, [sp, #12]
+    umull r3, r4, r2, r2
+    umull r5, r6, r2, r1
+    lsls r5, r6, #1
+    lsrs r6, r6, #31
+    adds r3, r3, r5
+    adcs r4, r6
+    str r3, [sp, #40]
+    str r4, [sp, #44]
+    lsls r5, r4, #14
+    lsrs r6, r3, #18
+    orrs r5, r6
+    umull r6, r5, r5, r5
+    str r5, [sp, #48]
+    ldr r0, [sp, #24]
+    lsrs r5, r0, #8
+    lsls r0, r0, #24
+    lsrs r0, r0, #24
+    str r0, [sp, #24]
+    ldr r1, [sp, #0]
+    adds r5, r5, r1
+    movs r6, #1
+    bics r6, r5
+    lsrs r7, r5, #1
+    movs r2, #1
+    ands r7, r2
+    ldr r2, [sp, #4]
+    bics r2, r1
+    eors r7, r2
+    str r7, [sp, #4]
+    str r6, [sp, #0]
+    ldr r5, =0x2AAAAAAA
+    ldr r6, =0xAAAAAAAB
+    umull r1, r2, r4, r6
+    umull r1, r6, r3, r5
+    umull r0, r7, r4, r5
+    movs r3, #0
+    adds r0, r0, r2
+    adcs r7, r3
+    adds r0, r0, r6
+    adcs r7, r3
+    ldr r5, [sp, #48]
+    ldr r6, =35791394
+    umull r1, r6, r5, r6
+    lsls r6, r6, #4
+    subs r0, r0, r6
+    sbcs r7, r3
+    ldr r6, [sp, #0]
+    ldr r1, [sp, #24]
+    cmp r6, #0
+    beq pmtrig_b
+    cmp r1, #0
+    bne pmtrig_b
+    ldr r5, [sp, #32]
+    ldr r6, [sp, #36]
+    umull r1, r2, r6, r0
+    umull r1, r3, r5, r7
+    umull r1, r4, r6, r7
+    movs r7, #0
+    adds r1, r1, r2
+    adcs r4, r7
+    adds r1, r1, r3
+    adcs r4, r7
+    subs r5, r5, r1
+    sbcs r6, r4
+    ldr r0, [sp, #4]
+    ldr r1, [sp, #20]
+    eors r0, r1
+    str r0, [sp, #4]
+    ldr r0, [sp, #28]
+    adds r0, #64
+    negs r0, r0
+    b pmtrig_round
+  pmtrig_b:
+    ldr r5, [sp, #12]
+    ldr r6, [sp, #8]
+    umull r1, r2, r5, r0
+    umull r1, r3, r6, r7
+    umull r1, r4, r5, r7
+    movs r7, #0
+    adds r1, r1, r2
+    adcs r4, r7
+    adds r1, r1, r3
+    adcs r4, r7
+    subs r6, r6, r1
+    sbcs r5, r4
+    str r6, [sp, #8]
+    str r5, [sp, #12]
+    ldr r3, [sp, #40]
+    ldr r4, [sp, #44]
+    lsrs r0, r3, #1
+    lsls r1, r4, #31
+    orrs r0, r1
+    lsrs r7, r4, #1
+    ldr r5, [sp, #48]
+    ldr r6, =178956971
+    umull r1, r6, r5, r6
+    lsls r6, r6, #4
+    movs r5, #0
+    subs r0, r0, r6
+    sbcs r7, r5
+    ldr r1, [sp, #24]
+    lsls r1, r1, #4
+    ldr r2, =PmTensorTrigTable
+    adds r2, r2, r1
+    adds r2, #48
+    movs r3, r2
+    ldr r1, [sp, #0]
+    ldr r5, [sp, #20]
+    cmp r1, #0
+    bne pmtrig_tsin
+    adds r2, #8
+    movs r1, #1
+    eors r5, r1
+    b pmtrig_tgo
+  pmtrig_tsin:
+    adds r3, #8
+  pmtrig_tgo:
+    str r5, [sp, #20]
+    ldr r4, [r2, #4]
+    ldr r2, [r2, #0]
+    umull r1, r5, r4, r0
+    umull r1, r6, r2, r7
+    umull r0, r1, r4, r7
+    movs r7, #0
+    adds r0, r0, r5
+    adcs r1, r7
+    adds r0, r0, r6
+    adcs r1, r7
+    subs r2, r2, r0
+    sbcs r4, r1
+    ldr r5, [r3, #4]
+    ldr r3, [r3, #0]
+    ldr r6, [sp, #12]
+    ldr r7, [sp, #8]
+    umull r0, r1, r5, r7
+    umull r0, r7, r3, r6
+    umull r0, r3, r5, r6
+    movs r5, #0
+    adds r0, r0, r1
+    adcs r3, r5
+    adds r0, r0, r7
+    adcs r3, r5
+    ldr r5, [sp, #20]
+    cmp r5, #0
+    bne pmtrig_ysub
+    adds r2, r2, r0
+    adcs r4, r3
+    b pmtrig_ydone
+  pmtrig_ysub:
+    subs r2, r2, r0
+    sbcs r4, r3
+  pmtrig_ydone:
+    movs r5, r2
+    movs r6, r4
+    movs r0, #63
+    negs r0, r0
+  pmtrig_round:
+    movs r1, r6
+    orrs r1, r5
+    beq pmtrig_zero
+    movs r4, #0
+    cmp r6, #0
+    bne pmtrig_r1
+    movs r6, r5
+    movs r5, #0
+    movs r4, #32
+  pmtrig_r1:
+    .byte 182, 250, 134, 241
+    adds r4, r4, r1
+    movs r2, #32
+    subs r2, r2, r1
+    lsls r6, r1
+    movs r3, r5
+    lsrs r3, r2
+    orrs r6, r3
+    lsls r5, r1
+    lsrs r3, r6, #8
+    lsls r2, r6, #24
+    bpl pmtrig_pack
+    lsls r2, r2, #1
+    orrs r2, r5
+    bne pmtrig_up
+    lsls r2, r3, #31
+    beq pmtrig_pack
+  pmtrig_up:
+    adds r3, #1
+  pmtrig_pack:
+    adds r0, #189
+    subs r0, r0, r4
+    lsls r0, r0, #23
+    adds r0, r0, r3
+    ldr r1, [sp, #4]
+    lsls r1, r1, #31
+    orrs r0, r1
+    b pmtrig_exit
+  pmtrig_zero:
+    ldr r0, [sp, #4]
+    lsls r0, r0, #31
+    b pmtrig_exit
+  pmtrig_nan:
+    ldr r1, =0x400000
+    orrs r0, r1
+    b pmtrig_exit
+  pmtrig_inf:
+    ldr r0, =0xFFC00000
+    b pmtrig_exit
+  pmtrig_tiny:
+    cmp r1, #0
+    beq pmtrig_exit
+    ldr r0, =0x3F800000
+  pmtrig_exit:
+    add sp, #56
+    pop {r5, r6, r7}
+  EndASM
+EndProcedure
+CompilerElse
+; sin (op 0) and cos (op 1), correctly rounded, in exact 32-bit integer
+; arithmetic (the bits of x in, the bits of the result out). |x| is reduced
+; against 2/pi taken to 320 bits (Payne and Hanek): Z = |x| 512/pi to 96
+; fraction bits, j = the nearest integer (quadrant j/256, step j mod 256 of a
+; 256-entry table of sin and cos of multiples of pi/512), b = (Z - j) pi/512,
+; |b| <= pi/1024. sin b = b (1 - b^2/6 + b^4/120) and cos b = 1 - b^2/2 +
+; b^4/24 in Q64, b^4 to 32 bits (without b^4/120, 186 arguments round the
+; other way; b^6/720 changes none); sin(t + b) and cos(t + b) from the table
+; in Q63.
+; Where the result is sin b alone (x near a multiple of pi/2) it is kept to
+; its own relative precision. Rounded once, to nearest-even.
+; Every binary32 argument was checked against a correctly rounded sin and cos.
+Procedure.l PmTensorTrigBits(b.l, op.l)
+  Protected a.l
+  Protected neg.l
+  Protected e.l
+  Protected m.l
+  Protected s.l
+  Protected w.l
+  Protected bb.l
+  Protected cb.l
+  Protected k.l
+  Protected p.l
+  Protected u.l
+  Protected v.l
+  Protected c.l
+  Protected z1.l
+  Protected z2.l
+  Protected z3.l
+  Protected z4.l
+  Protected sg.l
+  Protected j.l
+  Protected q.l
+  Protected zz.l
+  Protected fh.l
+  Protected fl.l
+  Protected bh.l
+  Protected bl.l
+  Protected qh.l
+  Protected ql.l
+  Protected b2h.l
+  Protected b2l.l
+  Protected th.l
+  Protected tl.l
+  Protected dh.l
+  Protected dl.l
+  Protected sh.l
+  Protected sl.l
+  Protected rh.l
+  Protected rl.l
+  Protected wantsin.l
+  Protected minus.l
+  Protected eb.l
+  Protected x4.l
+  a = b & $7FFFFFFF
+  If a > $7F800000
+    ProcedureReturn b | $400000
+  EndIf
+  If a = $7F800000
+    ProcedureReturn $FFC00000
+  EndIf
+  If a < $39800000
+    ; |x| < 2^-12: sin x rounds to x and cos x to 1
+    If op = 0
+      ProcedureReturn b
+    EndIf
+    ProcedureReturn $3F800000
+  EndIf
+  neg = 0
+  If a <> b
+    neg = 1
+  EndIf
+  e = a >> 23
+  m = a & $7FFFFF
+  m = m | $800000
+  ; the 160 bits of 2/pi at 2^(e - 14): words w.. of the table, shifted bb
+  s = 334 - e
+  w = s >> 5
+  w = w << 2
+  bb = s & 31
+  cb = 32 - bb
+  ; Z 2^128 = m A modulo 2^138, words z4..z1 carried a word at a time (the
+  ; lowest product word is left out: it changes no result)
+  k = 1
+  c = 0
+  While k < 5
+    u = PeekL(?PmTensorTrigTable + w + k * 4)
+    If bb <> 0
+      u = (u >> bb) & ((1 << cb) - 1)
+      v = PeekL(?PmTensorTrigTable + w + k * 4 + 4)
+      v = v << cb
+      u = u | v
+    EndIf
+    p = m * u
+    v = PmTensorMulHi32(m, u)
+    p = p + c
+    v = v + PmTensorBelow32(p, c)
+    c = v
+    If k = 1
+      z1 = p
+    ElseIf k = 2
+      z2 = p
+    ElseIf k = 3
+      z3 = p
+    Else
+      z4 = p
+    EndIf
+    k = k + 1
+  Wend
+  ; the nearest j, and |Z - j| in Q96 (z3 z2 z1), sg its sign
+  sg = (z3 >> 31) & 1
+  j = z4 + sg
+  j = j & 1023
+  If sg = 1
+    z1 = z1 ! $FFFFFFFF
+    z2 = z2 ! $FFFFFFFF
+    z3 = z3 ! $FFFFFFFF
+    z1 = z1 + 1
+    If z1 = 0
+      z2 = z2 + 1
+      If z2 = 0
+        z3 = z3 + 1
+      EndIf
+    EndIf
+  EndIf
+  q = j >> 8
+  j = j & 255
+  ; |Z - j| as a 64-bit mantissa fh fl times 2^-zz
+  zz = 0
+  If z3 = 0
+    zz = 32
+    z3 = z2
+    z2 = z1
+    z1 = 0
+    If z3 = 0
+      zz = 64
+      z3 = z2
+      z2 = 0
+    EndIf
+  EndIf
+  fh = z3
+  fl = z2
+  If fh <> 0
+    k = 0
+    While (fh & $80000000) = 0
+      fh = fh << 1
+      u = (fl >> 31) & 1
+      fh = fh | u
+      fl = fl << 1
+      u = (z1 >> 31) & 1
+      fl = fl | u
+      z1 = z1 << 1
+      k = k + 1
+    Wend
+    zz = zz + k
+  EndIf
+  ; b = |Z - j| pi/512: bh bl = b 2^(64 + zz)
+  u = PmTensorMulHi32(fh, $4442D184)
+  v = PmTensorMulHi32(fl, $01921FB5)
+  bl = fh * $01921FB5
+  bh = PmTensorMulHi32(fh, $01921FB5)
+  bl = bl + u
+  bh = bh + PmTensorBelow32(bl, u)
+  bl = bl + v
+  bh = bh + PmTensorBelow32(bl, v)
+  ; b in Q64 (qh ql): the mantissa shifted right zz
+  qh = bh
+  ql = bl
+  If zz >= 64
+    qh = 0
+    ql = 0
+  ElseIf zz >= 32
+    k = zz - 32
+    ql = (qh >> k) & ((1 << (32 - k)) - 1)
+    If k = 0
+      ql = qh
+    EndIf
+    qh = 0
+  ElseIf zz > 0
+    k = 32 - zz
+    ql = (ql >> zz) & ((1 << k) - 1)
+    u = qh << k
+    ql = ql | u
+    qh = (qh >> zz) & ((1 << k) - 1)
+  EndIf
+  ; b^2 in Q64 (b2h b2l)
+  b2l = qh * qh
+  b2h = PmTensorMulHi32(qh, qh)
+  u = PmTensorMulHi32(qh, ql)
+  v = u << 1
+  b2l = b2l + v
+  b2h = b2h + PmTensorBelow32(b2l, v)
+  u = (u >> 31) & 1
+  b2h = b2h + u
+  ; b^4 in Q60, one word, from b^2 in Q46
+  u = b2h << 14
+  v = (b2l >> 18) & $3FFF
+  x4 = u | v
+  x4 = PmTensorMulHi32(x4, x4)
+  ; t = b^2/6 - b^4/120 in Q64 (th tl)
+  tl = b2h * $2AAAAAAA
+  th = PmTensorMulHi32(b2h, $2AAAAAAA)
+  u = PmTensorMulHi32(b2h, $AAAAAAAB)
+  tl = tl + u
+  th = th + PmTensorBelow32(tl, u)
+  u = PmTensorMulHi32(b2l, $2AAAAAAA)
+  tl = tl + u
+  th = th + PmTensorBelow32(tl, u)
+  u = PmTensorMulHi32(x4, 35791394)
+  u = u << 4
+  c = PmTensorBelow32(tl, u)
+  tl = tl - u
+  th = th - c
+  ; the result is sin or cos of t + b, t = j pi/512, per quadrant
+  If op = 0
+    wantsin = 1 - (q & 1)
+    minus = (q >> 1) ! neg
+  Else
+    wantsin = q & 1
+    minus = ((q + 1) >> 1) & 1
+  EndIf
+  If wantsin = 1 And j = 0
+    ; sin b alone: b (1 - t), kept relative to b
+    ; sin b 2^(64 + zz) = bm - bm t
+    rl = bh * th
+    rh = PmTensorMulHi32(bh, th)
+    u = PmTensorMulHi32(bh, tl)
+    rl = rl + u
+    rh = rh + PmTensorBelow32(rl, u)
+    u = PmTensorMulHi32(bl, th)
+    rl = rl + u
+    rh = rh + PmTensorBelow32(rl, u)
+    c = PmTensorBelow32(bl, rl)
+    rl = bl - rl
+    rh = bh - rh
+    rh = rh - c
+    minus = minus ! sg
+    eb = -64 - zz
+  Else
+    ; sin b = b - b t (Q64, sh sl)
+    sl = qh * th
+    sh = PmTensorMulHi32(qh, th)
+    u = PmTensorMulHi32(qh, tl)
+    sl = sl + u
+    sh = sh + PmTensorBelow32(sl, u)
+    u = PmTensorMulHi32(ql, th)
+    sl = sl + u
+    sh = sh + PmTensorBelow32(sl, u)
+    c = PmTensorBelow32(ql, sl)
+    sl = ql - sl
+    sh = qh - sh
+    sh = sh - c
+    ; d = 1 - cos b = b^2/2 - b^4/24 (Q64, dh dl)
+    dl = (b2l >> 1) & $7FFFFFFF
+    u = b2h << 31
+    dl = dl | u
+    dh = b2h >> 1
+    u = PmTensorMulHi32(x4, 178956971)
+    u = u << 4
+    c = PmTensorBelow32(dl, u)
+    dl = dl - u
+    dh = dh - c
+    ; the table: sin t and cos t in Q63
+    k = j << 4
+    If wantsin = 1
+      ; sin(t + b) = sin t - sin t d +- cos t sin b
+      tl = PeekL(?PmTensorTrigTable + 48 + k)
+      th = PeekL(?PmTensorTrigTable + 52 + k)
+      w = PeekL(?PmTensorTrigTable + 56 + k)
+      p = PeekL(?PmTensorTrigTable + 60 + k)
+    Else
+      ; cos(t + b) = cos t - cos t d -+ sin t sin b
+      tl = PeekL(?PmTensorTrigTable + 56 + k)
+      th = PeekL(?PmTensorTrigTable + 60 + k)
+      w = PeekL(?PmTensorTrigTable + 48 + k)
+      p = PeekL(?PmTensorTrigTable + 52 + k)
+      sg = sg ! 1
+    EndIf
+    ; r = first - first d
+    rl = th * dh
+    rh = PmTensorMulHi32(th, dh)
+    u = PmTensorMulHi32(th, dl)
+    rl = rl + u
+    rh = rh + PmTensorBelow32(rl, u)
+    u = PmTensorMulHi32(tl, dh)
+    rl = rl + u
+    rh = rh + PmTensorBelow32(rl, u)
+    c = PmTensorBelow32(tl, rl)
+    rl = tl - rl
+    rh = th - rh
+    rh = rh - c
+    ; second sin b (Q63)
+    dl = p * sh
+    dh = PmTensorMulHi32(p, sh)
+    u = PmTensorMulHi32(p, sl)
+    dl = dl + u
+    dh = dh + PmTensorBelow32(dl, u)
+    u = PmTensorMulHi32(w, sh)
+    dl = dl + u
+    dh = dh + PmTensorBelow32(dl, u)
+    If sg = 0
+      rl = rl + dl
+      rh = rh + dh
+      rh = rh + PmTensorBelow32(rl, dl)
+    Else
+      c = PmTensorBelow32(rl, dl)
+      rl = rl - dl
+      rh = rh - dh
+      rh = rh - c
+    EndIf
+    eb = -63
+  EndIf
+  ; round rh rl 2^eb once: its top bit to bit 63, then 24 bits
+  If rh = 0 And rl = 0
+    If minus <> 0
+      ProcedureReturn $80000000
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  k = 0
+  If rh = 0
+    rh = rl
+    rl = 0
+    k = 32
+  EndIf
+  While (rh & $80000000) = 0
+    rh = rh << 1
+    u = (rl >> 31) & 1
+    rh = rh | u
+    rl = rl << 1
+    k = k + 1
+  Wend
+  ; the value is rh rl 2^(eb - k): its exponent 63 + eb - k
+  m = (rh >> 8) & $FFFFFF
+  If (rh & $80) <> 0
+    If (rh & $7F) <> 0 Or rl <> 0 Or (m & 1) <> 0
+      m = m + 1
+    EndIf
+  EndIf
+  e = 63 + eb
+  e = e - k
+  e = e + 126
+  e = e << 23
+  e = e + m
+  If minus <> 0
+    e = e | $80000000
+  EndIf
+  ProcedureReturn e
+EndProcedure
+CompilerEndIf
+
+; 2/pi to 320 fraction bits (twelve words, low first), then sin and cos of
+; j pi/512 (j = 0..255) in Q63, each as two words low first
+DataSection
+  PmTensorTrigTable:
+  Data.l $424DD2E0,$B7246E3A,$DEBBC561,$FE5163AB,$3C439041,$DB629599,$F534DDC0,$FC2757D1,$4E441529,$A2F9836E,$00000000,$00000000
+  Data.l $00000000,$00000000,$00000000,$80000000,$F3380389,$00C90F87,$3A2A4936,$7FFF6216
+  Data.l $CDEC7846,$01921D1F,$6E4B6D5E,$7FFD885A,$7C61DFA7,$025B26D7,$2D4684AE,$7FFA72D1
+  Data.l $F46CCFBF,$03242ABE,$133432ED,$7FF62182,$3A39E020,$03ED26E6,$C74FE0BD,$7FF09477
+  Data.l $65157346,$04B6195D,$FBDD7275,$7FE9CBBF,$A43350DA,$057F0034,$6E077CC6,$7FE1C76B
+  Data.l $437604FA,$0647D97C,$E5B5F78F,$7FD8878D,$B035F8B4,$0710A344,$355D6F35,$7FCE0C3E
+  Data.l $7E0837FB,$07D95B9E,$39C6B502,$7FC25596,$6B84D940,$08A2009A,$D9CF0F0D,$7FB563B2
+  Data.l $670CFAE6,$096A9049,$0620E855,$7FA736B4,$93904AD7,$0A3308BC,$B8E501B2,$7F97CEBC
+  Data.l $4D520C61,$0AFB6805,$F56C2469,$7F872BF2,$2EAD90AC,$0BC3AC35,$C7D1572A,$7F754E7F
+  Data.l $14DA15F1,$0C8BD35E,$44949678,$7F62368F,$24AE01BD,$0D53DB92,$882E1153,$7F4DE450
+  Data.l $CF616A7B,$0E1BC2E3,$B699EB51,$7F3857F5,$D74FE489,$0EE38765,$FADC8531,$7F2191B3
+  Data.l $54B9871A,$0FAB272B,$867F4D1F,$7F0991C3,$BA831D23,$1072A047,$910617EA,$7EF0585F
+  Data.l $DAF576AB,$1139F0CE,$575D048E,$7ED5E5C6,$EC7BCEB7,$120116D4,$1B3EEB63,$7EBA3A39
+  Data.l $8E613A22,$12C8106E,$22945A86,$7E9D55FC,$CD8D13BA,$138EDBB0,$B6CB20F9,$7E7F3956
+  Data.l $293E59DB,$145576B1,$24266A1D,$7E5FE493,$97C5F1FA,$151BDF85,$B9076B3A,$7E3F57FE
+  Data.l $8B3FC655,$15E21444,$C52EA4D6,$7E1D93E9,$F64AB23E,$16A81304,$98F5B9BB,$7DFA98A7
+  Data.l $50BF3147,$176DD9DE,$8481DD85,$7DD6668E,$9C64C5BA,$183366E8,$D6EEDCC3,$7DB0FDF7
+  Data.l $69A60AB6,$18F8B83C,$DD72C0AB,$7D8A5F3F,$DC436666,$19BDCBF2,$E27A1090,$7D628AC5
+  Data.l $B004509E,$1A82A025,$2CBCB339,$7D3980EC,$3D67226F,$1B4732EF,$FE4B7270,$7D0F4217
+  Data.l $7E4F62FD,$1C0B826A,$93962314,$7CE3CEB1,$12B28624,$1CCF8CB3,$226A7415,$7CB72724
+  Data.l $4543115D,$1D934FE5,$D8EB66DF,$7C894BDD,$101A1B52,$1E56CA1E,$DC8173B6,$7C5A3D4F
+  Data.l $215F1AAF,$1F19F97B,$48C35CA9,$7C29FBEE,$DFEDF8B5,$1FDCDC1A,$2E57B1C8,$7BF88830
+  Data.l $6FFB5BFF,$209F701C,$91CF0963,$7BC5E28F,$B7B72027,$2161B39F,$6A76EF25,$7B920B89
+  Data.l $63ECEEC1,$2223A4C5,$A1258CF4,$7B5D039D,$ECA2EE49,$22E541AE,$0EFE108D,$7B26CB4F
+  Data.l $99B67BA3,$23A6887E,$7C2DD0E3,$7AEF6323,$8776E2CD,$24677757,$9EA2366D,$7AB6CBA3
+  Data.l $AB3E0B51,$25280C5D,$18B76976,$7A7D055B,$D8070D45,$25E845B5,$77DFC9CE,$7A4210D8
+  Data.l $C302A362,$26A82185,$33443318,$7A05EEAD,$08296EFA,$27679DF4,$AA5D1121,$79C89F6D
+  Data.l $2ECC0286,$2826B928,$238447BA,$798A23B1,$AE20A77F,$28E5714A,$CA7FF190,$794A7C11
+  Data.l $F1CED449,$29A3C484,$AF05F9A8,$7909A92C,$5E784703,$2A61B101,$C3389322,$78C7ABA1
+  Data.l $563FB9FC,$2B1F34EB,$DA1B92FF,$78848413,$3D4D26B2,$2BDC4E6F,$A602AFBF,$78403328
+  Data.l $7E4F8C22,$2C98FBBA,$B6F8AAAF,$77FAB988,$8EFC2D64,$2D553AFB,$791F66D3,$77B417DF
+  Data.l $F48B3D5E,$2E110A61,$3308F184,$776C4EDB,$4831EC96,$2ECC681E,$040980B6,$77235F2D
+  Data.l $3B99CE03,$2F875262,$E2826B29,$76D94988,$9D5587E7,$3041C760,$9A261EA8,$768E0EA5
+  Data.l $5D52C5A3,$30FBC54D,$CA3518A3,$7641AF3C,$91495FA3,$31B54A5D,$E3B3E580,$75F42C0A
+  Data.l $7927AE5A,$326E54C7,$279A2B0C,$75A585CF,$837BFD75,$3326E2C2,$A4FAC27F,$7555BD4B
+  Data.l $51DB145B,$33DEF287,$3724E6B1,$7504D345,$BD43C921,$3496824F,$83BE7B08,$74B2C883
+  Data.l $DA7F9315,$354D9056,$F8D76FDE,$745F9DD0,$FE801228,$36041AD8,$CAF64919,$740B53FA
+  Data.l $C2B98057,$36BA2013,$F31DCBC3,$73B5EBD0,$097A0268,$376F9E46,$2CCBD783,$735F6626
+  Data.l $023DCD3F,$382493B0,$F3F170F3,$7307C3CF,$2E001521,$38D8FE93,$82E401C4,$72AF05A6
+  Data.l $6388BC2D,$398CDD32,$D047D3DA,$72552C84,$D3B6B58E,$3A402DD1,$8CF3CC6D,$71FA3948
+  Data.l $0DC712AB,$3AF2EEB7,$21CE6C76,$719E2CD2,$0398AFE2,$3BA51E29,$ADA41BA9,$71410804
+  Data.l $0DEC763C,$3C56BA70,$02F6C349,$70E2CBC6,$F0A227A1,$3D07C1D5,$A5C6BE4B,$708378FE
+  Data.l $DEF1AB11,$3DB832A5,$C9552436,$70231099,$7FA0CE83,$3E680B2C,$4DDF7448,$6FC19385
+  Data.l $F13573F7,$3F1749B7,$BE54A67E,$6F5F02B1,$CE241F6B,$3FC5EC97,$4E03A81C,$6EFB5F12
+  Data.l $30FADB66,$4073F21D,$D643497F,$6E96A99C,$B88869B9,$4121589A,$D413A2EB,$6E30E349
+  Data.l $8BFFB65A,$41CE1E64,$65B8F644,$6DCA0D14,$5F178202,$427A41D0,$48501388,$6D6227FA
+  Data.l $76263A73,$4325C135,$D55C4615,$6CF934FB,$AA39F645,$43D09AEC,$004ED0AD,$6C8F351C
+  Data.l $6D2C8A11,$447ACD50,$5407FE6E,$6C242960,$CDB3ACFA,$452456BC,$F051CEC6,$6BB812D0
+  Data.l $7B6D2281,$45CD358F,$875442B8,$6B4AF278,$CAE6DFB3,$46756827,$5B0351A9,$6ADCC964
+  Data.l $B9A321B2,$471CECE6,$3A868C0D,$6A6D98A4,$F2186BBC,$47C3C22E,$7F9A7268,$69FD614A
+  Data.l $CFAD62C6,$4869E664,$0BEB870B,$698C246C,$62B07CE3,$490F57EE,$466B211B,$6919E320
+  Data.l $744B7AA2,$49B41533,$189E0777,$68A69E81,$8A72A0AB,$4A581C9D,$EBE4DA1F,$683257AA
+  Data.l $EBCFA7DD,$4AFB6C97,$A6BE50D9,$67BD0FBC,$A3A85A4E,$4B9E038F,$AA0355C6,$6746C7D7
+  Data.l $85C0D384,$4C3FDFF3,$CE1D02CF,$66CF811F,$32395A54,$4CE10034,$603488BC,$66573CBB
+  Data.l $1967CAE0,$4D8162C4,$1F5D06EB,$65DDFBD3,$7FAC8730,$4E210617,$39B75AAA,$6563BF92
+  Data.l $8142E4F2,$4EBFE8A4,$498FED3D,$64E88926,$160D0EFE,$4F5E08E3,$527687B1,$646C59BF
+  Data.l $155B5137,$4FFB654D,$BE5033A5,$63EF328F,$39AEC57B,$5097FC5E,$5A633047,$637114CC
+  Data.l $24775860,$5133CC94,$545D02D4,$62F201AC,$61CD1C73,$51CED46E,$3752A9DB,$6271FA69
+  Data.l $6C24E2D8,$5269126E,$E8BAFAD2,$61F1003E,$B0001025,$53028517,$A5633146,$616F146B
+  Data.l $8F97A44F,$539B2AEF,$FE5DB748,$60EC382F,$66826CB5,$5433027D,$D5EB2EA2,$60686CCE
+  Data.l $8D56572F,$54CA0A4A,$5C5DC263,$5FE3B38D,$5D44DD45,$556040E2,$0CF6C88B,$5F5E0DB3
+  Data.l $33B27E8B,$55F5A4D2,$AABEBB78,$5ED77C89,$75C94158,$568A34A9,$3D5792F5,$5E50015D
+  Data.l $94063107,$571DEEF9,$0DC984AE,$5DC79D7C,$0DC1D0EF,$57B0D256,$A34A3401,$5D3E5236
+  Data.l $74B37B6D,$5842DD54,$BFFE590D,$5CB420DF,$706FA445,$58D40E8C,$5DB5E713,$5C290ACC
+  Data.l $C1E0F5C4,$59646497,$AAA2BA24,$5B9D1153,$46BC4017,$59F3DE12,$0609D449,$5B1035CF
+  Data.l $FCEF3242,$5A827999,$FCEF3242,$5A827999,$0609D449,$5B1035CF,$46BC4017,$59F3DE12
+  Data.l $AAA2BA24,$5B9D1153,$C1E0F5C4,$59646497,$5DB5E713,$5C290ACC,$706FA445,$58D40E8C
+  Data.l $BFFE590D,$5CB420DF,$74B37B6D,$5842DD54,$A34A3401,$5D3E5236,$0DC1D0EF,$57B0D256
+  Data.l $0DC984AE,$5DC79D7C,$94063107,$571DEEF9,$3D5792F5,$5E50015D,$75C94158,$568A34A9
+  Data.l $AABEBB78,$5ED77C89,$33B27E8B,$55F5A4D2,$0CF6C88B,$5F5E0DB3,$5D44DD45,$556040E2
+  Data.l $5C5DC263,$5FE3B38D,$8D56572F,$54CA0A4A,$D5EB2EA2,$60686CCE,$66826CB5,$5433027D
+  Data.l $FE5DB748,$60EC382F,$8F97A44F,$539B2AEF,$A5633146,$616F146B,$B0001025,$53028517
+  Data.l $E8BAFAD2,$61F1003E,$6C24E2D8,$5269126E,$3752A9DB,$6271FA69,$61CD1C73,$51CED46E
+  Data.l $545D02D4,$62F201AC,$24775860,$5133CC94,$5A633047,$637114CC,$39AEC57B,$5097FC5E
+  Data.l $BE5033A5,$63EF328F,$155B5137,$4FFB654D,$527687B1,$646C59BF,$160D0EFE,$4F5E08E3
+  Data.l $498FED3D,$64E88926,$8142E4F2,$4EBFE8A4,$39B75AAA,$6563BF92,$7FAC8730,$4E210617
+  Data.l $1F5D06EB,$65DDFBD3,$1967CAE0,$4D8162C4,$603488BC,$66573CBB,$32395A54,$4CE10034
+  Data.l $CE1D02CF,$66CF811F,$85C0D384,$4C3FDFF3,$AA0355C6,$6746C7D7,$A3A85A4E,$4B9E038F
+  Data.l $A6BE50D9,$67BD0FBC,$EBCFA7DD,$4AFB6C97,$EBE4DA1F,$683257AA,$8A72A0AB,$4A581C9D
+  Data.l $189E0777,$68A69E81,$744B7AA2,$49B41533,$466B211B,$6919E320,$62B07CE3,$490F57EE
+  Data.l $0BEB870B,$698C246C,$CFAD62C6,$4869E664,$7F9A7268,$69FD614A,$F2186BBC,$47C3C22E
+  Data.l $3A868C0D,$6A6D98A4,$B9A321B2,$471CECE6,$5B0351A9,$6ADCC964,$CAE6DFB3,$46756827
+  Data.l $875442B8,$6B4AF278,$7B6D2281,$45CD358F,$F051CEC6,$6BB812D0,$CDB3ACFA,$452456BC
+  Data.l $5407FE6E,$6C242960,$6D2C8A11,$447ACD50,$004ED0AD,$6C8F351C,$AA39F645,$43D09AEC
+  Data.l $D55C4615,$6CF934FB,$76263A73,$4325C135,$48501388,$6D6227FA,$5F178202,$427A41D0
+  Data.l $65B8F644,$6DCA0D14,$8BFFB65A,$41CE1E64,$D413A2EB,$6E30E349,$B88869B9,$4121589A
+  Data.l $D643497F,$6E96A99C,$30FADB66,$4073F21D,$4E03A81C,$6EFB5F12,$CE241F6B,$3FC5EC97
+  Data.l $BE54A67E,$6F5F02B1,$F13573F7,$3F1749B7,$4DDF7448,$6FC19385,$7FA0CE83,$3E680B2C
+  Data.l $C9552436,$70231099,$DEF1AB11,$3DB832A5,$A5C6BE4B,$708378FE,$F0A227A1,$3D07C1D5
+  Data.l $02F6C349,$70E2CBC6,$0DEC763C,$3C56BA70,$ADA41BA9,$71410804,$0398AFE2,$3BA51E29
+  Data.l $21CE6C76,$719E2CD2,$0DC712AB,$3AF2EEB7,$8CF3CC6D,$71FA3948,$D3B6B58E,$3A402DD1
+  Data.l $D047D3DA,$72552C84,$6388BC2D,$398CDD32,$82E401C4,$72AF05A6,$2E001521,$38D8FE93
+  Data.l $F3F170F3,$7307C3CF,$023DCD3F,$382493B0,$2CCBD783,$735F6626,$097A0268,$376F9E46
+  Data.l $F31DCBC3,$73B5EBD0,$C2B98057,$36BA2013,$CAF64919,$740B53FA,$FE801228,$36041AD8
+  Data.l $F8D76FDE,$745F9DD0,$DA7F9315,$354D9056,$83BE7B08,$74B2C883,$BD43C921,$3496824F
+  Data.l $3724E6B1,$7504D345,$51DB145B,$33DEF287,$A4FAC27F,$7555BD4B,$837BFD75,$3326E2C2
+  Data.l $279A2B0C,$75A585CF,$7927AE5A,$326E54C7,$E3B3E580,$75F42C0A,$91495FA3,$31B54A5D
+  Data.l $CA3518A3,$7641AF3C,$5D52C5A3,$30FBC54D,$9A261EA8,$768E0EA5,$9D5587E7,$3041C760
+  Data.l $E2826B29,$76D94988,$3B99CE03,$2F875262,$040980B6,$77235F2D,$4831EC96,$2ECC681E
+  Data.l $3308F184,$776C4EDB,$F48B3D5E,$2E110A61,$791F66D3,$77B417DF,$8EFC2D64,$2D553AFB
+  Data.l $B6F8AAAF,$77FAB988,$7E4F8C22,$2C98FBBA,$A602AFBF,$78403328,$3D4D26B2,$2BDC4E6F
+  Data.l $DA1B92FF,$78848413,$563FB9FC,$2B1F34EB,$C3389322,$78C7ABA1,$5E784703,$2A61B101
+  Data.l $AF05F9A8,$7909A92C,$F1CED449,$29A3C484,$CA7FF190,$794A7C11,$AE20A77F,$28E5714A
+  Data.l $238447BA,$798A23B1,$2ECC0286,$2826B928,$AA5D1121,$79C89F6D,$08296EFA,$27679DF4
+  Data.l $33443318,$7A05EEAD,$C302A362,$26A82185,$77DFC9CE,$7A4210D8,$D8070D45,$25E845B5
+  Data.l $18B76976,$7A7D055B,$AB3E0B51,$25280C5D,$9EA2366D,$7AB6CBA3,$8776E2CD,$24677757
+  Data.l $7C2DD0E3,$7AEF6323,$99B67BA3,$23A6887E,$0EFE108D,$7B26CB4F,$ECA2EE49,$22E541AE
+  Data.l $A1258CF4,$7B5D039D,$63ECEEC1,$2223A4C5,$6A76EF25,$7B920B89,$B7B72027,$2161B39F
+  Data.l $91CF0963,$7BC5E28F,$6FFB5BFF,$209F701C,$2E57B1C8,$7BF88830,$DFEDF8B5,$1FDCDC1A
+  Data.l $48C35CA9,$7C29FBEE,$215F1AAF,$1F19F97B,$DC8173B6,$7C5A3D4F,$101A1B52,$1E56CA1E
+  Data.l $D8EB66DF,$7C894BDD,$4543115D,$1D934FE5,$226A7415,$7CB72724,$12B28624,$1CCF8CB3
+  Data.l $93962314,$7CE3CEB1,$7E4F62FD,$1C0B826A,$FE4B7270,$7D0F4217,$3D67226F,$1B4732EF
+  Data.l $2CBCB339,$7D3980EC,$B004509E,$1A82A025,$E27A1090,$7D628AC5,$DC436666,$19BDCBF2
+  Data.l $DD72C0AB,$7D8A5F3F,$69A60AB6,$18F8B83C,$D6EEDCC3,$7DB0FDF7,$9C64C5BA,$183366E8
+  Data.l $8481DD85,$7DD6668E,$50BF3147,$176DD9DE,$98F5B9BB,$7DFA98A7,$F64AB23E,$16A81304
+  Data.l $C52EA4D6,$7E1D93E9,$8B3FC655,$15E21444,$B9076B3A,$7E3F57FE,$97C5F1FA,$151BDF85
+  Data.l $24266A1D,$7E5FE493,$293E59DB,$145576B1,$B6CB20F9,$7E7F3956,$CD8D13BA,$138EDBB0
+  Data.l $22945A86,$7E9D55FC,$8E613A22,$12C8106E,$1B3EEB63,$7EBA3A39,$EC7BCEB7,$120116D4
+  Data.l $575D048E,$7ED5E5C6,$DAF576AB,$1139F0CE,$910617EA,$7EF0585F,$BA831D23,$1072A047
+  Data.l $867F4D1F,$7F0991C3,$54B9871A,$0FAB272B,$FADC8531,$7F2191B3,$D74FE489,$0EE38765
+  Data.l $B699EB51,$7F3857F5,$CF616A7B,$0E1BC2E3,$882E1153,$7F4DE450,$24AE01BD,$0D53DB92
+  Data.l $44949678,$7F62368F,$14DA15F1,$0C8BD35E,$C7D1572A,$7F754E7F,$2EAD90AC,$0BC3AC35
+  Data.l $F56C2469,$7F872BF2,$4D520C61,$0AFB6805,$B8E501B2,$7F97CEBC,$93904AD7,$0A3308BC
+  Data.l $0620E855,$7FA736B4,$670CFAE6,$096A9049,$D9CF0F0D,$7FB563B2,$6B84D940,$08A2009A
+  Data.l $39C6B502,$7FC25596,$7E0837FB,$07D95B9E,$355D6F35,$7FCE0C3E,$B035F8B4,$0710A344
+  Data.l $E5B5F78F,$7FD8878D,$437604FA,$0647D97C,$6E077CC6,$7FE1C76B,$A43350DA,$057F0034
+  Data.l $FBDD7275,$7FE9CBBF,$65157346,$04B6195D,$C74FE0BD,$7FF09477,$3A39E020,$03ED26E6
+  Data.l $133432ED,$7FF62182,$F46CCFBF,$03242ABE,$2D4684AE,$7FFA72D1,$7C61DFA7,$025B26D7
+  Data.l $6E4B6D5E,$7FFD885A,$CDEC7846,$01921D1F,$3A2A4936,$7FFF6216,$F3380389,$00C90F87
+EndDataSection
+CompilerEndIf
+
+; Atan, correctly rounded (C6c-3), for a program that uses it
+; (#PMO_USE_ATAN), on the Pi 4 and the Pico: the same bits as the Windows
+; program (whose own ATan is corrected at two arguments). The Pico 2 keeps its
+; maths library's arctangent: a correctly rounded one costs it more than the
+; speed rule allows (see VALIDATION), so its Atan is held to the tolerance.
+CompilerIf #PMO_USE_ATAN = 1 And #PMO_INT8_BACKEND <> 3
+; 1/x for atan: Y ~ 2^87/m (m the 24-bit significand, above 2^23) in two
+; words, to within 3 units: a 256-entry start, two Newton steps in 32 bits and
+; one in 64. The same steps on every target give the same Y.
+Procedure.l PmTensorAtanRecip(m.l, *lo)
+  Protected y.l
+  Protected k.l
+  Protected pl.l
+  Protected ph.l
+  Protected el.l
+  Protected eh.l
+  Protected tl.l
+  Protected th.l
+  Protected u.l
+  Protected c.l
+  k = (m >> 15) & 255
+  y = PeekL(?PmTensorAtanTable + k * 4)
+  k = 0
+  While k < 2
+    ; e = 2^55 - m y (64 bits, small), y = y + (y e) / 2^55
+    pl = m * y
+    ph = PmTensorMulHi32(m, y)
+    el = 0 - pl
+    c = 0
+    If pl <> 0
+      c = 1
+    EndIf
+    eh = $800000 - ph
+    eh = eh - c
+    tl = y * eh
+    th = PmTensorMulHi32(y, eh)
+    If eh < 0
+      th = th - y
+    EndIf
+    u = PmTensorMulHi32(y, el)
+    tl = tl + u
+    th = th + PmTensorBelow32(tl, u)
+    tl = (tl >> 23) & $1FF
+    u = th << 9
+    tl = tl | u
+    y = y + tl
+    k = k + 1
+  Wend
+  ; Y = y 2^32 + (y e) / 2^23, e = 2^55 - m y now below 2^25
+  pl = m * y
+  el = 0 - pl
+  tl = y * el
+  th = PmTensorMulHi32(y, el)
+  If el < 0
+    th = th - y
+  EndIf
+  u = (tl >> 23) & $1FF
+  tl = th << 9
+  u = u | tl
+  PokeL(*lo, u)
+  th = th >> 23
+  ProcedureReturn y + th
+EndProcedure
+
+; atan on [2^-8, 1) from the table: x as xh xl in Q64, the result in Q63
+; (hi returned, lo through *lo). a0 + u (a1 + u (a2 + ... + u a7)), u = x - c,
+; c = j/256; the four inner steps in one word (Q31), the rest in two (Q63).
+Procedure.l PmTensorAtanTab(xh.l, xl.l, *lo)
+  Protected j.l
+  Protected uh.l
+  Protected uw.l
+  Protected base.l
+  Protected p.l
+  Protected t.l
+  Protected k.l
+  Protected ph.l
+  Protected pl.l
+  Protected zl.l
+  Protected zh.l
+  Protected u.l
+  j = (xh >> 24) & 255
+  uh = xh & $FFFFFF
+  base = j * 48
+  base = base + 976
+  uw = uh << 8
+  t = (xl >> 24) & $FF
+  uw = uw | t
+  p = PeekL(?PmTensorAtanTable + base + 44)
+  k = 40
+  While k >= 32
+    t = PmTensorMulHi32(p, uw)
+    If p < 0
+      t = t - uw
+    EndIf
+    t = t >> 8
+    p = PeekL(?PmTensorAtanTable + base + k) + t
+    k = k - 4
+  Wend
+  ; a3 + p u, p u = p uh + (p ul) / 2^32, signed
+  zl = p * uh
+  zh = PmTensorMulHi32(p, uh)
+  If p < 0
+    zh = zh - uh
+  EndIf
+  t = PmTensorMulHi32(p, xl)
+  If p < 0
+    t = t - xl
+  EndIf
+  zl = zl + t
+  zh = zh + PmTensorBelow32(zl, t)
+  If t < 0
+    zh = zh - 1
+  EndIf
+  pl = PeekL(?PmTensorAtanTable + base + 24)
+  ph = PeekL(?PmTensorAtanTable + base + 28)
+  pl = pl + zl
+  ph = ph + zh
+  ph = ph + PmTensorBelow32(pl, zl)
+  ; a2, a1, a0: P = a + (P u) / 2^64
+  k = 16
+  While k >= 0
+    zl = ph * uh
+    zh = PmTensorMulHi32(ph, uh)
+    If ph < 0
+      zh = zh - uh
+    EndIf
+    t = PmTensorMulHi32(ph, xl)
+    If ph < 0
+      t = t - xl
+    EndIf
+    zl = zl + t
+    zh = zh + PmTensorBelow32(zl, t)
+    If t < 0
+      zh = zh - 1
+    EndIf
+    u = PmTensorMulHi32(pl, uh)
+    zl = zl + u
+    zh = zh + PmTensorBelow32(zl, u)
+    pl = PeekL(?PmTensorAtanTable + base + k)
+    ph = PeekL(?PmTensorAtanTable + base + k + 4)
+    pl = pl + zl
+    ph = ph + zh
+    ph = ph + PmTensorBelow32(pl, zl)
+    k = k - 8
+  Wend
+  PokeL(*lo, pl)
+  ProcedureReturn ph
+EndProcedure
+
+; G = 1 - v^2/3 + v^4/5 - v^6/7 in Q64 (hi returned, lo through *lo), from
+; v^2 in Q64 (below 2^48)
+Procedure.l PmTensorAtanSeries(vh.l, vl.l, *lo)
+  Protected w.l
+  Protected th.l
+  Protected tl.l
+  Protected xl.l
+  Protected xh.l
+  Protected u.l
+  Protected c.l
+  ; w = v^2 (1/5 - v^2/7) in Q64, then 1/3 - w (th tl)
+  w = PmTensorMulHi32(vh, 613566757)
+  w = 858993459 - w
+  tl = vh * w
+  th = PmTensorMulHi32(vh, w)
+  u = PmTensorMulHi32(vl, w)
+  tl = tl + u
+  th = th + PmTensorBelow32(tl, u)
+  c = PmTensorBelow32($55555555, tl)
+  tl = $55555555 - tl
+  th = $55555555 - th
+  th = th - c
+  xl = vh * th
+  xh = PmTensorMulHi32(vh, th)
+  u = PmTensorMulHi32(vh, tl)
+  xl = xl + u
+  xh = xh + PmTensorBelow32(xl, u)
+  u = PmTensorMulHi32(vl, th)
+  xl = xl + u
+  xh = xh + PmTensorBelow32(xl, u)
+  c = 0
+  If xl <> 0
+    c = 1
+  EndIf
+  xl = 0 - xl
+  PokeL(*lo, xl)
+  xh = 0 - xh
+  ProcedureReturn xh - c
+EndProcedure
+
+; atan, correctly rounded, in exact 32-bit integer arithmetic (the bits of x
+; in, the bits of the result out). |x| < 2^-8: x (1 - x^2/3 + x^4/5 - x^6/7),
+; kept relative to x. |x| <= 1: a 255-bucket table of atan's Taylor
+; coefficients to degree 7 at c = j/256, in u = |x| - c (no division). |x| > 1:
+; pi/2 - atan(1/|x|), 1/|x| from PmTensorAtanRecip, then as above. Rounded
+; once, to nearest-even.
+; Every binary32 argument was checked against a correctly rounded atan.
+Procedure.l PmTensorAtanBits(b.l)
+  Protected a.l
+  Protected sg.l
+  Protected e.l
+  Protected m.l
+  Protected sh.l
+  Protected vl.l
+  Protected vh.l
+  Protected gl.l
+  Protected gh.l
+  Protected w0.l
+  Protected w1.l
+  Protected w2.l
+  Protected u.l
+  Protected t.l
+  Protected c.l
+  Protected rl.l
+  Protected rh.l
+  Protected ql.l
+  Protected qh.l
+  Protected k.l
+  Protected eb.l
+  a = b & $7FFFFFFF
+  sg = b & $80000000
+  If a > $7F800000
+    ProcedureReturn b | $400000
+  EndIf
+  If a >= $4C800000
+    ProcedureReturn sg | $3FC90FDB
+  EndIf
+  If a < $39800000
+    ProcedureReturn b
+  EndIf
+  If a = $3F800000
+    ProcedureReturn sg | $3F490FDB
+  EndIf
+  e = a >> 23
+  m = a & $7FFFFF
+  m = m | $800000
+  If a < $3B800000
+    ; x^2 in Q64 = m^2 / 2^(236 - 2e)
+    vl = m * m
+    vh = PmTensorMulHi32(m, m)
+    sh = e + e
+    sh = 236 - sh
+    If sh > 0
+      vl = (vl >> sh) & ((1 << (32 - sh)) - 1)
+      u = vh << (32 - sh)
+      vl = vl | u
+      vh = vh >> sh
+    EndIf
+    gh = PmTensorAtanSeries(vh, vl, @gl)
+    ; m G: three words
+    w0 = m * gl
+    w1 = PmTensorMulHi32(m, gl)
+    u = m * gh
+    w2 = PmTensorMulHi32(m, gh)
+    w1 = w1 + u
+    w2 = w2 + PmTensorBelow32(w1, u)
+    ; top bit of w2 to bit 31
+    k = 0
+    While (w2 & $80000000) = 0
+      w2 = w2 << 1
+      u = (w1 >> 31) & 1
+      w2 = w2 | u
+      w1 = w1 << 1
+      u = (w0 >> 31) & 1
+      w1 = w1 | u
+      w0 = w0 << 1
+      k = k + 1
+    Wend
+    rh = w2
+    rl = w1 | w0
+    ; the value is w2.. 2^(e - 214 + 64 - k), its exponent e - 150 + 95 - 64 - k
+    eb = e - 150
+    eb = eb + 31
+    eb = eb - k
+  Else
+    If a < $3F800000
+      ; |x| in Q64: m 2^(e - 86), the high word only
+      sh = e - 118
+      qh = m << sh
+      rh = PmTensorAtanTab(qh, 0, @rl)
+    Else
+      ; |x| > 1: y = 1/|x| in Q64 (qh ql) from Y 2^-(64 + s)
+      If m = $800000
+        rh = $80000000
+        rl = 0
+        sh = e - 128
+      Else
+        rh = PmTensorAtanRecip(m, @rl)
+        sh = e - 127
+      EndIf
+      qh = rh
+      ql = rl
+      If sh > 0
+        ql = (ql >> sh) & ((1 << (32 - sh)) - 1)
+        u = qh << (32 - sh)
+        ql = ql | u
+        qh = (qh >> sh) & ((1 << (32 - sh)) - 1)
+      EndIf
+      If (qh & $FF000000) = 0
+        ; y below 2^-8: atan y = Y G(y) 2^-(64 + s)
+        vl = qh * qh
+        vh = PmTensorMulHi32(qh, qh)
+        u = PmTensorMulHi32(qh, ql)
+        t = u << 1
+        vl = vl + t
+        vh = vh + PmTensorBelow32(vl, t)
+        u = (u >> 31) & 1
+        vh = vh + u
+        gh = PmTensorAtanSeries(vh, vl, @gl)
+        w1 = rh * gh
+        w2 = PmTensorMulHi32(rh, gh)
+        u = PmTensorMulHi32(rh, gl)
+        w1 = w1 + u
+        w2 = w2 + PmTensorBelow32(w1, u)
+        u = PmTensorMulHi32(rl, gh)
+        w1 = w1 + u
+        w2 = w2 + PmTensorBelow32(w1, u)
+        ; Q63: shift right s + 1
+        sh = sh + 1
+        w1 = (w1 >> sh) & ((1 << (32 - sh)) - 1)
+        u = w2 << (32 - sh)
+        w1 = w1 | u
+        w2 = (w2 >> sh) & ((1 << (32 - sh)) - 1)
+        rh = w2
+        rl = w1
+      Else
+        rh = PmTensorAtanTab(qh, ql, @rl)
+      EndIf
+      ; pi/2 - atan y, Q63
+      c = PmTensorBelow32($2168C235, rl)
+      rl = $2168C235 - rl
+      rh = $C90FDAA2 - rh
+      rh = rh - c
+    EndIf
+    ; top bit to bit 63
+    k = 0
+    While (rh & $80000000) = 0
+      rh = rh << 1
+      u = (rl >> 31) & 1
+      rh = rh | u
+      rl = rl << 1
+      k = k + 1
+    Wend
+    eb = 0 - k
+  EndIf
+  ; round rh (and the sticky rl) once: exponent eb (value in [2^eb, 2^(eb+1)))
+  m = (rh >> 8) & $FFFFFF
+  If (rh & $80) <> 0
+    If (rh & $7F) <> 0 Or rl <> 0 Or (m & 1) <> 0
+      m = m + 1
+    EndIf
+  EndIf
+  e = eb + 126
+  e = e << 23
+  e = e + m
+  ProcedureReturn e | sg
+EndProcedure
+
+; 2^55/m for the first Newton step (256 words), then for j = 1..255 atan's
+; Taylor coefficients at j/256: a0..a3 in Q63 (two words, low first) and
+; a4..a7 in Q31
+DataSection
+  PmTensorAtanTable:
+  Data.l $FF803FE0,$FE823CA5,$FD863087,$FC8C15B4,$FB93E673,$FA9D9D20,$F9A9342D,$F8B6A622
+  Data.l $F7C5ED9C,$F6D7054E,$F5E9E7FC,$F4FE9082,$F414F9CD,$F32D1EDF,$F246FACB,$F16288B9
+  Data.l $F07FC3E0,$EF9EA78C,$EEBF2F19,$EDE155F4,$ED05179C,$EC2A6FA0,$EB51599F,$EA79D14A
+  Data.l $E9A3D25E,$E8CF58AB,$E7FC600E,$E72AE475,$E65AE1DB,$E58C544A,$E4BF37D9,$E3F388AF
+  Data.l $E32942FF,$E260630A,$E198E51F,$E0D2C599,$E00E00E0,$DF4A9368,$DE8879B3,$DDC7B04C
+  Data.l $DD0833CE,$DC4A00DC,$DB8D1427,$DAD16A6B,$DA17006D,$D95DD300,$D8A5DEFF,$D7EF2151
+  Data.l $D73996E9,$D6853CC1,$D5D20FDF,$D5200D52,$D46F3234,$D3BF7BA8,$D310E6DA,$D2637100
+  Data.l $D1B71759,$D10BD72C,$D061ADC9,$CFB8988C,$CF1094D4,$CE69A00D,$CDC3B7A9,$CD1ED924
+  Data.l $CC7B01FF,$CBD82FC7,$CB36600D,$CA95906C,$C9F5BE85,$C956E803,$C8B90A96,$C81C23F5
+  Data.l $C78031E0,$C6E5321D,$C64B2278,$C5B200C6,$C519CAE0,$C4827EA8,$C3EC1A05,$C3569AE6
+  Data.l $C2C1FF3D,$C22E4506,$C19B6A42,$C1096CF6,$C0784B2F,$BFE80300,$BF589280,$BEC9F7CD
+  Data.l $BE3C310C,$BDAF3C63,$BD231803,$BC97C21E,$BC0D38EE,$BB837AB1,$BAFA85A9,$BA725820
+  Data.l $B9EAF063,$B9644CC4,$B8DE6B99,$B8594B40,$B7D4EA19,$B7514689,$B6CE5EF9,$B64C31D9
+  Data.l $B5CABD9A,$B54A00B5,$B4C9F9A5,$B44AA6E9,$B3CC0706,$B34E1884,$B2D0D9EF,$B25449D7
+  Data.l $B1D866D1,$B15D2F75,$B0E2A260,$B068BE31,$AFEF818C,$AF76EB18,$AEFEF982,$AE87AB76
+  Data.l $AE10FFA9,$AD9AF4D0,$AD2589A3,$ACB0BCE1,$AC3C8D4A,$ABC8F9A0,$AB5600AB,$AAE3A136
+  Data.l $AA71DA0D,$AA00AA01,$A9900FE6,$A9200A92,$A8B098E0,$A841B9AD,$A7D36BD7,$A765AE43
+  Data.l $A6F87FD6,$A68BDF79,$A61FCC16,$A5B4449D,$A54947FD,$A4DED52C,$A474EB1F,$A40B88D0
+  Data.l $A3A2AD39,$A33A575A,$A2D28634,$A26B38C8,$A2046E1F,$A19E253F,$A1385D35,$A0D3150C
+  Data.l $A06E4BD4,$A00A00A0,$9FA63284,$9F42E095,$9EE009EE,$9E7DADA9,$9E1BCAE3,$9DBA60BB
+  Data.l $9D596E54,$9CF8F2D1,$9C98ED58,$9C395D10,$9BDA4124,$9B7B98C0,$9B1D6311,$9ABF9F48
+  Data.l $9A624C97,$9A056A31,$99A8F74C,$994CF320,$98F15CE7,$989633DB,$983B773B,$97E12644
+  Data.l $97874039,$972DC45B,$96D4B1EF,$967C083B,$9623C686,$95CBEC1B,$95747844,$951D6A4D
+  Data.l $94C6C187,$94707D3F,$941A9CC8,$93C51F75,$9370049C,$931B4B91,$92C6F3AC,$9272FC48
+  Data.l $921F64BF,$91CC2C6C,$917952AE,$9126D6E5,$90D4B86F,$9082F6B0,$9031910A,$8FE086E2
+  Data.l $8F8FD7A0,$8F3F82A8,$8EEF8766,$8E9FE542,$8E509BA8,$8E01AA05,$8DB30FC6,$8D64CC5C
+  Data.l $8D16DF35,$8CC947C5,$8C7C057D,$8C2F17D2,$8BE27E39,$8B963829,$8B4A451A,$8AFEA483
+  Data.l $8AB355E0,$8A6858AB,$8A1DAC60,$89D3507D,$89894480,$893F87E8,$88F61A37,$88ACFAEE
+  Data.l $8864298F,$881BA59E,$87D36EA0,$878B841A,$8743E595,$86FC9296,$86B58AA8,$866ECD53
+  Data.l $86285A23,$85E230A3,$859C5060,$8556B8E7,$851169C7,$84CC6290,$8487A2D1,$84432A1B
+  Data.l $83FEF802,$83BB0C18,$837765F0,$83340520,$82F0E93D,$82AE11DE,$826B7E99,$82292F08
+  Data.l $81E722C2,$81A55963,$8163D283,$81228DBF,$80E18AB3,$80A0C8FB,$80604836,$80200802
+  Data.l $556EEEDD,$007FFFD5,$7FFF8000,$7FFF8000,$FE800200,$FF8000FF,$D559FFF9,$D5565552,$007FFD80,$199819A1,$FF8004AB,$EDB8DB5F
+  Data.l $ADDDD4B9,$00FFFEAA,$FFE00080,$7FFE0007,$D000FFFB,$FF0007FF,$567FF880,$D559552D,$00FFEC01,$19939A0A,$FF002553,$EDBEDA7E
+  Data.l $184C309A,$017FFB80,$7E938CD0,$7FFB8028,$93911540,$FE801AFE,$E29E9528,$D55E548A,$017FBC87,$198C1BD0,$FE807DEC,$EDC8D6AF
+  Data.l $BBB729AB,$01FFF555,$F8007FF8,$7FF8007F,$007FF601,$FE003FFA,$9FF880B0,$D56552D5,$01FF601C,$1981A098,$FE012A57,$EDD6CC72
+  Data.l $E314DFF7,$027FEB2B,$617E7AA6,$7FF38138,$B2E20F87,$FD807CED,$F1FD524F,$D56E4F3B,$027EC7D5,$19742AAC,$FD824655,$EDE8B6DE
+  Data.l $094B86B6,$02FFDC03,$A4ECCEB3,$7FEE0287,$78897FD2,$FD00D7D2,$A7154573,$D57948B0,$02FDE4D4,$1963BCFB,$FD03ED83,$EDFE8FAD
+  Data.l $E522E238,$037FC6DB,$9A6372F7,$7FE784AF,$9E9BEC03,$FC81569D,$3366FE5C,$D5863DEB,$037CA84B,$19505B1B,$FC863B4B,$EE184F35
+  Data.l $752EC495,$03FFAAB7,$007FE008,$7FE007FE,$3FEC05FE,$FC01FF40,$F882BF0E,$D5952D67,$03FB037E,$193A0946,$FC094ADE,$EE35EC75
+  Data.l $0BB125D9,$047F8697,$734F83D7,$7FD78CCC,$943D4CF8,$FB82D7A6,$99D9F127,$D5A61568,$0478E7CA,$1920CC57,$FB8D3727,$EE575D14
+  Data.l $5A727646,$04FF597C,$61D9C6EE,$7FCE1380,$409842C1,$FB03E5B7,$5DE5773F,$D5B8F3F4,$04F646A5,$1904A9CA,$FB121AC7,$EE7C9568
+  Data.l $7E8ECB53,$057F2269,$024BEA1E,$7FC39C8B,$A8D4F04B,$FA852F52,$9BD8D55F,$D5CDC6D8,$057311A2,$18E5A7BB,$FA981006,$EEA5887C
+  Data.l $0C368A7E,$05FEE061,$44C94EC4,$7FB82869,$428127A9,$FA06BA52,$35BBEEE3,$D5E48BA9,$05EF3A74,$18C3CCE2,$FA1F30D0,$EED22817
+  Data.l $1A6137D3,$067E9266,$C4E30621,$7FABB7A3,$E9477882,$F9888C87,$1EC0D9D2,$D5FD3FC1,$066AB2F1,$189F208F,$F9A796A6,$EF0264C3
+  Data.l $4E7110E7,$06FE377C,$B9B9CDBE,$7F9E4ACE,$34FB465E,$F90AABBD,$EDA71FAB,$D617E042,$06E56D14,$1877AAAE,$F9315A9B,$EF362DD3
+  Data.l $E7C6207E,$077DCEA7,$E4CDE708,$7F8FE289,$D16DDDE7,$F88D1DB2,$7AF9B2DC,$D6346A19,$075F5B04,$184D73BC,$F8BC9546,$EF6D716F
+  Data.l $CB3F7A72,$07FD56ED,$7F807F80,$7F807F80,$D82FC840,$F80FE81F,$8AF0E93C,$D652D9F8,$07D86F12,$182084CB,$F8495EC0,$EFA81C99
+  Data.l $8EA9537B,$087CCF53,$274AA4BC,$7F702269,$2C60F19F,$F79310B1,$82BDF09B,$D6732C5D,$08509BBC,$17F0E77A,$F7D7CE99,$EFE61B3B
+  Data.l $8416AC6F,$08FC36DF,$C8AE03C3,$7F5ECC05,$D8B18312,$F7169D08,$2901749E,$D6955D90,$08C7D3B5,$17BEA5F5,$F767FBCF,$F027582C
+  Data.l $C5254D01,$097B8C98,$88E3F689,$7F4C7D23,$6FB48F16,$F69A92BD,$712B8E93,$D6B969A3,$093E09E3,$1789CAEF,$F6F9FCC9,$F06BBD3E
+  Data.l $3E2ACEB6,$09FACF87,$AE4FA390,$7F39369A,$6EA4E592,$F61EF759,$517F9A30,$D6DF4C76,$09B33160,$175261A1,$F68DE750,$F0B33349
+  Data.l $B9497D90,$0A79FEB3,$87B833AF,$7F24F94E,$A2BB8EAA,$F5A3D05A,$A3732F14,$D70701B4,$0A273D84,$171875C4,$F623D087,$F0FDA234
+  Data.l $E96BD931,$0AF91927,$5250600A,$7F0FC62D,$91368C9D,$F5292331,$0E1C47BE,$D73084D8,$0A9A21DF,$16DC138E,$F5BBCCE4,$F14AF105
+  Data.l $75258676,$0B781DEE,$1E90D6B4,$7EF99E30,$E22D9C75,$F4AEF540,$FA5F8CE9,$D75BD128,$0B0BD242,$169D47AD,$F555F02E,$F19B05E6
+  Data.l $01788746,$0BF70C13,$B3EB2ED7,$7EE2825A,$CE51BBB6,$F4354BDC,$908CD16B,$D788E1BF,$0B7C42BD,$165C1F44,$F4F24D71,$F1EDC63B
+  Data.l $3C7D9417,$0C75E2A2,$735B5DF0,$7ECA73BB,$8FB33F36,$F3BC2C4A,$BF150773,$D7B7B184,$0BEB67A2,$1618A7E7,$F490F700,$F24316A5
+  Data.l $E7EE78B4,$0CF4A0A9,$38DDD636,$7EB1736B,$D5A94544,$F3439BBF,$4A025E4C,$D7E83B33,$0C59358A,$15D2EF94,$F431FE68,$F29ADB18
+  Data.l $E3915C1C,$0D734538,$3BD0AACA,$7E97828D,$3BF44369,$F2CB9F62,$E2D8C79C,$D81A7958,$0CC5A154,$158B04B1,$F3D57472,$F2F4F6E1
+  Data.l $3783E1BF,$0DF1CF5F,$EE4648C1,$7E7CA24E,$C5345FA6,$F2543C46,$4882DE59,$D84E6657,$0D30A028,$1540F606,$F37B691A,$F3514CB9
+  Data.l $1E651911,$0E703E2E,$DB50847D,$7E60D3E7,$58CB2D85,$F1DD7771,$6EED102C,$D883FC65,$0D9A2778,$14F4D2BA,$F323EB90,$F3AFBED0
+  Data.l $0F5D3733,$0EEE90B8,$844AE8A6,$7E441899,$443F4A3C,$F16755D4,$ADEEFD52,$D8BB3590,$0E022D05,$14A6AA4A,$F2CF0A30,$F4102EDB
+  Data.l $C8021D7B,$0F6CC610,$3D2B602C,$7E2671AF,$C037302F,$F0F1DC4F,$F72142F8,$D8F40BBD,$0E68A6DC,$14568C88,$F27CD27F,$F4727E21
+  Data.l $5617B6E3,$0FEADD4D,$07E07E08,$7E07E07E,$791F7275,$F07D0FB1,$123C51A3,$D92E78AB,$0ECD8B5A,$14048994,$F22D512B,$F4D68D8D
+  Data.l $212B3D98,$1068D584,$6EC4CCD5,$7DE86664,$1B8F649E,$F008F4B4,$DF9B8C68,$D96A75EF,$0F30D12E,$13B0B1DA,$F1E09209,$F53C3DB8
+  Data.l $F408818A,$10E6ADCC,$5E2EB516,$7DC804CA,$E47E02EE,$EF958FFE,$A07EB6EC,$D9A7FCFF,$0F926F5B,$135B1607,$F196A00E,$F5A36EF7
+  Data.l $0608505B,$11646541,$FD24AB87,$7DA6BD20,$3557BBBB,$EF22E625,$44A2AF76,$D9E7072A,$0FF25D35,$1303C709,$F14F8552,$F60C016C
+  Data.l $043726E5,$11E1FAFB,$853D78CC,$7D8490E2,$2C048426,$EEB0FBA6,$BCC997BA,$DA278D9D,$10509268,$12AAD608,$F10B4B0F,$F675D512
+  Data.l $1A535C5F,$125F6E17,$19B4898C,$7D618192,$3EEC69DD,$EE3FD4EC,$51C9E279,$DA698967,$10AD06F6,$12505460,$F0C9F99C,$F6E0C9CC
+  Data.l $FBA1FF32,$12DCBDB2,$9DBA510F,$7D3D90BB,$DD07991C,$EDCF764C,$FFBB3D33,$DAACF374,$1107B336,$11F4539C,$F08B9870,$F74CBF71
+  Data.l $EB99A397,$1359E8ED,$8A08E13E,$7D18BFF3,$12059294,$ED5FE408,$D4D7FBE6,$DAF1C496,$11608FD9,$1196E573,$F0502E21,$F7B995DA
+  Data.l $C6626C58,$13D6EEE8,$C1C4F11D,$7CF310D6,$2E96106D,$ECF12248,$53A9889F,$DB37F580,$11B795E9,$11381BBF,$F017C063,$F8272CF2
+  Data.l $092A9E48,$1453CEC6,$66B39E8C,$7CCC850A,$74DCDD52,$EC833521,$D81660F1,$DB7F7EC9,$120CBEC9,$10D8087A,$EFE2540D,$F89564BF
+  Data.l $DA4F1748,$14D087A9,$ACCD4972,$7CA51E3B,$C918A428,$EC162091,$FEE85FBE,$DBC858F1,$12600437,$1076BDBA,$EFAFED13,$F9041D73
+  Data.l $11570A46,$154D18BA,$AD35F547,$7C7CDE1F,$668383E9,$EBA9E880,$0F627159,$DC127C5F,$12B16049,$10144DA8,$EF808E8C,$F9733775
+  Data.l $3EC269DF,$15C9811E,$38A3AA48,$7C53C673,$9872F93F,$EB3E90BD,$667D5A25,$DC5DE160,$1300CD75,$0FB0CA7E,$EF543AB5,$F9E29371
+  Data.l $B3AA73F0,$1645BFFF,$A93B5989,$7C29D8FA,$77BB7760,$EAD41D02,$E363EB76,$DCAA802F,$134E4686,$0F4C4681,$EF2AF2EE,$FA521261
+  Data.l $8933D8DB,$16C1D489,$B3ECCEA4,$7BFF1781,$AC5AD41D,$EA6A90F0,$54C7DEE9,$DCF850F3,$1399C6A8,$0EE6D3FA,$EF04B7C0,$FAC1959B
+  Data.l $A7D201D5,$173DBDE8,$39563ECC,$7BD383DB,$336B7821,$EA01F012,$E6A99460,$DD474BBD,$13E3495F,$0E808536,$EEE188E0,$FB30FED9
+  Data.l $CE5B0227,$17B97B4B,$163807BA,$7BA71FE1,$296114D2,$E99A3DD9,$902E1954,$DD976891,$142ACA8C,$0E196C7B,$EEC1652E,$FBA0304B
+  Data.l $98EBC7D5,$18350BE3,$F3813150,$7B79ED73,$988E7574,$E9337D9F,$81203009,$DDE89F60,$1470466A,$0DB19C07,$EEA44ABD,$FC0F0C99
+  Data.l $879C28BC,$18B06EE2,$15FD42C0,$7B4BEE7B,$4BF2D964,$E8CDB2A7,$8EBA8124,$DE3AE80E,$14B3B990,$0D492609,$EE8A36D4,$FC7D76F2
+  Data.l $050271BD,$192BA37D,$2DABF7C8,$7B1D24E4,$A64C221D,$E868E019,$9F5AB8ED,$DE8E3A72,$14F520F0,$0CE01C9F,$EE7325F2,$FCEB5317
+  Data.l $6C86261D,$19A6A8E9,$24CB5C04,$7AED92A3,$7D6A019E,$E8050907,$14BF09B8,$DEE28E58,$153479D7,$0C7691CE,$EE5F13D3,$FD588560
+  Data.l $1081A5BD,$1A217E60,$EE9CC9A0,$7ABD39B1,$F9BD3CD2,$E7A23068,$34716518,$DF37DB80,$1571C1E9,$0C0C9780,$EE4DFB72,$FDC4F2C8
+  Data.l $40327944,$1A9C231B,$55ED3DAD,$7A8C1C10,$7A1D028C,$E740591D,$8E05B469,$DF8E19A3,$15ACF725,$0BA23F80,$EE3FD711,$FE3080F5
+  Data.l $4D780BCF,$1B169657,$CB696780,$7A5A3BC3,$7BBB4AA6,$E6DF85EB,$5ED26CF9,$DFE54073,$15E617E5,$0B379B70,$EE34A03B,$FE9B163F
+  Data.l $9260A204,$1B90D752,$33C5C920,$7A279AD7,$864029FF,$E67FB980,$F2CD0B93,$E03D479A,$161D22D6,$0ACCBCCF,$EE2C4FCA,$FF0499B8
+  Data.l $768466BF,$1C0AE54D,$B5C32DE6,$79F43B5A,$1C03084B,$E620F671,$02364C72,$E09626C1,$16521700,$0A61B4EB,$EE26DDEC,$FF6CF332
+  Data.l $742E6DCD,$1C84BF8A,$8817A916,$79C01F63,$AE57ABA5,$E5C33F38,$0BC45674,$E0EFD589,$1684F3BF,$09F694E2,$EE244228,$FFD40B48
+  Data.l $1D539552,$1CFE654E,$BF443951,$798B490B,$95E41C09,$E5669639,$AAFB88AD,$E14A4B94,$16B5B8C5,$098B6D9F,$EE247367,$0039CB61
+  Data.l $20573672,$1D77D5DF,$1B5F16CF,$7955BA72,$0EF376EF,$E50AFDBD,$EA69272F,$E1A58084,$16E46617,$09204FD2,$EE2767F2,$009E1DB7
+  Data.l $4C9D9DF5,$1DF11086,$D5DA999D,$791F75B9,$39B8E8B7,$E4B077F3,$9175C4BE,$E2016BFB,$1710FC0E,$08B54BF0,$EE2D1580,$0100ED5B
+  Data.l $96EC4D62,$1E6A148E,$6F508A9F,$78E87D0A,$1E75274C,$E45706F3,$6D87FA00,$E25E059C,$173B7B55,$084A7230,$EE357138,$0162263B
+  Data.l $1D980CCD,$1EE2E145,$7D599610,$78B0D28F,$B56FF72B,$E3FEACBA,$9632BD89,$E2BB450E,$1763E4E5,$07DFD285,$EE406FB6,$01C1B523
+  Data.l $2C80DD63,$1F5B75F9,$78787878,$78787878,$F2B67A3E,$E3A76B2E,$AC2D81A9,$E31921FD,$178A3A09,$07757C9B,$EE4E0513,$021F87C4
+  Data.l $40DBE413,$1FD3D1FC,$8A205FB4,$783F70F8,$D58E4698,$E351441B,$12D71ACC,$E377941B,$17AE7C58,$070B7FD7,$EE5E24ED,$027B8CB5
+  Data.l $0CCB6B4C,$204BF4A2,$5ADDD91E,$7805BE46,$7B8C8AA0,$E2FC3934,$24075AD4,$E3D6931F,$17D0ADB5,$06A1EB51,$EE70C269,$02D5B374
+  Data.l $7AC521EA,$20C3DD40,$E0A9838C,$77CB629B,$373FD450,$E2A84C13,$5DF64057,$E43616CA,$17F0D04F,$0638CDD4,$EE85D03D,$032DEC6B
+  Data.l $B0C6C4B1,$213B8B2F,$2D6B988D,$77906036,$AA5A6A5A,$E2557E39,$8B02939C,$E49616E6,$180EE69E,$05D035D9,$EE9D40B5,$038428EF
+  Data.l $135966A4,$21B2FDCA,$3DB73B52,$7754B955,$E34A87E9,$E203D110,$E324CC0B,$E4F68B47,$182AF360,$05683186,$EEB705B8,$03D85B43
+  Data.l $48639359,$222A346C,$C7C45602,$7718703B,$7E2D370A,$E1B345E9,$26DE1E70,$E5576BCE,$1844F99A,$0500CEAA,$EED310D2,$042A7695
+  Data.l $39CA8D43,$22A12E75,$0AAEA6DC,$76DB872F,$C907F9AD,$E163DDFB,$B3769D5C,$E5B8B065,$185CFC96,$049A1ABE,$EEF15338,$047A6F03
+  Data.l $17E2F04C,$2317EB46,$9E00769E,$769E0076,$EB34EEC1,$E1159A67,$90605F62,$E61A5108,$1872FFDF,$043422E1,$EF11BDCE,$04C83997
+  Data.l $5BB107A1,$238E6A42,$418F485F,$765FDE5C,$0FECA71B,$E0C87C36,$7598A978,$E67C45BF,$18870742,$03CEF3D5,$EF344131,$0513CC46
+  Data.l $C8F92BBA,$2404AACF,$ADB0A91E,$7621232B,$93D86D95,$E07C8456,$CAE32546,$E6DE86A2,$189916C9,$036A9A02,$EF58CDB8,$055D1DF1
+  Data.l $702083C7,$247AAC56,$63CD1A58,$75E1D132,$35975E51,$E031B3A2,$9FBE31A5,$E7410BDB,$18A932BD,$0307216D,$EF7F537E,$05A42662
+  Data.l $AFDE8B7C,$24F06E40,$7F56E73F,$75A1EABF,$49204AC3,$DFE80ADA,$9BF25E3B,$E7A3CDA4,$18B75FA2,$02A495BE,$EFA7C26A,$05E8DE4B
+  Data.l $36BFC405,$2565EFFB,$872A87F9,$75617223,$EDEA12EA,$DF9F8AA8,$E8A2203B,$E806C44A,$18C3A234,$0243023B,$EFD20A31,$062B3F42
+  Data.l $0479FC6E,$25DB30F5,$3F5E092E,$752069B0,$47C3CFA2,$DF5833A1,$11C1C4E1,$E869E82F,$18CDFF68,$01E271C9,$EFFE1A5D,$066B43BE
+  Data.l $6B12A32B,$2650309F,$7B84C0A4,$74DED3B8,$BA45E676,$DF12063F,$DFE294D3,$E8CD31C5,$18D67C67,$0182EEE7,$F02BE258,$06A8E718
+  Data.l $0FD7979A,$26C4EE6E,$F16C69AE,$749CB28F,$26C4E4A5,$DECD02EA,$2A3F0111,$E9309999,$18DD1E8F,$012483B3,$F05B516A,$06E42582
+  Data.l $EC2AF768,$273969D6,$0C5895AC,$745A088B,$2CAECCB8,$DE8929F0,$A0F88D99,$E9941848,$18E1EB6F,$00C739E5,$F08C56C8,$071CFC06
+  Data.l $4E22688A,$27ADA252,$C0C12E03,$7416D7FE,$6C3B5882,$DE467B8B,$8F7AFDC1,$E9F7A68A,$18E4E8C4,$006B1ACF,$F0BEE191,$07536882
+  Data.l $D8FA6528,$2821975A,$609895E6,$73D32340,$CB579012,$DE04F7DF,$96FB0A3A,$EA5B3D2C,$18E61C7B,$00102F61,$F0F2E0DA,$078769A4
+  Data.l $855E1351,$2895486D,$701DCAD9,$738EECA5,$BCB4FCF5,$DDC49EFB,$61099F2E,$EABED514,$18E58CAD,$FFB68021,$F12843B1,$07B8FEE4
+  Data.l $A184368F,$2908B509,$7B3EB36A,$734A3683,$88E4B03C,$DD8570D8,$4A374931,$EB226740,$18E33F99,$FF5E1532,$F15EF924,$07E82880
+  Data.l $D121CD87,$297BDCB0,$EB8E9BEF,$7305032F,$99664895,$DD476D5A,$04C61139,$EB85ECC8,$18DF3BAA,$FF06F652,$F196F045,$0814E778
+  Data.l $0D32F1CD,$29EEBEE7,$DED4B16E,$72BF54FF,$C5932441,$DD0A9451,$336A9147,$EBE95EDD,$18D9876E,$FEB12AD7,$F1D0182D,$083F3D87
+  Data.l $A39A93B7,$2A615B32,$FE361B47,$72792E47,$A14DF0E8,$DCCEE579,$FC1F846D,$EC4CB6CB,$18D22998,$FE5CB9B4,$F20A6008,$08672D1D
+  Data.l $3699AF80,$2AD3B11C,$55FF2487,$7232915C,$CD5ED8A0,$DC946079,$93117CAC,$ECAFEDFB,$18C928FB,$FE09A976,$F245B712,$088CB95D
+  Data.l $BC1E9C8A,$2B45C02E,$2E0EB67A,$71EB8090,$4964A002,$DC5B04E6,$BDAABEFE,$ED12FDEE,$18BE8C8D,$FDB80046,$F2820CA2,$08AFE613
+  Data.l $7CED1A7B,$2BB787F7,$E2E736C5,$71A3FE35,$C743249D,$DC22D23F,$4DC98979,$ED75E044,$18B25B5E,$FD67C3E9,$F2BF5028,$08D0B7B2
+  Data.l $139FC32C,$2C290806,$BF67AC4F,$715C0C9E,$FFF7CD25,$DBEBC7F3,$952D37E6,$EDD88EB7,$18A49C9D,$FD18F9C3,$F2FD713A,$08EF3349
+  Data.l $6B838B03,$2C9A3FEC,$D72FDF97,$7113AE1A,$09BCA558,$DBB5E55E,$D128D86A,$EE3B0320,$18955791,$FCCBA6D2,$F33C5F90,$090B5E81
+  Data.l $BF4DFBEE,$2D0B2F3E,$E1B1FCAB,$70CAE4F8,$AF630E41,$DB8129C6,$8EABCB3A,$EE9D3775,$1884939A,$FC7FCFB8,$F37C0B0D,$09253F98
+  Data.l $97AED9CB,$2D7BD593,$15F40EFC,$7081B386,$C8CF206B,$DB4D9464,$06B2FD86,$EEFF25C9,$1872582E,$FC3578B1,$F3BC63C2,$093CDD54
+  Data.l $C9BDE11D,$2DEC3283,$070381C1,$70381C0E,$947D17F9,$DB1B245D,$73373099,$EF60C84C,$185EACD8,$FBECA5A0,$F3FD59F1,$09523F04
+  Data.l $75455313,$2E5C45AA,$811CA28E,$6FEE20DA,$11FA62C1,$DAE9D8C5,$5CAE8A3B,$EFC2194F,$18499933,$FBA55A05,$F43EDE10,$09656C75
+  Data.l $02EA03E2,$2ECC0EA5,$6787F72B,$6FA3C433,$5D3C2DBD,$DAB9B09E,$E03962BD,$F023133F,$183324EE,$FB5F9906,$F480E0CE,$09766DEE
+  Data.l $2231A207,$2F3B8D13,$932F0BD4,$6F59085E,$0ABD9991,$DA8AAADC,$EE93E711,$F083B0AA,$181B57C4,$FB1B656D,$F4C35316,$09854C28
+  Data.l $C767EEB5,$2FAAC096,$B1EA3384,$6F0DEF9F,$84500CE8,$DA5CC660,$83E7B2BB,$F0E3EC3C,$1802397E,$FAD8C1AC,$F5062611,$09921047
+  Data.l $2963A10C,$3019A8D4,$26888957,$6EC27C38,$66886F39,$DA3001FE,$D899FCFA,$F143C0BF,$17E7D1F2,$FA97AFDA,$F5494B29,$099CC3D7
+  Data.l $BF2BAEEC,$30884571,$E99357E1,$6E76B066,$DEB46E2F,$DA045C78,$8B34579E,$F1A3291F,$17CC28FE,$FA5831BA,$F58CB40C,$09A570C2
+  Data.l $3D7DB749,$30F69618,$6ACDE1F0,$6E2A8E68,$09434C30,$D9D9D484,$C3874B5C,$F2022065,$17AF4687,$FA1A48B6,$F5D052B1,$09AC214A
+  Data.l $94364ADB,$31649A72,$73725FB4,$6DDE1876,$508E15FE,$D9B068C5,$4F275635,$F260A1BC,$1791327A,$F9DDF5EA,$F6141955,$09B0E005
+  Data.l $EB9BD0A6,$31D2522D,$092CDB34,$6D9150C8,$CBEB80D1,$D98817D3,$B765F40E,$F2BEA86C,$1771F4C8,$F9A33A1B,$F657FA81,$09B3B7D5
+  Data.l $A18CC488,$323FBCF9,$51D46FFD,$6D443991,$9EFC18EC,$D960E038,$50E9687C,$F31C2FE0,$17519566,$F96A15C3,$F69BE90C,$09B4B3E2
+  Data.l $46920E67,$32ACDA87,$77E34BBA,$6CF6D503,$591BD221,$D93AC06F,$4506FB1E,$F37933A0,$17301C49,$F9328909,$F6DFD81C,$09B3DF93
+  Data.l $9AD630CF,$3319AA8A,$8FADA7D2,$6CA9254C,$54E67866,$D915B6E6,$95043DC3,$F3D5AF55,$170D9168,$F8FC93CC,$F723BB26,$09B1468A
+  Data.l $8B020E1B,$33862CB9,$7D57CFAB,$6C5B2C97,$17BCED6D,$D8F1C1FF,$1764C580,$F4319EC9,$16E9FCB6,$F8C8359E,$F76785F3,$09ACF49C
+  Data.l $2D00031C,$33F260CC,$DB8B2385,$6C0CED0B,$B13991B2,$D8CEE00E,$6F6A7DF2,$F48CFDE3,$16C56625,$F8956DCB,$F7AB2C9E,$09A6F5CE
+  Data.l $BCA61630,$345E467C,$E2E9E4ED,$6BBE68CD,$1A82AADC,$D8AD0F5E,$FEEF6877,$F4E7C8AC,$169FD5A3,$F8643B56,$F7EEA398,$099F564C
+  Data.l $9847F96E,$34C9DD87,$52417807,$6B6FA1FE,$956A0EAE,$D88C4E2A,$D2C030C3,$F541FB4D,$16795318,$F8349D00,$F831DFA6,$09962265
+  Data.l $3D319E13,$353525AB,$577AA3D9,$6B209ABA,$0B49D0D4,$D86C9AA6,$899F84D9,$F59B920D,$1651E664,$F8069146,$F874D5E7,$098B6685
+  Data.l $440B16FE,$35A01EA8,$79473BC9,$6AD1551B,$6B8E2A46,$D84DF2F7,$361A90FB,$F5F48953,$16299761,$F7DA1666,$F8B77BCC,$097F2F30
+  Data.l $5D268736,$360AC841,$818C7D4B,$6A81D337,$09DD4ABD,$D830553B,$3B57608D,$F64CDDA5,$16006DDD,$F7AF2A5F,$F8F9C723,$097188FF
+  Data.l $4CB8D8D7,$3675223B,$68894EC4,$6A321720,$FBCE3F6A,$D813BF82,$2506340A,$F6A48BA9,$15D6719E,$F785CAF3,$F93BAE10,$09628096
+  Data.l $E6FDF7C7,$36DF2C5C,$40B76F43,$69E222E4,$762095BF,$D7F82FD7,$7A9F1A10,$F6FB9023,$15ABAA5B,$F75DF5AC,$F97D270E,$095222A4
+  Data.l $0C494AA9,$3748E66F,$23668AB1,$6991F88D,$2966DD3A,$D7DDA437,$8E154727,$F751E7F7,$15801FC3,$F737A7DA,$F9BE28F5,$09407BDB
+  Data.l $A503235A,$37B2503C,$1E100AA4,$69419A21,$9E16A7D4,$D7C41A97,$4629C530,$F7A79027,$1553D972,$F712DE97,$F9FEAAF3,$092D98ED
+  Data.l $9D93DF1A,$381B6992,$206261F9,$68F109A2,$8FF12592,$D7AB90E5,$E487216F,$F7FC85D2,$1526DEF7,$F6EF96CC,$FA3EA48E,$09198688
+  Data.l $E23D6D27,$3884323F,$EB0277D8,$68A0490D,$48B7F4AB,$D7940505,$C7CFBEEC,$F850C638,$14F937D3,$F6CDCD2D,$FA7E0DA8,$0904514F
+  Data.l $5AE3F146,$38ECAA15,$FF01BE94,$684F5A5D,$FA223CA1,$D77D74D2,$29C86347,$F8A44EB5,$14CAEB72,$F6AD7E3F,$FABCDE77,$08EE05DA
+  Data.l $E6C63606,$3954D0E5,$8E076B80,$67FE3F87,$1706A72C,$D767DE23,$D9C87684,$F8F71CC1,$149C0132,$F68EA65B,$FAFB0F8D,$08D6B0AE
+  Data.l $5826A12F,$39BCA686,$6B2B2E6C,$67ACFA7B,$ABAF4620,$D7533EC2,$F399433C,$F9492DF5,$146C805C,$F67141AC,$FB3899D2,$08BE5E3D
+  Data.l $6FE55ADF,$3A242ACD,$FC7FB214,$675B8D25,$B54CF0EF,$D73F9477,$92ED4CCE,$F99A8005,$143C7027,$F6554C36,$FB757683,$08A51ADF
+  Data.l $D90C5662,$3A8B5D93,$2D4B1A6D,$6709F96F,$78801F64,$D72CDD01,$83988CC8,$F9EB10C1,$140BD7B4,$F63AC1D2,$FBB19F34,$088AF2D2
+  Data.l $244DE9B0,$3AF23EB4,$60EBA22C,$66B8413A,$D6EDC119,$D71B1618,$EEB218C3,$FA3ADE16,$13DABE0F,$F6219E38,$FBED0DD1,$086FF232
+  Data.l $C3769ED1,$3B58CE0A,$66666666,$66666666,$A3D70A3D,$D70A3D70,$04C756B3,$FA89E60F,$13A92A30,$F609DCF9,$FC27BC96,$085424FD
+  Data.l $04D2E851,$3BBF0B76,$6C9E5D9D,$66146ACD,$F7ABA602,$D6FA50B5,$A5487F95,$FAD826CE,$137722F8,$F5F37985,$FC61A615,$08379707
+  Data.l $0E895FDB,$3C24F6D6,$F73166BE,$65C25044,$828E35C0,$D6EB4D90,$0355C06A,$FB259E96,$1344AF2F,$F5DE6F2D,$FC9AC532,$081A5400
+  Data.l $D9EA3414,$3C8A900C,$D3F94D11,$6570189D,$DDC37905,$D6DD31A2,$4813CFB0,$FB724BC0,$1311D587,$F5CAB924,$FCD31521,$07FC676C
+  Data.l $2EB46887,$3CEFD6FE,$112E8F15,$651DC5A4,$DC04EE8D,$D6CFFA8A,$32AE4ADC,$FBBE2CC3,$12DE9C99,$F5B85283,$FD0A9168,$07DDDCA2
+  Data.l $9E51884C,$3D54CB8F,$F42AA86F,$64CB591E,$D8B03046,$D6C3A5E1,$B62DA412,$FC09402E,$12AB0AE6,$F5A73646,$FD4135DB,$07BEBECA
+  Data.l $7F0869C0,$3DB96DA8,$F0C79203,$6478D4D0,$05CCBD14,$D6B8313D,$9545D53D,$FC5384AC,$127726D6,$F5975F52,$FD76FE9A,$079F18DB
+  Data.l $E7279F68,$3E1DBD31,$A15A1F1F,$64263A77,$B8E251A1,$D6AD9A2D,$FC4272F6,$FC9CF8FF,$1242F6B5,$F588C876,$FDABE813,$077EF599
+  Data.l $A8282F97,$3E81BA16,$BF44D35A,$63D38BCB,$B69A5E8A,$D6A3DE41,$1934181D,$FCE59C05,$120E80B7,$F57B6C6E,$FDDFEEFD,$075E5F93
+  Data.l $49C92A29,$3EE56443,$1C20C23F,$6380CA81,$7D279507,$D69AFB03,$B2827B2C,$FD2D6CB0,$11D9CAF5,$F56F45DF,$FE131059,$073D611F
+  Data.l $0524B11B,$3F48BBA6,$9B7A0044,$632DF846,$8D6EEC3D,$D692EDFA,$BC05D04C,$FD746A0F,$11A4DB6D,$F5644F61,$FE454970,$071C045F
+  Data.l $BFBF064F,$3FABC02E,$2D1D23C1,$62DB16C6,$B2EDE822,$D68BB4AB,$EAC96806,$FDBA9346,$116FB801,$F55A837B,$FE7697D1,$06FA5338
+  Data.l $06902E4D,$400E71CF,$C7F34C73,$628827A4,$4A5A4FB9,$D6854C99,$4798C227,$FDFFE792,$113A6678,$F551DCA5,$FEA6F94F,$06D85756
+  Data.l $0908B53E,$4070D07A,$656A2102,$62352C82,$86F7E2EC,$D67FB343,$C0778FD4,$FE446644,$1104EC7E,$F54A554D,$FED66C00,$06B61A29
+  Data.l $941220C8,$40D2DC24,$FD652B56,$61E226F9,$B6A10088,$D67AE628,$B9245F07,$FE880EC7,$10CF4FA3,$F543E7D4,$FF04EE3A,$0693A4E3
+  Data.l $0D0B96E3,$413494C5,$82B5F6E2,$618F18A1,$847F8B13,$D676E2C5,$9AC4E590,$FECAE09A,$10999559,$F53E8E94,$FF327E96,$0671007A
+  Data.l $6CC33F15,$4195FA53,$E0184F01,$613C0309,$3A73B6BE,$D673A695,$62DA1A4B,$FF0CDB52,$1063C2F8,$F53A43DD,$FF5F1BE7,$064E35A5
+  Data.l $3A6CE0DC,$41F70CC9,$F5AFF727,$60E8E7BE,$0126C42D,$D6712F12,$31998145,$FF4DFE99,$102DDDB9,$F53701FB,$FF8AC53F,$062B4CDC
+  Data.l $86963F77,$4257CC21,$97053310,$6095C847,$1EC802D5,$D66F79B5,$D7C8432F,$FF8E4A2D,$0FF7EABB,$F534C333,$FFB579E9,$06084E59
+  Data.l $E619B084,$42B83858,$897D721B,$6042A625,$3472CA16,$D66E83F7,$6433DA55,$FFCDBDE3,$0FC1EEFF,$F53381C7,$FFDF3968,$05E54214
+  Data.l $6D0F6833,$4318516D,$834D6EB1,$5FEF82D5,$7A3C6A9F,$D66E4B50,$B0E34F9E,$000C59A0,$0F8BEF6A,$F53337F9,$00080378,$05C22FC7
+  Data.l $A9BDF33E,$4378175E,$2AE210F1,$5F9C5FCF,$F9E96925,$D66ECD38,$F01B313C,$004A1D5F,$0F55F0C2,$F533E006,$002FD808,$059F1EEA
+  Data.l $9F8A5400,$43D78A2D,$16BD62C4,$5F493E85,$C849A0E1,$D6700728,$394D9B32,$0087092E,$0F1FF7B3,$F535742E,$0056B73D,$057C16B8
+  Data.l $C1E8356A,$4436A9DC,$CDC4E301,$5EF62064,$3D3B3709,$D671F698,$160ED7BB,$00C31D2B,$0EEA08CC,$F537EEB3,$007CA16B,$05591E2A
+  Data.l $EF4AA3DB,$4495766F,$C7FE8574,$5EA306D6,$2A5490BD,$D6749900,$0F264B7D,$00FE5988,$0EB4287D,$F53B49D6,$00A19717,$05363BF8
+  Data.l $6C15B931,$44F3EFEC,$6FB9AE24,$5E4FF33E,$1035C2E9,$D677EBDA,$39D28FA2,$0138BE88,$0E7E5B1B,$F53F7FE0,$00C598F6,$0513769E
+  Data.l $DD91A6B4,$45521658,$23217796,$5DFCE6FA,$528236E9,$D67BECA0,$C556CA6B,$01724C7F,$0E48A4DF,$F5448B1C,$00E8A7E6,$04F0D455
+  Data.l $44DF84CB,$45AFE9BD,$36359555,$5DA9E363,$6A837FB8,$D68098CE,$88E68644,$01AB03D3,$0E1309E4,$F54A65DB,$010AC4F2,$04CE5B19
+  Data.l $F9F04DC6,$460D6A22,$F5272654,$5D56E9CD,$18769A0F,$D685EDE1,$920477EE,$01E2E4F8,$0DDD8E2A,$F5510A76,$012BF14E,$04AC10A8
+  Data.l $A67E665A,$466A9794,$A716CD74,$5D03FB89,$93850DDC,$D68BE956,$B367D5FE,$0219F073,$0DA83594,$F558734C,$014C2E55,$0489FA81
+  Data.l $410A13B8,$46C7721E,$91316989,$5CB119E0,$B86BA144,$D69288AE,$147B176F,$025026D9,$0D7303E9,$F5609AC6,$016B7D88,$04681DE7
+  Data.l $07D93C94,$4723F9CD,$FA28C9F1,$5C5E4617,$36D0849C,$D699C96B,$C1862436,$028588CB,$0D3DFCD4,$F5697B56,$0189E08A,$04467FDF
+  Data.l $7BFACFCE,$47802EAF,$2E05C0B8,$5C0B8170,$BD4B13D0,$D6A1A90F,$3C9539F3,$02BA16FD,$0D0923E5,$F5730F78,$01A75923,$04252533
+  Data.l $5C4E28B6,$47DC10D5,$8250F7B6,$5BB8CD24,$241F7C36,$D6AA2522,$0F2D005E,$02EDD22D,$0CD47C91,$F57D51B3,$01C3E93B,$04041274
+  Data.l $A08EC687,$4837A04F,$5A8FF2F8,$5B662A6B,$96B0C626,$D6B33B2A,$5CDB84FB,$0320BB28,$0CA00A2F,$F5883C9A,$01DF92D7,$03E34BF4
+  Data.l $7464A9D7,$4892DD30,$2D13AFCF,$5B139A76,$BBABEFA5,$D6BCE8B3,$76B5140B,$0352D2C9,$0C6BCFFF,$F593CACC,$01FA581E,$03C2D5D1
+  Data.l $3279A871,$48EDC78B,$88165586,$5AC11E71,$DBEEF14E,$D6C72B4A,$6FCB2611,$038419F7,$0C37D123,$F59FF6F7,$02143B4D,$03A2B3EE
+  Data.l $5F940557,$49485F74,$1725728D,$5A6EB785,$082EB00B,$D6D20080,$B2AADD70,$03B491A5,$0C0410A3,$F5ACBBD4,$022D3EC2,$0382E9F7
+  Data.l $A5B6983A,$49A2A501,$A8D6470A,$5A1C66D3,$3D5F05B0,$D6DD65E6,$97EFD6ED,$03E43AD3,$0BD0916F,$F5BA142D,$024564EE,$03637B61
+  Data.l $CF46CD44,$49FC9849,$34C1A45D,$59CA2D7B,$87E02FA2,$D6E95913,$FDF75A6F,$0413168B,$0B9D565A,$F5C7FADA,$025CB05E,$03446B6E
+  Data.l $C238C37B,$4A563964,$E1C4EFC0,$59780C94,$257515F5,$D6F5D7A1,$E1BF4726,$044125E4,$0B6A6220,$F5D66AC2,$027323B2,$0325BD29
+  Data.l $7B41CDC3,$4AAF886B,$0C85DD3F,$59260535,$A605FE4A,$D702DF2B,$F8FB677D,$046E69FE,$0B37B762,$F5E55EDC,$0288C1A1,$0307736C
+  Data.l $091197EB,$4B088578,$4E367FA0,$58D4186B,$0B335CDF,$D7106D53,$4D6B2E38,$049AE405,$0B0558A9,$F5F4D230,$029D8CF3,$02E990DE
+  Data.l $87922F07,$4B6130A5,$8397512A,$58824742,$E6BC933C,$D71E7FBA,$D979364F,$04C6952C,$0AD34864,$F604BFD8,$02B18883,$02CC17F7
+  Data.l $1B2F29C6,$4BB98A10,$D434E120,$583092C0,$77BE86F3,$D72D140A,$262D3B8B,$04F17EB4,$0AA188EB,$F61522FC,$02C4B73E,$02AF0AFC
+  Data.l $EC242B61,$4C1191D4,$B9DED995,$57DEFBE7,$C6CE143B,$D73C27EC,$EA78A192,$051BA1E2,$0A701C7D,$F625F6DB,$02D71C1E,$02926C07
+  Data.l $21D2F941,$4C694812,$0856196A,$578D83B4,$C0F27752,$D74BB910,$ABE5031F,$05450009,$0A3F0543,$F63736C0,$02E8BA2C,$02763D03
+  Data.l $DE21595E,$4CC0ACE6,$F52FA698,$573C2B1D,$5183DD50,$D75BC529,$60ABAA86,$056D9A81,$0A0E454D,$F648DE0D,$02F9947D,$025A7FAF
+  Data.l $38DEED10,$4D17C073,$1FEA4543,$56EAF319,$7AF260AF,$D76C49ED,$133C407A,$059572AB,$09DDDE95,$F65AE835,$0309AE34,$023F35A0
+  Data.l $3B3339E4,$4D6E82D8,$9A3488DE,$5699DC94,$6E79C7F1,$D77D4518,$87386D7F,$05BC89EF,$09ADD2FD,$F66D50BD,$03190A7C,$02246040
+  Data.l $DB140FD6,$4DC4F437,$F0613D2A,$5648E87A,$A2C66D1F,$D78EB469,$DFE99E00,$05E2E1BE,$097E2452,$F680133E,$0327AC8B,$020A00D2
+  Data.l $F6C47A48,$4E1B14B4,$32080DEA,$55F817B2,$E98FC3B1,$D7A095A4,$483590B1,$06087B90,$094ED44C,$F6932B65,$0335979E,$01F01873
+  Data.l $505C66DD,$4E70E473,$FAD05D04,$55A76B1B,$842CFF86,$D7B2E692,$9C15D252,$062D58E1,$091FE48C,$F6A694F2,$0342CEF9,$01D6A816
+  Data.l $89592B68,$4EC66397,$7B643FD4,$5556E395,$37286B51,$D7C5A4FF,$1395C9C4,$06517B37,$08F1569E,$F6BA4BB8,$034F55E9,$01BDB08E
+  Data.l $1E37121F,$4F1B9247,$8289A5B9,$550681F7,$5CD60708,$D7D8CEBC,$EF5A7AD9,$0674E41A,$08C32BFB,$F6CE4B9F,$035B2FBD,$01A53287
+  Data.l $6214112D,$4F7070A8,$865FB2FB,$54B64716,$F6F20F8B,$D7EC619F,$26B6AE04,$0697951D,$08956605,$F6E290A2,$03665FC9,$018D2E8E
+  Data.l $7A5BD0F6,$4FC4FEE2,$ADBE648E,$546633C2,$BF4C1837,$D8005B84,$174DB6E2,$06B98FD3,$0868060E,$F6F716CF,$0370E966,$0175A50B
+  Data.l $5A7D2255,$50193D1D,$D9B69A7D,$541648C7,$37836507,$D814BA4A,$3646A2FB,$06DAD5D7,$083B0D50,$F70BDA4C,$037ACFEE,$015E964A
+  Data.l $BFA9044F,$506D2B81,$AF30B039,$53C686ED,$B7D93894,$D8297BD4,$C3112E12,$06FB68C8,$080E7CF4,$F720D74F,$038416BD,$01480276
+  Data.l $2C9B56ED,$50C0CA39,$A0A7D365,$5376EEF7,$7D1DCCEA,$D83E9E0D,$7BBD7097,$071B4A4B,$07E25612,$F7360A24,$038CC130,$0131E99E
+  Data.l $E56D5704,$5114196D,$F8005328,$532781A4,$B5BCB02C,$D8541EE2,$52E6D898,$073A7C07,$07B699AD,$F74B6F2B,$0394D2A2,$011C4BB3
+  Data.l $EB71FD1A,$5167194A,$E0772B92,$52D83FB0,$8DED3F6E,$D869FC47,$27329C98,$0758FFA8,$078B48B8,$F76102D9,$039C4E72,$0107288D
+  Data.l $F91C57B2,$51B9C9FB,$70A91A06,$528929D2,$3B0BF9DF,$D8803434,$7C617B14,$0776D6DD,$07606412,$F776C1B4,$03A337F8,$00F27FE8
+  Data.l $7DEFF7CC,$520C2BAD,$B4AF9111,$523A40BC,$06216597,$D896C4A6,$35F44038,$0794035A,$0735EC8B,$F78CA85A,$03A9928D,$00DE5168
+  Data.l $9A7B8492,$525E3E8C,$B851EB85,$51EB851E,$559B3D08,$D8ADAB9F,$5362360E,$07B086D4,$070BE2E2,$F7A2B37C,$03AF6188,$00CA9C9A
+  Data.l $1C5D89B2,$52B002C7,$91494830,$519CF7A3,$B63C993E,$D8C4E727,$ADE051A0,$07CC6304,$06E247C5,$F7B8DFDC,$03B4A839,$00B760F2
+  Data.l $7A53923F,$5301788B,$699580BD,$514E98F2,$E349C8EB,$D8DC754B,$B7B7A17B,$07E799A6,$06B91BD3,$F7CF2A54,$03B969EE,$00A49DD1
+  Data.l $D053A079,$5352A008,$89E1B7E4,$510069AE,$CDF47F6B,$D8F4541D,$3D29377D,$08022C78,$06905F9A,$F7E58FD0,$03BDA9F2,$00925281
+  Data.l $DBB0114A,$53A3796E,$63F70423,$50B26A77,$A40D0146,$D90C81B4,$26DD80B9,$081C1D39,$06681399,$F7FC0D4F,$03C16B87,$00807E3B
+  Data.l $F745F8EB,$53F404ED,$9D3BC5AE,$50649BE8,$D5FCECF4,$D924FC2C,$3DDCBAA4,$08356DAB,$06403842,$F8129FE4,$03C4B1ED,$006F2023
+  Data.l $17B60492,$544442B7,$193E3F5F,$5016FE9A,$1C103786,$D93DC1A8,$F10DF485,$084E1F91,$0618CDF6,$F82944B6,$03C7805A,$005E374C
+  Data.l $C7A7EBD6,$549432FB,$044913A7,$4FC99320,$7B10ECA8,$D956D04D,$1C39CF01,$086634B2,$05F1D50B,$F83FF8FF,$03C9DA02,$004DC2BA
+  Data.l $24187AE4,$54E3D5EE,$DE004F7C,$4F7C5A0A,$483A38C2,$D9702649,$D08DF20F,$087DAED1,$05CB4DC6,$F856BA0B,$03CBC20D,$003DC160
+  Data.l $D8B23D8A,$55332BC0,$8405B672,$4F2F53E7,$2C873A7C,$D989C1CD,$1E9DFAD3,$08948FB8,$05A53860,$F86D853A,$03CD3B9F,$002E3221
+  Data.l $1C30D199,$558234A7,$3CA30BE9,$4EE2813F,$27620EFD,$D9A3A110,$E1DE6F79,$08AAD92C,$057F9507,$F8845800,$03CE49D3,$001F13D4
+  Data.l $ACCEE616,$55D0F0D4,$C1791E46,$4E95E297,$90B7818B,$D9BDC24E,$8D96168A,$08C08CF8,$055A63D9,$F89B2FE0,$03CEEFBA,$00106543
+  Data.l $CCBEEB51,$561F607D,$4A3261C8,$4E497873,$1A73BC02,$D9D823CA,$FB41E1BD,$08D5ACE3,$0535A4EA,$F8B20A72,$03CF305E,$0002252B
+  Data.l $3EAE76E5,$566D83D7,$9737F165,$4DFD4350,$D16C49F7,$D9F2C3C9,$3A67715E,$08EA3AB8,$05115842,$F8C8E55F,$03CF0EC1,$FFF4523D
+  Data.l $42545D73,$56BB5B16,$FC67D487,$4DB143AA,$1DBBB428,$DA0DA09A,$61D20D9B,$08FE383E,$04ED7DDC,$F8DFBE64,$03CE8DD9,$FFE6EB21
+  Data.l $910982CE,$5708E670,$6BCB711F,$4D6579FA,$C292ED27,$DA28B88C,$6235CDB4,$0911A73F,$04CA15AB,$F8F6934D,$03CDB095,$FFD9EE75
+  Data.l $5A6C6040,$5756261C,$804D19E7,$4D19E6B3,$DD84BB4E,$DA4409F8,$DA348262,$09248983,$04A71F93,$F90D61F8,$03CC79D9,$FFCD5ACC
+  Data.l $410F3F7A,$57A31A50,$886BB0D7,$4CCE8A47,$E54F3E5F,$DA5F933A,$EBBFD8D8,$0936E0D3,$04849B71,$F9242856,$03CAEC7E,$FFC12EB3
+  Data.l $573127C9,$57EFC343,$90EB5E32,$4C836524,$A827A19E,$DA7B52B4,$12D40E0F,$0948AEF7,$04628915,$F93AE467,$03C90B55,$FFB568B0
+  Data.l $1B817A24,$583C212D,$6F826472,$4C3877B5,$498BFCE6,$DA9746CD,$FD866EF0,$0959F5B3,$0440E848,$F951943C,$03C6D922,$FFAA073F
+  Data.l $75EE37B5,$58883445,$CD81217A,$4BEDC261,$3F9F58E2,$DAB36DF1,$6562C90A,$096AB6D0,$041FB8C8,$F96835F8,$03C458A1,$FF9F08D8
+  Data.l $B47CED9D,$58D3FCC4,$32745532,$4BA3458E,$5013BBD8,$DACFC692,$EA12D8FD,$097AF410,$03FEFA49,$F97EC7CC,$03C18C81,$FF946BED
+  Data.l $882E3FC2,$591F7AE3,$0EC0CD71,$4B59019C,$8CA61570,$DAEC4F27,$ED4AAF41,$098AAF38,$03DEAC78,$F99547FC,$03BE7768,$FF8A2EEC
+  Data.l $01EC0BA2,$596AAEDB,$C6379ED3,$4B0EF6E9,$4F2FD0C0,$DB09062D,$6FF4F1A7,$0999EA0A,$03BECEF9,$F9ABB4D8,$03BB1BEE,$FF80503C
+  Data.l $8F821B49,$59B598E4,$BAA21969,$4AC525D2,$3551C474,$DB25EA25,$F099CFB9,$09A8A645,$039F6166,$F9C20CC3,$03B77CA3,$FF76CE43
+  Data.l $F8A15FCE,$5A003939,$5644AFB9,$4A7B8EAF,$1BBC295A,$DB42F996,$4AFB71B3,$09B6E5AA,$03806353,$F9D84E2D,$03B39C0B,$FF6DA763
+  Data.l $5BEDA9D9,$5A4A9015,$16580DB2,$4A3231D5,$19172FE2,$DB60330C,$98E29D72,$09C4A9F4,$0361D44C,$F9EE7796,$03AF7C9C,$FF64D9FA
+  Data.l $2C15D609,$5A949DB1,$9577A45A,$49E90F96,$788FBD37,$DB7D9518,$14164210,$09D1F4E0,$0343B3D4,$FA04878C,$03AB20C3,$FF5C6465
+  Data.l $2CF66258,$5ADE6248,$9604F60B,$49A02843,$B40BC8AC,$DB9B1E51,$F9789209,$09DEC825,$0326016A,$FA1A7CAB,$03A68AE2,$FF5444FF
+  Data.l $70C660E0,$5B27DE15,$0C7EF5DA,$49577C29,$6E09C211,$DBB8CD53,$6D444C8F,$09EB257D,$0308BC84,$FA30559F,$03A1BD4E,$FF4C7A23
+  Data.l $554EBBC8,$5B711154,$29CCD3A6,$490F0B91,$6B2E5977,$DBD6A0BE,$6064D128,$09F70E9B,$02EBE492,$FA461120,$039CBA52,$FF450228
+  Data.l $812BBD69,$5BB9FC40,$657B94D5,$48C6D6C3,$8B83F08E,$DBF49738,$76E39499,$0A028532,$02CF78FC,$FA5BADF4,$0397842A,$FF3DDB69
+  Data.l $E118CF3A,$5C029F15,$87EDE048,$487EDE04,$C36EEDBC,$DC12AF6C,$EF658BA3,$0A0D8AF2,$02B37928,$FA712AF0,$03921D0B,$FF37043D
+  Data.l $A546615D,$5C4AFA10,$B47D6A7F,$48372196,$145A1892,$DC30E80B,$8BB31EE5,$0A18218A,$0297E473,$FA8686F3,$038C871B,$FF307AFE
+  Data.l $3EB9EC33,$5C930D6D,$738D7510,$47EFA1B9,$851E1726,$DC4F3FC8,$7A453B79,$0A224AA4,$027CBA35,$FA9BC0EC,$0386C477,$FF2A3E06
+  Data.l $5CB7FCBC,$5CDAD968,$BC8DDAC7,$47A85EA9,$1A271388,$DC6DB55F,$40D21555,$0A2C07E9,$0261F9C2,$FAB0D7D4,$0380D72E,$FF244BB0
+  Data.l $EA383C18,$5D225E3E,$FFEE27AA,$476158A1,$CD5B8041,$DC8C478D,$A7D4333F,$0A355AFE,$0247A267,$FAC5CAB1,$037AC145,$FF1EA259
+  Data.l $0B6361EE,$5D699C2E,$3100421B,$471A8FDA,$85C6E2A9,$DCAAF518,$A7066008,$0A3E4587,$022DB36F,$FADA9896,$037484B5,$FF194060
+  Data.l $1B1B0119,$5DB09373,$CFCA2FEB,$46D40487,$0F0B79AF,$DCC9BCC8,$52CF21BF,$0A46C924,$02142C1E,$FAEF40A0,$036E236D,$FF142426
+  Data.l $A88B1D73,$5DF7444B,$F2C687ED,$468DB6DD,$109D879F,$DCE89D6A,$CA965DB1,$0A4EE771,$01FB0BB5,$FB03C1F9,$03679F4E,$FF0F4C0D
+  Data.l $74C57940,$5E3DAEF5,$50932606,$4647A70D,$04CAF574,$DD0795D1,$27FFD70B,$0A56A20A,$01E25170,$FB181BD5,$0360FA31,$FF0AB67C
+  Data.l $70668845,$5E83D3AE,$498DBD0A,$4601D544,$2F91F64B,$DD26A4D4,$6F053E0B,$0A5DFA84,$01C9FC88,$FB2C4D75,$035A35E0,$FF0661DC
+  Data.l $B943F631,$5EC9B2B4,$F15DE718,$45BC41AE,$954941C9,$DD45C94F,$7EEA8E96,$0A64F274,$01B20C32,$FB405621,$0353541F,$FF024C9A
+  Data.l $9824ADBB,$5F0F4C46,$186C5A10,$4576EC77,$F11C6C97,$DD650223,$040786C7,$0A6B8B6B,$019A7FA0,$FB54352F,$034C56A1,$FEFE7523
+  Data.l $7E824D56,$5F54A0A2,$5546EAF3,$4531D5C4,$AB5ED65B,$DD844E36,$6A6108A2,$0A71C6F5,$018355FF,$FB67E9FD,$03453F13,$FEFAD9ED
+  Data.l $0453F638,$5F99B007,$0DF10FB3,$44ECFDBC,$CFB79561,$DDA3AC71,$D10D457D,$0A77A69D,$016C8E7C,$FB7B73F3,$033E0F15,$FEF7796E
+  Data.l $E5E261FD,$5FDE7AB2,$812093C6,$44A86481,$0328B883,$DDC31BC4,$FE5D9D83,$0A7D2BEA,$0156283F,$FB8ED284,$0336C83D,$FEF45222
+  Data.l $01A52AFF,$602300E5,$CF66388F,$44640A35,$79F42901,$DDE29B20,$54C92AAC,$0A825860,$0140226C,$FBA2052B,$032F6C15,$FEF16287
+  Data.l $56293320,$606742DC,$0441FEF0,$441FEEF8,$ED6066B8,$DE02297E,$C892FB8B,$0A872D7D,$012A7C28,$FBB50B6D,$0327FC1E,$FEEEA923
+  Data.l $000014A3,$60AB40D8,$1F22DC13,$43DC12E5,$915F4A65,$DE21C5DB,$D627106D,$0A8BACBF,$01153494,$FBC7E4D8,$032079D0,$FEEC247C
+  Data.l $37B8884C,$60EEFB17,$1C519F7A,$43987618,$0A18EAEF,$DE416F37,$79293B80,$0A8FD79F,$01004ACD,$FBDA9101,$0318E695,$FEE9D321
+  Data.l $4FDFABF4,$613271D9,$FDC6D4AC,$435518A9,$615CB41D,$DE612496,$243113B7,$0A93AF92,$00EBBDF2,$FBED0F88,$031143D0,$FEE7B3A3
+  Data.l $B30B145B,$6175A55D,$D3EB6EFD,$4311FAB1,$FBFAAECC,$DE80E502,$B92E3976,$0A973609,$00D78D1C,$FBFF6012,$030992D9,$FEE5C499
+  Data.l $E1EB9502,$61B895E3,$C64411AC,$42CF1C44,$8F06EC92,$DEA0AF8A,$82703BD5,$0A9A6C74,$00C3B765,$FC118250,$0301D4FE,$FEE4049F
+  Data.l $7168A885,$61FB43AB,$1C06CA96,$428C7D76,$1508FAB4,$DEC0833F,$2C4D7D65,$0A9D543D,$00B03BE5,$FC2375F7,$02FA0B84,$FEE27256
+  Data.l $08C463DA,$623DAEF4,$449B195B,$424A1E57,$C319328F,$DEE05F36,$BF6487F6,$0A9FEECA,$009D19B3,$FC353AC5,$02F237A6,$FEE10C64
+  Data.l $5FC7DEAA,$627FD7FD,$E0042080,$4207FEF7,$FDEDB00C,$DF00428B,$9B734FA0,$0AA23D80,$008A4FE3,$FC46D081,$02EA5A96,$FEDFD175
+  Data.l $3CF7FAF0,$62C1BF07,$C734E19C,$41C61F65,$4ED8A92C,$DF202C5D,$72BFF667,$0AA441BE,$0077DD89,$FC5836F4,$02E2757C,$FEDEC039
+  Data.l $73D275BF,$63036451,$144E68F2,$41847FAD,$58B9D4AD,$DF401BCD,$460EB337,$0AA5FCE0,$0065C1B9,$FC696DF4,$02DA8977,$FEDDD766
+  Data.l $E3132B28,$6344C81B,$2AC7D050,$41431FD8,$CCE480BC,$DF601002,$61209089,$0AA7703E,$0053FB85,$FC7A755A,$02D2979F,$FEDD15B9
+  Data.l $7301770A,$6385EAA6,$BF800410,$4101FFEF,$5FFBEDD8,$DF800828,$57B6C8A9,$0AA89D2D,$004289FF,$FC8B4D06,$02CAA100,$FEDC79F3
+  Data.l $13C59C77,$63C6CC31,$E0B93868,$40C11FFA,$BEC77580,$DFA0036C,$031697BB,$0AA984FE,$00316C38,$FC9BF4DF,$02C2A6A0,$FEDC02DA
+  Data.l $BBC61D68,$64076CFB,$FDFE0004,$40807FFE,$82FFF7EE,$DFC00102,$80096D73,$0AAA28FD,$0020A140,$FCAC6CD0,$02BAA97B,$FEDBAF3B
+  Data.l $660CEC4F,$6447CD46,$EFEFF800,$40401FFF,$2817FFF0,$DFE00020,$2D557ADB,$0AAA8A75,$00102828,$FCBCB4CD,$02B2AA85,$FEDB7DE7
+EndDataSection
+CompilerEndIf
+
 Procedure.i PmTensorIsNan(v.f)
   If (PeekL(@v) & $7FFFFFFF) > $7F800000
     ProcedureReturn 1
@@ -2455,11 +3953,23 @@ Procedure PmTensorTrig(*src.i, *dst.i, count.i, op.i)
   While i < count
     v = *ps.f
     If op = 0
-      v = Sin(v)
+      CompilerIf #PMO_USE_TRIG = 1
+        PokeL(@v, PmTensorTrigBits(PeekL(ps), 0))
+      CompilerElse
+        v = Sin(v)
+      CompilerEndIf
     ElseIf op = 1
-      v = Cos(v)
+      CompilerIf #PMO_USE_TRIG = 1
+        PokeL(@v, PmTensorTrigBits(PeekL(ps), 1))
+      CompilerElse
+        v = Cos(v)
+      CompilerEndIf
     Else
-      v = MathATan(v)
+      CompilerIf #PMO_USE_ATAN = 1 And #PMO_INT8_BACKEND <> 3
+        PokeL(@v, PmTensorAtanBits(PeekL(ps)))
+      CompilerElse
+        v = MathATan(v)
+      CompilerEndIf
     EndIf
     *pd.f = v
     ps = ps + 4 : pd = pd + 4 : i = i + 1

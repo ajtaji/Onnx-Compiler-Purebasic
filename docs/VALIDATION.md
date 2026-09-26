@@ -1331,6 +1331,145 @@ Every support-file procedure this change touches (the emitted source changes onl
 | `tensor_fp32_windows.pbi` | `PmTensorUnaryMathSerial` | changed |
 
 
+## The same bits on every target, third stage: Sin, Cos and Atan — September 26, 2026
+
+Sin and Cos are now correctly rounded on the Pi 4, Pico and Pico 2, on both
+paths, and Atan on the Pico and on the Pi 4's fixed-shape path; every one of
+those gives the Windows program's bits. The Windows host's own Sin, Cos and ATan are correctly
+rounded but for eight arguments, which the Windows kernels now correct.
+
+**The method.** As for Exp and Log, one exact integer method per function,
+in the spelling each target runs fastest.
+
+- Sin and Cos: |x| is reduced against 2/pi held to 320 bits (Payne and
+  Hanek, so a huge argument is as exact as a small one): Z = |x| 512/pi to 96
+  fraction bits, j the nearest integer, b = (Z - j) pi/512 with |b| <=
+  pi/1024; sin b and cos b by short polynomials in Q64; sin and cos of
+  j pi/512 from a 256-entry table in Q63; the angle-addition formula; and
+  where the result is sin b alone (x near a multiple of pi/2) it is kept to
+  its own relative precision. Rounded once.
+- Atan: |x| < 2^-8 by its series, kept relative to x; |x| <= 1 by a
+  255-bucket table of atan's Taylor coefficients to degree 7 at j/256 (no
+  division); |x| > 1 as pi/2 - atan(1/|x|), 1/|x| to within three units of
+  2^-64 by Newton's method in 32-bit steps. Rounded once.
+- The spellings: 32-bit words (the Pico, whose 32 x 32 high word is now
+  Cortex-M0+ assembly, and the Pi 4), UMULL/UMAAL assembly (the Pico 2's Sin
+  and Cos), and the Pi 4's Exp moved from 64-bit BASIC to A64 assembly of
+  the same method (5 times faster).
+- The Pi 4's four-lane Sin/Cos kernel (the runtime-dimension path) now
+  evaluates in binary64 lanes and tests each result: if it lies within 1024
+  binary64 units of a binary32 rounding midpoint, or an argument is beyond
+  2^20, an infinity or a NaN, those four go to the integer method. So it too
+  gives the correctly rounded result, and it is faster than before.
+
+**Proved, and where not every argument, how much.** Against the correctly
+rounded result:
+
+- Every one of the 2^32 binary32 arguments: the 32-bit word spellings of
+  Sin, Cos and Atan compiled by the Windows compiler, with the Pico's and
+  with the Pi 4's high-word helper; the Pico 2's Sin and Cos (its assembly,
+  in its build of the runtime, in the emulator); the Pi 4's assembly Exp;
+  the Pi 4's four-lane Sin kernel; and the Windows kernels (serial and the
+  pool's range kernel, in place too).
+- The Pi 4's and Pico's builds of the runtime in the emulator: every 16th
+  block of 2^20 arguments (268 million arguments per function) and every
+  block holding special values or the edges of the methods; the Pi 4's
+  four-lane Cos kernel the same way. The procedures they run are the
+  proven text, byte for byte.
+- The Pico's high-word helpers, now Cortex-M0+ assembly without a branch on
+  the data: a million operand pairs and every pair of edge values, against
+  exact products.
+
+Two polynomial terms were dropped because the proof showed they change no
+result; one (b^4/120) was kept because without it 186 arguments round the
+other way.
+
+**Where the rule said no.** The owner's speed rule allows a correctly
+rounded function to cost a target no more than about 10% on that function;
+where it would cost more, the target keeps its fast function, held to the
+tolerance and named in `TOLERANCE_ONLY` with the reason.
+
+- The Pico 2's Atan: its maths library's arctangent takes about 160
+  instructions on the FPU; the table method needs thirteen 64-bit products
+  and more than 250 instructions in assembly. It keeps the library's.
+- The Pi 4's four-lane Atan (the runtime-dimension path, 12 instructions an
+  element): a correctly rounded one needs binary64 division and a longer
+  polynomial, more than twice the cost. Its fixed-shape Atan is correctly
+  rounded.
+
+**Windows.** The host's Sin is not correctly rounded at `46199998` and
+`C6199998`, Cos at `5F18B878`, `DF18B878`, `6115CB11` and `E115CB11`, ATan at
+`3D8D6B23` and `BD8D6B23`. The Log scan of the second stage is now general:
+each kernel scans its arguments with SSE2 before it runs and, only when one
+of its function's arguments is present, computes that range one element at a
+time with the correctly rounded result in its place. Every argument of the
+serial kernel and of the pool's range kernel was checked, in place too. The
+host's NaN is already x86's: a NaN argument comes back quieted with its
+payload and sign, Sin and Cos of an infinity are `FFC00000`, Atan of ±inf is
+±pi/2.
+
+**Speed.** Every changed kernel is as fast as before or faster on every target, but
+the Pico 2's Sin and Cos, which cost it 6.8 to 8.3% more - inside the rule's
+10%. Instructions for the whole 8,192-element request in unicorn:
+
+| Kernel | Pi 4 | Pico | Pico 2 |
+|---|---|---|---|
+| Sin | 139,007,712 → 47,172,369 (−66%) | 27,837,035 → 21,740,916 (−22%) | 3,753,445 → 4,064,430 (+8.3%) |
+| Cos | 139,267,616 → 47,146,524 (−66%) | 27,946,564 → 21,719,682 (−22%) | 3,828,260 → 4,089,354 (+6.8%) |
+| Atan | 191,023,393 → 38,021,777 (−80%) | 20,332,586 → 17,817,787 (−12%) | unchanged (its library's) |
+| Exp | 9,901,776 → 3,876,646 (−61%, now assembly) | 22,403,813 → 11,914,489 (−47%, the M0+ high word) | unchanged |
+| Log | unchanged | 22,766,573 → 13,207,913 (−42%, the M0+ high word) | unchanged |
+
+The Pi 4's four-lane Sin/Cos kernel: 36.6 → 33.3 instructions an element
+for Sin and 35.8 → 32.3 for Cos, whatever the range of the arguments. On
+Windows the host functions are unchanged and the scan is the whole cost: 2.7
+ms against the serial Sin kernel's 123 ms over 8M elements (2.2%, best of
+25). Kokoro-82M on Windows (51 Sin nodes), 15 requests each, old and new
+interleaved while the emulator sweeps loaded the machine: FP32 1,798.2
+against 1,793.9 ms median, INT8 1,344.5 against 1,344.3 - no measurable
+change, and the same output bits.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py`: the 604 cases | Windows (both branches), Pi 4, Pico and Pico 2: 604 of 604 bit-identical to the definition; `--mutants` 72 of 72 caught |
+| `runtime_mutants.py`: the 38 before (two of them moved to the Pi 4's assembly Exp and the Pico's M0+ high word, which replaced the code they planted in), and six new: the word spelling's exponent, the M33 quadrant, a sign in the four-lane kernel, Atan's scaling, and the Windows corrections of Sin and Atan | 44 of 44 as required |
+| `tests/node_suite/targeted_ops.py`: 1,075 cases - the 1,069 before; Sin, Cos and Atan on the special values, the eight arguments the host gets wrong, multiples of pi/2, the four-lane kernel's 2^20 edge, huge and tiny arguments and Atan's 2^-8, 1 and 2^26 edges, on both paths | 1,075 of 1,075 as expected; `targeted_defaults`, `targeted_norm_small`, `targeted_control`, `targeted_optional_outputs` 148, 132, 41 and 14 as expected |
+| `ops_targets_gate.py`: those cases, BatchNormalization, and the NaN, comparison, Clip, Floor, Round and Tanh cases, on the Pi 4, Pico and Pico 2 | 125 builds, 375 runs: 364 bit-identical to the Windows program; 11 within the tolerance and named in `TOLERANCE_ONLY` - Sigmoid (six, the last stage) and Atan where the speed rule keeps the fast one (the Pico 2's four, the Pi 4's four-lane kernel's one). Sin and Cos left the list |
+| `pi4_control_gate.py` | 29 of 41, as before |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,239 both |
+| Models that use none of these forms (four models, fp32/fp16/bf16/int4, five targets), this change against `4ddd397` | All 80 emitted sources, packs and manifests byte-identical; all 32 fixed-shape images byte-identical; the four models' Windows outputs and all 30 outputs of their Pi 4, Pico and Pico 2 programs byte-identical |
+| Kokoro-82M, FP32 and INT8, for Windows | Source and pack byte-identical; `tensor_fp32_windows.pbi` differs (the scans); the output for the reference request byte-identical, FP32 and INT8 |
+
+Output bits that change: on the Pi 4, Pico and Pico 2, every Sin and Cos
+result, and every Atan result of the Pi 4's and Pico's scalar kernels, that
+was not correctly rounded (about a quarter of those sampled), Sin(-0) (now
+-0 on the Pico and Pico 2) and Atan(-0) (now -0 where it is correctly
+rounded), and the NaN of an infinity's sine or cosine (now x86's
+`FFC00000`); on Windows, the eight arguments.
+
+Every support-file procedure this change touches (the emitted source does not change):
+
+| Support file | Procedure | |
+|---|---|---|
+| `tensor_fp32.pmi` | `PmTensorAtanBits` | added |
+| `tensor_fp32.pmi` | `PmTensorAtanRecip` | added |
+| `tensor_fp32.pmi` | `PmTensorAtanSeries` | added |
+| `tensor_fp32.pmi` | `PmTensorAtanTab` | added |
+| `tensor_fp32.pmi` | `PmTensorBelow32` | changed (the Pico's: assembly) |
+| `tensor_fp32.pmi` | `PmTensorExpBits` | changed (the Pi 4's: assembly) |
+| `tensor_fp32.pmi` | `PmTensorMulHi32` | changed (the Pico's: assembly) |
+| `tensor_fp32.pmi` | `PmTensorTrig` | changed |
+| `tensor_fp32.pmi` | `PmTensorTrigBits` | added |
+| `tensor_fp32_windows.pbi` | `PmFastTrigRange` | changed |
+| `tensor_fp32_windows.pbi` | `PmTensorHardScan` | added (was `PmTensorLogHardScan`) |
+| `tensor_fp32_windows.pbi` | `PmTensorLogHardScan` | removed |
+| `tensor_fp32_windows.pbi` | `PmTensorTrigHard` | added |
+| `tensor_fp32_windows.pbi` | `PmTensorTrigHardArgs` | added |
+| `tensor_fp32_windows.pbi` | `PmTensorTrigSerial` | changed |
+| `tensor_fp32_windows.pbi` | `PmTensorUnaryMathSerial` | changed (the scan's new name) |
+| `tensor_trig_a64.pmi` | `PmTensorTrigA64` | changed |
+
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.
@@ -1353,15 +1492,15 @@ Every support-file procedure this change touches (the emitted source changes onl
 - Some kernels of the base runtime (not of the operator-set lane) match the
   Windows program on the Pi 4, Pico and Pico 2 within the node-suite
   tolerance but not bit for bit. `ops_targets_gate.py` names each in
-  `TOLERANCE_ONLY` with its reason and still holds it to the tolerance: Sin,
-  Cos, Atan and Sigmoid, whose target libraries miss the correctly rounded
-  result by one or two units in the last place on some arguments (Windows is
-  correctly rounded but for eight arguments in all), and
-  whose NaN from an invalid argument is x86's `FFC00000` on Windows and
-  `7FC00000` on the targets; Sin(-0) on the Pico and Pico 2 and Atan(-0) on
-  all three targets give +0. The later stages of
-  [the same bits on every target](#the-same-bits-on-every-target-first-stage-square-root-abs-negate-and-batchnormalization--september-25-2026)
-  move them to the correctly rounded result and empty the list.
+  `TOLERANCE_ONLY` with its reason and still holds it to the tolerance
+  (a name may be limited to one target): Sigmoid, whose target libraries'
+  Exp misses the correctly rounded result on some arguments, until the last
+  stage of
+  [the same bits on every target](#the-same-bits-on-every-target-first-stage-square-root-abs-negate-and-batchnormalization--september-25-2026);
+  and, under the owner's speed rule (a correctly rounded function may cost a
+  target no more than about 10%), Atan on the Pico 2 and on the Pi 4's
+  runtime-dimension path, which keep their fast arctangents (within one or
+  two units in the last place; NaN `7FC00000`; Atan(-0) +0).
   LayerNormalization, Softmax and the other composite kernels are not yet
   covered by the target gate.
 - Windows x64 is the verified host. Linux/macOS hosting, other PureBasic

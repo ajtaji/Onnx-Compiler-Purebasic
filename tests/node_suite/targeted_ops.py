@@ -1242,6 +1242,25 @@ def cases() -> list[Case]:
             want = fn(x.astype(np.float64)).astype(np.float32)
         c.append(Case("%s_specials" % op.lower(), [N(op, ["x"], ["y"])], [("x", F, [x.size])], [("y", F, [x.size])],
                       {"x": x}, opset=13, oracle=("own", lambda feeds, w=want: [w])))
+    # Sin, Cos and Atan on every special value, the edges of their methods and
+    # the arguments hardest to round (C6c-3): correctly rounded on every target
+    # but the Pico 2's Atan, and x86's NaN. The eight arguments at which the
+    # Windows host's own functions are not correctly rounded (the kernel
+    # corrects them); multiples of pi/2 in binary32; the Pi 4 vector kernel's
+    # 2^20 edge; the huge and the tiny; Atan's 2^-8, 1 and 2^26 edges.
+    hard_trig = np.array([0x46199998, 0xC6199998, 0x5F18B878, 0xDF18B878, 0x6115CB11, 0xE115CB11, 0x3D8D6B23, 0xBD8D6B23,
+                          0x3FC90FDB, 0x40490FDB, 0x40C90FDB, 0x4096CBE4, 0x49800000, 0x497FFFFF, 0x49800001, 0xC9800000,
+                          0x4B7FFFFF, 0x5A800000, 0x7F7FFFFF, 0xFF7FFFFF, 0x39800000, 0x397FFFFF, 0x3B800000, 0x3B7FFFFF,
+                          0x3F800001, 0x3F7FFFFF, 0x4C800000, 0x4C7FFFFF, 0x4BFFFFFF, 0x00800000, 0x80000001],
+                         np.uint32).view(np.float32)
+    rng_tr = np.random.default_rng(6363)  # its own stream: the cases after these keep their data
+    for op, fn in (("Sin", np.sin), ("Cos", np.cos), ("Atan", np.arctan)):
+        x = np.concatenate([spec[:24], hard_trig, rng_tr.uniform(-1e5, 1e5, 24).astype(np.float32),
+                            rng_tr.uniform(-10, 10, 16).astype(np.float32)]).astype(np.float32)
+        with np.errstate(all="ignore"):
+            want = fn(x.astype(np.float64)).astype(np.float32)
+        c.append(Case("%s_specials" % op.lower(), [N(op, ["x"], ["y"])], [("x", F, [x.size])], [("y", F, [x.size])],
+                      {"x": x}, opset=13, oracle=("own", lambda feeds, w=want: [w])))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

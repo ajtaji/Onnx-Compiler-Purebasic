@@ -363,21 +363,24 @@ Global PmTensorTrigOk.i
 ; as the caller left it and PmTensorUnaryMathOk is cleared.  The op is decided
 ; once, before the loop, because a per-element test can only ever be a slower
 ; way to get the same answer.
-; 1 when one of the five binary32 arguments at which the host's Log is not
-; correctly rounded (every argument checked, C6c-2) is among the count at
-; *src. Four at a time with SSE2, compared with all five and never stopping
-; early, so the answer costs the same whatever the data; a remainder, or a
-; build without the assembler backend, is compared one at a time.
-Procedure.i PmTensorLogHardScan(*src, count.i)
+; 1 when one of the arguments at which the host's function is not correctly
+; rounded (every argument checked: Log C6c-2, Sin, Cos and ATan C6c-3) is
+; among the count at *src; *args is that function's five four-lane vectors
+; (an argument repeated where it has fewer). Four at a time with SSE2,
+; compared with all five and never stopping early, so the answer costs the
+; same whatever the data; a remainder, or a build without the assembler
+; backend, is compared one at a time.
+Procedure.i PmTensorHardScan(*src, count.i, *args)
   Protected hit.i
   Protected n4.i
   Protected ps.i
   Protected pc.i
   Protected i.i
+  Protected j.i
   Protected k.l
   n4 = count >> 2
   ps = *src
-  pc = ?PmTensorLogHardArgs
+  pc = *args
   i = 0
   CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
     If n4 > 0
@@ -388,7 +391,7 @@ Procedure.i PmTensorLogHardScan(*src, count.i)
       !movdqu xmm2,[rdx]
       !movdqu xmm3,[rdx+16]
       !movdqu xmm4,[rdx+32]
-      !pmtensorloghard_loop:
+      !pmtensorhard_loop:
       !movdqu xmm0,[rax]
       !movdqa xmm5,xmm0
       !pcmpeqd xmm5,xmm2
@@ -407,7 +410,7 @@ Procedure.i PmTensorLogHardScan(*src, count.i)
       !por xmm1,xmm5
       !add rax,16
       !dec rcx
-      !jnz pmtensorloghard_loop
+      !jnz pmtensorhard_loop
       !pmovmskb eax,xmm1
       !mov [p.v_hit],rax
     EndIf
@@ -415,9 +418,11 @@ Procedure.i PmTensorLogHardScan(*src, count.i)
   CompilerEndIf
   While i < count
     k = PeekL(*src + i * 4)
-    If k = $3C413D3A Or k = $65D890D3 Or k = $6F31A8EC Or k = $41178FEB Or k = $4C5D65A5
-      hit = 1
-    EndIf
+    For j = 0 To 4
+      If k = PeekL(*args + j * 16)
+        hit = 1
+      EndIf
+    Next
     i = i + 1
   Wend
   If hit <> 0
@@ -433,7 +438,70 @@ DataSection
   Data.l $6F31A8EC,$6F31A8EC,$6F31A8EC,$6F31A8EC
   Data.l $41178FEB,$41178FEB,$41178FEB,$41178FEB
   Data.l $4C5D65A5,$4C5D65A5,$4C5D65A5,$4C5D65A5
+  PmTensorSinHardArgs:
+  Data.l $46199998,$46199998,$46199998,$46199998
+  Data.l $C6199998,$C6199998,$C6199998,$C6199998
+  Data.l $46199998,$46199998,$46199998,$46199998
+  Data.l $46199998,$46199998,$46199998,$46199998
+  Data.l $46199998,$46199998,$46199998,$46199998
+  PmTensorCosHardArgs:
+  Data.l $5F18B878,$5F18B878,$5F18B878,$5F18B878
+  Data.l $DF18B878,$DF18B878,$DF18B878,$DF18B878
+  Data.l $6115CB11,$6115CB11,$6115CB11,$6115CB11
+  Data.l $E115CB11,$E115CB11,$E115CB11,$E115CB11
+  Data.l $5F18B878,$5F18B878,$5F18B878,$5F18B878
+  PmTensorAtanHardArgs:
+  Data.l $3D8D6B23,$3D8D6B23,$3D8D6B23,$3D8D6B23
+  Data.l $BD8D6B23,$BD8D6B23,$BD8D6B23,$BD8D6B23
+  Data.l $3D8D6B23,$3D8D6B23,$3D8D6B23,$3D8D6B23
+  Data.l $3D8D6B23,$3D8D6B23,$3D8D6B23,$3D8D6B23
+  Data.l $3D8D6B23,$3D8D6B23,$3D8D6B23,$3D8D6B23
 EndDataSection
+
+; Sin, Cos or ATan one element at a time, with the correctly rounded result
+; at the host's eight arguments (C6c-3); for a range that holds one of them.
+; Each argument is read before its result is written, so it may run in place.
+Procedure PmTensorTrigHard(*src, *dst, count.i, op.i)
+  Protected i.i
+  Protected k.l
+  Protected v.f
+  i = 0
+  While i < count
+    k = PeekL(*src + i * 4)
+    v = PeekF(*src + i * 4)
+    If op = 0
+      v = Sin(v)
+      Select k
+        Case $46199998 : PokeL(@v, $BEB1FA5D)
+        Case $C6199998 : PokeL(@v, $3EB1FA5D)
+      EndSelect
+    ElseIf op = 1
+      v = Cos(v)
+      Select k
+        Case $5F18B878, $DF18B878 : PokeL(@v, $3F7F14BB)
+        Case $6115CB11, $E115CB11 : PokeL(@v, $3F78142F)
+      EndSelect
+    Else
+      v = ATan(v)
+      Select k
+        Case $3D8D6B23 : PokeL(@v, $3D8D31C3)
+        Case $BD8D6B23 : PokeL(@v, $BD8D31C3)
+      EndSelect
+    EndIf
+    PokeF(*dst + i * 4, v)
+    i = i + 1
+  Wend
+EndProcedure
+
+; The five-vector argument table of op (0 Sin, 1 Cos, 2 ATan)
+Procedure.i PmTensorTrigHardArgs(op.i)
+  If op = 0
+    ProcedureReturn ?PmTensorSinHardArgs
+  ElseIf op = 1
+    ProcedureReturn ?PmTensorCosHardArgs
+  EndIf
+  ProcedureReturn ?PmTensorAtanHardArgs
+EndProcedure
 
 Procedure PmTensorUnaryMathSerial(*src, *dst, count.i, op.i)
   ; the op is decided once, outside the loop
@@ -455,7 +523,7 @@ Procedure PmTensorUnaryMathSerial(*src, *dst, count.i, op.i)
       ; arguments, whose correctly rounded results are put in their place.
       ; The arguments are read before anything is written, so the kernel may
       ; run in place.
-      If PmTensorLogHardScan(*src, count) = 0
+      If PmTensorHardScan(*src, count, ?PmTensorLogHardArgs) = 0
         While i < count : PokeF(*dst + i * 4, Log(PeekF(*src + i * 4))) : i = i + 1 : Wend
       Else
         While i < count
@@ -507,6 +575,12 @@ Procedure PmTensorTrigSerial(*src, *dst, count.i, op.i)
   Protected v.f
   If op < 0 Or op > 2
     PmTensorTrigOk = 0
+    ProcedureReturn
+  EndIf
+  ; correctly rounded (C6c-3): the host's Sin, Cos and ATan are, except at
+  ; eight arguments; a range holding one of them goes the careful way
+  If PmTensorHardScan(*src, count, PmTensorTrigHardArgs(op)) <> 0
+    PmTensorTrigHard(*src, *dst, count, op)
     ProcedureReturn
   EndIf
   i = 0
@@ -657,6 +731,12 @@ EndStructure
 ; exactly as they were written there, for one range of elements.
 Procedure PmFastTrigRange(*Src, *Dst, Count.i, Op.i)
   Protected i.i
+  If Op >= 0 And Op <= 2
+    If PmTensorHardScan(*Src, Count, PmTensorTrigHardArgs(Op)) <> 0
+      PmTensorTrigHard(*Src, *Dst, Count, Op)
+      ProcedureReturn
+    EndIf
+  EndIf
   Select Op
     Case 0
       For i=0 To Count-1 : PokeF(*Dst+i*4,Sin(PeekF(*Src+i*4))) : Next
