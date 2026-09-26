@@ -1550,6 +1550,13 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
   PmoEmitLine(File, "#PMO_USE_CONV = " + Str(Bool(FindMapElement(UsedOps(), "Conv"))))
   PmoEmitLine(File, "#PMO_USE_LSTM = " + Str(Bool(FindMapElement(UsedOps(), "LSTM"))))
   PmoEmitLine(File, "#PMO_USE_INT8 = " + Str(Bool(ListSize(*Ir\QuantWeights()) > 0)))
+  If *Profile\SourceDialect = #PMO_SOURCE_PUREMETAL
+    ; the correctly rounded maths families (C6c): each brings its own tables,
+    ; so a program carries only the ones its graph uses
+    PmoEmitLine(File, "#PMO_USE_EXPLOG = " + Str(Bool(FindMapElement(UsedOps(), "Exp") Or FindMapElement(UsedOps(), "Log"))))
+    PmoEmitLine(File, "#PMO_USE_TRIG = " + Str(Bool(FindMapElement(UsedOps(), "Sin") Or FindMapElement(UsedOps(), "Cos"))))
+    PmoEmitLine(File, "#PMO_USE_ATAN = " + Str(Bool(FindMapElement(UsedOps(), "Atan"))))
+  EndIf
   PmoEmitLine(File, "#PMO_INT64_SPLIT = " + Str(Bool(*Profile\NativeIntegerBytes = 4)))
   PmoEmitLine(File, "#PMO_INT8_BACKEND = " + Str(1+Bool(*Profile\NativeIntegerBytes=4)+Bool(*Profile\Id="pico2")))
   PmoEmitLine(File)

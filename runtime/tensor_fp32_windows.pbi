@@ -363,9 +363,82 @@ Global PmTensorTrigOk.i
 ; as the caller left it and PmTensorUnaryMathOk is cleared.  The op is decided
 ; once, before the loop, because a per-element test can only ever be a slower
 ; way to get the same answer.
+; 1 when one of the five binary32 arguments at which the host's Log is not
+; correctly rounded (every argument checked, C6c-2) is among the count at
+; *src. Four at a time with SSE2, compared with all five and never stopping
+; early, so the answer costs the same whatever the data; a remainder, or a
+; build without the assembler backend, is compared one at a time.
+Procedure.i PmTensorLogHardScan(*src, count.i)
+  Protected hit.i
+  Protected n4.i
+  Protected ps.i
+  Protected pc.i
+  Protected i.i
+  Protected k.l
+  n4 = count >> 2
+  ps = *src
+  pc = ?PmTensorLogHardArgs
+  i = 0
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
+    If n4 > 0
+      !mov rax,[p.v_ps]
+      !mov rcx,[p.v_n4]
+      !mov rdx,[p.v_pc]
+      !pxor xmm1,xmm1
+      !movdqu xmm2,[rdx]
+      !movdqu xmm3,[rdx+16]
+      !movdqu xmm4,[rdx+32]
+      !pmtensorloghard_loop:
+      !movdqu xmm0,[rax]
+      !movdqa xmm5,xmm0
+      !pcmpeqd xmm5,xmm2
+      !por xmm1,xmm5
+      !movdqa xmm5,xmm0
+      !pcmpeqd xmm5,xmm3
+      !por xmm1,xmm5
+      !movdqa xmm5,xmm0
+      !pcmpeqd xmm5,xmm4
+      !por xmm1,xmm5
+      !movdqu xmm5,[rdx+48]
+      !pcmpeqd xmm5,xmm0
+      !por xmm1,xmm5
+      !movdqu xmm5,[rdx+64]
+      !pcmpeqd xmm5,xmm0
+      !por xmm1,xmm5
+      !add rax,16
+      !dec rcx
+      !jnz pmtensorloghard_loop
+      !pmovmskb eax,xmm1
+      !mov [p.v_hit],rax
+    EndIf
+    i = n4 << 2
+  CompilerEndIf
+  While i < count
+    k = PeekL(*src + i * 4)
+    If k = $3C413D3A Or k = $65D890D3 Or k = $6F31A8EC Or k = $41178FEB Or k = $4C5D65A5
+      hit = 1
+    EndIf
+    i = i + 1
+  Wend
+  If hit <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+DataSection
+  PmTensorLogHardArgs:
+  Data.l $3C413D3A,$3C413D3A,$3C413D3A,$3C413D3A
+  Data.l $65D890D3,$65D890D3,$65D890D3,$65D890D3
+  Data.l $6F31A8EC,$6F31A8EC,$6F31A8EC,$6F31A8EC
+  Data.l $41178FEB,$41178FEB,$41178FEB,$41178FEB
+  Data.l $4C5D65A5,$4C5D65A5,$4C5D65A5,$4C5D65A5
+EndDataSection
+
 Procedure PmTensorUnaryMathSerial(*src, *dst, count.i, op.i)
   ; the op is decided once, outside the loop
   Protected i.i
+  Protected k.l
   Protected v.f
   Protected mask.q = $7FFFFFFF7FFFFFFF
   Protected flip.q = $8000000080000000
@@ -378,7 +451,26 @@ Procedure PmTensorUnaryMathSerial(*src, *dst, count.i, op.i)
     Case 0
       While i < count : PokeF(*dst + i * 4, Exp(PeekF(*src + i * 4))) : i = i + 1 : Wend
     Case 1
-      While i < count : PokeF(*dst + i * 4, Log(PeekF(*src + i * 4))) : i = i + 1 : Wend
+      ; correctly rounded (C6c-2): the host's Log is, except at five
+      ; arguments, whose correctly rounded results are put in their place.
+      ; The arguments are read before anything is written, so the kernel may
+      ; run in place.
+      If PmTensorLogHardScan(*src, count) = 0
+        While i < count : PokeF(*dst + i * 4, Log(PeekF(*src + i * 4))) : i = i + 1 : Wend
+      Else
+        While i < count
+          k = PeekL(*src + i * 4)
+          PokeF(*dst + i * 4, Log(PeekF(*src + i * 4)))
+          Select k
+            Case $3C413D3A : PokeL(*dst + i * 4, $C08E158F)
+            Case $65D890D3 : PokeL(*dst + i * 4, $4254D1F9)
+            Case $6F31A8EC : PokeL(*dst + i * 4, $42845A89)
+            Case $41178FEB : PokeL(*dst + i * 4, $400FE5E7)
+            Case $4C5D65A5 : PokeL(*dst + i * 4, $418F034B)
+          EndSelect
+          i = i + 1
+        Wend
+      EndIf
     Case 2
       ; correctly rounded (C6c-1); the NaN of an invalid argument is x86's,
       ; which is the definition every target reproduces

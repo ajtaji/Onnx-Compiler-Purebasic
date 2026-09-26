@@ -678,7 +678,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
     PmdLine(file,"#PMD_WORKING_MEMORY_LIMIT="+Str(workingLimit))
     PmdLine(file,"#PMD_METADATA_RESERVE="+Str(metadataBytes))
     PmdLine(file,"#PMO_WEIGHT_FILE_BYTES="+Str(ir\WeightBytes))
-    PmdLine(file,"#PMO_USE_BATCHNORM=1 : #PMO_USE_STFT=1 : #PMO_USE_RESIZE=1 : #PMO_USE_CONVTRANSPOSE=1 : #PMO_USE_CONV=1 : #PMO_USE_LSTM=1 : #PMO_USE_INT8=1")
+    PmdLine(file,"#PMO_USE_BATCHNORM=1 : #PMO_USE_STFT=1 : #PMO_USE_RESIZE=1 : #PMO_USE_CONVTRANSPOSE=1 : #PMO_USE_CONV=1 : #PMO_USE_LSTM=1 : #PMO_USE_INT8=1 : #PMO_USE_EXPLOG=1 : #PMO_USE_TRIG=1 : #PMO_USE_ATAN=1")
     PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\math.pmi"+Chr(34))
     PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_fp32.pmi"+Chr(34))
     If PmoTargets(targetIndex)\NativeIntegerBytes=8 : PmdLine(file,"XIncludeFile "+Chr(34)+GetFilePart(prefix)+".runtime\tensor_fp32_neon.pmi"+Chr(34)) : EndIf

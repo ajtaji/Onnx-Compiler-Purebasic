@@ -209,6 +209,1893 @@ Procedure.f PmTensorSqrtF(x.f)
   ProcedureReturn r
 EndProcedure
 
+; Exp and Log, correctly rounded (C6c-2). Compiled when the program uses them
+; (#PMO_USE_EXPLOG, which a generated program sets from its graph): their
+; tables are some 6 KB, and a program without Exp or Log keeps its image.
+CompilerIf #PMO_USE_EXPLOG = 1
+; The binary32 nearest the exact result, so every target gives the Windows
+; program's bits. The Windows program's own Exp is correctly rounded for every
+; argument, and its Log is except at five, which tensor_fp32_windows.pbi
+; corrects. Each is one exact
+; integer method in two spellings with the same steps and truncations: 32-bit
+; words (the Pico, and the Pi 4's Log, whose .l arithmetic is the same) and
+; UMULL/UMAAL assembly (the Pico 2), plus 64-bit integers for the Pi 4's Exp.
+; Every spelling was run on every binary32 argument (the 32- and 64-bit ones
+; by the Windows compiler, and each target's build in the emulator) against a
+; correctly rounded result. NaN is x86's, as for the square root: a NaN
+; argument comes back quieted (its payload and sign kept), and Log of a
+; negative argument is FFC00000.
+CompilerIf #PMO_INT8_BACKEND = 1
+; The high word of the unsigned 64-bit product of two 32-bit words (a 64-bit
+; multiply where .i is 64 bits).
+Procedure.l PmTensorMulHi32(a.l, b.l)
+  Protected x.i
+  Protected y.i
+  x = a & $FFFFFFFF
+  y = b & $FFFFFFFF
+  x = x * y
+  x = x >> 32
+  ProcedureReturn x
+EndProcedure
+
+; 1 when the unsigned word a is below the unsigned word b
+Procedure.l PmTensorBelow32(a.l, b.l)
+  Protected x.i
+  Protected y.i
+  x = a & $FFFFFFFF
+  y = b & $FFFFFFFF
+  If x < y
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; exp, correctly rounded, in exact 64-bit integer arithmetic (the bits of x in,
+; the bits of the result out). x = (256 i + j) ln2/256 + r with 0 <= r < ln2/256
+; (r to 2^-64, from ln2/256 to 2^-96); e^r - 1 = r + r^2/2 + r^3 (1/6 + r/24 +
+; r^2/120) in Q64; the result 2^i * 2^(j/256) * e^r in Q62, rounded once to
+; nearest-even at its own 24 bits (a subnormal result at its own position).
+; Every binary32 argument was checked against a correctly rounded exp.
+Procedure.i PmTensorExpBits(b.i)
+  Protected a.i
+  Protected neg.i
+  Protected e.i
+  Protected m.i
+  Protected k.i
+  Protected sh.i
+  Protected xs.i
+  Protected kl0.i
+  Protected klh.i
+  Protected r.i
+  Protected rh.i
+  Protected rl.i
+  Protected r2.i
+  Protected v.i
+  Protected w.i
+  Protected q.i
+  Protected c.i
+  Protected t.i
+  Protected pp.i
+  Protected j.i
+  Protected i.i
+  Protected tt.i
+  Protected tl.i
+  Protected ph.i
+  Protected pl.i
+  Protected y.i
+  Protected p.i
+  Protected biased.i
+  Protected msk.i
+  Protected rem.i
+  Protected half.i
+  Protected mm.i
+  a = b & $7FFFFFFF
+  If a > $7F800000
+    ProcedureReturn (b | $400000) & $FFFFFFFF
+  EndIf
+  neg = 0
+  If (b & $80000000) <> 0
+    neg = 1
+  EndIf
+  If a = $7F800000
+    If neg = 0
+      ProcedureReturn $7F800000
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If a < $33000000
+    ProcedureReturn $3F800000
+  EndIf
+  If neg = 0 And a >= $42B17218
+    ProcedureReturn $7F800000
+  EndIf
+  If neg = 1 And a >= $42D00000
+    ProcedureReturn 0
+  EndIf
+  e = a >> 23
+  m = a & $7FFFFF
+  m = m | $800000
+  ; k = floor(|x| * 256/ln2), from 2^28/ln2 rounded down (up for a negative x,
+  ; whose k is one more), so r is never negative
+  If neg = 0
+    t = m * 387270501
+  Else
+    t = m * 387270502
+  EndIf
+  sh = 170 - e
+  k = 0
+  If sh < 53
+    k = t >> sh
+  EndIf
+  k = k + neg
+  ; |x| * 2^64 modulo 2^64, and k * ln2/256 in Q96 without its lowest word
+  sh = e - 86
+  xs = m << sh
+  kl0 = k * $ABC9E3B3
+  t = kl0 >> 32
+  kl0 = kl0 & $FFFFFFFF
+  klh = k * $00B17217F7D1CF79
+  klh = klh + t
+  ; r in Q64
+  If neg = 0
+    r = xs - klh
+    If kl0 <> 0
+      r = r - 1
+    EndIf
+  Else
+    r = klh - xs
+  EndIf
+  ; r^2/2 in Q64
+  rh = r >> 32
+  rl = r & $FFFFFFFF
+  r2 = rh * rh
+  r2 = r2 >> 1
+  t = rh * rl
+  t = t >> 32
+  r2 = r2 + t
+  ; v = r in Q40, w = r^2/2 in Q50, q = r^3 in Q57
+  v = r >> 24
+  w = r2 >> 14
+  q = w * v
+  q = q >> 32
+  q = q & $FFFFFFFF
+  ; c = 1/6 + r/24 + r^2/120 in Q32
+  c = v * 178956971
+  c = c >> 40
+  t = r2 >> 32
+  t = t * 71582788
+  t = t >> 32
+  c = c + t
+  c = c + 715827883
+  ; P = r + r^2/2 + r^3 c in Q64
+  t = q * c
+  t = t >> 25
+  pp = r + r2
+  pp = pp + t
+  ; 2^(j/256) in Q62, k = 256 i + j
+  If neg = 1
+    k = 0 - k
+  EndIf
+  j = k & 255
+  i = k >> 8
+  j = j << 3
+  tl = PeekL(?PmTensorExpTable + j)
+  tl = tl & $FFFFFFFF
+  tt = PeekL(?PmTensorExpTable + j + 4)
+  ; y = T + T P in Q62
+  ph = pp >> 32
+  pl = pp & $FFFFFFFF
+  y = tt << 32
+  y = y | tl
+  t = tt * ph
+  y = y + t
+  t = tt * pl
+  t = t >> 32
+  y = y + t
+  t = tl * ph
+  t = t >> 32
+  y = y + t
+  ; round once, at the result's own 24 bits
+  p = 61
+  If y >= $4000000000000000
+    p = 62
+  EndIf
+  biased = i + p
+  biased = biased + 65
+  If biased >= 255
+    ProcedureReturn $7F800000
+  EndIf
+  sh = p - 23
+  If biased <= 0
+    sh = sh + 1
+    sh = sh - biased
+  EndIf
+  If sh >= 64
+    ProcedureReturn 0
+  EndIf
+  mm = y >> sh
+  msk = 1 << sh
+  msk = msk - 1
+  rem = y & msk
+  t = sh - 1
+  half = 1 << t
+  If rem > half Or (rem = half And (mm & 1) <> 0)
+    mm = mm + 1
+  EndIf
+  If biased <= 0
+    ProcedureReturn mm
+  EndIf
+  t = biased << 23
+  mm = mm - $800000
+  ProcedureReturn t + mm
+EndProcedure
+
+; log, correctly rounded, in exact 32-bit integer arithmetic (the bits of x in,
+; the bits of the result out). x = 2^E m; the top 8 bits of m's fraction pick
+; c = C/1024 (C from a table), so r = c m - 1 = N/2^33 is EXACT, |r| <= 2^-8.
+; log x = E' ln2 + T + log1p(r), where T = -log(c) (less ln2, and E' = E + 1,
+; when m >= 1.414), and log1p(r) = r G, G = 1 - r/2 + r^2 (1/3 - r/4 + r^2/5),
+; evaluated on |r| so every product is unsigned. (That degree is enough: every
+; argument checks; without the r^2/5 term one argument, 41178FEB, rounds the
+; other way.) The two
+; buckets beside x = 1 have c = 1 and c = 1/2 exactly, so there T = 0 and the
+; result is r G to its full relative precision. The sum is in Q88 (three
+; words), rounded once to nearest-even at its own 24 bits.
+; Every binary32 argument was checked against a correctly rounded log.
+Procedure.l PmTensorLogBits(b.l)
+  Protected a.l
+  Protected e.l
+  Protected mm.l
+  Protected z.l
+  Protected j.l
+  Protected d.l
+  Protected nn.l
+  Protected neg.l
+  Protected t.l
+  Protected n2l.l
+  Protected n2h.l
+  Protected u.l
+  Protected xl.l
+  Protected xh.l
+  Protected hl.l
+  Protected hh.l
+  Protected wl.l
+  Protected wh.l
+  Protected gl.l
+  Protected gh.l
+  Protected v0.l
+  Protected v1.l
+  Protected v2.l
+  Protected c.l
+  Protected p0.l
+  Protected p1.l
+  Protected p2.l
+  Protected s0.l
+  Protected s1.l
+  Protected s2.l
+  Protected k.l
+  Protected sg.l
+  a = b & $7FFFFFFF
+  If a > $7F800000
+    ProcedureReturn b | $400000
+  EndIf
+  If a = 0
+    ProcedureReturn $FF800000
+  EndIf
+  If a <> b
+    ProcedureReturn $FFC00000
+  EndIf
+  If a = $7F800000
+    ProcedureReturn a
+  EndIf
+  If a = $3F800000
+    ProcedureReturn 0
+  EndIf
+  e = a >> 23
+  mm = a & $7FFFFF
+  If e = 0
+    ; a subnormal: its leading bit moved up to bit 23
+    z = 1
+    While (mm & $800000) = 0
+      mm = mm << 1
+      z = z - 1
+    Wend
+    e = z
+  Else
+    mm = mm | $800000
+  EndIf
+  e = e - 127
+  j = mm >> 15
+  j = j & 255
+  d = 0
+  If j >= 106
+    d = 1
+  EndIf
+  e = e + d
+  ; r = N/2^33 exactly: N is the low word of C m (C m - 2^33 is below 2^25)
+  j = j << 2
+  nn = PeekL(?PmTensorLogTable + j)
+  nn = nn * mm
+  neg = 0
+  t = nn
+  If nn < 0
+    neg = 1
+    t = 0 - nn
+  EndIf
+  ; t^2 (r^2 in Q66)
+  n2l = t * t
+  n2h = PmTensorMulHi32(t, t)
+  ; r^2/5 in Q64: (t^2 (2^32/5)) / 2^66
+  xl = n2h * 858993459
+  xh = PmTensorMulHi32(n2h, 858993459)
+  u = PmTensorMulHi32(n2l, 858993459)
+  xl = xl + u
+  xh = xh + PmTensorBelow32(xl, u)
+  xl = (xl >> 2) & $3FFFFFFF
+  u = xh << 30
+  xl = xl | u
+  xh = xh >> 2
+  ; H = 1/3 -+ r/4 + r^2 H2 in Q64 (r/4 = t 2^29)
+  hl = xl + $55555555
+  hh = xh + $55555555
+  hh = hh + PmTensorBelow32(hl, xl)
+  u = t << 29
+  v1 = t >> 3
+  If neg = 0
+    c = PmTensorBelow32(hl, u)
+    hl = hl - u
+    hh = hh - v1
+    hh = hh - c
+  Else
+    hl = hl + u
+    hh = hh + v1
+    hh = hh + PmTensorBelow32(hl, u)
+  EndIf
+  ; W = r^2 H in Q64: (t^2 H) / 2^66
+  wl = n2h * hh
+  wh = PmTensorMulHi32(n2h, hh)
+  u = PmTensorMulHi32(n2h, hl)
+  wl = wl + u
+  wh = wh + PmTensorBelow32(wl, u)
+  u = PmTensorMulHi32(n2l, hh)
+  wl = wl + u
+  wh = wh + PmTensorBelow32(wl, u)
+  wl = (wl >> 2) & $3FFFFFFF
+  u = wh << 30
+  wl = wl | u
+  wh = wh >> 2
+  ; |G - 1| = r/2 -+ W in Q64 (r/2 = t 2^30)
+  gl = t << 30
+  gh = t >> 2
+  If neg = 0
+    c = PmTensorBelow32(gl, wl)
+    gl = gl - wl
+    gh = gh - wh
+    gh = gh - c
+  Else
+    gl = gl + wl
+    gh = gh + wh
+    gh = gh + PmTensorBelow32(gl, wl)
+  EndIf
+  ; t |G - 1| / 2^9 in Q88: v2 v1 v0
+  v0 = t * gl
+  v1 = PmTensorMulHi32(t, gl)
+  u = t * gh
+  v2 = PmTensorMulHi32(t, gh)
+  v1 = v1 + u
+  v2 = v2 + PmTensorBelow32(v1, u)
+  v0 = (v0 >> 9) & $7FFFFF
+  u = v1 << 23
+  v0 = v0 | u
+  v1 = (v1 >> 9) & $7FFFFF
+  u = v2 << 23
+  v1 = v1 | u
+  v2 = v2 >> 9
+  ; |log1p(r)| = |r| G in Q88: p2 p1 p0 (|r| = t 2^55)
+  p1 = t << 23
+  p2 = t >> 9
+  If neg = 0
+    p0 = 0 - v0
+    c = 0
+    If v0 <> 0
+      c = 1
+    EndIf
+    u = PmTensorBelow32(p1, v1)
+    p1 = p1 - v1
+    If p1 = 0 And c = 1
+      u = 1
+    EndIf
+    p1 = p1 - c
+    p2 = p2 - v2
+    p2 = p2 - u
+  Else
+    p0 = v0
+    p1 = p1 + v1
+    p2 = p2 + v2
+    p2 = p2 + PmTensorBelow32(p1, v1)
+  EndIf
+  ; S = E' ln2 + T in Q88: s2 s1 s0 (ln2 = $B17217 F7D1CF79 ABC9E3B4)
+  k = e
+  If e < 0
+    k = 0 - e
+  EndIf
+  s0 = k * $ABC9E3B4
+  c = PmTensorMulHi32(k, $ABC9E3B4)
+  s1 = k * $F7D1CF79
+  u = PmTensorMulHi32(k, $F7D1CF79)
+  s1 = s1 + c
+  u = u + PmTensorBelow32(s1, c)
+  s2 = k * $B17217
+  s2 = s2 + u
+  If e < 0
+    ; negate the three words
+    s0 = s0 ! $FFFFFFFF
+    s1 = s1 ! $FFFFFFFF
+    s2 = s2 ! $FFFFFFFF
+    s0 = s0 + 1
+    If s0 = 0
+      s1 = s1 + 1
+      If s1 = 0
+        s2 = s2 + 1
+      EndIf
+    EndIf
+  EndIf
+  u = PeekL(?PmTensorLogTable + 1024 + j + j + j)
+  s0 = s0 + u
+  c = PmTensorBelow32(s0, u)
+  u = PeekL(?PmTensorLogTable + 1028 + j + j + j)
+  s1 = s1 + c
+  c = PmTensorBelow32(s1, c)
+  s1 = s1 + u
+  c = c + PmTensorBelow32(s1, u)
+  u = PeekL(?PmTensorLogTable + 1032 + j + j + j)
+  s2 = s2 + c
+  s2 = s2 + u
+  ; S = S -+ |log1p(r)|
+  If neg = 0
+    s0 = s0 + p0
+    c = PmTensorBelow32(s0, p0)
+    s1 = s1 + c
+    c = PmTensorBelow32(s1, c)
+    s1 = s1 + p1
+    c = c + PmTensorBelow32(s1, p1)
+    s2 = s2 + c
+    s2 = s2 + p2
+  Else
+    c = PmTensorBelow32(s0, p0)
+    s0 = s0 - p0
+    u = PmTensorBelow32(s1, p1)
+    s1 = s1 - p1
+    If s1 = 0 And c = 1
+      u = 1
+    EndIf
+    s1 = s1 - c
+    s2 = s2 - p2
+    s2 = s2 - u
+  EndIf
+  ; the sign, then |S|
+  sg = 0
+  If s2 < 0
+    sg = $80000000
+    s0 = s0 ! $FFFFFFFF
+    s1 = s1 ! $FFFFFFFF
+    s2 = s2 ! $FFFFFFFF
+    s0 = s0 + 1
+    If s0 = 0
+      s1 = s1 + 1
+      If s1 = 0
+        s2 = s2 + 1
+      EndIf
+    EndIf
+  EndIf
+  ; |S| is at least 2^64 (Q88), so its top bit is in s2: move it to bit 31
+  k = 31
+  If (s2 & $FFFF0000) = 0
+    s2 = s2 << 16
+    k = k - 16
+  EndIf
+  If (s2 & $FF000000) = 0
+    s2 = s2 << 8
+    k = k - 8
+  EndIf
+  If (s2 & $F0000000) = 0
+    s2 = s2 << 4
+    k = k - 4
+  EndIf
+  If (s2 & $C0000000) = 0
+    s2 = s2 << 2
+    k = k - 2
+  EndIf
+  If (s2 & $80000000) = 0
+    s2 = s2 << 1
+    k = k - 1
+  EndIf
+  ; the bits of s1 (and s0) that follow, by the same shift
+  u = 31 - k
+  If u > 0
+    z = 32 - u
+    c = (s1 >> z)
+    t = 1 << u
+    t = t - 1
+    c = c & t
+    s2 = s2 | c
+    s1 = s1 << u
+    c = s0 >> z
+    c = c & t
+    s1 = s1 | c
+    s0 = s0 << u
+  EndIf
+  ; round once: s2 holds the 24 bits and the round bit
+  mm = (s2 >> 8) & $FFFFFF
+  If (s2 & $80) <> 0
+    If (s2 & $7F) <> 0 Or s1 <> 0 Or s0 <> 0 Or (mm & 1) <> 0
+      mm = mm + 1
+    EndIf
+  EndIf
+  k = k + 102
+  k = k << 23
+  k = k + mm
+  ProcedureReturn k | sg
+EndProcedure
+CompilerElseIf #PMO_INT8_BACKEND = 3
+; exp, correctly rounded, on the Cortex-M33: the same exact integer method as
+; the 32-bit procedure (every step and every truncation the same), written with
+; UMULL/UMAAL. x = (256 i + j) ln2/256 + r with 0 <= r < ln2/256 (r to 2^-64,
+; from ln2/256 to 2^-96); e^r - 1 = r + r^2/2 + r^3 (1/6 + r/24 + r^2/120) in
+; Q64; 2^i * 2^(j/256) * e^r in Q62, rounded once to nearest-even at its own 24
+; bits (a subnormal result at its own position). A register shift by 32 or
+; more gives 0 on this core, which the k and |x| * 2^96 steps rely on.
+; Every binary32 argument was checked against a correctly rounded exp.
+Procedure.i PmTensorExpBits(b.i)
+  ASM
+    push {r5, r6, r7}
+    lsls r1, r0, #1
+    lsrs r1, r1, #1
+    ldr r2, =0x7F800000
+    cmp r1, r2
+    bhi pmexp_nan
+    beq pmexp_inf
+    ldr r2, =0x33000000
+    cmp r1, r2
+    blo pmexp_one
+    movs r7, #0
+    cmp r0, #0
+    blt pmexp_neg
+    ldr r2, =0x42B17218
+    cmp r1, r2
+    bhs pmexp_huge
+    b pmexp_go
+  pmexp_neg:
+    ldr r2, =0x42D00000
+    cmp r1, r2
+    bhs pmexp_zero
+    movs r7, #1
+  pmexp_go:
+    lsrs r2, r1, #23
+    lsls r3, r1, #9
+    lsrs r3, r3, #9
+    movs r4, #1
+    lsls r4, r4, #23
+    orrs r3, r4
+    ldr r4, =387270501
+    adds r4, r4, r7
+    umull r5, r6, r3, r4
+    movs r5, #138
+    subs r5, r5, r2
+    lsrs r6, r5
+    adds r6, r6, r7
+    subs r2, #86
+    movs r4, r3
+    lsls r4, r2
+    movs r5, r2
+    subs r5, #32
+    movs r1, r3
+    lsls r1, r5
+    negs r5, r5
+    lsrs r3, r5
+    orrs r3, r1
+    ldr r2, =0xABC9E3B3
+    umull r0, r1, r6, r2
+    ldr r2, =0xF7D1CF79
+    movs r5, #0
+    umaal r1, r5, r6, r2
+    ldr r2, =0x00B17217
+    muls r2, r6
+    adds r2, r2, r5
+    cmp r7, #0
+    bne pmexp_dneg
+    negs r0, r0
+    sbcs r4, r1
+    sbcs r3, r2
+    b pmexp_dgo
+  pmexp_dneg:
+    subs r4, r1, r4
+    sbcs r2, r3
+    movs r3, r2
+    negs r6, r6
+  pmexp_dgo:
+    mov r12, r6
+    umull r0, r1, r3, r3
+    umull r2, r5, r3, r4
+    lsrs r0, r0, #1
+    lsls r2, r1, #31
+    orrs r0, r2
+    lsrs r1, r1, #1
+    movs r2, #0
+    adds r0, r0, r5
+    adcs r1, r2
+    lsls r2, r3, #8
+    lsrs r5, r4, #24
+    orrs r2, r5
+    lsls r5, r1, #18
+    lsrs r6, r0, #14
+    orrs r5, r6
+    umull r6, r7, r5, r2
+    ldr r5, =178956971
+    umull r6, r5, r2, r5
+    lsrs r5, r5, #8
+    ldr r6, =71582788
+    umull r2, r6, r1, r6
+    adds r5, r5, r6
+    ldr r6, =715827883
+    adds r5, r5, r6
+    umull r2, r6, r7, r5
+    lsrs r2, r2, #25
+    lsls r5, r6, #7
+    orrs r2, r5
+    lsrs r6, r6, #25
+    adds r4, r4, r0
+    adcs r3, r1
+    adds r4, r4, r2
+    adcs r3, r6
+    mov r6, r12
+    lsls r5, r6, #24
+    lsrs r5, r5, #21
+    ldr r0, =PmTensorExpTable
+    adds r0, r0, r5
+    ldr r1, [r0, #4]
+    ldr r0, [r0, #0]
+    asrs r6, r6, #8
+    umull r2, r5, r1, r3
+    adds r2, r2, r0
+    adcs r5, r1
+    umull r7, r4, r1, r4
+    movs r7, #0
+    adds r2, r2, r4
+    adcs r5, r7
+    umull r4, r1, r0, r3
+    adds r2, r2, r1
+    adcs r5, r7
+    lsrs r1, r5, #30
+    adds r0, r1, #6
+    adds r6, r6, r1
+    adds r6, #126
+    cmp r6, #255
+    bge pmexp_huge
+    cmp r6, #0
+    bgt pmexp_round
+    adds r0, #1
+    subs r0, r0, r6
+    movs r6, #1
+    cmp r0, #32
+    bge pmexp_zero
+  pmexp_round:
+    subs r1, r0, #1
+    movs r3, r5
+    lsrs r3, r1
+    movs r4, #33
+    subs r4, r4, r0
+    lsls r5, r4
+    orrs r5, r2
+    lsrs r3, r3, #1
+    bcc pmexp_pack
+    cmp r5, #0
+    bne pmexp_up
+    lsls r4, r3, #31
+    beq pmexp_pack
+  pmexp_up:
+    adds r3, #1
+  pmexp_pack:
+    subs r6, #1
+    lsls r6, r6, #23
+    adds r0, r6, r3
+    b pmexp_done
+  pmexp_nan:
+    ldr r1, =0x400000
+    orrs r0, r1
+    b pmexp_done
+  pmexp_inf:
+    cmp r0, #0
+    blt pmexp_zero
+  pmexp_huge:
+    ldr r0, =0x7F800000
+    b pmexp_done
+  pmexp_zero:
+    movs r0, #0
+    b pmexp_done
+  pmexp_one:
+    ldr r0, =0x3F800000
+  pmexp_done:
+    pop {r5, r6, r7}
+  EndASM
+EndProcedure
+
+; log, correctly rounded, on the Cortex-M33: the same exact integer method as
+; the 32-bit procedure (every step and every truncation the same), written with
+; UMULL/UMAAL. x = 2^E m; c = C/1024 from the table, r = c m - 1 = N/2^33
+; exactly; log x = E' ln2 + T + r G with G = 1 - r/2 + r^2 (1/3 - r/4 + r^2/5)
+; on |r|; the sum in Q88 (three words), rounded once to nearest-even.
+; The one CLZ is written as its encoding (.byte), which this assembler has no
+; mnemonic for: clz r1, r5 = FAB5 F185.
+; Every binary32 argument was checked against a correctly rounded log.
+Procedure.i PmTensorLogBits(b.i)
+  ASM
+    push {r5, r6, r7}
+    lsls r1, r0, #1
+    lsrs r1, r1, #1
+    ldr r2, =0x7F800000
+    cmp r1, r2
+    bhi pmlog_nan
+    cmp r1, #0
+    beq pmlog_minf
+    cmp r0, #0
+    blt pmlog_invalid
+    cmp r1, r2
+    beq pmlog_done
+    ldr r2, =0x3F800000
+    cmp r1, r2
+    beq pmlog_zero
+    lsrs r2, r1, #23
+    lsls r3, r1, #9
+    lsrs r3, r3, #9
+    cmp r2, #0
+    bne pmlog_normal
+    movs r2, #1
+  pmlog_subloop:
+    lsrs r4, r3, #23
+    bne pmlog_subdone
+    lsls r3, r3, #1
+    subs r2, #1
+    b pmlog_subloop
+  pmlog_normal:
+    movs r4, #1
+    lsls r4, r4, #23
+    orrs r3, r4
+  pmlog_subdone:
+    subs r2, #127
+    lsrs r4, r3, #15
+    uxtb r4, r4
+    cmp r4, #106
+    blo pmlog_lowj
+    adds r2, #1
+  pmlog_lowj:
+    lsls r4, r4, #2
+    ldr r5, =PmTensorLogTable
+    ldr r6, [r5, r4]
+    muls r6, r3
+    adds r7, r4, r4
+    adds r7, r7, r4
+    adds r5, r5, r7
+    movs r7, #1
+    lsls r7, r7, #10
+    adds r5, r5, r7
+    push {r2, r5}
+    asrs r7, r6, #31
+    eors r6, r7
+    subs r6, r6, r7
+    umull r0, r1, r6, r6
+    ldr r2, =858993459
+    umull r3, r4, r1, r2
+    umull r5, r2, r0, r2
+    movs r5, #0
+    adds r3, r3, r2
+    adcs r4, r5
+    lsrs r3, r3, #2
+    lsls r2, r4, #30
+    orrs r3, r2
+    lsrs r4, r4, #2
+    ldr r2, =0x55555555
+    adds r3, r3, r2
+    adcs r4, r2
+    lsls r2, r6, #29
+    lsrs r5, r6, #3
+    cmp r7, #0
+    bne pmlog_hneg
+    subs r3, r3, r2
+    sbcs r4, r5
+    b pmlog_hdone
+  pmlog_hneg:
+    adds r3, r3, r2
+    adcs r4, r5
+  pmlog_hdone:
+    umull r0, r2, r0, r4
+    umull r3, r5, r1, r3
+    umull r1, r4, r1, r4
+    movs r0, #0
+    adds r1, r1, r2
+    adcs r4, r0
+    adds r1, r1, r5
+    adcs r4, r0
+    lsrs r1, r1, #2
+    lsls r2, r4, #30
+    orrs r1, r2
+    lsrs r4, r4, #2
+    lsls r2, r6, #30
+    lsrs r3, r6, #2
+    cmp r7, #0
+    bne pmlog_gneg
+    subs r2, r2, r1
+    sbcs r3, r4
+    b pmlog_gdone
+  pmlog_gneg:
+    adds r2, r2, r1
+    adcs r3, r4
+  pmlog_gdone:
+    umull r0, r1, r6, r2
+    umull r2, r3, r6, r3
+    movs r4, #0
+    adds r1, r1, r2
+    adcs r3, r4
+    lsrs r0, r0, #9
+    lsls r2, r1, #23
+    orrs r0, r2
+    lsrs r1, r1, #9
+    lsls r2, r3, #23
+    orrs r1, r2
+    lsrs r3, r3, #9
+    lsls r4, r6, #23
+    lsrs r5, r6, #9
+    cmp r7, #0
+    bne pmlog_pneg
+    negs r0, r0
+    sbcs r4, r1
+    sbcs r5, r3
+    pop {r2, r6}
+    ldr r1, [r6, #0]
+    adds r0, r0, r1
+    ldr r1, [r6, #4]
+    adcs r4, r1
+    ldr r1, [r6, #8]
+    adcs r5, r1
+    b pmlog_qdone
+  pmlog_pneg:
+    adds r4, r4, r1
+    adcs r5, r3
+    pop {r2, r6}
+    ldr r1, [r6, #0]
+    subs r1, r1, r0
+    ldr r3, [r6, #4]
+    sbcs r3, r4
+    ldr r6, [r6, #8]
+    sbcs r6, r5
+    movs r0, r1
+    movs r4, r3
+    movs r5, r6
+  pmlog_qdone:
+    asrs r7, r2, #31
+    eors r2, r7
+    subs r2, r2, r7
+    mov r12, r7
+    ldr r3, =0xABC9E3B4
+    umull r1, r3, r2, r3
+    ldr r6, =0xF7D1CF79
+    movs r7, #0
+    umaal r3, r7, r2, r6
+    ldr r6, =0xB17217
+    muls r6, r2
+    adds r6, r6, r7
+    mov r7, r12
+    eors r1, r7
+    eors r3, r7
+    eors r6, r7
+    subs r1, r1, r7
+    sbcs r3, r7
+    sbcs r6, r7
+    adds r0, r0, r1
+    adcs r4, r3
+    adcs r5, r6
+    asrs r7, r5, #31
+    eors r0, r7
+    eors r4, r7
+    eors r5, r7
+    subs r0, r0, r7
+    sbcs r4, r7
+    sbcs r5, r7
+    lsls r7, r7, #31
+    mov r12, r7
+    .byte 181, 250, 133, 241
+    movs r2, #32
+    subs r2, r2, r1
+    lsls r5, r1
+    movs r3, r4
+    lsrs r3, r2
+    orrs r5, r3
+    lsls r4, r1
+    movs r3, r0
+    lsrs r3, r2
+    orrs r4, r3
+    lsls r0, r1
+    lsrs r3, r5, #8
+    lsls r2, r5, #24
+    bpl pmlog_pack
+    lsls r2, r2, #1
+    orrs r2, r4
+    orrs r2, r0
+    bne pmlog_up
+    lsls r2, r3, #31
+    beq pmlog_pack
+  pmlog_up:
+    adds r3, #1
+  pmlog_pack:
+    movs r0, #133
+    subs r0, r0, r1
+    lsls r0, r0, #23
+    adds r0, r0, r3
+    mov r1, r12
+    orrs r0, r1
+    b pmlog_done
+  pmlog_nan:
+    ldr r1, =0x400000
+    orrs r0, r1
+    b pmlog_done
+  pmlog_minf:
+    ldr r0, =0xFF800000
+    b pmlog_done
+  pmlog_invalid:
+    ldr r0, =0xFFC00000
+    b pmlog_done
+  pmlog_zero:
+    movs r0, #0
+  pmlog_done:
+    pop {r5, r6, r7}
+  EndASM
+EndProcedure
+CompilerElse
+; The high word of the unsigned 64-bit product of two 32-bit words, from four
+; 16 x 16 products. Every value is a 32-bit pattern; each statement stores one
+; operation's result, so the bits are the same wherever .l is 32 bits.
+Procedure.l PmTensorMulHi32(a.l, b.l)
+  Protected alo.l
+  Protected ahi.l
+  Protected blo.l
+  Protected bhi.l
+  Protected p00.l
+  Protected p01.l
+  Protected p10.l
+  Protected p11.l
+  Protected mid.l
+  Protected t.l
+  Protected hi.l
+  alo = a & $FFFF
+  ahi = (a >> 16) & $FFFF
+  blo = b & $FFFF
+  bhi = (b >> 16) & $FFFF
+  p00 = alo * blo
+  p01 = alo * bhi
+  p10 = ahi * blo
+  p11 = ahi * bhi
+  mid = (p00 >> 16) & $FFFF
+  t = p01 & $FFFF
+  mid = mid + t
+  t = p10 & $FFFF
+  mid = mid + t
+  hi = (p01 >> 16) & $FFFF
+  t = (p10 >> 16) & $FFFF
+  hi = hi + t
+  t = mid >> 16
+  hi = hi + t
+  hi = hi + p11
+  ProcedureReturn hi
+EndProcedure
+
+; 1 when the unsigned word a is below the unsigned word b
+Procedure.l PmTensorBelow32(a.l, b.l)
+  Protected ua.l
+  Protected ub.l
+  ua = a ! $80000000
+  ub = b ! $80000000
+  If ua < ub
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; exp, correctly rounded, in exact 32-bit integer arithmetic (the bits of x in,
+; the bits of the result out). x = (256 i + j) ln2/256 + r with 0 <= r < ln2/256
+; (r to 2^-64, from ln2/256 to 2^-96); e^r - 1 = r + r^2/2 + r^3 (1/6 + r/24 +
+; r^2/120) in Q64; the result 2^i * 2^(j/256) * e^r in Q62, rounded once to
+; nearest-even at its own 24 bits (a subnormal result at its own position).
+; Every binary32 argument was checked against a correctly rounded exp.
+Procedure.l PmTensorExpBits(b.l)
+  Protected a.l
+  Protected neg.l
+  Protected e.l
+  Protected m.l
+  Protected th.l
+  Protected sh.l
+  Protected k.l
+  Protected s.l
+  Protected x1.l
+  Protected x2.l
+  Protected kl0.l
+  Protected kl1.l
+  Protected kl2.l
+  Protected c.l
+  Protected c1.l
+  Protected bw.l
+  Protected rh.l
+  Protected rl.l
+  Protected al.l
+  Protected ah.l
+  Protected bh.l
+  Protected r2l.l
+  Protected r2h.l
+  Protected v.l
+  Protected w.l
+  Protected q.l
+  Protected t.l
+  Protected cl.l
+  Protected ch.l
+  Protected pl.l
+  Protected ph.l
+  Protected j.l
+  Protected i.l
+  Protected tl.l
+  Protected tt.l
+  Protected yl.l
+  Protected yh.l
+  Protected p.l
+  Protected biased.l
+  Protected msk.l
+  Protected remh.l
+  Protected half.l
+  Protected mm.l
+  a = b & $7FFFFFFF
+  If a > $7F800000
+    ProcedureReturn b | $400000
+  EndIf
+  neg = 0
+  If a <> b
+    neg = 1
+  EndIf
+  If a = $7F800000
+    If neg = 0
+      ProcedureReturn $7F800000
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If a < $33000000
+    ProcedureReturn $3F800000
+  EndIf
+  If neg = 0 And a >= $42B17218
+    ProcedureReturn $7F800000
+  EndIf
+  If neg = 1 And a >= $42D00000
+    ProcedureReturn 0
+  EndIf
+  e = a >> 23
+  m = a & $7FFFFF
+  m = m | $800000
+  ; k = floor(|x| * 256/ln2), from 2^28/ln2 rounded down (up for a negative x,
+  ; whose k is one more), so r is never negative
+  If neg = 0
+    th = PmTensorMulHi32(m, 387270501)
+  Else
+    th = PmTensorMulHi32(m, 387270502)
+  EndIf
+  sh = 138 - e
+  k = 0
+  If sh < 32
+    k = th >> sh
+  EndIf
+  k = k + neg
+  ; |x| * 2^96 modulo 2^96: words x2 x1 (the lowest is zero)
+  s = e - 86
+  If s >= 32
+    s = s - 32
+    x2 = m << s
+    x1 = 0
+  Else
+    x1 = m << s
+    s = 32 - s
+    x2 = m >> s
+  EndIf
+  ; k * ln2/256 in Q96, modulo 2^96
+  kl0 = k * $ABC9E3B3
+  c = PmTensorMulHi32(k, $ABC9E3B3)
+  kl1 = k * $F7D1CF79
+  c1 = PmTensorMulHi32(k, $F7D1CF79)
+  kl1 = kl1 + c
+  c1 = c1 + PmTensorBelow32(kl1, c)
+  kl2 = k * $00B17217
+  kl2 = kl2 + c1
+  ; r in Q64 (the Q96 difference without its lowest word)
+  If neg = 0
+    bw = 0
+    If kl0 <> 0
+      bw = 1
+    EndIf
+    rl = x1 - kl1
+    c = PmTensorBelow32(x1, kl1)
+    If rl = 0 And bw = 1
+      c = 1
+    EndIf
+    rl = rl - bw
+    rh = x2 - kl2
+    rh = rh - c
+  Else
+    rl = kl1 - x1
+    c = PmTensorBelow32(kl1, x1)
+    rh = kl2 - x2
+    rh = rh - c
+  EndIf
+  ; r^2/2 in Q64: r2h r2l
+  al = rh * rh
+  ah = PmTensorMulHi32(rh, rh)
+  bh = PmTensorMulHi32(rh, rl)
+  r2l = (al >> 1) & $7FFFFFFF
+  t = ah << 31
+  r2l = r2l | t
+  r2h = ah >> 1
+  r2l = r2l + bh
+  r2h = r2h + PmTensorBelow32(r2l, bh)
+  ; v = r in Q40, w = r^2/2 in Q50, q = r^3 in Q57
+  v = rh << 8
+  t = (rl >> 24) & $FF
+  v = v | t
+  w = r2h << 18
+  t = (r2l >> 14) & $3FFFF
+  w = w | t
+  q = PmTensorMulHi32(w, v)
+  ; c = 1/6 + r/24 + r^2/120 in Q32
+  c = PmTensorMulHi32(v, 178956971)
+  c = c >> 8
+  t = PmTensorMulHi32(r2h, 71582788)
+  c = c + t
+  c = c + 715827883
+  ; r^3 c in Q64: ch cl
+  cl = q * c
+  ch = PmTensorMulHi32(q, c)
+  cl = (cl >> 25) & $7F
+  t = ch << 7
+  cl = cl | t
+  ch = ch >> 25
+  ; P = r + r^2/2 + r^3 c in Q64: ph pl
+  pl = rl + r2l
+  ph = rh + r2h
+  ph = ph + PmTensorBelow32(pl, rl)
+  t = pl
+  pl = pl + cl
+  ph = ph + ch
+  ph = ph + PmTensorBelow32(pl, t)
+  ; 2^(j/256) in Q62, k = 256 i + j
+  If neg = 1
+    k = 0 - k
+  EndIf
+  j = k & 255
+  i = k >> 8
+  j = j << 3
+  tl = PeekL(?PmTensorExpTable + j)
+  tt = PeekL(?PmTensorExpTable + j + 4)
+  ; y = T + T P in Q62: yh yl
+  yl = tt * ph
+  yh = PmTensorMulHi32(tt, ph)
+  t = yl
+  yl = yl + tl
+  yh = yh + tt
+  yh = yh + PmTensorBelow32(yl, t)
+  c = PmTensorMulHi32(tt, pl)
+  t = yl
+  yl = yl + c
+  yh = yh + PmTensorBelow32(yl, t)
+  c = PmTensorMulHi32(tl, ph)
+  t = yl
+  yl = yl + c
+  yh = yh + PmTensorBelow32(yl, t)
+  ; round once, at the result's own 24 bits
+  p = 61
+  If yh >= $40000000
+    p = 62
+  EndIf
+  biased = i + p
+  biased = biased + 65
+  If biased >= 255
+    ProcedureReturn $7F800000
+  EndIf
+  sh = p - 55
+  If biased <= 0
+    sh = sh + 1
+    sh = sh - biased
+  EndIf
+  If sh >= 32
+    ProcedureReturn 0
+  EndIf
+  mm = yh >> sh
+  msk = 1 << sh
+  msk = msk - 1
+  remh = yh & msk
+  t = sh - 1
+  half = 1 << t
+  If remh > half Or (remh = half And (yl <> 0 Or (mm & 1) <> 0))
+    mm = mm + 1
+  EndIf
+  If biased <= 0
+    ProcedureReturn mm
+  EndIf
+  t = biased << 23
+  mm = mm - $800000
+  ProcedureReturn t + mm
+EndProcedure
+
+; log, correctly rounded, in exact 32-bit integer arithmetic (the bits of x in,
+; the bits of the result out). x = 2^E m; the top 8 bits of m's fraction pick
+; c = C/1024 (C from a table), so r = c m - 1 = N/2^33 is EXACT, |r| <= 2^-8.
+; log x = E' ln2 + T + log1p(r), where T = -log(c) (less ln2, and E' = E + 1,
+; when m >= 1.414), and log1p(r) = r G, G = 1 - r/2 + r^2 (1/3 - r/4 + r^2/5),
+; evaluated on |r| so every product is unsigned. (That degree is enough: every
+; argument checks; without the r^2/5 term one argument, 41178FEB, rounds the
+; other way.) The two
+; buckets beside x = 1 have c = 1 and c = 1/2 exactly, so there T = 0 and the
+; result is r G to its full relative precision. The sum is in Q88 (three
+; words), rounded once to nearest-even at its own 24 bits.
+; Every binary32 argument was checked against a correctly rounded log.
+Procedure.l PmTensorLogBits(b.l)
+  Protected a.l
+  Protected e.l
+  Protected mm.l
+  Protected z.l
+  Protected j.l
+  Protected d.l
+  Protected nn.l
+  Protected neg.l
+  Protected t.l
+  Protected n2l.l
+  Protected n2h.l
+  Protected u.l
+  Protected xl.l
+  Protected xh.l
+  Protected hl.l
+  Protected hh.l
+  Protected wl.l
+  Protected wh.l
+  Protected gl.l
+  Protected gh.l
+  Protected v0.l
+  Protected v1.l
+  Protected v2.l
+  Protected c.l
+  Protected p0.l
+  Protected p1.l
+  Protected p2.l
+  Protected s0.l
+  Protected s1.l
+  Protected s2.l
+  Protected k.l
+  Protected sg.l
+  a = b & $7FFFFFFF
+  If a > $7F800000
+    ProcedureReturn b | $400000
+  EndIf
+  If a = 0
+    ProcedureReturn $FF800000
+  EndIf
+  If a <> b
+    ProcedureReturn $FFC00000
+  EndIf
+  If a = $7F800000
+    ProcedureReturn a
+  EndIf
+  If a = $3F800000
+    ProcedureReturn 0
+  EndIf
+  e = a >> 23
+  mm = a & $7FFFFF
+  If e = 0
+    ; a subnormal: its leading bit moved up to bit 23
+    z = 1
+    While (mm & $800000) = 0
+      mm = mm << 1
+      z = z - 1
+    Wend
+    e = z
+  Else
+    mm = mm | $800000
+  EndIf
+  e = e - 127
+  j = mm >> 15
+  j = j & 255
+  d = 0
+  If j >= 106
+    d = 1
+  EndIf
+  e = e + d
+  ; r = N/2^33 exactly: N is the low word of C m (C m - 2^33 is below 2^25)
+  j = j << 2
+  nn = PeekL(?PmTensorLogTable + j)
+  nn = nn * mm
+  neg = 0
+  t = nn
+  If nn < 0
+    neg = 1
+    t = 0 - nn
+  EndIf
+  ; t^2 (r^2 in Q66)
+  n2l = t * t
+  n2h = PmTensorMulHi32(t, t)
+  ; r^2/5 in Q64: (t^2 (2^32/5)) / 2^66
+  xl = n2h * 858993459
+  xh = PmTensorMulHi32(n2h, 858993459)
+  u = PmTensorMulHi32(n2l, 858993459)
+  xl = xl + u
+  xh = xh + PmTensorBelow32(xl, u)
+  xl = (xl >> 2) & $3FFFFFFF
+  u = xh << 30
+  xl = xl | u
+  xh = xh >> 2
+  ; H = 1/3 -+ r/4 + r^2 H2 in Q64 (r/4 = t 2^29)
+  hl = xl + $55555555
+  hh = xh + $55555555
+  hh = hh + PmTensorBelow32(hl, xl)
+  u = t << 29
+  v1 = t >> 3
+  If neg = 0
+    c = PmTensorBelow32(hl, u)
+    hl = hl - u
+    hh = hh - v1
+    hh = hh - c
+  Else
+    hl = hl + u
+    hh = hh + v1
+    hh = hh + PmTensorBelow32(hl, u)
+  EndIf
+  ; W = r^2 H in Q64: (t^2 H) / 2^66
+  wl = n2h * hh
+  wh = PmTensorMulHi32(n2h, hh)
+  u = PmTensorMulHi32(n2h, hl)
+  wl = wl + u
+  wh = wh + PmTensorBelow32(wl, u)
+  u = PmTensorMulHi32(n2l, hh)
+  wl = wl + u
+  wh = wh + PmTensorBelow32(wl, u)
+  wl = (wl >> 2) & $3FFFFFFF
+  u = wh << 30
+  wl = wl | u
+  wh = wh >> 2
+  ; |G - 1| = r/2 -+ W in Q64 (r/2 = t 2^30)
+  gl = t << 30
+  gh = t >> 2
+  If neg = 0
+    c = PmTensorBelow32(gl, wl)
+    gl = gl - wl
+    gh = gh - wh
+    gh = gh - c
+  Else
+    gl = gl + wl
+    gh = gh + wh
+    gh = gh + PmTensorBelow32(gl, wl)
+  EndIf
+  ; t |G - 1| / 2^9 in Q88: v2 v1 v0
+  v0 = t * gl
+  v1 = PmTensorMulHi32(t, gl)
+  u = t * gh
+  v2 = PmTensorMulHi32(t, gh)
+  v1 = v1 + u
+  v2 = v2 + PmTensorBelow32(v1, u)
+  v0 = (v0 >> 9) & $7FFFFF
+  u = v1 << 23
+  v0 = v0 | u
+  v1 = (v1 >> 9) & $7FFFFF
+  u = v2 << 23
+  v1 = v1 | u
+  v2 = v2 >> 9
+  ; |log1p(r)| = |r| G in Q88: p2 p1 p0 (|r| = t 2^55)
+  p1 = t << 23
+  p2 = t >> 9
+  If neg = 0
+    p0 = 0 - v0
+    c = 0
+    If v0 <> 0
+      c = 1
+    EndIf
+    u = PmTensorBelow32(p1, v1)
+    p1 = p1 - v1
+    If p1 = 0 And c = 1
+      u = 1
+    EndIf
+    p1 = p1 - c
+    p2 = p2 - v2
+    p2 = p2 - u
+  Else
+    p0 = v0
+    p1 = p1 + v1
+    p2 = p2 + v2
+    p2 = p2 + PmTensorBelow32(p1, v1)
+  EndIf
+  ; S = E' ln2 + T in Q88: s2 s1 s0 (ln2 = $B17217 F7D1CF79 ABC9E3B4)
+  k = e
+  If e < 0
+    k = 0 - e
+  EndIf
+  s0 = k * $ABC9E3B4
+  c = PmTensorMulHi32(k, $ABC9E3B4)
+  s1 = k * $F7D1CF79
+  u = PmTensorMulHi32(k, $F7D1CF79)
+  s1 = s1 + c
+  u = u + PmTensorBelow32(s1, c)
+  s2 = k * $B17217
+  s2 = s2 + u
+  If e < 0
+    ; negate the three words
+    s0 = s0 ! $FFFFFFFF
+    s1 = s1 ! $FFFFFFFF
+    s2 = s2 ! $FFFFFFFF
+    s0 = s0 + 1
+    If s0 = 0
+      s1 = s1 + 1
+      If s1 = 0
+        s2 = s2 + 1
+      EndIf
+    EndIf
+  EndIf
+  u = PeekL(?PmTensorLogTable + 1024 + j + j + j)
+  s0 = s0 + u
+  c = PmTensorBelow32(s0, u)
+  u = PeekL(?PmTensorLogTable + 1028 + j + j + j)
+  s1 = s1 + c
+  c = PmTensorBelow32(s1, c)
+  s1 = s1 + u
+  c = c + PmTensorBelow32(s1, u)
+  u = PeekL(?PmTensorLogTable + 1032 + j + j + j)
+  s2 = s2 + c
+  s2 = s2 + u
+  ; S = S -+ |log1p(r)|
+  If neg = 0
+    s0 = s0 + p0
+    c = PmTensorBelow32(s0, p0)
+    s1 = s1 + c
+    c = PmTensorBelow32(s1, c)
+    s1 = s1 + p1
+    c = c + PmTensorBelow32(s1, p1)
+    s2 = s2 + c
+    s2 = s2 + p2
+  Else
+    c = PmTensorBelow32(s0, p0)
+    s0 = s0 - p0
+    u = PmTensorBelow32(s1, p1)
+    s1 = s1 - p1
+    If s1 = 0 And c = 1
+      u = 1
+    EndIf
+    s1 = s1 - c
+    s2 = s2 - p2
+    s2 = s2 - u
+  EndIf
+  ; the sign, then |S|
+  sg = 0
+  If s2 < 0
+    sg = $80000000
+    s0 = s0 ! $FFFFFFFF
+    s1 = s1 ! $FFFFFFFF
+    s2 = s2 ! $FFFFFFFF
+    s0 = s0 + 1
+    If s0 = 0
+      s1 = s1 + 1
+      If s1 = 0
+        s2 = s2 + 1
+      EndIf
+    EndIf
+  EndIf
+  ; |S| is at least 2^64 (Q88), so its top bit is in s2: move it to bit 31
+  k = 31
+  If (s2 & $FFFF0000) = 0
+    s2 = s2 << 16
+    k = k - 16
+  EndIf
+  If (s2 & $FF000000) = 0
+    s2 = s2 << 8
+    k = k - 8
+  EndIf
+  If (s2 & $F0000000) = 0
+    s2 = s2 << 4
+    k = k - 4
+  EndIf
+  If (s2 & $C0000000) = 0
+    s2 = s2 << 2
+    k = k - 2
+  EndIf
+  If (s2 & $80000000) = 0
+    s2 = s2 << 1
+    k = k - 1
+  EndIf
+  ; the bits of s1 (and s0) that follow, by the same shift
+  u = 31 - k
+  If u > 0
+    z = 32 - u
+    c = (s1 >> z)
+    t = 1 << u
+    t = t - 1
+    c = c & t
+    s2 = s2 | c
+    s1 = s1 << u
+    c = s0 >> z
+    c = c & t
+    s1 = s1 | c
+    s0 = s0 << u
+  EndIf
+  ; round once: s2 holds the 24 bits and the round bit
+  mm = (s2 >> 8) & $FFFFFF
+  If (s2 & $80) <> 0
+    If (s2 & $7F) <> 0 Or s1 <> 0 Or s0 <> 0 Or (mm & 1) <> 0
+      mm = mm + 1
+    EndIf
+  EndIf
+  k = k + 102
+  k = k << 23
+  k = k + mm
+  ProcedureReturn k | sg
+EndProcedure
+CompilerEndIf
+
+; 2^(j/256) in Q62, low word first (the exp above); then C for c = C/1024,
+; and T in Q88, three words low first (the log above)
+DataSection
+  PmTensorExpTable:
+  Data.l $00000000,$40000000,$6AF2FB58,$402C6BE9,$ECCCD5B6,$4058F6A7,$EC0A036A,$4085A050
+  Data.l $DE0183BA,$40B268F9,$46EF302B,$40DF50B8,$B9FE12F6,$410C57A1,$D952C4A6,$41397DCB
+  Data.l $5615D0EC,$4166C34C,$F07E22A3,$41942838,$77DB771B,$41C1ACA7,$CAA0D899,$41EF50AD
+  Data.l $D66F2023,$421D1461,$981F7E98,$424AF7D9,$1BCE0D15,$4278FB2B,$7CE464AF,$42A71E6C
+  Data.l $E6243D8A,$42D561B3,$91B21550,$4303C517,$C91FDD02,$433248AD,$E577AE44,$4360EC8C
+  Data.l $4F468808,$438FB0CB,$7EA712B6,$43BE957F,$FB4C6BC9,$43ED9ABF,$5C8CF8EA,$441CC0A3
+  Data.l $496D4294,$444C0740,$78AAD636,$447B6EAD,$B0C72FEE,$44AAF701,$C812ABD2,$44DAA053
+  Data.l $A4B77ECD,$450A6ABA,$3CC4B723,$453A564D,$96394492,$456A6322,$C70F0819,$459A9151
+  Data.l $F545EB73,$45CAE0F1,$56EF0042,$45FB521A,$3237A6EF,$462BE4E2,$DD74BD4B,$465C9960
+  Data.l $BF2DD4F3,$468D6FAD,$4E28717C,$46BE67E0,$11734E6B,$46EF8210,$A071AD01,$4720BE54
+  Data.l $A2E6A9E0,$47521CC5,$D1009A90,$47839D7A,$F36472E2,$47B5408B,$E3393241,$47E70610
+  Data.l $8A3358EE,$4818EE21,$E2A06536,$484AF8D5,$F7725895,$487D2645,$E44B44EA,$48AF7689
+  Data.l $D588E19B,$48E1E9B9,$085028D6,$49147FEE,$CA98FCD6,$4947393E,$7B39D53E,$497A15C4
+  Data.l $89F37496,$49AD1597,$777CA5E0,$49E038D0,$D58E025B,$4A137F87,$46EDBF6A,$4A46E9D6
+  Data.l $7F7B84B1,$4A7A77D4,$443C4A6B,$4AAE299B,$6B663FF7,$4AE1FF43,$DC6CBAB0,$4B15F8E5
+  Data.l $900C2D00,$4B4A169B,$905625D1,$4B7E587D,$F8BD5847,$4BB2BEA4,$F621ABD6,$4BE7492A
+  Data.l $C6DC54B8,$4C1BF828,$BACBF4CB,$4C50CBB7,$3360C4D5,$4C85C3F1,$A3A8C63C,$4CBAE0EE
+  Data.l $905BFD32,$4CF022C9,$8FE8B365,$4D25899B,$4A7FC325,$4D5B157E,$7A20EB1E,$4D90C68B
+  Data.l $EAA72A9C,$4DC69CDC,$79D52661,$4DFC988C,$17619617,$4E32B9B4,$C503BA65,$4E69006D
+  Data.l $967FDBA8,$4E9F6CD3,$B1B3D155,$4ED5FEFF,$4EA39210,$4F0CB70C,$B785CC80,$4F439513
+  Data.l $48D088D7,$4F7A9930,$7145D328,$4FB1C37C,$B2006E83,$4FE91412,$9E8090DF,$50208B0D
+  Data.l $DCB8A7E1,$50582887,$251A267C,$508FEC9C,$42A25B72,$50C7D765,$12E750C4,$50FFE8FE
+  Data.l $8624B40C,$51382181,$9F48C7CF,$5170810A,$74015DC9,$51A907B4,$2CC8DA3E,$51E1B59A
+  Data.l $04F3404F,$521A8AD7,$4ABB4762,$52538786,$5F4F799D,$528CABC3,$B6DF5B77,$52C5F7A9
+  Data.l $D8A89C75,$52FF6B54,$5F045106,$533906E0,$F774358F,$5372CA67,$62AFFAAE,$53ACB607
+  Data.l $74B29AB5,$53E6C9DA,$14C7B869,$542105FD,$3D990704,$545B6A8B,$FD3BBB8E,$5495F7A0
+  Data.l $753E077C,$54D0AD5A,$DAB49CBD,$550B8BD3,$76483B15,$55469329,$A44346F0,$5581C377
+  Data.l $D49F699C,$55BD1CDA,$8B133AF4,$55F89F6F,$5F1FF495,$56344B52,$FC1F2E82,$5670209F
+  Data.l $2150A563,$56AC1F75,$A1E80A49,$56E847EE,$651ADC07,$57249A29,$662E4A33,$57611642
+  Data.l $B48521BA,$579DBC56,$73ADC331,$57DA8C83,$DB7022C2,$581786E5,$37DBD1E5,$5854AB9B
+  Data.l $E95612C8,$5891FAC0,$64A7F584,$58CF7474,$330C7F1E,$590D18D3,$F23EDA52,$594AE7FA
+  Data.l $54889245,$5988E209,$20CFD70C,$59C7071C,$32A5CC20,$5A055751,$7A54E0C0,$5A43D2C6
+  Data.l $FCEF3242,$5A827999,$D45CF869,$5AC14BE9,$2F6AFBB6,$5B0049D4,$51D915C8,$5B3F7377
+  Data.l $9468BBC9,$5B7EC8F1,$64EB92F4,$5BBE4A61,$46520F3E,$5BFDF7E5,$D0BA1C1A,$5C3DD19B
+  Data.l $B17DCF75,$5C7DD7A3,$AB4226DF,$5CBE0A1B,$9605CEF5,$5CFE6922,$5F2FF504,$5D3EF4D7
+  Data.l $099F22FE,$5D7FAD59,$ADB825B8,$5DC092C6,$7974FD86,$5E01A53F,$B073D935,$5E42E4E2
+  Data.l $AC061B5F,$5E8451CF,$DB3F6A41,$5EC5EC25,$C304C9F1,$5F07B404,$FE1BC11C,$5F49A98B
+  Data.l $3D398841,$5F8BCCDB,$4712437C,$5FCE1E12,$F86846D8,$60109D50,$441B6546,$60534AB7
+  Data.l $33384A2B,$60962665,$E507DD9A,$60D9307A,$8F1EB339,$611C6918,$7D6C83E4,$615FD05E
+  Data.l $124BB204,$61A3666D,$C690D8AF,$61E72B64,$299A6599,$622B1F66,$E1603DD5,$626F4291
+  Data.l $AA836D6F,$62B39508,$585DE1ED,$62F816EB,$D5122FBD,$633CC85A,$219B628F,$6381A978
+  Data.l $55DCD8AE,$63C6BA64,$A0B22959,$640BFB40,$47FF1623,$64516C2E,$A8BF8766,$64970D4E
+  Data.l $371793D1,$64DCDEC3,$7E639312,$6522E0AD,$21483BA7,$6569132F,$D9C2CBE4,$65AF7669
+  Data.l $79393E2E,$65F60A7F,$E88A8873,$663CCF91,$281EE6E9,$6683C5C3,$4FF83222,$66CAED35
+  Data.l $8FC24072,$6712460A,$2EE352AF,$6759D065,$8C8C8C61,$67A18C67,$1FCA775B,$67E97A34
+  Data.l $779592CA,$683199ED,$3AE2EDC6,$6879EBB6,$28B4CD63,$68C26FB1,$182B5E56,$690B2601
+  Data.l $F895722D,$69540EC8,$D181482A,$699D2A2B,$C2CD61BD,$69E6784C,$04B962B0,$6A2FF94F
+  Data.l $E7F6FD10,$6A79AD55,$D5BAE8C5,$6AC39484,$4FCDE703,$6B0DAEFF,$F09DD17F,$6B57FCE8
+  Data.l $6B4EB57A,$6BA27E65,$8BCBFAB5,$6BED3398,$36D99642,$6C381CA6,$6A25494E,$6C8339B2
+  Data.l $3C57EBDB,$6CCE8AE1,$DD26C382,$6D1A1056,$9564E639,$6D65CA37,$C714A92B,$6DB1B8A7
+  Data.l $ED791BAB,$6DFDDBCB,$9D278E49,$6E4A33C8,$84192610,$6E96C0C2,$69BC7BF8,$6EE382DE
+  Data.l $2F074892,$6F307A41,$CE881BF9,$6F7DA70F,$5C782210,$6FCB096F,$06CCF314,$7018A185
+  Data.l $154A7089,$70666F76,$E994AE92,$70B47367,$FF41E9B4,$7102AD7F,$EBEC8913,$71511DE3
+  Data.l $5F452D29,$719FC4B9,$2324CB0C,$71EEA226,$1B9ED447,$723DB650,$47136B40,$728D015D
+  Data.l $BE41A454,$72DC8373,$B459D38B,$732C3CB9,$770FE711,$737C2D55,$6EADCE5F,$73CC556D
+  Data.l $1E25EE34,$741CB528,$2325A155,$746D4CAC,$3627C62B,$74BE1C20,$2A87593E,$750F23AB
+  Data.l $EE921C97,$75606373,$8B9B4C20,$75B1DBA1,$260E5EEE,$76038C5B,$FD81D5A0,$765575C7
+  Data.l $6CCA15C2,$76A7980F,$EA0C5249,$76F9F358,$06D1812E,$774C87CC,$70195E36,$779F5590
+  Data.l $EE6D7AE6,$77F25CCD,$65F45BB5,$78459DAC,$D684A285,$78991853,$5BB84661,$78ECCCEC
+  Data.l $2CFFD89D,$7940BB9E,$9DB5D74E,$7994E491,$1D320D2D,$79E947EF,$36DCFEEF,$7A3DE5DF
+  Data.l $92436616,$7A92BE8A,$F329B948,$7AE7D219,$399FC237,$7B3D20B6,$6214411C,$7B92AA88
+  Data.l $85689DDC,$7BE86FB9,$D904A6CE,$7C3E7072,$AEEA5D3A,$7C94ACDD,$75C9CF9B,$7CEB2523
+  Data.l $B915019D,$7D41D96D,$2113E1FA,$7D98C9E6,$72F84E24,$7DEFF6B6,$90F223DE,$7E476008
+  Data.l $7A4360BA,$7E9F0606,$4B544F9A,$7EF6E8DA,$3DC7C426,$7F4F08AE,$A88F6453,$7FA765AC
+  PmTensorLogTable:
+  Data.l $00000400,$000003FA,$000003F6,$000003F2,$000003EE,$000003EA,$000003E7,$000003E3
+  Data.l $000003DF,$000003DB,$000003D8,$000003D4,$000003D0,$000003CD,$000003C9,$000003C6
+  Data.l $000003C2,$000003BE,$000003BB,$000003B8,$000003B4,$000003B1,$000003AD,$000003AA
+  Data.l $000003A7,$000003A3,$000003A0,$0000039D,$00000399,$00000396,$00000393,$00000390
+  Data.l $0000038D,$0000038A,$00000386,$00000383,$00000380,$0000037D,$0000037A,$00000377
+  Data.l $00000374,$00000371,$0000036E,$0000036B,$00000368,$00000365,$00000363,$00000360
+  Data.l $0000035D,$0000035A,$00000357,$00000355,$00000352,$0000034F,$0000034C,$0000034A
+  Data.l $00000347,$00000344,$00000342,$0000033F,$0000033C,$0000033A,$00000337,$00000334
+  Data.l $00000332,$0000032F,$0000032D,$0000032A,$00000328,$00000325,$00000323,$00000320
+  Data.l $0000031E,$0000031C,$00000319,$00000317,$00000314,$00000312,$00000310,$0000030D
+  Data.l $0000030B,$00000309,$00000306,$00000304,$00000302,$00000300,$000002FD,$000002FB
+  Data.l $000002F9,$000002F7,$000002F5,$000002F2,$000002F0,$000002EE,$000002EC,$000002EA
+  Data.l $000002E8,$000002E6,$000002E3,$000002E1,$000002DF,$000002DD,$000002DB,$000002D9
+  Data.l $000002D7,$000002D5,$000002D3,$000002D1,$000002CF,$000002CD,$000002CB,$000002C9
+  Data.l $000002C7,$000002C5,$000002C4,$000002C2,$000002C0,$000002BE,$000002BC,$000002BA
+  Data.l $000002B8,$000002B6,$000002B5,$000002B3,$000002B1,$000002AF,$000002AD,$000002AC
+  Data.l $000002AA,$000002A8,$000002A6,$000002A5,$000002A3,$000002A1,$0000029F,$0000029E
+  Data.l $0000029C,$0000029A,$00000298,$00000297,$00000295,$00000293,$00000292,$00000290
+  Data.l $0000028F,$0000028D,$0000028B,$0000028A,$00000288,$00000286,$00000285,$00000283
+  Data.l $00000282,$00000280,$0000027F,$0000027D,$0000027C,$0000027A,$00000278,$00000277
+  Data.l $00000275,$00000274,$00000272,$00000271,$0000026F,$0000026E,$0000026C,$0000026B
+  Data.l $0000026A,$00000268,$00000267,$00000265,$00000264,$00000262,$00000261,$00000260
+  Data.l $0000025E,$0000025D,$0000025B,$0000025A,$00000259,$00000257,$00000256,$00000254
+  Data.l $00000253,$00000252,$00000250,$0000024F,$0000024E,$0000024C,$0000024B,$0000024A
+  Data.l $00000248,$00000247,$00000246,$00000245,$00000243,$00000242,$00000241,$00000240
+  Data.l $0000023E,$0000023D,$0000023C,$0000023A,$00000239,$00000238,$00000237,$00000236
+  Data.l $00000234,$00000233,$00000232,$00000231,$00000230,$0000022E,$0000022D,$0000022C
+  Data.l $0000022B,$0000022A,$00000228,$00000227,$00000226,$00000225,$00000224,$00000223
+  Data.l $00000222,$00000220,$0000021F,$0000021E,$0000021D,$0000021C,$0000021B,$0000021A
+  Data.l $00000219,$00000218,$00000216,$00000215,$00000214,$00000213,$00000212,$00000211
+  Data.l $00000210,$0000020F,$0000020E,$0000020D,$0000020C,$0000020B,$0000020A,$00000209
+  Data.l $00000208,$00000207,$00000206,$00000205,$00000204,$00000203,$00000202,$00000200
+  Data.l $00000000,$00000000,$00000000
+  Data.l $40E0A5D0,$214586B5,$00018121
+  Data.l $F1D57405,$3F2D065D,$00028325
+  Data.l $CC031046,$7098EBE0,$0003862E
+  Data.l $F19424C9,$C7FA8B89,$00048A3E
+  Data.l $7E712B2D,$5E1A42F5,$00058F58
+  Data.l $5EF96CF8,$E668911D,$000653DA
+  Data.l $84AF2E48,$C965E600,$00075AC9
+  Data.l $C5D4E9D1,$D0CEFD54,$000862C7
+  Data.l $C6BA625A,$2E1E2DD6,$00096BD7
+  Data.l $C6452101,$6A16F1F4,$000A3357
+  Data.l $20827CCA,$796A5DAC,$000B3E4A
+  Data.l $9A8BE976,$0A4FD9A1,$000C4A55
+  Data.l $533F881C,$C549B0B8,$000D1415
+  Data.l $1F49850D,$037B954F,$000E220F
+  Data.l $29CD930E,$6E33F727,$000EED45
+  Data.l $464C1C0D,$88D5C980,$000FFD34
+  Data.l $96D7B5CC,$B3CAE830,$00110E45
+  Data.l $24D977C5,$643D190B,$0011DBD2
+  Data.l $8BA8B1CB,$A44717A4,$0012AA04
+  Data.l $2F52EDA7,$A7D1EE64,$0013BDF5
+  Data.l $5B208C20,$4BC31018,$00148DAE
+  Data.l $749E6AFA,$B01ADE25,$0015A3AB
+  Data.l $994C9D33,$89365A79,$001674F0
+  Data.l $2E91E1DE,$00226ED9,$001746E1
+  Data.l $E7E668F4,$27506A47,$00185FD9
+  Data.l $AE1D5EA4,$5D594988,$0019335E
+  Data.l $6326CA56,$E9277CAC,$001A0792
+  Data.l $4D88AF64,$5A52FF00,$001B2396
+  Data.l $C646C121,$769FCA10,$001BF968
+  Data.l $232FE712,$BFEE13A8,$001CCFED
+  Data.l $5007E9C6,$638446A2,$001DA727
+  Data.l $3A643884,$91A32D3E,$001E7F16
+  Data.l $9B27AA2C,$7D9005DA,$001F57BC
+  Data.l $9CF169FC,$14A3D81A,$002079B8
+  Data.l $E628FCDF,$224CEBAA,$0021540D
+  Data.l $BC671684,$044FC8F7,$00222F1D
+  Data.l $4445BD9B,$FB7D9E67,$00230AE8
+  Data.l $2C593DF2,$4BE4BA82,$0023E772
+  Data.l $69D0F61C,$3CDBBEAD,$0024C4BA
+  Data.l $AD997037,$190D0273,$0025A2C2
+  Data.l $2308262C,$2E82285C,$0026818B
+  Data.l $170D6CDF,$CEAFE552,$00276116
+  Data.l $5F4DE97E,$4E81FBA7,$00284166
+  Data.l $BCAA7EDB,$06676AC1,$0029227B
+  Data.l $05FF36A2,$525ED48A,$002A0456
+  Data.l $7F72E468,$84C20BA3,$002A9B57
+  Data.l $F70525DA,$D6A87B63,$002B7E80
+  Data.l $82AC3785,$6E66BAEC,$002C6274
+  Data.l $CB1995EA,$B577A706,$002D4733
+  Data.l $D8ABE762,$192280A8,$002E2CC0
+  Data.l $411C1D06,$0526B50C,$002EC63B
+  Data.l $CA741E7F,$795EB59F,$002FAD20
+  Data.l $7FD5207A,$EB3EA25D,$003094D6
+  Data.l $556AA2DA,$D671FD18,$00317D5F
+  Data.l $82A239CA,$73F979B2,$003218DB
+  Data.l $DD9E9046,$802354EA,$003302C6
+  Data.l $26B432C1,$0E112CC8,$0033ED88
+  Data.l $77C81F71,$05CD560A,$00348A81
+  Data.l $A5350EB3,$862D2759,$003576AB
+  Data.l $4E562A64,$AEB79C79,$003663B0
+  Data.l $1A0EE736,$617047A4,$0037022E
+  Data.l $F1B3F7AB,$80CEAABD,$0037F0A3
+  Data.l $38D3A69D,$8DE01EE1,$0038DFF7
+  Data.l $A9E8AA14,$93B678A4,$00398001
+  Data.l $AF4C76CD,$D0E3E8C9,$003A70CC
+  Data.l $D7FDCB41,$7F65E8A0,$003B11D2
+  Data.l $7FA92376,$8C46B56A,$003C0419
+  Data.l $244EC084,$FFCE2024,$003CA61D
+  Data.l $9C5C18AA,$91FD2413,$003D99E5
+  Data.l $EA6D13E0,$F5BF37BC,$003E3CEB
+  Data.l $FB328338,$D96766F2,$003F3238
+  Data.l $0C6F004A,$67D40F9A,$003FD644
+  Data.l $DCFADE86,$589B1A43,$00407AB9
+  Data.l $78E3BE66,$83658D68,$0041722F
+  Data.l $513F45FE,$3E2B9E5D,$004217AE
+  Data.l $458B1E75,$9D858B8C,$004310B5
+  Data.l $36A5B087,$82DE0203,$0043B741
+  Data.l $78CE2D08,$089F91EF,$00445E3A
+  Data.l $529024AA,$B5157F0C,$0045597B
+  Data.l $003792C7,$3BC62B7D,$00460186
+  Data.l $054B0B7C,$58E34CFB,$0046A9FF
+  Data.l $512C374A,$9E2267D1,$0047A785
+  Data.l $FBD748D7,$B43AE350,$00485115
+  Data.l $1BB75D1B,$647AE924,$0048FB16
+  Data.l $E0EFADDA,$44D36E49,$0049A588
+  Data.l $38D546BD,$9A68F6FD,$004AA608
+  Data.l $7911955F,$0AB733B9,$004B5198
+  Data.l $2DABE192,$C13AA751,$004BFD9A
+  Data.l $2502735F,$5944829F,$004CAA11
+  Data.l $323B4D88,$6F60B22B,$004D56FC
+  Data.l $8C753393,$D66EFD4F,$004E5B38
+  Data.l $D52D81AF,$DCCCC60E,$004F0949
+  Data.l $83D680D4,$8F05A0F9,$004FB7D1
+  Data.l $86DD921C,$8F57A31C,$005066D0
+  Data.l $D4EDADB8,$814E7D22,$00511647
+  Data.l $18FB4C15,$09C7106C,$0051C637
+  Data.l $334DAF4C,$CEF3107B,$0052769F
+  Data.l $6D5E1BB8,$B762EB29,$00538021
+  Data.l $94817D84,$7446E5F1,$005431BC
+  Data.l $01722AA4,$BE3DCBF6,$0054E3D2
+  Data.l $7F4AEB72,$41A54531,$00559665
+  Data.l $0A585A91,$AC44A964,$00564974
+  Data.l $EE0A4BB4,$AD50F6C7,$0056FD01
+  Data.l $1A1229D1,$F570D6B7,$0057B10C
+  Data.l $A94FE1DC,$36C0B07B,$00586597
+  Data.l $0D5BD0FF,$2D04FB0E,$FFA7A889
+  Data.l $2E7088C7,$7CF5AAD8,$FFA85E13
+  Data.l $E8F873FA,$E557939A,$FFA9141E
+  Data.l $067AC357,$1E47F437,$FFA9CAAC
+  Data.l $91DE37D3,$E16F0479,$FFAA81BB
+  Data.l $C4826CEB,$EA046207,$FFAB394E
+  Data.l $6478B7CE,$F4D38D34,$FFABF165
+  Data.l $6CC017CC,$C0407603,$FFACAA01
+  Data.l $92CD9AD8,$AA221D7C,$FFAD0681
+  Data.l $CFFE1A10,$FEFFD8BC,$FFADBFE5
+  Data.l $0BD21321,$F78E84F6,$FFAE79D0
+  Data.l $29931716,$57EC5FB1,$FFAF3443
+  Data.l $0BCFB608,$E5E56071,$FFAFEF3D
+  Data.l $E3265C6A,$68F823C1,$FFB0AAC1
+  Data.l $E34328CA,$AA5AE858,$FFB166CE
+  Data.l $36AC53B0,$75009E94,$FFB22366
+  Data.l $DE4EA1A5,$8DB35B07,$FFB281E6
+  Data.l $823D5C1F,$A69E69DE,$FFB33F4F
+  Data.l $A9748A03,$4BE72BD0,$FFB3FD45
+  Data.l $9E08F77D,$4EBDE9F3,$FFB4BBC8
+  Data.l $BF51F3AB,$822750DB,$FFB57AD9
+  Data.l $852DB3EC,$B085E572,$FFB5DA97
+  Data.l $43DDB15C,$BC822718,$FFB69A7F
+  Data.l $76F5EB09,$10C21A69,$FFB75AF8
+  Data.l $C9FDF9A1,$86DD7435,$FFB81C01
+  Data.l $0D564F2B,$F323A507,$FFB87CBC
+  Data.l $466DC55E,$B83E12DD,$FFB93EA1
+  Data.l $8BA74A27,$C7ABDA8A,$FFBA0119
+  Data.l $A65DFC98,$01DE5E97,$FFBAC426
+  Data.l $8499D671,$F5B15D3E,$FFBB25E3
+  Data.l $9D817D53,$1946D4AB,$FFBBE9D0
+  Data.l $7E09BF1E,$A19522D3,$FFBCAE52
+  Data.l $82302180,$7631BC72,$FFBD736C
+  Data.l $E2BF3A5D,$660EA143,$FFBDD632
+  Data.l $66BCD237,$E3F050E8,$FFBE9C30
+  Data.l $0BB183E5,$FA4F7343,$FFBF62C8
+  Data.l $E5CAB480,$E94ABF8C,$FFBFC64E
+  Data.l $E5557328,$254383AA,$FFC08DCF
+  Data.l $FD6A526F,$AED55F75,$FFC0F1C9
+  Data.l $4F1417E4,$31A1DF45,$FFC1BA34
+  Data.l $29987EE5,$164509EA,$FFC2833C
+  Data.l $2DC07473,$5AAB4B40,$FFC2E7FB
+  Data.l $2C2AF000,$23AA1A34,$FFC3B1F1
+  Data.l $3E59D733,$BEA82705,$FFC47C86
+  Data.l $17F0D932,$CA19C544,$FFC4E20D
+  Data.l $70128AAA,$FC929832,$FFC5AD94
+  Data.l $6E32FC15,$63EC7447,$FFC61395
+  Data.l $A7B44FC2,$70CACBBC,$FFC6E010
+  Data.l $B109A5D6,$578A37B6,$FFC7468B
+  Data.l $AB5C1E44,$89E3763C,$FFC813FC
+  Data.l $AC0C62EE,$17A4E653,$FFC87AF3
+  Data.l $22EC011F,$C2E094B7,$FFC9495C
+  Data.l $4E633FCE,$62FE801A,$FFCA186D
+  Data.l $F5395F14,$A373DB68,$FFCA8034
+  Data.l $3735E265,$AFB76466,$FFCB5041
+  Data.l $CD91DC9F,$C03A9539,$FFCBB887
+  Data.l $5450E708,$A30408F9,$FFCC8993
+  Data.l $4A9B22BC,$BAFCFE6C,$FFCCF259
+  Data.l $95422101,$E797E843,$FFCDC466
+  Data.l $AB4EC28D,$42EF257E,$FFCE2DAE
+  Data.l $DFBFEDFD,$35BE6DDE,$FFCF00BF
+  Data.l $AADF4E2C,$14F35D8D,$FFCF6A89
+  Data.l $52F9201D,$BD79502A,$FFCFD47E
+  Data.l $C83929A5,$FBDE4DED,$FFD0A8ED
+  Data.l $6DF970C4,$DAE1BDB1,$FFD11367
+  Data.l $9B0956A4,$D0BCAB15,$FFD1E8E0
+  Data.l $E5571347,$31CC5BC6,$FFD253E0
+  Data.l $42403938,$7B1AA55E,$FFD32A65
+  Data.l $9FAA3F4E,$AEAAB150,$FFD395EB
+  Data.l $6F183BEC,$1EB0D858,$FFD4019F
+  Data.l $59748AAA,$4CCFBEF4,$FFD4D98E
+  Data.l $6B2259B8,$57B9A522,$FFD545CA
+  Data.l $F2FAFEAF,$16BB9E9B,$FFD61ECC
+  Data.l $4BB3F21A,$18CB5435,$FFD68B92
+  Data.l $6B637027,$66323845,$FFD6F886
+  Data.l $23840FC2,$811B0880,$FFD7D2FA
+  Data.l $6ACEA39F,$9E2673AC,$FFD8407A
+  Data.l $8864D275,$BFC2E117,$FFD91C07
+  Data.l $335D018D,$1511E361,$FFD98A15
+  Data.l $02D738FB,$CE37005A,$FFD9F851
+  Data.l $67F4471E,$0FC015B9,$FFDAD55A
+  Data.l $7AB0E89C,$EA872A5C,$FFDB4425
+  Data.l $055C2074,$CDEB4A69,$FFDBB321
+  Data.l $ADF3F72E,$55A130BF,$FFDC91AA
+  Data.l $0297B61C,$4E06B3DE,$FFDD0137
+  Data.l $2EBBF60E,$F7317AA7,$FFDD70F4
+  Data.l $32D11D0B,$065EE34D,$FFDE5103
+  Data.l $82B8ABE9,$C231CC79,$FFDEC153
+  Data.l $ABCE6E05,$DA6B4D23,$FFDF31D5
+  Data.l $3E973804,$7A81856A,$FFDFA289
+  Data.l $30FD12FE,$013C8221,$FFE08486
+  Data.l $9E83368F,$3FEE9D59,$FFE0F5CF
+  Data.l $8B763AF1,$B698EB98,$FFE1674A
+  Data.l $16157800,$91D50D1A,$FFE1D8F8
+  Data.l $A1BC89AC,$29934CA2,$FFE2BCEC
+  Data.l $B24AF229,$4073EC1E,$FFE32F32
+  Data.l $EA29E810,$70A438BC,$FFE3A1AB
+  Data.l $F7BC3988,$D44F125E,$FFE48737
+  Data.l $BA7CE0F7,$6411BC01,$FFE4FA4B
+  Data.l $9AF42DD5,$C5B52A9C,$FFE56D92
+  Data.l $E8920684,$27F9E32B,$FFE5E10E
+  Data.l $24133C38,$B9DFCC53,$FFE654BD
+  Data.l $0A534BD6,$29CE64DF,$FFE73CBA
+  Data.l $CD246978,$6717D7D5,$FFE7B107
+  Data.l $7BBB7F37,$9284ED33,$FFE82589
+  Data.l $BC035C42,$DC5941EC,$FFE89A40
+  Data.l $641B6646,$751A94B4,$FFE90F2D
+  Data.l $4E21163B,$56C8AF3C,$FFE9F9A7
+  Data.l $B0A8DD54,$020FE3D7,$FFEA6F35
+  Data.l $96D87198,$C0F9E7C0,$FFEAE4F8
+  Data.l $F09844BA,$C55E4FBF,$FFEB5AF2
+  Data.l $C44560D9,$4159B90F,$FFEBD123
+  Data.l $6D667C8A,$69E42E2F,$FFECBE28
+  Data.l $1D359A90,$7C0A21E1,$FFED34FD
+  Data.l $07049659,$D0F5EBE9,$FFEDAC09
+  Data.l $B0A16176,$9C24E6BB,$FFEE234D
+  Data.l $179DA3E9,$115C851F,$FFEE9AC9
+  Data.l $F46D48AC,$64AAD901,$FFEF127C
+  Data.l $CFE4B59A,$CA671B8E,$FFEF8A67
+  Data.l $CF419B47,$9FF74EAC,$FFF07AE7
+  Data.l $2332314F,$79EC4FF5,$FFF0F37C
+  Data.l $F70E1D67,$3A927A56,$FFF16C4A
+  Data.l $99B2A03E,$17B6F069,$FFF1E551
+  Data.l $9EB9759C,$47734720,$FFF25E91
+  Data.l $84A04029,$002E16E5,$FFF2D80B
+  Data.l $414BE2FF,$789B8E0A,$FFF351BE
+  Data.l $8E84D2B2,$E7BE0498,$FFF3CBAB
+  Data.l $DCE586AF,$84E69181,$FFF445D3
+  Data.l $B9CAB857,$281B8D95,$FFF53AD2
+  Data.l $C3AD4817,$9E593771,$FFF5B5A9
+  Data.l $2B7F5270,$2300A150,$FFF630BC
+  Data.l $73BD48B2,$EEF58BC6,$FFF6AC09
+  Data.l $1E9AE88A,$3B6E1340,$FFF72793
+  Data.l $C4B78114,$41F34F44,$FFF7A358
+  Data.l $ECC1C0FB,$3C61F33F,$FFF81F59
+  Data.l $074D3982,$64EAF0CF,$FFF89B96
+  Data.l $010AE692,$F6141B9A,$FFF9180F
+  Data.l $ECBF63E2,$2AB8CEBA,$FFF994C6
+  Data.l $55B602AD,$3E0A93B9,$FFFA11B9
+  Data.l $DB10B6C4,$6B91CB1D,$FFFA8EE9
+  Data.l $C432D6A4,$EF2E56A2,$FFFB0C56
+  Data.l $4EA0FF32,$05184506,$FFFB8A02
+  Data.l $860C24B1,$E9E07F83,$FFFC07EA
+  Data.l $87DA109A,$DA7178F6,$FFFC8611
+  Data.l $245B5DA2,$140FDEB1,$FFFD0477
+  Data.l $E0FF94D1,$D45B4B04,$FFFD831A
+  Data.l $703C8970,$594EF987,$FFFE01FD
+  Data.l $C587A5B9,$E1427D16,$FFFE811E
+  Data.l $FDAFBCA5,$AAEA77A1,$FFFF007F
+  Data.l $00000000,$00000000,$00000000
+EndDataSection
+CompilerEndIf
+
 Procedure.i PmTensorIsNan(v.f)
   If (PeekL(@v) & $7FFFFFFF) > $7F800000
     ProcedureReturn 1
@@ -505,9 +2392,17 @@ Procedure PmTensorUnaryMath(*src.i, *dst.i, count.i, op.i)
   While i < count
     v = *ps.f
     If op = 0
-      *pd.f = Exp(v)
+      CompilerIf #PMO_USE_EXPLOG = 1
+        PokeL(pd, PmTensorExpBits(PeekL(ps)))
+      CompilerElse
+        *pd.f = Exp(v)
+      CompilerEndIf
     ElseIf op = 1
-      *pd.f = Log(v)
+      CompilerIf #PMO_USE_EXPLOG = 1
+        PokeL(pd, PmTensorLogBits(PeekL(ps)))
+      CompilerElse
+        *pd.f = Log(v)
+      CompilerEndIf
     ElseIf op = 2
       *pd.f = PmTensorSqrtF(v)
     ElseIf op = 3

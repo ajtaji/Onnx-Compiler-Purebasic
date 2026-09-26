@@ -1220,6 +1220,28 @@ def cases() -> list[Case]:
             want = {"Sqrt": np.sqrt, "Abs": np.abs, "Neg": np.negative}[op](spec)
         c.append(Case("%s_specials" % op.lower(), [N(op, ["x"], ["y"])], [("x", F, [spec.size])], [("y", F, [spec.size])],
                       {"x": spec}, opset=13, oracle=("own", lambda feeds, w=want: [w])))
+    # Exp and Log on every special value, the edges of their ranges and the
+    # arguments hardest to round (C6c-2): correctly rounded on every target,
+    # and x86's NaN. Exp: the overflow and underflow edges, the first
+    # subnormal results, |x| near 2^-25, and the twelve arguments whose exact
+    # result lies closest to a rounding midpoint. Log: 1 and its neighbours,
+    # the table's bucket edges, subnormals, and the five arguments at which the
+    # Windows host's own Log is not correctly rounded (the kernel corrects them).
+    hard_exp = np.array([0x42B17217, 0x42B17218, 0xC2AEAC4F, 0xC2AEAC50, 0xC2CFF1B4, 0xC2CFF1B5, 0xC2CFFFFF, 0xC2D00000,
+                         0x33000000, 0x32FFFFFF, 0xB3000000, 0xB2FFFFFF, 0x33800000, 0xB3800000, 0x3F317218, 0x41200000,
+                         0xC1200000, 0xC16912CD, 0xC2B2E798, 0xBBF0EDF1, 0xBAE0E25C, 0x377EFF81, 0x4288942B, 0x40315B33,
+                         0x4001B249, 0x3D1A274E, 0xC13D6631, 0xC0781533, 0x41CBF87B], np.uint32).view(np.float32)
+    hard_log = np.array([0x3C413D3A, 0x65D890D3, 0x6F31A8EC, 0x41178FEB, 0x4C5D65A5, 0x3F7FFFFF, 0x3F800001, 0x3F7FFF00,
+                         0x3F810000, 0x3F80FFFF, 0x3FB50000, 0x3FB4FFFF, 0x3FFFFFFF, 0x3F3504F3, 0x00400000, 0x402DF854,
+                         0x40000000, 0x7F000000, 0x3F000001], np.uint32).view(np.float32)
+    rng_el = np.random.default_rng(6262)  # its own stream: the cases after these keep their data
+    for op, extra, fn in (("Exp", np.concatenate([hard_exp, rng_el.uniform(-104, 89, 40).astype(np.float32)]), np.exp),
+                          ("Log", np.concatenate([hard_log, np.exp(rng_el.uniform(-80, 80, 40)).astype(np.float32)]), np.log)):
+        x = np.concatenate([spec[:24], extra]).astype(np.float32)
+        with np.errstate(all="ignore"):
+            want = fn(x.astype(np.float64)).astype(np.float32)
+        c.append(Case("%s_specials" % op.lower(), [N(op, ["x"], ["y"])], [("x", F, [x.size])], [("y", F, [x.size])],
+                      {"x": x}, opset=13, oracle=("own", lambda feeds, w=want: [w])))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

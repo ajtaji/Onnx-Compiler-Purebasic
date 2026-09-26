@@ -1233,6 +1233,104 @@ Every support-file procedure this change touches (the emitted source does not ch
 | `tensor_norm_small.pmi` | `PmTensorInstanceNormStats` | changed |
 
 
+## The same bits on every target, second stage: Exp and Log — September 26, 2026
+
+The second of four stages (the first is
+[above](#the-same-bits-on-every-target-first-stage-square-root-abs-negate-and-batchnormalization--september-25-2026)).
+Exp and Log are now correctly rounded on the Pi 4, Pico and Pico 2, so every
+target gives the Windows program's bits: the host's Exp is correctly rounded
+for all 2^32 arguments, and its Log for all but five, which the Windows kernel
+now corrects.
+
+**The method.** Each function is one exact integer method, written in the
+form each target runs fastest: 32-bit words (the Pico, and the Pi 4's Log),
+64-bit integers (the Pi 4's Exp) and Cortex-M33 assembly with `UMULL` and
+`UMAAL` (the Pico 2). No floating-point operation is involved, so nothing
+depends on a maths library or an FPU.
+
+- Exp: x = k ln2/256 + r with 0 <= r < ln2/256, r to 2^-64 (ln2/256 held to
+  2^-96); e^r - 1 = r + r^2/2 + r^3 (1/6 + r/24 + r^2/120) in Q64; the result
+  2^(k/256) e^r in Q62 from a 256-entry table, rounded once at its own 24 bits
+  (a subnormal result at its own position).
+- Log: x = 2^E m; the top eight bits of m pick c = C/1024, so r = c m - 1 is
+  exact; log x = E' ln2 + T + r G with G = 1 - r/2 + r^2 (1/3 - r/4 + r^2/5),
+  in Q88. The two buckets beside x = 1 have c = 1 and c = 1/2 exactly, so
+  there the result is r G to its full relative precision and nothing cancels.
+
+**Proved, not sampled.** Each spelling was run on every one of the 2^32
+binary32 arguments against the correctly rounded result: the 32- and 64-bit
+spellings compiled by the Windows compiler, and each target's build of the
+runtime file itself (`runtime/tensor_fp32.pmi`, not a copy) in the emulator,
+in 4,096 chunks compared by hash. Every spelling agrees on every argument. The
+proof also measured the margin: the hardest Exp argument lies 2^-27 of half a
+unit from a rounding midpoint, and the method carries about 6 more bits than
+that needs. Log's polynomial is as short as the proof allows: without its
+r^2/5 term one argument, `41178FEB`, rounds the other way.
+
+**Windows.** The host's Exp needs nothing. Its Log is correctly rounded except
+at `3C413D3A`, `65D890D3`, `6F31A8EC`, `41178FEB` and `4C5D65A5`; the kernel
+scans its arguments four at a time with SSE2 before it runs and, only if one
+of the five is present, computes that range one element at a time with the
+correctly rounded result in their place. The arguments are read before any
+result is written, so the kernel may still run in place. Its NaN is already
+x86's: every NaN argument was checked, and comes back quieted with its payload
+and sign; Log of a negative argument is `FFC00000`, of ±0 is -inf.
+
+**Only where used.** The two tables are some 6 KB. A generated Pi 4, Pico or
+Pico 2 program now says which correctly rounded families its graph uses
+(`#PMO_USE_EXPLOG`, and `#PMO_USE_TRIG` and `#PMO_USE_ATAN` for the next
+stage), and a program without Exp or Log compiles exactly the code it did
+before. `runtime/tensor_features_all.pmi` switches all three on for the
+runtime-library tests.
+
+**Speed.** Every changed kernel is faster on every target. Instructions for
+the whole 8,192-element request in unicorn:
+
+| Kernel | Pi 4 | Pico | Pico 2 |
+|---|---|---|---|
+| Exp | 30,996,454 → 9,901,776 (−68%) | 30,584,394 → 22,403,813 (−27%) | 3,772,731 → 2,779,224 (−26%) |
+| Log | 261,872,322 → 28,068,004 (−89%) | 27,873,949 → 22,766,573 (−18%) | 3,497,445 → 3,087,913 (−12%) |
+
+On Windows, wall clock of the serial kernel over 16M elements (best of
+eleven): Log 173–181 ms before and 175–181 ms after (the scan is within the
+noise); Exp unchanged. Kokoro-82M on Windows, 15 requests each, old and new interleaved, in
+two samples taken while the emulator sweeps loaded the machine: FP32
+1,629.2 against 1,638.0 ms and 1,577.2 against 1,571.9 ms median; INT8
+1,263.2 against 1,266.3 and 1,234.5 against 1,233.8 - within the noise,
+as it has to be: Kokoro has no Log node, so the Windows code it runs did
+not change. The same output bits.
+
+| Check | Result |
+|---|---|
+| Every binary32 argument, each spelling | Exp and Log: the 32- and 64-bit spellings compiled by the Windows compiler, and each target's build of `runtime/tensor_fp32.pmi` in the emulator (Pi 4, Pico, Pico 2), all 2^32 arguments: every result the correctly rounded one. The Windows kernel itself (`PmTensorUnaryMathSerial`; Exp run in place): the same |
+| `ops_kernel_check.py`: the 604 cases | Windows (both branches), Pi 4, Pico and Pico 2: 604 of 604 bit-identical to the definition; `--mutants` 72 of 72 caught |
+| `runtime_mutants.py`: the 30 before, and eight new: the rounding of each spelling (32-bit words, the Pi 4's 64-bit Exp, the Pico 2's assembly), the 32-bit high word, the Pi 4's word helper, the M33 Log's rounding, the Windows correction of the host's Log and its scan | 38 of 38 as required |
+| `tests/node_suite/targeted_ops.py`: 1,069 cases - the 1,065 before; Exp and Log on the special values, the edges of their ranges and methods and their hardest arguments (including the five where the host's Log is not correctly rounded), on both paths | 1,069 of 1,069 as expected; `targeted_defaults`, `targeted_norm_small`, `targeted_control`, `targeted_optional_outputs` 148, 132, 41 and 14 as expected |
+| `ops_targets_gate.py`: those cases, BatchNormalization, and the NaN, comparison, Clip, Floor, Round and Tanh cases, on the Pi 4, Pico and Pico 2 | 119 builds, 357 runs: 333 bit-identical to the Windows program; 24 within the tolerance and named in `TOLERANCE_ONLY` (Sin, Cos, Atan and Sigmoid, the later stages). Log left the list |
+| `pi4_control_gate.py` | 29 of 41, as before |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,239 both |
+| Models that use none of these forms (four models, fp32/fp16/bf16/int4, five targets), this change against `51c9a34` | The 16 Windows sources, packs and manifests byte-identical; the 64 others differ only by the three new `#PMO_USE_` lines, and all 32 fixed-shape Pico and Pico 2 images are byte-identical. Output bits: the four models' Windows outputs byte-identical, and all 30 outputs of their Pi 4, Pico and Pico 2 programs byte-identical |
+| Kokoro-82M, FP32 and INT8, for Windows | Source and pack byte-identical; `tensor_fp32_windows.pbi` differs (Log only; Kokoro has no Log node); the output for the reference request byte-identical, FP32 and INT8 |
+
+Output bits that change: on the Pi 4, Pico and Pico 2, every Exp and Log
+result that was not correctly rounded (a quarter of those sampled), and the
+NaN of Log of a negative argument, now x86's `FFC00000`; on Windows, Log at
+its five arguments.
+
+Every support-file procedure this change touches (the emitted source changes only by the `#PMO_USE_` lines):
+
+| Support file | Procedure | |
+|---|---|---|
+| `tensor_features_all.pmi` | (the three new switches) | changed |
+| `tensor_fp32.pmi` | `PmTensorBelow32` | added |
+| `tensor_fp32.pmi` | `PmTensorExpBits` | added |
+| `tensor_fp32.pmi` | `PmTensorLogBits` | added |
+| `tensor_fp32.pmi` | `PmTensorMulHi32` | added |
+| `tensor_fp32.pmi` | `PmTensorUnaryMath` | changed |
+| `tensor_fp32_windows.pbi` | `PmTensorLogHardScan` | added |
+| `tensor_fp32_windows.pbi` | `PmTensorUnaryMathSerial` | changed |
+
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.
@@ -1255,10 +1353,10 @@ Every support-file procedure this change touches (the emitted source does not ch
 - Some kernels of the base runtime (not of the operator-set lane) match the
   Windows program on the Pi 4, Pico and Pico 2 within the node-suite
   tolerance but not bit for bit. `ops_targets_gate.py` names each in
-  `TOLERANCE_ONLY` with its reason and still holds it to the tolerance: Log,
-  Sin, Cos, Atan and Sigmoid, whose target libraries miss the correctly
-  rounded result by one or two units in the last place on some arguments
-  (Windows is correctly rounded but for thirteen arguments in all), and
+  `TOLERANCE_ONLY` with its reason and still holds it to the tolerance: Sin,
+  Cos, Atan and Sigmoid, whose target libraries miss the correctly rounded
+  result by one or two units in the last place on some arguments (Windows is
+  correctly rounded but for eight arguments in all), and
   whose NaN from an invalid argument is x86's `FFC00000` on Windows and
   `7FC00000` on the targets; Sin(-0) on the Pico and Pico 2 and Atan(-0) on
   all three targets give +0. The later stages of
