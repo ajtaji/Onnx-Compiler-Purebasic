@@ -778,7 +778,9 @@ Procedure PmTensorReduce(*g.PmTensorReduceArgs)
   i = 0
   While i < outCount
     t = *g\Dst + i * size
-    If *g\Op = 1
+    If *g\Op >= 2
+      PokeL(t, $80000000)
+    ElseIf *g\Op = 1
       If *g\Kind = 1
         PokeL(t, $3F800000)
       Else
@@ -818,7 +820,12 @@ Procedure PmTensorReduce(*g.PmTensorReduceArgs)
     t = *g\Dst + target * size
     s = *g\Src + i * size
     If *g\Kind = 1
-      If *g\Op = 1
+      If *g\Op >= 2
+        cur = PmTensorGet(t, 0)
+        value = PmTensorGet(s, 0)
+        cur = cur + value
+        PmTensorPut(t, 0, cur)
+      ElseIf *g\Op = 1
         cur = PmTensorGet(t, 0)
         value = PmTensorGet(s, 0)
         cur = cur * value
@@ -849,6 +856,17 @@ Procedure PmTensorReduce(*g.PmTensorReduceArgs)
     EndIf
     i = i + 1
   Wend
+  If *g\Op = 3
+    ; the mean: each sum divided once by the number of elements it holds
+    value = srcCount / outCount
+    i = 0
+    While i < outCount
+      cur = PmTensorGet(*g\Dst, i)
+      cur = cur / value
+      PmTensorPut(*g\Dst, i, cur)
+      i = i + 1
+    Wend
+  EndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------

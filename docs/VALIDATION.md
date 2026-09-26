@@ -1600,6 +1600,44 @@ Every support-file procedure this change touches (the emitted source changes onl
 | `tensor_dynamic_ops.pmi` | `DOpKindOk` | changed (UINT8) |
 | `tensor_dynamic_ops.pmi` | `DOpTfIdf` | added |
 
+## ReduceMean and ReduceSum on any axes, fixed shapes — September 26, 2026
+
+On the fixed-shape path ReduceMean and ReduceSum took one final axis and
+refused the others. They now reduce over any set of axes, negative axes
+included, and absent axes reduce over every axis. With
+`noop_with_empty_axes` 1 and no axes they give the identity. Both the
+attribute form (ReduceMean before opset 18, ReduceSum before 13) and the
+input form are accepted. The runtime-dimension path already did this.
+
+- A single final axis keeps its contiguous kernel and its emitted code, so
+  a model that compiled before emits the same source.
+- Every other form runs the general reduction kernel that ReduceMax and
+  ReduceProd use, with two new operations: the sum and the mean, in FLOAT.
+- The sum starts at -0 and adds each element in order, so a one-element
+  reduction returns the element, -0 included, as numpy does. The mean
+  divides each sum once by the number of elements it holds.
+- On Windows the host compiler adds -0 and -0 as +0, so the Windows kernels
+  restore the sign of an all -0 sum and give the targets' bits.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py` | 633 of 633 on Windows (both branches), Pi 4, Pico and Pico 2; `--mutants` 75 of 75 caught (the reduction is not in the operator-set kernels; unchanged) |
+| `runtime_mutants.py`: the 52 before, and two new: the Windows sum without its -0 correction, and the mean as a product with the reciprocal on the targets | 54 of 54 as required |
+| `tests/node_suite/targeted_ops.py`: 1,157 cases - the 1,105 before; ReduceMean and ReduceSum over the first axis, a middle axis, the first and last together, a negative middle axis and every axis listed, keepdims 0 and 1, in the attribute and the input form, axes absent with and without keepdims, and the empty-axes identity, on both paths; the data holds signed zeros and an all -0 slice | 1,157 of 1,157 as expected; `targeted_defaults`, `targeted_norm_small`, `targeted_control`, `targeted_optional_outputs` 148, 132, 41 and 14 as expected |
+| `ops_targets_gate.py`: every ReduceMean, ReduceSum and other reduction case, and the NaN, specials, Where and Cast cases, on the Pi 4, Pico and Pico 2 | 208 builds, 624 runs: 612 bit-identical to the Windows program, all 156 runs of the new forms among them; 8 within the tolerance and named in `TOLERANCE_ONLY`, as before; 4 INT64 ReduceL1 and ReduceSumSquare runs refused on the Pico and Pico 2, as the INT64 contract requires |
+| `pi4_control_gate.py` | 29 of 41, as before |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,248 both: the 20 official ReduceMean and ReduceSum cases run on the runtime-dimension path, which already reduced any axes, and pass before and after |
+| Models that use none of these forms (four models, fp32/fp16/bf16/int4, five targets), this change against `45690a5` | All 80 emitted sources, packs and manifests byte-identical; the 16 runtime-dimension sources build; 16 of the 32 fixed-shape images, the Pico and Pico 2 builds, differ because they link the changed reduction kernel; the four models' Windows outputs and all 30 outputs of their Pi 4, Pico and Pico 2 programs byte-identical |
+| Kokoro-82M, FP32 and INT8, for Windows | Source and pack byte-identical; `tensor_norm_small_windows.pbi` differs; the output byte-identical; 15 requests each, interleaved: FP32 1,263.8 against 1,259.9 ms median, INT8 1,006.1 against 1,003.5 |
+
+Every support-file procedure this change touches:
+
+| Support file | Procedure | |
+|---|---|---|
+| `tensor_norm_small.pmi` | `PmTensorReduce` | changed (sum and mean) |
+| `tensor_norm_small_windows.pbi` | `PmReduceTask` | changed (sum and mean, the pool's range) |
+| `tensor_norm_small_windows.pbi` | `PmTensorReduce` | changed (sum and mean, serial) |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

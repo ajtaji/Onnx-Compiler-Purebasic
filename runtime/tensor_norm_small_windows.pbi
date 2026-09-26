@@ -640,7 +640,9 @@ Procedure PmReduceTask(*j.PmReduceJob, task.i, worker.i)
   If last > *j\Outputs : last = *j\Outputs : EndIf
   For o = first To last - 1
     *t = *g\Dst + o * size
-    If *g\Op = 1
+    If *g\Op >= 2
+      PokeL(*t, $80000000)
+    ElseIf *g\Op = 1
       If *g\Kind = 1 : PokeL(*t, $3F800000) : Else : PmNsWriteInt(*t, 0, *g\Kind, 1) : EndIf
     Else
       Select *g\Kind
@@ -667,7 +669,12 @@ Procedure PmReduceTask(*j.PmReduceJob, task.i, worker.i)
       Next
       *s = *g\Src + at * size
       If *g\Kind = 1
-        If *g\Op = 1
+        If *g\Op >= 2
+          ; -0 + -0 is -0 (IEEE 754); the host compiler gives +0 (see PmOpAddF)
+          cur = PeekF(*t) : value = PeekF(*s) : cur = cur + value
+          If (PeekL(@cur) & $7FFFFFFF) = 0 And (PeekL(*t) & PeekL(*s) & $80000000) <> 0 : PokeL(@cur, $80000000) : EndIf
+          PokeF(*t, cur)
+        ElseIf *g\Op = 1
           cur = PeekF(*t) : value = PeekF(*s) : cur = cur * value : PokeF(*t, cur)
         ElseIf PmNsIsNan(*t) = 0 And (PmNsIsNan(*s) Or PeekF(*s) > PeekF(*t))
           PokeL(*t, PeekL(*s))
@@ -682,6 +689,10 @@ Procedure PmReduceTask(*j.PmReduceJob, task.i, worker.i)
         PmNsWriteInt(*t, 0, *g\Kind, ci)
       EndIf
     Next
+    If *g\Op = 3
+      ; the mean: the sum divided once by the number of elements it holds
+      cur = PeekF(*t) : value = *j\Reduced : cur = cur / value : PokeF(*t, cur)
+    EndIf
   Next
 EndProcedure
 
@@ -715,7 +726,9 @@ Procedure PmTensorReduce(*g.PmTensorReduceArgs)
   EndIf
   For i = 0 To outCount - 1
     *t = *g\Dst + i * size
-    If *g\Op = 1
+    If *g\Op >= 2
+      PokeL(*t, $80000000)
+    ElseIf *g\Op = 1
       If *g\Kind = 1 : PokeL(*t, $3F800000) : Else : PmNsWriteInt(*t, 0, *g\Kind, 1) : EndIf
     Else
       Select *g\Kind
@@ -735,7 +748,12 @@ Procedure PmTensorReduce(*g.PmTensorReduceArgs)
     Next
     *t = *g\Dst + target * size : *s = *g\Src + i * size
     If *g\Kind = 1
-      If *g\Op = 1
+      If *g\Op >= 2
+        ; -0 + -0 is -0 (IEEE 754); the host compiler gives +0 (see PmOpAddF)
+        cur = PeekF(*t) : value = PeekF(*s) : cur = cur + value
+        If (PeekL(@cur) & $7FFFFFFF) = 0 And (PeekL(*t) & PeekL(*s) & $80000000) <> 0 : PokeL(@cur, $80000000) : EndIf
+        PokeF(*t, cur)
+      ElseIf *g\Op = 1
         cur = PeekF(*t) : value = PeekF(*s) : cur = cur * value : PokeF(*t, cur)
       ElseIf PmNsIsNan(*t) = 0 And (PmNsIsNan(*s) Or PeekF(*s) > PeekF(*t))
         PokeL(*t, PeekL(*s))
@@ -750,6 +768,14 @@ Procedure PmTensorReduce(*g.PmTensorReduceArgs)
       PmNsWriteInt(*t, 0, *g\Kind, ci)
     EndIf
   Next
+  If *g\Op = 3
+    ; the mean: each sum divided once by the number of elements it holds
+    value = srcCount / outCount
+    For i = 0 To outCount - 1
+      *t = *g\Dst + i * size
+      cur = PeekF(*t) : cur = cur / value : PokeF(*t, cur)
+    Next
+  EndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------

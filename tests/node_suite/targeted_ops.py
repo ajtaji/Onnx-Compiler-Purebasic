@@ -1344,6 +1344,30 @@ def cases() -> list[Case]:
     c.append(Case("refuse_bitshift_uint16", [N("BitShift", ["x", "y"], ["z"], direction="LEFT")],
                   [("x", U16b, [3]), ("y", U16b, [3])], [("z", U16b, [3])],
                   {"x": np.array([1, 2, 3], np.uint16), "y": np.array([1, 2, 3], np.uint16)}, opset=11, refuse="UINT16"))
+    # ReduceMean and ReduceSum on any axes on both paths: the first, a middle
+    # and several axes, negative axes, absent axes (every axis), the
+    # empty-axes identity (-0 kept), keepdims 0 and 1, the attribute form
+    # (ReduceMean-13, ReduceSum-11) and the input form (ReduceSum-13,
+    # ReduceMean-18)
+    rng_rd = np.random.default_rng(8888)  # its own stream: the cases after these keep their data
+    rx = (rng_rd.standard_normal((3, 4, 5)) * 4).astype(np.float32)
+    rx.flat[:3] = [-0.0, 0.0, -0.0]
+    rx[:, 1, 2] = -0.0  # an all -0 slice: its sum and mean are -0
+    for op in ("ReduceMean", "ReduceSum"):
+        lo = op.lower()
+        for tag, axes, keep, oshape in (("axis0", [0], 1, [1, 4, 5]), ("middle", [1], 0, [3, 5]), ("first_last", [0, -1], 1, [1, 4, 1]),
+                                        ("neg_middle", [-2], 1, [3, 1, 5]), ("all_axes_listed", [0, 1, 2], 0, [])):
+            c.append(Case("%s_any_%s_attr" % (lo, tag), [N(op, ["x"], ["y"], axes=axes, keepdims=keep)], [("x", F, [3, 4, 5])],
+                          [("y", F, oshape)], {"x": rx}, opset=11, oracle="ref"))
+            c.append(Case("%s_any_%s_input" % (lo, tag), [N(op, ["x", "a"], ["y"], keepdims=keep)], [("x", F, [3, 4, 5])],
+                          [("y", F, oshape)], {"x": rx}, [numpy_helper.from_array(np.array(axes, np.int64), "a")],
+                          opset=18 if op == "ReduceMean" else 13, oracle="ref"))
+        c.append(Case("%s_any_absent_keep" % lo, [N(op, ["x"], ["y"], keepdims=1)], [("x", F, [3, 4, 5])], [("y", F, [1, 1, 1])],
+                      {"x": rx}, opset=11, oracle="ref"))
+        c.append(Case("%s_any_absent_drop" % lo, [N(op, ["x"], ["y"], keepdims=0)], [("x", F, [3, 4, 5])], [("y", F, [])],
+                      {"x": rx}, opset=11, oracle="ref"))
+        c.append(Case("%s_any_noop_empty" % lo, [N(op, ["x"], ["y"], keepdims=1, noop_with_empty_axes=1)], [("x", F, [3, 4, 5])],
+                      [("y", F, [3, 4, 5])], {"x": rx}, opset=18, oracle="ref"))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

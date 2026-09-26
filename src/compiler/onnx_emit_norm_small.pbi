@@ -280,7 +280,8 @@ Procedure.i PmoEmitNsReduce(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, ProcName.
   If *Data = 0 Or *Y = 0 : ProcedureReturn PmoEmitNsFail(*Node, "input data and its output need concrete shapes.") : EndIf
   Rank = PmoEmitRank(*Data)
   If Rank > 8 : ProcedureReturn PmoEmitNsFail(*Node, "the input rank " + Str(Rank) + " exceeds eight.") : EndIf
-  If Opset >= 18
+  ; the axes became an input at ReduceSum-13 and at the others' 18
+  If Opset >= 18 Or (Op = "ReduceSum" And Opset >= 13)
     If PmoEmitNsAttributesAllowed(*Node, "|keepdims|noop_with_empty_axes|", Opset) = 0 : ProcedureReturn #False : EndIf
     If PmoEmitInput(*Node, 1) <> ""
       *Axes = PmoEmitConstant(*Ir, PmoEmitInput(*Node, 1))
@@ -290,7 +291,7 @@ Procedure.i PmoEmitNsReduce(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, ProcName.
     Noop = Bool(PmoEmitAttrI(*Node, "noop_with_empty_axes", 0) <> 0)
   Else
     If PmoEmitNsAttributesAllowed(*Node, "|axes|keepdims|", Opset) = 0 : ProcedureReturn #False : EndIf
-    If PmoEmitInput(*Node, 1) <> "" : ProcedureReturn PmoEmitNsFail(*Node, "input axes is not part of " + Op + " before opset 18; axes is an attribute there.") : EndIf
+    If PmoEmitInput(*Node, 1) <> "" : ProcedureReturn PmoEmitNsFail(*Node, "input axes is not part of " + Op + " at opset " + Str(Opset) + "; axes is an attribute there.") : EndIf
     Count = PmoEmitAttrListCount(*Node, "axes")
   EndIf
   If Op = "ReduceMax" And *Data\ElementType <> 1 And *Data\ElementType <> 7 And *Data\ElementType <> 9
@@ -298,6 +299,9 @@ Procedure.i PmoEmitNsReduce(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, ProcName.
   EndIf
   If Op = "ReduceProd" And *Data\ElementType <> 1 And *Data\ElementType <> 7
     ProcedureReturn PmoEmitNsFail(*Node, "data type " + PmoEmitNsTypeName(*Data\ElementType) + " is not implemented by fixed-shape emission; FLOAT and INT64 are.")
+  EndIf
+  If (Op = "ReduceMean" Or Op = "ReduceSum") And *Data\ElementType <> 1
+    ProcedureReturn PmoEmitNsFail(*Node, "data type " + PmoEmitNsTypeName(*Data\ElementType) + " is not implemented; FLOAT is.")
   EndIf
   For Index = 0 To Count - 1
     If *Axes : Axis = PmoEmitConstI(*Ir, PmoEmitInput(*Node, 1), Index, @Ok) : Else : Axis = PmoEmitAttrListI(*Node, "axes", Index, 0) : EndIf
@@ -323,7 +327,7 @@ Procedure.i PmoEmitNsReduce(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, ProcName.
   PmoEmitLine(File, "  " + ProcName + "Args\Rank = " + Str(Rank))
   PmoEmitLine(File, "  " + ProcName + "Args\Dims = @" + ProcName + "Dims(0)")
   PmoEmitLine(File, "  " + ProcName + "Args\Mask = " + Str(Mask))
-  PmoEmitLine(File, "  " + ProcName + "Args\Op = " + Str(Bool(Op = "ReduceProd")))
+  PmoEmitLine(File, "  " + ProcName + "Args\Op = " + Str(Bool(Op = "ReduceProd") + 2 * Bool(Op = "ReduceSum") + 3 * Bool(Op = "ReduceMean")))
   PmoEmitLine(File, "  " + ProcName + "Args\Kind = " + Str(*Data\ElementType))
   PmoEmitLine(File, "  PmTensorReduce(@" + ProcName + "Args)")
   PmoEmitLine(File, "EndProcedure") : PmoEmitLine(File)
@@ -441,7 +445,7 @@ Procedure.i PmoEmitNormSmallHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Ma
     Case "Not" : Done = PmoEmitNsNot(File, *Ir, *Ref, ProcName, Opset)
     Case "TopK" : Done = PmoEmitNsTopK(File, *Ir, *Ref, ProcName, Opset)
     Case "ScatterElements", "Scatter" : Done = PmoEmitNsScatterElements(File, *Ir, *Ref, ProcName, Opset)
-    Case "ReduceMax", "ReduceProd" : Done = PmoEmitNsReduce(File, *Ir, *Ref, ProcName, Opset)
+    Case "ReduceMax", "ReduceProd", "ReduceMean", "ReduceSum" : Done = PmoEmitNsReduce(File, *Ir, *Ref, ProcName, Opset)
     Case "Pad" : Done = PmoEmitNsPad(File, *Ir, *Ref, ProcName, Opset)
   EndSelect
   If Done = 0 Or PmoEmitError <> "" : ProcedureReturn #False : EndIf

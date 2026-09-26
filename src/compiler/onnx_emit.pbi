@@ -932,6 +932,26 @@ EndProcedure
 XIncludeFile "onnx_emit_norm_small.pbi"
 XIncludeFile "onnx_emit_ops.pbi"
 
+; 1 when a ReduceMean or ReduceSum node names exactly one axis, the last:
+; the form the contiguous kernels (PmTensorReduceMeanLast/SumLast) compute.
+Procedure.i PmoEmitReduceLastAxis(*Ir.PmoIrModel, *Node.PmoOnnxNode)
+  Protected *A.PmoIrValue = PmoEmitValue(*Ir, PmoEmitInput(*Node, 0)), *C.PmoIrConstant, Rank.i, Axis.q, Ok.Integer
+  If *A = 0 : ProcedureReturn #False : EndIf
+  Rank = PmoEmitRank(*A)
+  If ListSize(*Node\Inputs()) > 1 And PmoEmitInput(*Node, 1) <> ""
+    *C = PmoEmitConstant(*Ir, PmoEmitInput(*Node, 1))
+    If *C = 0 Or *C\Elements <> 1 : ProcedureReturn #False : EndIf
+    Axis = PmoEmitConstI(*Ir, PmoEmitInput(*Node, 1), 0, @Ok)
+    If Ok\i = 0 : ProcedureReturn #False : EndIf
+  ElseIf PmoEmitAttrListCount(*Node, "axes") = 1
+    Axis = PmoEmitAttrListI(*Node, "axes", 0, 0)
+  Else
+    ProcedureReturn #False
+  EndIf
+  If Axis < 0 : Axis + Rank : EndIf
+  ProcedureReturn Bool(Axis = Rank - 1)
+EndProcedure
+
 Procedure.i PmoEmitGeneratedHelpers(File.i, *Ir.PmoIrModel, *Profile.PmoTargetProfile, Map Calls.s())
   Protected Op.s
   ClearMap(Calls())
@@ -970,6 +990,12 @@ Procedure.i PmoEmitGeneratedHelpers(File.i, *Ir.PmoIrModel, *Profile.PmoTargetPr
         If PmoEmitExpandHelper(File, *Ir, @*Ir\Nodes(), Calls()) = 0 : ProcedureReturn #False : EndIf
       Case "InstanceNormalization", "TopK", "ScatterElements", "Scatter", "ReduceMax", "ReduceProd", "Not", "Pad"
         If PmoEmitNormSmallHelper(File, *Ir, @*Ir\Nodes(), Calls()) = 0 : ProcedureReturn #False : EndIf
+      Case "ReduceMean", "ReduceSum"
+        ; the single final axis keeps its contiguous kernel; any other axes
+        ; set, absent axes and the empty-axes identity take the general one
+        If PmoEmitReduceLastAxis(*Ir, *Ir\Nodes()\Node) = 0
+          If PmoEmitNormSmallHelper(File, *Ir, @*Ir\Nodes(), Calls()) = 0 : ProcedureReturn #False : EndIf
+        EndIf
       Case "NonZero"
         If PmoEmitNonZeroHelper(File, *Ir, @*Ir\Nodes(), Calls()) = 0 : ProcedureReturn #False : EndIf
       Case "ScatterND"
