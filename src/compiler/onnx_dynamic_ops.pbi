@@ -366,7 +366,7 @@ Procedure.i PmdOpsValidate(*Node.PmoOnnxNode)
         Reason = PmdNsTypeReason(*Node, 0, "input", "|1|2|3|6|7|9|")
         If Reason = "" And PmoEmitNsAttributePresent(*Node, "to") = 0 : Reason = "attribute to is required." : EndIf
         If Reason = "" And FindString("|1|2|3|6|7|9|", "|" + Str(PmoEmitAttrI(*Node, "to", 0)) + "|") = 0
-          Reason = "to = " + Str(PmoEmitAttrI(*Node, "to", 0)) + " is not implemented; FLOAT, UINT8, INT8, INT32, INT64 and BOOL are."
+          Reason = "to = " + PmoTypeLabel(PmoEmitAttrI(*Node, "to", 0)) + " is not implemented; FLOAT, UINT8, INT8, INT32, INT64 and BOOL are."
         EndIf
         If Reason = "" And PmdNsDeclaredType(PmoEmitInput(*Node, 0)) <> 0
           If PmdOpsKindWidth(PmdNsDeclaredType(PmoEmitInput(*Node, 0))) <> PmdOpsKindWidth(PmoEmitAttrI(*Node, "to", 0))

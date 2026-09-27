@@ -437,6 +437,29 @@ Procedure.i PmoCompileSupportedOp(Operation.s)
   ProcedureReturn Bool(FindString("|Add|Sub|Mul|Div|Pow|Relu|LeakyRelu|Sigmoid|Tanh|Exp|Log|Sqrt|Abs|Neg|Sin|Cos|Atan|Floor|Round|MatMul|Gemm|Softmax|ReduceMean|ReduceSum|CumSum|LayerNormalization|BatchNormalization|Conv|ConvTranspose|Clip|Resize|STFT|LSTM|Gather|Cast|Range|Equal|Greater|GreaterOrEqual|Less|LessOrEqual|And|Where|Slice|Expand|Pad|NonZero|ScatterND|Identity|InstanceNormalization|TopK|ScatterElements|Scatter|ReduceMax|ReduceProd|Not|Reshape|Flatten|Squeeze|Unsqueeze|Transpose|Concat|RandomNormal|RandomNormalLike|RandomUniform|RandomUniformLike|Bernoulli|Multinomial|", "|" + Operation + "|"))
 EndProcedure
 
+; An operator no path implements because of the kind of value it works on
+; (strings, images, optional values) is refused by that kind, before either
+; path is chosen, so both give the same sentence; subgraphs are searched too.
+Procedure.s PmoCompileUnsupportedKind(*Graph.PmoOnnxGraph)
+  Protected Reason.s
+  ForEach *Graph\Nodes()
+    Reason = PmoUnsupportedReason(*Graph\Nodes()\Operation)
+    If Reason <> "" And (*Graph\Nodes()\Domain = "" Or *Graph\Nodes()\Domain = "ai.onnx")
+      If *Graph\Nodes()\Name <> ""
+        ProcedureReturn *Graph\Nodes()\Operation + " node '" + *Graph\Nodes()\Name + "' " + Reason
+      EndIf
+      ProcedureReturn *Graph\Nodes()\Operation + " node (unnamed) " + Reason
+    EndIf
+    ForEach *Graph\Nodes()\Attributes()
+      If *Graph\Nodes()\Attributes()\Graph
+        Reason = PmoCompileUnsupportedKind(*Graph\Nodes()\Attributes()\Graph)
+        If Reason <> "" : ProcedureReturn Reason : EndIf
+      EndIf
+    Next
+  Next
+  ProcedureReturn ""
+EndProcedure
+
 Procedure.i PmoCompileValidate(*Ir.PmoIrModel)
   NewMap Produced.i()
   Protected DefaultOpset.q
@@ -491,7 +514,7 @@ Procedure.i PmoCompileValidate(*Ir.PmoIrModel)
       If *Value\ElementType <> 1 And *Value\ElementType <> 7 And *Value\ElementType <> 9 And
          Not ((*Value\ElementType = 2 Or *Value\ElementType = 3 Or *Value\ElementType = 6) And
               FindString("|QuantizeLinear|DequantizeLinear|DynamicQuantizeLinear|MatMulInteger|QLinearMatMul|ConvInteger|QLinearConv|Cast|Bernoulli|Multinomial|CumProd|BitCast|TensorScatter|BitShift|Identity|Reshape|Flatten|Squeeze|Unsqueeze|Neg|Abs|", "|" + *Ir\Nodes()\Node\Operation + "|"))
-        ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " output " + Name + " uses unsupported runtime type " + Str(*Value\ElementType))
+        ProcedureReturn PmoCompileFail("node " + Str(NodeIndex) + " output " + Name + " uses unsupported runtime type " + PmoTypeLabel(*Value\ElementType))
       EndIf
       Produced(Name) = #True
     Next
@@ -980,6 +1003,8 @@ Procedure.i PmoCompileCommand(ModelPath.s)
     ProcedureReturn PmoCompileFail("--kokoro-text requires pi4 or unoq; Windows uses --speech-ui. Full Kokoro cannot fit Pico RAM.")
   EndIf
   If PmoOnnxLoad(ModelPath, @Model) = 0 : ProcedureReturn PmoCompileFail(PmoWireError) : EndIf
+  RandomReason = PmoCompileUnsupportedKind(@Model\Graph)
+  If RandomReason <> "" : PmoCompileFail(RandomReason) : Goto PmoCompileCommandFailed : EndIf
   RandomReason = PmoCompileFoldMel(@Model)
   If RandomReason <> "" : PmoCompileFail(RandomReason) : Goto PmoCompileCommandFailed : EndIf
   ForEach Shapes()

@@ -80,7 +80,7 @@ Procedure.s PmoEmitNsTypeName(ElementType.i)
     Case 7 : ProcedureReturn "INT64"
     Case 9 : ProcedureReturn "BOOL"
   EndSelect
-  ProcedureReturn "element type " + Str(ElementType)
+  ProcedureReturn PmoTypeName(ElementType)
 EndProcedure
 
 Procedure.i PmoEmitNsAttributePresent(*Node.PmoOnnxNode, Name.s)

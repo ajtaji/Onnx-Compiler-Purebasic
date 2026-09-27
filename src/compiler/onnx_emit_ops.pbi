@@ -1415,7 +1415,7 @@ Procedure.i PmoEmitOpsBitCast(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, ProcNam
   If PmoEmitNsAttributePresent(*Node, "to") = 0 : ProcedureReturn PmoEmitNsFail(*Node, "attribute to is required.") : EndIf
   Kind = PmoEmitAttrI(*Node, "to", 0)
   If PmoOpsKindWidth(Kind) = 0
-    ProcedureReturn PmoEmitNsFail(*Node, "to = " + Str(Kind) + " (" + PmoEmitNsTypeName(Kind) + ") is not implemented; FLOAT, UINT8, INT8, INT32, INT64 and BOOL are.")
+    ProcedureReturn PmoEmitNsFail(*Node, "to = " + PmoTypeLabel(Kind) + " is not implemented; FLOAT, UINT8, INT8, INT32, INT64 and BOOL are.")
   EndIf
   If PmoOpsKindWidth(Kind) <> PmoOpsKindWidth(*X\ElementType)
     ProcedureReturn PmoEmitNsFail(*Node, "to = " + PmoEmitNsTypeName(Kind) + " has another bit width than the input's " + PmoEmitNsTypeName(*X\ElementType) + "; BitCast keeps the width.")

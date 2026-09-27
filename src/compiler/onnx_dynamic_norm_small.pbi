@@ -139,7 +139,7 @@ Procedure.s PmdNsTypeName(ElementType.i)
     Case 13 : ProcedureReturn "UINT64"
     Case 16 : ProcedureReturn "BFLOAT16"
   EndSelect
-  ProcedureReturn "element type " + Str(ElementType)
+  ProcedureReturn PmoTypeName(ElementType)
 EndProcedure
 
 ; "" when input Index of the node is undeclared or of a type in Allowed

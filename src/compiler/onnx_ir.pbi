@@ -185,7 +185,7 @@ Procedure.i PmoIrAddValue(*Ir.PmoIrModel, *Value.PmoOnnxValue)
   ElementBytes = PmoIrElementBytes(*Value\ElementType)
   If ElementBytes = 0
     ProcedureReturn PmoIrFail("tensor " + *Value\Name + " uses unsupported ONNX type " +
-                              Str(*Value\ElementType))
+                              PmoTypeLabel(*Value\ElementType))
   EndIf
   NewList Shape.q()
   ForEach *Value\Dims()

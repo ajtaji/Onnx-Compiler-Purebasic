@@ -179,7 +179,7 @@ Procedure.s PmoEmitGet(ElementType.i, Pointer.s, Index.s)
     Case 3 : ProcedureReturn "(((PeekA(" + Pointer + " + " + Index + ") & 255) ! 128) - 128)"
     Case 6 : ProcedureReturn "PeekL(" + Pointer + " + (" + Index + ") * 4)"
   EndSelect
-  PmoEmitFail("no generated load for ONNX tensor type " + Str(ElementType))
+  PmoEmitFail("no generated load for ONNX tensor type " + PmoTypeLabel(ElementType))
   ProcedureReturn "0"
 EndProcedure
 
@@ -191,7 +191,7 @@ Procedure.s PmoEmitPut(ElementType.i, Pointer.s, Index.s, Value.s)
     Case 2, 3 : ProcedureReturn "PokeA(" + Pointer + " + " + Index + ", (" + Value + ") & 255)"
     Case 6 : ProcedureReturn "PokeL(" + Pointer + " + (" + Index + ") * 4, " + Value + ")"
   EndSelect
-  PmoEmitFail("no generated store for ONNX tensor type " + Str(ElementType))
+  PmoEmitFail("no generated store for ONNX tensor type " + PmoTypeLabel(ElementType))
   ProcedureReturn ""
 EndProcedure
 
@@ -788,7 +788,7 @@ Procedure.i PmoEmitScatterHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map 
   ; ScatterND-18: each update is combined with the element already at its
   ; destination, in index order, so a repeated index accumulates.
   If Reduction <> "none" And *Data\ElementType <> 1 And *Data\ElementType <> 7
-    ProcedureReturn PmoEmitFail("ScatterND reduction " + Reduction + " is implemented for FLOAT and INT64 data; this data is ONNX type " + Str(*Data\ElementType))
+    ProcedureReturn PmoEmitFail("ScatterND reduction " + Reduction + " is implemented for FLOAT and INT64 data; this data is ONNX type " + PmoTypeLabel(*Data\ElementType))
   EndIf
   If *Data\ElementType = 7 : Scalar = ".i" : EndIf
   Depth = PmoEmitDim(*Indices, PmoEmitRank(*Indices) - 1)

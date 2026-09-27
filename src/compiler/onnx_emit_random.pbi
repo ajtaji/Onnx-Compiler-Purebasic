@@ -61,7 +61,7 @@ Procedure.s PmoRandomTypeName(ElementType.i)
     Case 12 : ProcedureReturn "UINT32"
     Case 13 : ProcedureReturn "UINT64"
   EndSelect
-  ProcedureReturn "type " + Str(ElementType)
+  ProcedureReturn PmoTypeName(ElementType)
 EndProcedure
 
 Procedure.s PmoRandomLabel(*Node.PmoOnnxNode, NodeIndex.i)

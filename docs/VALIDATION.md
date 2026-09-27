@@ -1638,6 +1638,38 @@ Every support-file procedure this change touches:
 | `tensor_norm_small_windows.pbi` | `PmReduceTask` | changed (sum and mean, the pool's range) |
 | `tensor_norm_small_windows.pbi` | `PmTensorReduce` | changed (sum and mean, serial) |
 
+## Refusals that name what they refuse — September 26, 2026
+
+A refusal now names what it refuses. Nothing here changes what compiles or
+what a compiled program computes; only the sentences change.
+
+- **Element types by name.** Every sentence that gave an ONNX element type
+  as a number now gives its name and code: "FLOAT16 (10)", not "type 10".
+  This covers the graph's inputs and values, Cast's `to`, the kernels' data
+  types, sequences, and a sparse Constant.
+- **Operators refused for the kind of value they work on.** These are
+  refused before either path is chosen, so the fixed-shape and
+  runtime-dimension paths give the same sentence, and a node inside an If or
+  Loop branch is found too. Each sentence names the node and says what to do
+  instead:
+  - StringNormalizer, StringConcat, StringSplit and RegexFullMatch work on
+    STRING tensors, which the compiler does not carry. Turn the text into
+    numbers, token ids for example, before the model.
+  - ImageDecoder decodes compressed image bytes, and the compiler carries no
+    image codec. Decode the image before the model and feed it the pixels.
+  - Optional, OptionalHasElement and OptionalGetElement work on optional
+    values. Give the model a plain tensor or sequence instead.
+
+| Check | Result |
+|---|---|
+| `tests/node_suite/targeted_ops.py`: 1,175 cases - the 1,157 before; StringConcat, RegexFullMatch, StringNormalizer, StringSplit, ImageDecoder (named), Optional with OptionalHasElement, Optional inside an If branch, Cast to FLOAT16 and a FLOAT16 input, each refused with its sentence on both paths | 1,175 of 1,175 as expected; `targeted_defaults`, `targeted_norm_small`, `targeted_control`, `targeted_optional_outputs` 148, 132, 41 and 14 as expected |
+| `ops_kernel_check.py`, `runtime_mutants.py` | 633 of 633 on every target and 75 of 75 mutants caught; 54 of 54 as required |
+| `ops_targets_gate.py`: the NaN, specials, reduction and Cast cases on the Pi 4, Pico and Pico 2 | 606 runs: 594 bit-identical to the Windows program; 8 within the tolerance and named in `TOLERANCE_ONLY` and 4 INT64 runs refused on the Pico and Pico 2, as before |
+| `pi4_control_gate.py` | 29 of 41, as before |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,248 both, and no outcome changes. The sentences of 358 refused cases change: 315 name an element type, 20 name STRING tensors, 13 optional values, 9 the image codec, and one optional graph input says what to give instead |
+| Models (four models, fp32/fp16/bf16/int4, five targets), this change against `aebec1e` | All 80 emitted sources, packs and manifests and all 32 fixed-shape images byte-identical; the 16 runtime-dimension sources build; the four models' Windows outputs and all 30 outputs of their Pi 4, Pico and Pico 2 programs byte-identical |
+| Kokoro-82M, FP32 and INT8, for Windows | Source, pack and support files byte-identical; the output byte-identical |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

@@ -49,7 +49,7 @@ Procedure.i PmoTraceValidateFeed(*Input.PmoOnnxValue, *Array.PmoNpyArray)
   Protected Index.i
   If *Input\ElementType <> *Array\ElementType
     ProcedureReturn PmoTraceFail("trace input " + *Input\Name + " has ONNX type " +
-                                 Str(*Array\ElementType) + ", expected " + Str(*Input\ElementType))
+                                 PmoTypeLabel(*Array\ElementType) + ", expected " + PmoTypeLabel(*Input\ElementType))
   EndIf
   If *Input\HasShape And ListSize(*Input\Dims()) <> ListSize(*Array\Dims())
     ProcedureReturn PmoTraceFail("trace input " + *Input\Name + " has the wrong rank")

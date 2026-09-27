@@ -770,7 +770,7 @@ def cases() -> list[Case]:
             c.append(Case("%s_periodic%d" % (op.lower(), periodic), [N(op, ["n"], ["w"], periodic=periodic), N("Add", ["w", "x"], ["y"])],
                           [("x", F, [10])], [("y", F, [10])], {"x": np.zeros(10, np.float32)}, [init("n", np.array(10, np.int64))],
                           opset=17))
-    for fixed_path, text in ((True, "uses unsupported runtime type 11"), (False, "output_datatype DOUBLE is not implemented")):
+    for fixed_path, text in ((True, "uses unsupported runtime type DOUBLE (11)"), (False, "output_datatype DOUBLE is not implemented")):
         c.append(Case("refuse_hannwindow_double" + ("" if fixed_path else "_runtime"),
                       [N("HannWindow", ["n"], ["w"], output_datatype=11), N("Cast", ["w"], ["w32"], to=F), N("Add", ["w32", "x"], ["y"])],
                       [("x", F, [10])], [("y", F, [10])], {"x": np.zeros(10, np.float32)}, [init("n", np.array(10, np.int64))], opset=17,
@@ -1368,6 +1368,32 @@ def cases() -> list[Case]:
                       {"x": rx}, opset=11, oracle="ref"))
         c.append(Case("%s_any_noop_empty" % lo, [N(op, ["x"], ["y"], keepdims=1, noop_with_empty_axes=1)], [("x", F, [3, 4, 5])],
                       [("y", F, [3, 4, 5])], {"x": rx}, opset=18, oracle="ref"))
+    # named refusals: an operator refused for the kind of value it works on
+    # says which kind, on both paths, and an element type is named, not numbered
+    S8, U8 = TensorProto.STRING, TensorProto.UINT8
+    words = np.array(["a", "b"], dtype=object)
+    c.append(Case("refuse_string_concat", [N("StringConcat", ["x", "y"], ["z"])], [("x", S8, [2]), ("y", S8, [2])], [("z", S8, [2])],
+                  {"x": words, "y": words}, opset=20, symbolic_axes=(), refuse="StringConcat node (unnamed) works on STRING tensors"))
+    c.append(Case("refuse_regex_full_match", [N("RegexFullMatch", ["x"], ["y"], pattern="a+")], [("x", S8, [2])], [("y", B, [2])],
+                  {"x": words}, opset=20, symbolic_axes=(), refuse="RegexFullMatch node (unnamed) works on STRING tensors"))
+    c.append(Case("refuse_string_normalizer", [N("StringNormalizer", ["x"], ["y"], case_change_action="LOWER")], [("x", S8, [2])],
+                  [("y", S8, [2])], {"x": words}, opset=20, symbolic_axes=(), refuse="StringNormalizer node (unnamed) works on STRING tensors"))
+    c.append(Case("refuse_string_split", [N("StringSplit", ["x"], ["y", "n"])], [("x", S8, [2])], [("y", S8, [2, 1]), ("n", I64, [2])],
+                  {"x": words}, opset=20, symbolic_axes=(), refuse="StringSplit node (unnamed) works on STRING tensors"))
+    c.append(Case("refuse_image_decoder", [N("ImageDecoder", ["x"], ["y"], name="decode")], [("x", U8, [16])], [("y", U8, [2, 2, 3])],
+                  {"x": np.zeros(16, np.uint8)}, opset=20, symbolic_axes=(), refuse="ImageDecoder node 'decode' decodes compressed image bytes"))
+    c.append(Case("refuse_optional_has_element", [N("Optional", ["x"], ["o"]), N("OptionalHasElement", ["o"], ["h"])], [("x", F, [3])],
+                  [("h", B, [])], {"x": f32(3)}, opset=18, refuse="Optional node (unnamed) works on optional values"))
+    c.append(Case("refuse_optional_in_branch", [N("If", ["c"], ["y"], then_branch=helper.make_graph(
+        [N("Optional", ["x"], ["o"]), N("OptionalGetElement", ["o"], ["t"]), N("Identity", ["t"], ["r"])], "then", [],
+        [helper.make_tensor_value_info("r", F, [3])]), else_branch=helper.make_graph(
+        [N("Identity", ["x"], ["r2"])], "else", [], [helper.make_tensor_value_info("r2", F, [3])]))],
+        [("c", B, []), ("x", F, [3])], [("y", F, [3])], {"c": np.array(True), "x": f32(3)}, opset=18, symbolic_axes=(),
+        refuse="Optional node (unnamed) works on optional values"))
+    c.append(Case("refuse_cast_float16_named", [N("Cast", ["x"], ["y"], to=TensorProto.FLOAT16), N("Cast", ["y"], ["z"], to=F)],
+                  [("x", F, [3])], [("z", F, [3])], {"x": f32(3)}, opset=20, refuse="to = FLOAT16 (10) is not implemented by"))
+    c.append(Case("refuse_input_float16_named", [N("Abs", ["x"], ["y"])], [("x", TensorProto.FLOAT16, [3])], [("y", TensorProto.FLOAT16, [3])],
+                  {"x": np.ones(3, np.float16)}, opset=20, refuse="FLOAT16 (10)"))
     # Bernoulli and Multinomial: this compiler's specified generator
     bp = RNG.uniform(0, 1, (3, 4, 5)).astype(np.float32)
     bp.flat[:4] = [0.0, 1.0, np.nan, 0.5]

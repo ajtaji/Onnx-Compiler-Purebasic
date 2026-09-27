@@ -296,7 +296,7 @@ Procedure.i PmcDensify(*Node.PmoOnnxNode, *Attribute.PmoOnnxAttribute, *Tensor.P
   EndIf
   Width = PmoIrElementBytes(*Attribute\SparseValues\DataType)
   If Width = 0
-    ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value holds ONNX element type " + Str(*Attribute\SparseValues\DataType) + ", which this compiler does not carry.")
+    ProcedureReturn PmcFail(PmcLabel(*Node) + " attribute sparse_value holds ONNX element type " + PmoTypeLabel(*Attribute\SparseValues\DataType) + ", which this compiler does not carry.")
   EndIf
   Rank = ListSize(*Attribute\SparseDims())
   Dim Stride.q(Rank)
@@ -916,12 +916,12 @@ Procedure.i PmcInferGraph(*Graph.PmoOnnxGraph, IsTop.i, Depth.i)
           PmcSetKind(*Graph\Inputs()\Name, #PMC_KIND_TENSOR)
         Case #PMO_VALUE_SEQUENCE
           If PmcElementTypeCarried(*Graph\Inputs()\SequenceElementType) = 0
-            ProcedureReturn PmcFail("Graph input '" + *Graph\Inputs()\Name + "' is a sequence of element type " + Str(*Graph\Inputs()\SequenceElementType) + "; a sequence input must declare FLOAT, INT32, INT64 or BOOL tensors.")
+            ProcedureReturn PmcFail("Graph input '" + *Graph\Inputs()\Name + "' is a sequence of element type " + PmoTypeLabel(*Graph\Inputs()\SequenceElementType) + "; a sequence input must declare FLOAT, INT32, INT64 or BOOL tensors.")
           EndIf
           PmcUsed = #True
           PmcSetKind(*Graph\Inputs()\Name, #PMC_KIND_SEQUENCE, *Graph\Inputs()\SequenceElementType)
         Case #PMO_VALUE_OPTIONAL
-          ProcedureReturn PmcFail("Graph input '" + *Graph\Inputs()\Name + "' is an optional value; optional types (Optional, OptionalHasElement, OptionalGetElement) are not implemented.")
+          ProcedureReturn PmcFail("Graph input '" + *Graph\Inputs()\Name + "' is an optional value, which this compiler does not carry. Give the model a plain tensor or sequence in place of the optional value.")
         Default
           ProcedureReturn PmcFail("Graph input '" + *Graph\Inputs()\Name + "' is a map, sparse tensor or nested sequence, which this compiler does not carry.")
       EndSelect
@@ -1263,7 +1263,7 @@ Procedure.i PmcLowerSequenceMap(*Top.PmoOnnxGraph, *Graph.PmoOnnxGraph, Map Take
     SelectElement(*Body\Outputs(), j)
     Element(j) = *Body\Outputs()\ElementType
     If PmcElementTypeCarried(Element(j)) = 0
-      ProcedureReturn PmcFail(Label + " body output " + Str(j) + " declares element type " + Str(Element(j)) + "; declare FLOAT, INT32, INT64 or BOOL, the element type of the output sequence.")
+      ProcedureReturn PmcFail(Label + " body output " + Str(j) + " declares element type " + PmoTypeLabel(Element(j)) + "; declare FLOAT, INT32, INT64 or BOOL, the element type of the output sequence.")
     EndIf
   Next
   For j = 0 To Count - 1

@@ -54,7 +54,7 @@ Procedure.s PmoEmitClipBound(*Ir.PmoIrModel, *Node.PmoOnnxNode, Position.i, Attr
     ProcedureReturn ""
   EndIf
   If *Bound\ElementType <> 1
-    PmoEmitNodeFail(*Node, "input " + Attribute + " is ONNX element type " + Str(*Bound\ElementType) + "; fixed-shape emission clips FLOAT tensors, so the bound must be FLOAT (1).")
+    PmoEmitNodeFail(*Node, "input " + Attribute + " is ONNX element type " + PmoTypeLabel(*Bound\ElementType) + "; fixed-shape emission clips FLOAT tensors, so the bound must be FLOAT (1).")
     ProcedureReturn ""
   EndIf
   If *Bound\Elements <> 1
@@ -72,7 +72,7 @@ Procedure.i PmoEmitClipCall(File.i, *Ir.PmoIrModel, *Node.PmoOnnxNode, Source.s,
   Protected Hi.s
   If *X = 0 : ProcedureReturn PmoEmitNodeFail(*Node, "input has no tensor.") : EndIf
   If *X\ElementType <> 1
-    ProcedureReturn PmoEmitNodeFail(*Node, "input is ONNX element type " + Str(*X\ElementType) + "; fixed-shape emission implements Clip for FLOAT (1) only.")
+    ProcedureReturn PmoEmitNodeFail(*Node, "input is ONNX element type " + PmoTypeLabel(*X\ElementType) + "; fixed-shape emission implements Clip for FLOAT (1) only.")
   EndIf
   Lo = PmoEmitClipBound(*Ir, *Node, 1, "min", -3.402823466e+38, MinAddress)
   If Lo = "" : ProcedureReturn #False : EndIf
@@ -132,7 +132,7 @@ Procedure.i PmoEmitSoftmaxShape(*Ir.PmoIrModel, *Node.PmoOnnxNode, *Outer.Quad, 
   Protected Opset.q = PmoEmitOpset(*Ir)
   If *X = 0 : ProcedureReturn PmoEmitNodeFail(*Node, "input has no tensor.") : EndIf
   If *X\ElementType <> 1
-    ProcedureReturn PmoEmitNodeFail(*Node, "input is ONNX element type " + Str(*X\ElementType) + "; fixed-shape emission implements Softmax for FLOAT (1) only.")
+    ProcedureReturn PmoEmitNodeFail(*Node, "input is ONNX element type " + PmoTypeLabel(*X\ElementType) + "; fixed-shape emission implements Softmax for FLOAT (1) only.")
   EndIf
   Rank = PmoEmitRank(*X)
   If Opset >= 13 : Given = PmoEmitAttrI(*Node, "axis", -1) : Else : Given = PmoEmitAttrI(*Node, "axis", 1) : EndIf
@@ -234,13 +234,13 @@ Procedure.i PmoEmitPowHelper(File.i, *Ir.PmoIrModel, *Ref.PmoIrNodeRef, Map Call
   Protected IB.s
   If *A = 0 Or *B = 0 Or *Out = 0 : ProcedureReturn PmoEmitNodeFail(*Node, "an operand or the result has no tensor.") : EndIf
   If *A\ElementType <> 1 And *A\ElementType <> 7
-    ProcedureReturn PmoEmitNodeFail(*Node, "the base is ONNX element type " + Str(*A\ElementType) + "; fixed-shape emission implements Pow for a FLOAT (1) or INT64 (7) base.")
+    ProcedureReturn PmoEmitNodeFail(*Node, "the base is ONNX element type " + PmoTypeLabel(*A\ElementType) + "; fixed-shape emission implements Pow for a FLOAT (1) or INT64 (7) base.")
   EndIf
   If PmoEmitPowRead(*B\ElementType, "*b", "0") = ""
-    ProcedureReturn PmoEmitNodeFail(*Node, "the exponent is ONNX element type " + Str(*B\ElementType) + "; fixed-shape emission reads a FLOAT (1), INT32 (6), INT64 (7), UINT32 (12) or UINT64 (13) exponent.")
+    ProcedureReturn PmoEmitNodeFail(*Node, "the exponent is ONNX element type " + PmoTypeLabel(*B\ElementType) + "; fixed-shape emission reads a FLOAT (1), INT32 (6), INT64 (7), UINT32 (12) or UINT64 (13) exponent.")
   EndIf
   If *Out\ElementType <> *A\ElementType
-    ProcedureReturn PmoEmitNodeFail(*Node, "the result is ONNX element type " + Str(*Out\ElementType) + " but the base is " + Str(*A\ElementType) + "; the specification gives the result the base's type.")
+    ProcedureReturn PmoEmitNodeFail(*Node, "the result is ONNX element type " + PmoTypeLabel(*Out\ElementType) + " but the base is " + PmoTypeLabel(*A\ElementType) + "; the specification gives the result the base's type.")
   EndIf
   IA = PmoEmitBroadcastIndex("i", *A, *Out) : IB = PmoEmitBroadcastIndex("i", *B, *Out)
   If PmoEmitError <> "" : ProcedureReturn #False : EndIf
@@ -324,7 +324,7 @@ Procedure.i PmoEmitLayerNormOperand(*Node.PmoOnnxNode, *X.PmoIrValue, *T.PmoIrVa
   Protected XAxis.i
   If *T = 0 : ProcedureReturn PmoEmitNodeFail(*Node, "input " + Label + " has no tensor.") : EndIf
   If *T\ElementType <> 1
-    ProcedureReturn PmoEmitNodeFail(*Node, "input " + Label + " is ONNX element type " + Str(*T\ElementType) + "; fixed-shape emission implements LayerNormalization for FLOAT (1) only.")
+    ProcedureReturn PmoEmitNodeFail(*Node, "input " + Label + " is ONNX element type " + PmoTypeLabel(*T\ElementType) + "; fixed-shape emission implements LayerNormalization for FLOAT (1) only.")
   EndIf
   RankT = PmoEmitRank(*T)
   If RankT > Rank
@@ -355,7 +355,7 @@ Procedure.i PmoEmitLayerNormShape(*Ir.PmoIrModel, *Node.PmoOnnxNode, *Outer.Quad
   Protected Index.i
   If *X = 0 : ProcedureReturn PmoEmitNodeFail(*Node, "input X has no tensor.") : EndIf
   If *X\ElementType <> 1
-    ProcedureReturn PmoEmitNodeFail(*Node, "input X is ONNX element type " + Str(*X\ElementType) + "; fixed-shape emission implements LayerNormalization for FLOAT (1) only.")
+    ProcedureReturn PmoEmitNodeFail(*Node, "input X is ONNX element type " + PmoTypeLabel(*X\ElementType) + "; fixed-shape emission implements LayerNormalization for FLOAT (1) only.")
   EndIf
   Rank = PmoEmitRank(*X)
   Axis = Given : If Axis < 0 : Axis + Rank : EndIf
@@ -397,7 +397,7 @@ Procedure.i PmoEmitBatchNormForm(*Ir.PmoIrModel, *Node.PmoOnnxNode)
   Protected Index.i
   If *X = 0 : ProcedureReturn PmoEmitNodeFail(*Node, "input X has no tensor.") : EndIf
   If *X\ElementType <> 1
-    ProcedureReturn PmoEmitNodeFail(*Node, "input X is ONNX element type " + Str(*X\ElementType) + "; fixed-shape emission implements BatchNormalization for FLOAT (1) only.")
+    ProcedureReturn PmoEmitNodeFail(*Node, "input X is ONNX element type " + PmoTypeLabel(*X\ElementType) + "; fixed-shape emission implements BatchNormalization for FLOAT (1) only.")
   EndIf
   If PmoEmitRank(*X) < 2
     ProcedureReturn PmoEmitNodeFail(*Node, "input X has rank " + Str(PmoEmitRank(*X)) + "; the specification requires a batch axis and a channel axis.")
