@@ -1666,7 +1666,7 @@ what a compiled program computes; only the sentences change.
 | `ops_kernel_check.py`, `runtime_mutants.py` | 633 of 633 on every target and 75 of 75 mutants caught; 54 of 54 as required |
 | `ops_targets_gate.py`: the NaN, specials, reduction and Cast cases on the Pi 4, Pico and Pico 2 | 606 runs: 594 bit-identical to the Windows program; 8 within the tolerance and named in `TOLERANCE_ONLY` and 4 INT64 runs refused on the Pico and Pico 2, as before |
 | `pi4_control_gate.py` | 29 of 41, as before |
-| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,248 both, and no outcome changes. The sentences of 358 refused cases change: 315 name an element type, 20 name STRING tensors, 13 optional values, 9 the image codec, and one optional graph input says what to give instead |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,248 both, and no outcome changes. The sentences of 358 refused cases change: 315 name an element type, 20 name STRING tensors, 13 optional values, 9 the image codec, and one optional graph input says what to give instead. Every case: [`tests/node_suite/results/2026-09-26b-onnx-1.22.0.md`](../tests/node_suite/results/2026-09-26b-onnx-1.22.0.md) and `.json`, measured with `--from-commit` at `bc56e80` |
 | Models (four models, fp32/fp16/bf16/int4, five targets), this change against `aebec1e` | All 80 emitted sources, packs and manifests and all 32 fixed-shape images byte-identical; the 16 runtime-dimension sources build; the four models' Windows outputs and all 30 outputs of their Pi 4, Pico and Pico 2 programs byte-identical |
 | Kokoro-82M, FP32 and INT8, for Windows | Source, pack and support files byte-identical; the output byte-identical |
 
