@@ -773,32 +773,47 @@ pmoNeonConvFpEdgeFourCount:
     mul x17, x7, x8                  ; weights per output channel
     ldr x10, [x0, #88]               ; first output channel
     mul x10, x10, x17
-    add x10, x10, x11
     lsl x10, x10, #2
     ldr x2, [x0, #8]
-    add x13, x2, x10                 ; four weight cursors
+    add x13, x2, x10                 ; four weight cursors, tap zero
     lsl x17, x17, #2
     add x14, x13, x17
     add x15, x14, x17
     add x16, x15, x17
 
-    sub x12, x8, x5                  ; taps skipped, per input channel
-    lsl x12, x12, #2
+    sub x12, x8, x5
+    sub x12, x12, x11                ; padded taps right of the kept ones
     lsl x4, x4, #2                   ; bytes between source channels
     lsl x6, x6, #2                   ; bytes between kept taps
     add x17, x0, #128
     ld1 { v16.4s }, [x17]            ; one accumulator lane per output channel
-    ; Both loops below are do-while, so an empty group or a position that keeps
-    ; no tap would run 2^64 times.  Branch to the store, where the accumulators
-    ; still hold the bias.
+    movi v3.4s, #0                   ; the padding's zeros
+    ; An empty group would run the do-while loops 2^64 times: straight to the
+    ; store, where the accumulators still hold the bias. A position may keep
+    ; no tap; its padded taps still add 0 * w, as ONNX's zero padding does.
     cmp x7, #1
-    b.lt pmoNeonConvFpEdgeFourStore
-    cmp x5, #1
     b.lt pmoNeonConvFpEdgeFourStore
     mov x8, x7
 pmoNeonConvFpEdgeFourChannel:
+    mov x9, x11
+    cbz x9, pmoNeonConvFpEdgeFourKept
+pmoNeonConvFpEdgeFourLeft:
+    ld1 { v0.s }[0], [x13]
+    ld1 { v0.s }[1], [x14]
+    ld1 { v0.s }[2], [x15]
+    ld1 { v0.s }[3], [x16]
+    fmul v2.4s, v3.4s, v0.4s
+    fadd v16.4s, v16.4s, v2.4s
+    add x13, x13, #4
+    add x14, x14, #4
+    add x15, x15, #4
+    add x16, x16, #4
+    subs x9, x9, #1
+    b.ne pmoNeonConvFpEdgeFourLeft
+pmoNeonConvFpEdgeFourKept:
     mov x10, x1
     mov x9, x5
+    cbz x9, pmoNeonConvFpEdgeFourRight
 pmoNeonConvFpEdgeFourKernel:
 pmoNeonConvFpEdgeFourSource:
     ldr s1, [x10]
@@ -817,11 +832,24 @@ pmoNeonConvFpEdgeFourAdd:
     add x16, x16, #4
     subs x9, x9, #1
     b.ne pmoNeonConvFpEdgeFourKernel
+pmoNeonConvFpEdgeFourRight:
+    mov x9, x12
+    cbz x9, pmoNeonConvFpEdgeFourNext
+pmoNeonConvFpEdgeFourRightLoop:
+    ld1 { v0.s }[0], [x13]
+    ld1 { v0.s }[1], [x14]
+    ld1 { v0.s }[2], [x15]
+    ld1 { v0.s }[3], [x16]
+    fmul v2.4s, v3.4s, v0.4s
+    fadd v16.4s, v16.4s, v2.4s
+    add x13, x13, #4
+    add x14, x14, #4
+    add x15, x15, #4
+    add x16, x16, #4
+    subs x9, x9, #1
+    b.ne pmoNeonConvFpEdgeFourRightLoop
+pmoNeonConvFpEdgeFourNext:
     add x1, x1, x4
-    add x13, x13, x12
-    add x14, x14, x12
-    add x15, x15, x12
-    add x16, x16, x12
     subs x8, x8, #1
     b.ne pmoNeonConvFpEdgeFourChannel
 pmoNeonConvFpEdgeFourStore:
@@ -906,24 +934,36 @@ pmoNeonConvFpEdgeOneCount:
     mul x17, x7, x8                  ; weights per output channel
     ldr x10, [x0, #88]               ; output channel
     mul x10, x10, x17
-    add x10, x10, x11
     lsl x10, x10, #2
     ldr x2, [x0, #8]
-    add x13, x2, x10                 ; weight cursor
+    add x13, x2, x10                 ; weight cursor, tap zero
 
-    sub x12, x8, x5                  ; taps skipped, per input channel
-    lsl x12, x12, #2
+    sub x12, x8, x5
+    sub x12, x12, x11                ; padded taps right of the kept ones
     lsl x4, x4, #2                   ; bytes between source channels
     lsl x6, x6, #2                   ; bytes between kept taps
     ldr s16, [x0, #128]              ; bias
+    movi v3.4s, #0                   ; the padding's zeros
+    ; An empty group would run the do-while loops 2^64 times: straight to the
+    ; store, where the accumulators still hold the bias. A position may keep
+    ; no tap; its padded taps still add 0 * w, as ONNX's zero padding does.
     cmp x7, #1
-    b.lt pmoNeonConvFpEdgeOneStore
-    cmp x5, #1
     b.lt pmoNeonConvFpEdgeOneStore
     mov x8, x7
 pmoNeonConvFpEdgeOneChannel:
+    mov x9, x11
+    cbz x9, pmoNeonConvFpEdgeOneKept
+pmoNeonConvFpEdgeOneLeft:
+    ldr s0, [x13]
+    fmul s2, s3, s0
+    fadd s16, s16, s2
+    add x13, x13, #4
+    subs x9, x9, #1
+    b.ne pmoNeonConvFpEdgeOneLeft
+pmoNeonConvFpEdgeOneKept:
     mov x10, x1
     mov x9, x5
+    cbz x9, pmoNeonConvFpEdgeOneRight
 pmoNeonConvFpEdgeOneKernel:
 pmoNeonConvFpEdgeOneSource:
     ldr s1, [x10]
@@ -935,8 +975,18 @@ pmoNeonConvFpEdgeOneAdd:
     add x13, x13, #4
     subs x9, x9, #1
     b.ne pmoNeonConvFpEdgeOneKernel
+pmoNeonConvFpEdgeOneRight:
+    mov x9, x12
+    cbz x9, pmoNeonConvFpEdgeOneNext
+pmoNeonConvFpEdgeOneRightLoop:
+    ldr s0, [x13]
+    fmul s2, s3, s0
+    fadd s16, s16, s2
+    add x13, x13, #4
+    subs x9, x9, #1
+    b.ne pmoNeonConvFpEdgeOneRightLoop
+pmoNeonConvFpEdgeOneNext:
     add x1, x1, x4
-    add x13, x13, x12
     subs x8, x8, #1
     b.ne pmoNeonConvFpEdgeOneChannel
 pmoNeonConvFpEdgeOneStore:
@@ -971,18 +1021,22 @@ Procedure PmTensorConv1DFp32One(*g.PmTensorConv1DArgs, bn.i, oc.i, ox.i)
   Protected srcIndex.i
   Protected weightIndex.i
   Protected sum.f
+  Protected zero.f
   inPerGroup=*g\InChannels / *g\Groups : outPerGroup=*g\OutChannels / *g\Groups
-  group=oc/outPerGroup : sum=0.0
+  group=oc/outPerGroup : sum=0.0 : zero=0.0
   If *g\Bias<>0 : sum=PmTensorGet(*g\Bias,oc) : EndIf
   icg=0
   While icg<inPerGroup
     ic=group*inPerGroup+icg : kx=0
     While kx<*g\Kernel
       ix=ox* *g\Stride-*g\PadLeft+kx* *g\Dilation
+      weightIndex=(oc*inPerGroup+icg)* *g\Kernel+kx
       If ix>=0 And ix<*g\InWidth
         srcIndex=(bn* *g\InChannels+ic)* *g\InWidth+ix
-        weightIndex=(oc*inPerGroup+icg)* *g\Kernel+kx
         sum=sum+PmTensorGet(*g\Src,srcIndex)*PmTensorGet(*g\Weight,weightIndex)
+      Else
+        ; a padded tap: the padding's zero times the weight
+        sum=sum+zero*PmTensorGet(*g\Weight,weightIndex)
       EndIf
       kx+1
     Wend

@@ -1771,6 +1771,124 @@ Every support-file procedure this change touches (the emitted source changes onl
 | `tensor_simd_windows.pbi` | `PmFastLstmUnits`, `PmFastLstm` | changed |
 | `tensor_dynamic_windows.pbi`, `tensor_dynamic_portable.pmi` | `DLstm` | changed (sequence lengths checked, no longer copied to INT64) |
 
+## The same bits on every target: Conv, ConvTranspose, Gemm and MatMul — September 27, 2026
+
+Conv (1-D and 2-D), ConvTranspose, Gemm and MatMul now give the same bits on
+Windows, the Pi 4, the Pico and the Pico 2, on both paths. The four identity
+models, model-fix and model-dyn among them, are bit-identical end to end on
+every target. Before, their first convolution already differed from Windows
+in the last bits.
+
+**Where they diverged.**
+- The Pi 4, Pico and Pico 2 already agreed with one another. Each output
+  started at its bias, then added each tap's product in input-channel and
+  tap order, rounding the product and the sum to binary32 each time.
+- Windows was the outlier:
+  - Its fixed-shape Conv, Conv2D, ConvTranspose, Gemm and MatMul evaluated
+    `sum + x * w` as one wider host expression.
+  - The runtime-dimension product's last few columns did the same.
+  - Its runtime-dimension ConvTranspose summed in another order: a product
+    over input channels per tap, then the taps.
+- One question of definition also came up: the targets skipped a padded
+  tap, while Windows' runtime-dimension product added the padding's zeros.
+  That changes a result only when the running sum is -0 or the weight is
+  not finite.
+
+**The definition, on every target.**
+
+| Operator | Computed as |
+|---|---|
+| Conv, Conv2D | The input padded with zeros, as ONNX defines it. Each output starts at its bias (+0 without one) and adds every tap's product, a padded tap's being 0 * w, in input-channel then tap order. Each product and each sum is rounded to binary32. |
+| ConvTranspose | Each output starts at its bias. Then, input channel by input channel of its group, it adds the products of the taps that reach it, in ascending input position. Only real inputs contribute; each product and each sum is rounded to binary32. |
+| Gemm | The dot product from +0 in order, then times alpha, then plus beta * C. Every operation is rounded to binary32. |
+| MatMul | The dot product from +0 in order, each operation rounded to binary32. |
+
+**How each path computes it.**
+- **Windows:**
+  - Every multiply-accumulate of the fixed-shape kernels is SSE, which
+    rounds as the targets do, and is faster: the fixed-shape Conv 1.7 times,
+    Gemm 2.5 times and ConvTranspose 2 times.
+  - The runtime-dimension product's last columns are SSE too.
+  - The runtime-dimension ConvTranspose is now, for each output residue
+    mod the stride, one product in the definition's order. The input row is
+    gathered with zeros past its ends, and outputs that those zeros could
+    change are computed again by the definition: those whose row's bias is
+    -0, or whose value came out NaN.
+- **The targets:** the padded taps are added: in the Pi 4's two edge
+  kernels, its scalar body, and the portable Conv and Conv2D (the Pico, the
+  Pico 2, and the Pi 4's fixed-shape Conv).
+
+**Where the rule said no.** One case differs only in a NaN payload, and it
+is named in `TOLERANCE_ONLY`. An infinite weight at the padding makes
+0 * inf, a NaN the processor itself creates: `FFC00000` on x86 and
+`7FC00000` on the Arm cores. Every other bit is the same.
+
+**Speed.**
+
+Instructions per request in the emulator, representative shapes (old → new):
+
+| Conv | Pi 4 | Pico | Pico 2 |
+|---|---|---|---|
+| 64 → 64 channels, width 100, k3 pad 1, runtime dimensions | 2,362,771 → 2,391,315 (+1.2%) | 546,598,826 → 548,958,123 (+0.4%) | 217,947,572 → 220,093,877 (+1.0%) |
+| the same, fixed shape | 306,012,562 → 306,807,188 (+0.3%) | 547,638,145 → 549,989,250 (+0.4%) | 217,760,740 → 219,913,444 (+1.0%) |
+| depthwise, 64 channels, width 200, runtime dimensions | +0.1% | +0.3% | +0.6% |
+| Conv2D 8 → 16, 32 × 32, 3 × 3 pad 1 | 326,210,790 → 295,039,208 (−9.6%) | 544,774,845 → 519,366,334 (−4.7%) | 240,576,399 → 211,471,248 (−12%) |
+
+- Across the target gate's small Conv cases the cost is +0% to +2%
+  (+5% on the signed-zero case, which is mostly padding).
+- ConvTranspose, Gemm and MatMul are unchanged on the targets.
+
+On Windows, Kokoro's layer shapes, best of 15 in each of three interleaved
+rounds (every round gave the same or within 1 ms):
+- runtime-dimension ConvTranspose:
+  - 512 → 256, k20, s10: 15 → 10 ms.
+  - 256 → 128, k12, s6: 16 → 15 ms.
+  - depthwise, 1,090 channels, s2: 7 → 1 ms.
+- fixed-shape ConvTranspose 64 → 32, k12, s6: 2 → 1 ms.
+- fixed-shape Conv 128 → 128: 5 → 3 ms.
+- Gemm 64 × 512 × 512: 5 → 2 ms.
+- runtime-dimension Conv (512 channels, and depthwise) and the inverse-STFT
+  ConvTranspose: under a millisecond, unchanged.
+
+Kokoro-82M on Windows, 15 requests each, old and new interleaved, median:
+
+| | first run | second run |
+|---|---|---|
+| FP32 | 1,270.0 → 1,185.6 ms (−6.6%) | 1,260.0 → 1,176.4 ms (−6.6%) |
+| INT8 | 1,004.3 → 977.8 ms (−2.6%) | 1,000.8 → 977.3 ms (−2.3%) |
+
+**Kokoro's output.** The output changes, since its convolutions on Windows now
+compute the definition. Against ONNX Runtime (FP32):
+- the log-mel distance is 0.289 → 0.292 dB for FP32 and 0.607 → 0.550 dB for
+  INT8;
+- no duration changes, in either.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py` | 633 of 633 on Windows (both branches), Pi 4, Pico and Pico 2; `--mutants` 75 of 75 caught (the operator-set kernels; unchanged) |
+| `runtime_mutants.py`: the 60 before, and nine new: a padded tap skipped on Windows, on the portable targets and in the Pi 4's edge kernels; the Windows multiply-accumulate as one wide expression; the runtime-dimension product's last columns in binary64; Gemm's beta * C as one wide expression; the runtime-dimension ConvTranspose's taps in ascending order; its edge outputs not computed again; the Windows fixed-shape ConvTranspose's multiply-accumulate as one wide expression | 69 of 69 as required |
+| `tests/node_suite/targeted_ops.py`: 1,228 cases - the 1,187 before, and 41 new, on both paths where the path takes them. Conv: same padding, stride and dilation, groups, depthwise, 300 wide, a width that leaves a tail, stride 6, signed zeros with -0 biases, and an infinite weight at the padding. Conv2D, fixed shape: pads and stride, groups and dilation, signed zeros. ConvTranspose: Kokoro's upsampling, its 1,090-channel depthwise, its inverse STFT, groups and dilation, a tail, signed zeros, and -0 biases at the input's edges. Gemm with alpha, beta and a column or full C, and MatMul with a tail | 1,228 of 1,228 as expected; `targeted_defaults`, `targeted_norm_small`, `targeted_control`, `targeted_optional_outputs` 148, 132, 41 and 14 as expected |
+| `ops_targets_gate.py`: those cases, the LSTM cases, `lstm_nan_guard`, and the NaN, specials, reduction, Where, Cast, Sigmoid, Tanh, Softmax, LayerNormalization, TfIdfVectorizer and BitShift cases, on the Pi 4, Pico and Pico 2 | 283 builds, 849 runs: 831 bit-identical to the Windows program, 117 of the 123 new Conv, ConvTranspose, Gemm and MatMul runs among them; 14 within the tolerance and named in `TOLERANCE_ONLY` (the 8 before and the 6 `conv1d_padding_inf` runs); 4 INT64 runs refused on the Picos, as before |
+| The four identity models on the Pi 4, Pico and Pico 2 against the Windows program | This change: 12 of 12 bit-identical, model-fix and model-dyn among them. The previous compiler: 6 of 12 (model-fix 643 elements differ, model-dyn 49). The targets' own outputs are the same with both compilers (30 of 30 output files): Windows moved to them |
+| `pi4_control_gate.py` | 29 of 41, as before |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,248 both |
+| Models (four models, fp32/fp16/bf16/int4, five targets), this change against `4adbc53` | Every emitted source, pack and manifest byte-identical (80 of 80); the runtime-dimension sources build (16 of 16). The fixed-shape images: 24 of 32 byte-identical; the 8 that differ are model-fix's Pico and Pico 2 images, whose Conv now adds the padded taps. On Windows the outputs of dense and twice are byte-identical, and those of model-fix and model-dyn change: they are now the targets' bits |
+| Kokoro-82M, FP32 and INT8, for Windows | Source and pack byte-identical; `tensor_fp32_windows.pbi` and `tensor_simd_windows.pbi` differ; the output changes, as above |
+
+Every support-file procedure this change touches (the emitted sources are unchanged):
+
+| Support file | Procedure | |
+|---|---|---|
+| `tensor_fp32.pmi` | `PmTensorConv1D`, `PmTensorConv2D` | changed (a padded tap adds 0 * w) |
+| `tensor_fp32_neon.pmi` | `PmTensorConv1DFp32EdgeFour`, `PmTensorConv1DFp32EdgeOne`, `PmTensorConv1DFp32One` | changed (the taps before and past the input add 0 * w) |
+| `tensor_fp32_windows.pbi` | `PmTensorConv1DWorker`, `PmTensorConv2DRows` | changed (SSE multiply-accumulate; a padded tap adds 0 * w) |
+| `tensor_fp32_windows.pbi` | `PmTensorConvTranspose1DRows`, `PmTensorGemmRows`, `PmTensorMatMul2Serial` | changed (SSE multiply-accumulate; Gemm's alpha and beta * C each rounded) |
+| `tensor_fp32_windows.pbi` | `PmConvTExactAt`, `PmConvTFixEdges` | added (and the macros `PmConvMac`, `PmConvTMac`) |
+| `tensor_simd_windows.pbi` | `PmFastRow` | changed (its last columns in SSE) |
+| `tensor_simd_windows.pbi` | `PmFastConvTranspose` | changed (one product per output residue, in the definition's order) |
+| `tensor_simd_windows.pbi` | `PmFastConvTWeightsTask`, `PmFastConvTGatherTask`, `PmFastConvTPlaceTask` | added |
+| `tensor_simd_windows.pbi` | `PmFastScatterTask` | removed (nothing calls it) |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

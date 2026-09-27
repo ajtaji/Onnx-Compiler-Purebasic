@@ -1347,6 +1347,86 @@ def cases() -> list[Case]:
                   [init("W", zw), init("R", np.zeros((1, 4, 1), np.float32)), init("B", np.zeros((1, 8), np.float32)),
                    init("H0", np.zeros((1, 1, 1), np.float32)), init("C0", np.full((1, 1, 1), -1.0, np.float32))],
                   opset=14, oracle="ort", symbolic_axes=(0,)))
+    # Conv, Conv2D and ConvTranspose, the same bits on every target: padding,
+    # strides, dilations, groups (depthwise too), with and without bias,
+    # widths on and off the four-lane width and past 256 (the host's tiled
+    # product), Kokoro's shapes scaled down, and signed zeros (a -0 bias, zero
+    # inputs, positive weights at the padding; an infinite weight there, which
+    # the zero padding turns to NaN) on both paths (Conv2D: the
+    # fixed-shape path, which alone implements it). onnxruntime
+    # decides ConvTranspose: the reference evaluator's grouped one fails.
+    rng_cv = np.random.default_rng(3131)  # its own stream: the cases after these keep their data
+    def conv_case(name, op, xs, ws, attrs, bias=True, zeros=False, inf=False):
+        x = rng_cv.standard_normal(xs).astype(np.float32)
+        w = (rng_cv.standard_normal(ws) * 0.3).astype(np.float32)
+        oc = ws[1] * attrs.get("group", 1) if op == "ConvTranspose" else ws[0]
+        b = rng_cv.standard_normal(oc).astype(np.float32)
+        if zeros:
+            # a -0 bias and zero inputs keep the running sum at -0 until the
+            # first padded tap, whose weight is positive: 0 * w is +0 there
+            x[..., :3] = 0.0
+            x[..., -2:] = -0.0
+            w[w > 0] *= -1.0
+            w[..., 0] = np.abs(w[..., 0])
+            b[::2] = -0.0
+        if inf:
+            w.flat[0] = np.inf
+        inits = [init("W", w)]
+        ins = ["x", "W"]
+        if bias:
+            inits.append(init("B", b))
+            ins.append("B")
+        g = helper.make_graph([N(op, ins, ["y"], **attrs)], name, [helper.make_tensor_value_info("x", F, list(xs))],
+                              [helper.make_tensor_value_info("y", F, None)], inits)
+        m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 20)])
+        m.ir_version = 8
+        ys = list(onnx.shape_inference.infer_shapes(m).graph.output[0].type.tensor_type.shape.dim)
+        ys = [d.dim_value for d in ys]
+        c.append(Case(name, [N(op, ins, ["y"], **attrs)], [("x", F, list(xs))], [("y", F, ys)], {"x": x}, inits,
+                      opset=20, oracle="ort" if op == "ConvTranspose" else "ref", dynamic=len(xs) == 3))
+    conv_case("conv1d_same_pads", "Conv", (1, 16, 40), (24, 16, 3), {"pads": [1, 1]})
+    conv_case("conv1d_stride_dilation", "Conv", (2, 8, 37), (6, 8, 5), {"strides": [2], "dilations": [2], "pads": [3, 2]})
+    conv_case("conv1d_groups", "Conv", (1, 12, 30), (12, 4, 3), {"group": 3, "dilations": [2], "pads": [2, 2]}, bias=False)
+    conv_case("conv1d_depthwise", "Conv", (1, 16, 50), (16, 1, 3), {"group": 16, "pads": [1, 1]})
+    conv_case("conv1d_wide", "Conv", (1, 8, 300), (16, 8, 3), {"pads": [1, 1]})
+    conv_case("conv1d_tail", "Conv", (1, 5, 7), (3, 5, 3), {})
+    conv_case("conv1d_stride6", "Conv", (1, 6, 64), (10, 6, 12), {"strides": [6], "pads": [3, 3]})
+    conv_case("conv1d_signed_zero", "Conv", (1, 6, 12), (8, 6, 3), {"pads": [2, 2]}, zeros=True)
+    conv_case("conv1d_padding_inf", "Conv", (1, 3, 10), (2, 3, 3), {"pads": [1, 1]}, inf=True)
+    conv_case("conv2d_pads_stride", "Conv", (1, 3, 9, 11), (4, 3, 3, 3), {"pads": [1, 1, 1, 1], "strides": [2, 1]})
+    conv_case("conv2d_groups_dilation", "Conv", (2, 4, 8, 8), (6, 2, 3, 2), {"group": 2, "dilations": [2, 1], "pads": [2, 1, 1, 0]},
+              bias=False)
+    conv_case("conv2d_signed_zero", "Conv", (1, 2, 5, 6), (3, 2, 3, 3), {"pads": [1, 1, 1, 1]}, zeros=True)
+    conv_case("convtranspose_upsample", "ConvTranspose", (1, 16, 9), (16, 8, 20), {"strides": [10], "pads": [5, 5]})
+    conv_case("convtranspose_depthwise_pool", "ConvTranspose", (1, 12, 10), (12, 1, 3),
+              {"group": 12, "strides": [2], "pads": [1, 1], "output_padding": [1]})
+    conv_case("convtranspose_istft", "ConvTranspose", (1, 22, 7), (22, 1, 20), {"strides": [5]}, bias=False)
+    conv_case("convtranspose_groups_dilation", "ConvTranspose", (2, 6, 8), (6, 2, 4), {"group": 3, "strides": [3], "dilations": [2], "pads": [1, 2]})
+    conv_case("convtranspose_tail", "ConvTranspose", (1, 5, 7), (5, 3, 4), {"strides": [2]})
+    conv_case("convtranspose_signed_zero", "ConvTranspose", (1, 4, 9), (4, 3, 3), {"strides": [2], "pads": [1, 1]}, zeros=True)
+    # taps past the input's start come first in an output's order: with a -0
+    # bias, zero inputs and positive weights on those taps, an added 0 * w
+    # would turn the -0 into +0; only real inputs contribute
+    cvt_x = rng_cv.standard_normal((1, 4, 9)).astype(np.float32)
+    cvt_x[..., :3] = 0.0
+    cvt_w = np.abs(rng_cv.standard_normal((4, 3, 4)) * 0.3).astype(np.float32)
+    cvt_w[..., 0] *= -1.0
+    cvt_b = rng_cv.standard_normal(3).astype(np.float32)
+    cvt_b[::2] = -0.0
+    c.append(Case("convtranspose_input_edges", [N("ConvTranspose", ["x", "W", "B"], ["y"])], [("x", F, [1, 4, 9])], [("y", F, [1, 3, 12])],
+                  {"x": cvt_x}, [init("W", cvt_w), init("B", cvt_b)], opset=20, oracle="ort"))
+    # Gemm and MatMul on the same terms (the identity models' layers after
+    # their convolutions): alpha, beta with C per column and whole, transB,
+    # widths off the four-lane width
+    gm_a = rng_cv.standard_normal((5, 9)).astype(np.float32)
+    gm_b = rng_cv.standard_normal((7, 9)).astype(np.float32)
+    for tag, cs in (("column_c", (7,)), ("full_c", (5, 7))):
+        gm_c = rng_cv.standard_normal(cs).astype(np.float32)
+        c.append(Case("gemm_alpha_beta_" + tag, [N("Gemm", ["a", "b", "c"], ["y"], alpha=0.5, beta=0.7, transB=1)], [("a", F, [5, 9])],
+                      [("y", F, [5, 7])], {"a": gm_a}, [init("b", gm_b), init("c", gm_c)], opset=20, oracle="ref"))
+    c.append(Case("matmul_tail", [N("MatMul", ["a", "b"], ["y"])], [("a", F, [3, 5])], [("y", F, [3, 7])],
+                  {"a": rng_cv.standard_normal((3, 5)).astype(np.float32)}, [init("b", rng_cv.standard_normal((5, 7)).astype(np.float32))],
+                  opset=20, oracle="ref"))
     # TfIdfVectorizer (C7): INT64 and INT32 inputs, [C] and [B, C], unigrams,
     # bigrams and trigrams, skips, TF, IDF and TFIDF with and without weights,
     # a repeated n-gram (counted at its last index), pool values beyond 32 bits;

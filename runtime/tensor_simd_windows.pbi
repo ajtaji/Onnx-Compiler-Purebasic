@@ -6,6 +6,7 @@
 ; https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-isprocessorfeaturepresent
 Global PmFastAvx.i=IsProcessorFeaturePresent_(39)
 Declare PmFastGemm(*A,*B,*Dst,M.i,K.i,N.i,*Bias=0,Grain.i=0)
+Declare PmFastCopyWindow(*src,*dst,inWidth.i,start.i,count.i,stride.i)
 
 Procedure PmFastReduceSerial(*Src,*Dst,Outer.i,Width.i,Mean.i)
   Protected row.i,j.i,ps.i=*Src,length.i=Width,total.f,divisor.f=Width
@@ -190,76 +191,181 @@ Procedure PmFastRow(*A,*B,*Dst,K.i,N.i,Bias.f,BWidth.i=0)
       col+4
     Wend
   CompilerEndIf
-  While col<N
-    sum=Bias : pa=*A : pb=*B+col*4
-    For inner=0 To K-1
-      sum+PeekF(pa)*PeekF(pb) : pa+4 : pb+stride
-    Next
-    PokeF(*Dst+col*4,sum) : col+1
-  Wend
+  ; the last N mod 4 columns: one lane each, every product and sum rounded
+  ; to binary32 as in the vector lanes (the host compiler's own expression
+  ; would keep the product wider)
+  CompilerIf #PB_Compiler_Backend=#PB_Backend_Asm And #PB_Compiler_Processor=#PB_Processor_x64
+    While col<N
+      pa=*A : pb=*B+col*4 : pd=*Dst+col*4
+      !mov rax,[p.v_pa]
+      !mov rcx,[p.v_pb]
+      !mov r8,[p.v_stride]
+      !mov rdx,[p.v_length]
+      !movss xmm0,[p.v_biasvalue]
+      !test rdx,rdx
+      !jz pmfastrow_store1
+      !pmfastrow_loop1:
+      !movss xmm2,[rax]
+      !mulss xmm2,[rcx]
+      !addss xmm0,xmm2
+      !add rax,4
+      !add rcx,r8
+      !dec rdx
+      !jnz pmfastrow_loop1
+      !pmfastrow_store1:
+      !mov r9,[p.v_pd]
+      !movss [r9],xmm0
+      col+1
+    Wend
+  CompilerElse
+    While col<N
+      sum=Bias : pa=*A : pb=*B+col*4
+      For inner=0 To K-1
+        sum+PeekF(pa)*PeekF(pb) : pa+4 : pb+stride
+      Next
+      PokeF(*Dst+col*4,sum) : col+1
+    Wend
+  CompilerEndIf
 EndProcedure
 
-Structure PmFastScatter
-  G.i : Columns.i : Bn.i : Group.i : OutGroup.i : Chunk.i
+; ConvTranspose on the runtime-dimension path, in the definition's order:
+; each output starts at its bias and takes, input channel by input channel of
+; its group, its taps in ascending input position, each product and each sum
+; rounded to binary32 (as every target and the fixed-shape path). The outputs
+; of one residue r = (ox + PadLeft) mod Stride share their taps (kx with
+; kx * Dilation mod Stride = r), so for each residue and group they are one
+; product: A[ocg][(icg, t)] = W[ic][ocg][kx_t], taps t in ascending input
+; position; B[(icg, t)][j] = X[ic][j + c_t], the input row gathered (zeros
+; past its ends); K = inGroup * taps, summed in that order by PmFastGemm from
+; the bias. PmConvTFixEdges then corrects what the gathered zeros can change.
+Structure PmFastConvTGather
+  G.i : B.i : Cols.i : Bn.i : Group.i : InGroup.i : Taps.i : Offsets.i : J0.i : Chunk.i
 EndStructure
 
-Procedure PmFastScatterTask(*c.PmFastScatter,task.i,worker.i)
-  Protected *g.PmTensorConvTranspose1DArgs=*c\G,oc.i=task* *c\Chunk,last.i=oc+ *c\Chunk,dst.i,src.i,kx.i,ix.i,ox.i,bias.f
-  If last>*c\OutGroup : last=*c\OutGroup : EndIf
-  While oc<last
-    dst=*g\Dst+(*c\Bn* *g\OutChannels+*c\Group* *c\OutGroup+oc)* *g\OutWidth*4
-    bias=0 : If *g\Bias : bias=PeekF(*g\Bias+(*c\Group* *c\OutGroup+oc)*4) : EndIf
-    For ox=0 To *g\OutWidth-1 : PokeF(dst+ox*4,bias) : Next
-    For kx=0 To *g\Kernel-1
-      src=*c\Columns+(oc* *g\Kernel+kx)* *g\InWidth*4
-      For ix=0 To *g\InWidth-1
-        ox=ix* *g\Stride- *g\PadLeft+kx* *g\Dilation
-        If ox>=0 And ox< *g\OutWidth : PokeF(dst+ox*4,PeekF(dst+ox*4)+PeekF(src+ix*4)) : EndIf
-      Next
-    Next
-    oc+1
+Procedure PmFastConvTGatherTask(*c.PmFastConvTGather,task.i,worker.i)
+  Protected *g.PmTensorConvTranspose1DArgs=*c\G,row.i=task* *c\Chunk,last.i=row+ *c\Chunk,icg.i,t.i,src.i
+  If last>*c\InGroup* *c\Taps : last=*c\InGroup* *c\Taps : EndIf
+  While row<last
+    icg=row/ *c\Taps : t=row % *c\Taps
+    src=*g\Src+((*c\Bn* *g\InChannels+*c\Group* *c\InGroup+icg)* *g\InWidth)*4
+    PmFastCopyWindow(src,*c\B+row* *c\Cols*4,*g\InWidth,*c\J0+PeekI(*c\Offsets+t*8),*c\Cols,1)
+    row+1
   Wend
 EndProcedure
 
-Procedure.i PmFastConvTranspose(*g.PmTensorConvTranspose1DArgs,Available.i)
-  Protected sc.PmFastScatter,tasks.i
-  Protected inGroup.i=*g\InChannels/ *g\Groups,outGroup.i=*g\OutChannels/ *g\Groups
-  Protected rows.i=outGroup* *g\Kernel,weightBytes.i,outputBytes.i,weights.i,columns.i
-  Protected bn.i,group.i,ic.i,oc.i,kx.i,ix.i,ox.i,row.i,src.i,dst.i,i.i,bias.f
-  If rows<=0 Or inGroup<=0 Or *g\InWidth<=0 Or rows>Available/4/inGroup : ProcedureReturn 0 : EndIf
-  weightBytes=rows*inGroup*4
-  If rows>(Available-weightBytes)/4/ *g\InWidth : ProcedureReturn 0 : EndIf
-  outputBytes=rows* *g\InWidth*4
-  weights=AllocateMemory(weightBytes) : columns=AllocateMemory(outputBytes)
-  If weights=0 Or columns=0
-    If weights : FreeMemory(weights) : EndIf
-    If columns : FreeMemory(columns) : EndIf
-    ProcedureReturn 0
-  EndIf
-  For group=0 To *g\Groups-1
-    For oc=0 To outGroup-1
-      For kx=0 To *g\Kernel-1
-        row=oc* *g\Kernel+kx
-        For ic=0 To inGroup-1
-          src=((group*inGroup+ic)*outGroup+oc)* *g\Kernel+kx
-          PokeF(weights+(row*inGroup+ic)*4,PeekF(*g\Weight+src*4))
-        Next
+; The product's columns to their outputs, Stride apart, for output channels
+; [first, last) of the chunk.
+Structure PmFastConvTPlace
+  C.i : Dst.i : Cols.i : Stride.i : RowStride.i : Rows.i : Chunk.i : Bias.i : Taps.i
+EndStructure
+
+Procedure PmFastConvTPlaceTask(*c.PmFastConvTPlace,task.i,worker.i)
+  Protected ocg.i=task* *c\Chunk,last.i=ocg+ *c\Chunk,j.i,dst.i,src.i,bits.l,stride.i=*c\Stride*4
+  If last>*c\Rows : last=*c\Rows : EndIf
+  While ocg<last
+    dst=*c\Dst+ocg* *c\RowStride
+    If *c\Taps>0
+      src=*c\C+ocg* *c\Cols*4
+      For j=0 To *c\Cols-1 : PokeL(dst,PeekL(src)) : dst+stride : src+4 : Next
+    Else
+      bits=0 : If *c\Bias : bits=PeekL(*c\Bias+ocg*4) : EndIf
+      For j=0 To *c\Cols-1 : PokeL(dst,bits) : dst+stride : Next
+    EndIf
+    ocg+1
+  Wend
+EndProcedure
+
+; A[ocg][(icg, t)] = W[group * inGroup + icg][ocg][kx_t], rows [first, last)
+Structure PmFastConvTWeights
+  G.i : A.i : Group.i : InGroup.i : OutGroup.i : Taps.i : TapList.i : Chunk.i
+EndStructure
+
+Procedure PmFastConvTWeightsTask(*c.PmFastConvTWeights,task.i,worker.i)
+  Protected *g.PmTensorConvTranspose1DArgs=*c\G,ocg.i=task* *c\Chunk,last.i=ocg+ *c\Chunk,icg.i,t.i,dst.i,src.i,kn.i=*g\Kernel,m.i=*c\Taps
+  If last>*c\OutGroup : last=*c\OutGroup : EndIf
+  While ocg<last
+    dst=*c\A+ocg* *c\InGroup*m*4
+    For icg=0 To *c\InGroup-1
+      src=*g\Weight+((*c\Group* *c\InGroup+icg)* *c\OutGroup+ocg)*kn*4
+      For t=0 To m-1
+        PokeL(dst,PeekL(src+PeekI(*c\TapList+t*8)*4)) : dst+4
       Next
     Next
-    For bn=0 To *g\Batches-1
-      PmFastGemm(weights,*g\Src+(bn* *g\InChannels+group*inGroup)* *g\InWidth*4,columns,rows,inGroup,*g\InWidth)
-      ; Output channels split across the pool; a channel's taps are added in
-      ; the whole loop's order (kernel tap, then input position).
-      sc\G=*g : sc\Columns=columns : sc\Bn=bn : sc\Group=group : sc\OutGroup=outGroup
-      tasks=PmPoolTasks(outGroup,PmPoolMax(1,#PMELEM_CHEAP/PmPoolMax(*g\InWidth* *g\Kernel,1)),1,@sc\Chunk)
-      If tasks<=1
-        sc\Chunk=outGroup : PmFastScatterTask(@sc,0,0)
-      Else
-        PmPoolRun(@PmFastScatterTask(),@sc,tasks)
+    ocg+1
+  Wend
+EndProcedure
+
+#PMFAST_CONVT_COLUMNS = 1024
+
+Procedure.i PmFastConvTranspose(*g.PmTensorConvTranspose1DArgs,Available.i)
+  Protected inGroup.i=*g\InChannels/ *g\Groups,outGroup.i=*g\OutChannels/ *g\Groups
+  Protected st.i=*g\Stride,dl.i=*g\Dilation,pl.i=*g\PadLeft,kn.i=*g\Kernel
+  Protected rho.i,m.i,kx.i,t.i,ox0.i,n.i,group.i,bn.i,j0.i,cols.i,ocg.i,icg.i,tasks.i,bias.i
+  Protected *taps,*offsets,*a,*b,*c,aBytes.i,bBytes.i,cBytes.i
+  Protected ga.PmFastConvTGather,pc.PmFastConvTPlace,wa.PmFastConvTWeights
+  If inGroup<=0 Or outGroup<=0 Or st<=0 Or kn<=0 Or dl<=0 Or *g\OutWidth<=0 Or *g\InWidth<=0 : ProcedureReturn 0 : EndIf
+  aBytes=outGroup*inGroup*kn*4 : bBytes=inGroup*kn*#PMFAST_CONVT_COLUMNS*4 : cBytes=outGroup*#PMFAST_CONVT_COLUMNS*4
+  If aBytes+bBytes+cBytes>Available : ProcedureReturn 0 : EndIf
+  *taps=AllocateMemory(kn*8+8) : *offsets=AllocateMemory(kn*8+8)
+  *a=AllocateMemory(aBytes+16) : *b=AllocateMemory(bBytes+16) : *c=AllocateMemory(cBytes+16)
+  If *taps=0 Or *offsets=0 Or *a=0 Or *b=0 Or *c=0
+    If *taps : FreeMemory(*taps) : EndIf
+    If *offsets : FreeMemory(*offsets) : EndIf
+    If *a : FreeMemory(*a) : EndIf
+    If *b : FreeMemory(*b) : EndIf
+    If *c : FreeMemory(*c) : EndIf
+    ProcedureReturn 0
+  EndIf
+  For rho=0 To st-1
+    ; this residue's taps in ascending input position: descending kx
+    m=0
+    For kx=kn-1 To 0 Step -1
+      If (kx*dl) % st=rho : PokeI(*taps+m*8,kx) : m+1 : EndIf
+    Next
+    ox0=((rho-pl) % st+st) % st
+    If ox0>=*g\OutWidth : Continue : EndIf
+    n=(*g\OutWidth-1-ox0)/st+1
+    For t=0 To m-1 : PokeI(*offsets+t*8,(ox0+pl-PeekI(*taps+t*8)*dl)/st) : Next
+    For group=0 To *g\Groups-1
+      bias=0 : If *g\Bias : bias=*g\Bias+group*outGroup*4 : EndIf
+      If m>0
+        wa\G=*g : wa\A=*a : wa\Group=group : wa\InGroup=inGroup : wa\OutGroup=outGroup : wa\Taps=m : wa\TapList=*taps
+        tasks=PmPoolTasks(outGroup,PmPoolMax(1,#PMELEM_CHEAP/PmPoolMax(inGroup*m,1)),1,@wa\Chunk)
+        If tasks<=1
+          wa\Chunk=outGroup : PmFastConvTWeightsTask(@wa,0,0)
+        Else
+          PmPoolRun(@PmFastConvTWeightsTask(),@wa,tasks)
+        EndIf
       EndIf
+      For bn=0 To *g\Batches-1
+        j0=0
+        While j0<n
+          cols=n-j0 : If cols>#PMFAST_CONVT_COLUMNS : cols=#PMFAST_CONVT_COLUMNS : EndIf
+          If m>0
+            ga\G=*g : ga\B=*b : ga\Cols=cols : ga\Bn=bn : ga\Group=group : ga\InGroup=inGroup : ga\Taps=m : ga\Offsets=*offsets : ga\J0=j0
+            tasks=PmPoolTasks(inGroup*m,PmPoolMax(1,#PMELEM_CHEAP/PmPoolMax(cols,1)),1,@ga\Chunk)
+            If tasks<=1
+              ga\Chunk=inGroup*m : PmFastConvTGatherTask(@ga,0,0)
+            Else
+              PmPoolRun(@PmFastConvTGatherTask(),@ga,tasks)
+            EndIf
+            PmFastGemm(*a,*b,*c,outGroup,inGroup*m,cols,bias)
+          EndIf
+          pc\C=*c : pc\Cols=cols : pc\Stride=st : pc\Rows=outGroup : pc\Bias=bias : pc\Taps=m
+          pc\RowStride=*g\OutWidth*4 : pc\Dst=*g\Dst+((bn* *g\OutChannels+group*outGroup)* *g\OutWidth+ox0+j0*st)*4
+          tasks=PmPoolTasks(outGroup,PmPoolMax(1,#PMELEM_CHEAP/PmPoolMax(cols,1)),1,@pc\Chunk)
+          If tasks<=1
+            pc\Chunk=outGroup : PmFastConvTPlaceTask(@pc,0,0)
+          Else
+            PmPoolRun(@PmFastConvTPlaceTask(),@pc,tasks)
+          EndIf
+          j0+cols
+        Wend
+      Next
     Next
   Next
-  FreeMemory(weights) : FreeMemory(columns)
+  FreeMemory(*taps) : FreeMemory(*offsets) : FreeMemory(*a) : FreeMemory(*b) : FreeMemory(*c)
+  PmConvTFixEdges(*g)
   ProcedureReturn 1
 EndProcedure
 

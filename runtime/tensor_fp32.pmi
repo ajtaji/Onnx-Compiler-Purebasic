@@ -7196,6 +7196,7 @@ Procedure PmTensorConv1D(*g.PmTensorConv1DArgs)
   Protected aScale.f
   Protected converted.f
   Protected sum.f
+  Protected zero.f
   inPerGroup = *g\InChannels / *g\Groups
   outPerGroup = *g\OutChannels / *g\Groups
   CompilerIf #PMO_USE_INT8 = 1
@@ -7204,6 +7205,7 @@ Procedure PmTensorConv1D(*g.PmTensorConv1DArgs)
     ProcedureReturn
   EndIf
   CompilerEndIf
+  zero = 0.0
   bn = 0
   While bn < *g\Batches
     oc = 0
@@ -7219,10 +7221,14 @@ Procedure PmTensorConv1D(*g.PmTensorConv1DArgs)
           kx = 0
           While kx < *g\Kernel
             ix = ox * *g\Stride - *g\PadLeft + kx * *g\Dilation
+            weightIndex = (oc * inPerGroup + icg) * *g\Kernel + kx
             If ix >= 0 And ix < *g\InWidth
               srcIndex = (bn * *g\InChannels + ic) * *g\InWidth + ix
-              weightIndex = (oc * inPerGroup + icg) * *g\Kernel + kx
-                sum = sum + PmTensorGet(*g\Src, srcIndex) * PmTensorGet(*g\Weight, weightIndex)
+              sum = sum + PmTensorGet(*g\Src, srcIndex) * PmTensorGet(*g\Weight, weightIndex)
+            Else
+              ; a padded tap: the padding's zero times the weight (ONNX pads
+              ; with zeros; 0 * w is -0 for a negative w and NaN for inf)
+              sum = sum + zero * PmTensorGet(*g\Weight, weightIndex)
             EndIf
             kx = kx + 1
           Wend
@@ -7379,6 +7385,7 @@ Procedure PmTensorConv2D(*g.PmTensorConv2DArgs)
   Protected aScale.f
   Protected converted.f
   Protected sum.f
+  Protected zero.f
   inPerGroup = *g\InChannels / *g\Groups
   outPerGroup = *g\OutChannels / *g\Groups
   CompilerIf #PMO_USE_INT8 = 1
@@ -7387,6 +7394,7 @@ Procedure PmTensorConv2D(*g.PmTensorConv2DArgs)
     ProcedureReturn
   EndIf
   CompilerEndIf
+  zero = 0.0
   bn = 0
   While bn < *g\Batches
     oc = 0
@@ -7404,15 +7412,25 @@ Procedure PmTensorConv2D(*g.PmTensorConv2DArgs)
             ky = 0
             While ky < *g\KernelH
               iy = oy * *g\StrideH - *g\PadTop + ky * *g\DilationH
+              weightIndex = ((oc * inPerGroup + icg) * *g\KernelH + ky) * *g\KernelW
               If iy >= 0 And iy < *g\InH
+                srcIndex = ((bn * *g\InChannels + ic) * *g\InH + iy) * *g\InW
                 kx = 0
                 While kx < *g\KernelW
                   ix = ox * *g\StrideW - *g\PadLeft + kx * *g\DilationW
                   If ix >= 0 And ix < *g\InW
-                    srcIndex = ((bn * *g\InChannels + ic) * *g\InH + iy) * *g\InW + ix
-                    weightIndex = ((oc * inPerGroup + icg) * *g\KernelH + ky) * *g\KernelW + kx
-                      sum = sum + PmTensorGet(*g\Src, srcIndex) * PmTensorGet(*g\Weight, weightIndex)
+                    sum = sum + PmTensorGet(*g\Src, srcIndex + ix) * PmTensorGet(*g\Weight, weightIndex + kx)
+                  Else
+                    ; a padded tap: the padding's zero times the weight
+                    sum = sum + zero * PmTensorGet(*g\Weight, weightIndex + kx)
                   EndIf
+                  kx = kx + 1
+                Wend
+              Else
+                ; a padded row: every tap is the padding's zero times its weight
+                kx = 0
+                While kx < *g\KernelW
+                  sum = sum + zero * PmTensorGet(*g\Weight, weightIndex + kx)
                   kx = kx + 1
                 Wend
               EndIf

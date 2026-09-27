@@ -74,6 +74,39 @@ Macro PmTensorPut(base, index, value)
   PokeF((base) + (index) * 4, (value))
 EndMacro
 
+; One multiply-accumulate of a convolution as every target computes it: the
+; product and the sum each rounded to binary32, IEEE 754 (SSE). The host
+; compiler's own `sum + x * w` keeps the product wider and adds -0 and -0 as
+; +0. PmConvMac: sum = sum + [px] * [pw] (the caller declares sum.f, px.i,
+; pw.i). PmConvTMac: [pd] = [pd] + value * [pw] (value.f, pw.i, pd.i).
+Macro PmConvMac
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
+    !mov rax,[p.v_px]
+    !movss xmm1,[rax]
+    !mov rax,[p.v_pw]
+    !mulss xmm1,[rax]
+    !movss xmm0,[p.v_sum]
+    !addss xmm0,xmm1
+    !movss [p.v_sum],xmm0
+  CompilerElse
+    sum = sum + PeekF(px) * PeekF(pw)
+  CompilerEndIf
+EndMacro
+
+Macro PmConvTMac
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
+    !movss xmm1,[p.v_value]
+    !mov rax,[p.v_pw]
+    !mulss xmm1,[rax]
+    !mov rax,[p.v_pd]
+    !movss xmm0,[rax]
+    !addss xmm0,xmm1
+    !movss [rax],xmm0
+  CompilerElse
+    PokeF(pd, PeekF(pd) + value * PeekF(pw))
+  CompilerEndIf
+EndMacro
+
 ; NaN and the host compiler (forums 995, 997, 998). PureBasic before 6.41
 ; answers a float comparison with a NaN operand by the operand order and by
 ; whether a side is a literal (v < 0.0 and v <= 0.0 true, a > b, a >= b and
@@ -1797,6 +1830,8 @@ Procedure PmTensorMatMul2Serial(*a, *b, *dst, m.i, k.i, n.i)
   Protected pb.i
   Protected pd.i
   Protected sum.f
+  Protected px.i
+  Protected pw.i
   row = 0
   While row < m
     col = 0
@@ -1806,7 +1841,8 @@ Procedure PmTensorMatMul2Serial(*a, *b, *dst, m.i, k.i, n.i)
       pa = *a + (row * k) * 4
       pb = *b + col * 4
       While inner < k
-        sum = sum + PeekF(pa) * PeekF(pb)
+        px = pa : pw = pb
+        PmConvMac
         pa = pa + 4
         pb = pb + n * 4
         inner = inner + 1
@@ -1939,6 +1975,9 @@ Procedure PmTensorGemmRows(*g.PmTensorGemmArgs, first.i, last.i)
   Protected ic.i
   Protected accumulator.i
   Protected sum.f
+  Protected px.i
+  Protected pw.i
+  Protected beta.f = *g\Beta
   row = first
   While row < last
     col = 0
@@ -1948,7 +1987,8 @@ Procedure PmTensorGemmRows(*g.PmTensorGemmArgs, first.i, last.i)
       While inner < *g\K
         If *g\TransA = 0 : ia = row * *g\K + inner : Else : ia = inner * *g\M + row : EndIf
         If *g\TransB = 0 : ib = inner * *g\N + col : Else : ib = col * *g\K + inner : EndIf
-          sum = sum + PmTensorGet(*g\A, ia) * PmTensorGet(*g\B, ib)
+        px = *g\A + ia * 4 : pw = *g\B + ib * 4
+        PmConvMac
         inner = inner + 1
       Wend
       sum = sum * *g\Alpha
@@ -1960,7 +2000,18 @@ Procedure PmTensorGemmRows(*g.PmTensorGemmArgs, first.i, last.i)
         Else
           ic = row * *g\N + col
         EndIf
-        sum = sum + *g\Beta * PmTensorGet(*g\C, ic)
+        ; sum + beta * c: the product and the sum each binary32
+        px = *g\C + ic * 4
+        CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
+          !movss xmm1,[p.v_beta]
+          !mov rax,[p.v_px]
+          !mulss xmm1,[rax]
+          !movss xmm0,[p.v_sum]
+          !addss xmm0,xmm1
+          !movss [p.v_sum],xmm0
+        CompilerElse
+          sum = sum + beta * PeekF(px)
+        CompilerEndIf
       EndIf
       PmTensorPut(*g\Dst, row * *g\N + col, sum)
       col = col + 1
@@ -2900,6 +2951,8 @@ Procedure PmTensorConvTranspose1DRows(*g.PmTensorConvTranspose1DArgs, first.i, l
   Protected weightIndex.i
   Protected dstIndex.i
   Protected value.f
+  Protected pw.i
+  Protected pd.i
   inPerGroup = *g\InChannels / *g\Groups
   outPerGroup = *g\OutChannels / *g\Groups
   work = first
@@ -2927,7 +2980,8 @@ Procedure PmTensorConvTranspose1DRows(*g.PmTensorConvTranspose1DArgs, first.i, l
           If ox >= 0 And ox < *g\OutWidth
             weightIndex = (ic * outPerGroup + ocg) * *g\Kernel + kx
             dstIndex = (bn * *g\OutChannels + oc) * *g\OutWidth + ox
-            PmTensorPut(*g\Dst, dstIndex, PmTensorGet(*g\Dst, dstIndex) + value * PmTensorGet(*g\Weight, weightIndex))
+            pw = *g\Weight + weightIndex * 4 : pd = *g\Dst + dstIndex * 4
+            PmConvTMac
           EndIf
           kx = kx + 1
         Wend
@@ -2939,6 +2993,84 @@ Procedure PmTensorConvTranspose1DRows(*g.PmTensorConvTranspose1DArgs, first.i, l
   Wend
 EndProcedure
 
+
+; One output of the 1-D transposed convolution by the definition: the bias,
+; then for each input channel of its group, the taps reaching it in ascending
+; input position, every operation binary32; as the bits of the binary32.
+Procedure.l PmConvTExactAt(*g.PmTensorConvTranspose1DArgs, bn.i, oc.i, ox.i)
+  Protected inPerGroup.i = *g\InChannels / *g\Groups, outPerGroup.i = *g\OutChannels / *g\Groups
+  Protected group.i = oc / outPerGroup, ocg.i = oc % outPerGroup
+  Protected icg.i, kx.i, ix.i, num.i, px.i, pw.i, sum.f
+  PokeL(@sum, 0)
+  If *g\Bias <> 0 : PokeL(@sum, PeekL(*g\Bias + oc * 4)) : EndIf
+  icg = 0
+  While icg < inPerGroup
+    kx = *g\Kernel - 1
+    While kx >= 0
+      num = ox + *g\PadLeft - kx * *g\Dilation
+      If num >= 0 And num % *g\Stride = 0
+        ix = num / *g\Stride
+        If ix < *g\InWidth
+          px = *g\Src + ((bn * *g\InChannels + group * inPerGroup + icg) * *g\InWidth + ix) * 4
+          pw = *g\Weight + (((group * inPerGroup + icg) * outPerGroup + ocg) * *g\Kernel + kx) * 4
+          PmConvMac
+        EndIf
+      EndIf
+      kx = kx - 1
+    Wend
+    icg = icg + 1
+  Wend
+  ProcedureReturn PeekL(@sum)
+EndProcedure
+
+; As PmConv1DFixEdges: the runtime-dimension product gathers zeros for taps
+; past the input's ends; an output reached by such a tap is computed again by
+; the definition when its row's bias is -0 or its value came out NaN.
+Procedure PmConvTFixEdges(*g.PmTensorConvTranspose1DArgs)
+  Protected *edge, count.i, ox.i, kx.i, num.i, ix.i, bn.i, oc.i, row.i, negative.i, i.i
+  Protected lead.i, tail.i
+  ; a tap before the input needs ox < (Kernel - 1) * Dilation - PadLeft, one
+  ; past it ox >= InWidth * Stride - PadLeft: only those outputs are looked at
+  lead = (*g\Kernel - 1) * *g\Dilation - *g\PadLeft
+  If lead < 0 : lead = 0 : EndIf
+  If lead > *g\OutWidth : lead = *g\OutWidth : EndIf
+  tail = *g\InWidth * *g\Stride - *g\PadLeft
+  If tail < lead : tail = lead : EndIf
+  If tail > *g\OutWidth : tail = *g\OutWidth : EndIf
+  *edge = AllocateMemory((lead + *g\OutWidth - tail) * 8 + 8)
+  If *edge = 0 : ProcedureReturn : EndIf
+  ox = 0
+  While ox < *g\OutWidth
+    If ox = lead : ox = tail : EndIf
+    If ox >= *g\OutWidth : Break : EndIf
+    For kx = 0 To *g\Kernel - 1
+      num = ox + *g\PadLeft - kx * *g\Dilation
+      If ((num % *g\Stride) + *g\Stride) % *g\Stride = 0
+        ix = (num - ((num % *g\Stride) + *g\Stride) % *g\Stride) / *g\Stride
+        If num < 0 Or ix >= *g\InWidth
+          PokeI(*edge + count * 8, ox) : count + 1 : Break
+        EndIf
+      EndIf
+    Next
+    ox + 1
+  Wend
+  If count > 0
+    For bn = 0 To *g\Batches - 1
+      For oc = 0 To *g\OutChannels - 1
+        negative = 0
+        If *g\Bias <> 0 And (PeekL(*g\Bias + oc * 4) & $FFFFFFFF) = $80000000 : negative = 1 : EndIf
+        row = *g\Dst + (bn * *g\OutChannels + oc) * *g\OutWidth * 4
+        For i = 0 To count - 1
+          ox = PeekI(*edge + i * 8)
+          If negative Or (PeekL(row + ox * 4) & $7FFFFFFF) > $7F800000
+            PokeL(row + ox * 4, PmConvTExactAt(*g, bn, oc, ox))
+          EndIf
+        Next
+      Next
+    Next
+  EndIf
+  FreeMemory(*edge)
+EndProcedure
 
 Procedure PmTensorConvTranspose1D(*g.PmTensorConvTranspose1DArgs)
   Protected macs.q = *g\InWidth
@@ -3149,6 +3281,9 @@ Procedure PmTensorConv1DWorker(*worker.PmTensorConv1DWorker)
   Protected accumulator.i
   Protected converted.f
   Protected sum.f
+  Protected px.i
+  Protected pw.i
+  Protected zero.f = 0.0
   inPerGroup = *g\InChannels / *g\Groups
   outPerGroup = *g\OutChannels / *g\Groups
   work = *worker\WorkStart
@@ -3166,11 +3301,15 @@ Procedure PmTensorConv1DWorker(*worker.PmTensorConv1DWorker)
         kx = 0
         While kx < *g\Kernel
           ix = ox * *g\Stride - *g\PadLeft + kx * *g\Dilation
+          weightIndex = (oc * inPerGroup + icg) * *g\Kernel + kx
+          pw = *g\Weight + weightIndex * 4
           If ix >= 0 And ix < *g\InWidth
             srcIndex = (bn * *g\InChannels + ic) * *g\InWidth + ix
-            weightIndex = (oc * inPerGroup + icg) * *g\Kernel + kx
-              sum = sum + PmTensorGet(*g\Src, srcIndex) * PmTensorGet(*g\Weight, weightIndex)
+            px = *g\Src + srcIndex * 4
+          Else
+            px = @zero
           EndIf
+          PmConvMac
           kx = kx + 1
         Wend
         icg = icg + 1
@@ -3326,6 +3465,9 @@ Procedure PmTensorConv2DRows(*g.PmTensorConv2DArgs, first.i, last.i)
   Protected aScale.f
   Protected converted.f
   Protected sum.f
+  Protected px.i
+  Protected pw.i
+  Protected zero.f = 0.0
   inPerGroup = *g\InChannels / *g\Groups
   outPerGroup = *g\OutChannels / *g\Groups
   work = first
@@ -3345,15 +3487,28 @@ Procedure PmTensorConv2DRows(*g.PmTensorConv2DArgs, first.i, last.i)
             ky = 0
             While ky < *g\KernelH
               iy = oy * *g\StrideH - *g\PadTop + ky * *g\DilationH
+              weightIndex = ((oc * inPerGroup + icg) * *g\KernelH + ky) * *g\KernelW
+              pw = *g\Weight + weightIndex * 4
               If iy >= 0 And iy < *g\InH
+                srcIndex = ((bn * *g\InChannels + ic) * *g\InH + iy) * *g\InW
                 kx = 0
                 While kx < *g\KernelW
                   ix = ox * *g\StrideW - *g\PadLeft + kx * *g\DilationW
                   If ix >= 0 And ix < *g\InW
-                    srcIndex = ((bn * *g\InChannels + ic) * *g\InH + iy) * *g\InW + ix
-                    weightIndex = ((oc * inPerGroup + icg) * *g\KernelH + ky) * *g\KernelW + kx
-                      sum = sum + PmTensorGet(*g\Src, srcIndex) * PmTensorGet(*g\Weight, weightIndex)
+                    px = *g\Src + (srcIndex + ix) * 4
+                  Else
+                    px = @zero
                   EndIf
+                  PmConvMac
+                  pw = pw + 4
+                  kx = kx + 1
+                Wend
+              Else
+                px = @zero
+                kx = 0
+                While kx < *g\KernelW
+                  PmConvMac
+                  pw = pw + 4
                   kx = kx + 1
                 Wend
               EndIf
