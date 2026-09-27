@@ -412,6 +412,7 @@ Procedure PmFastLstmUnits(*s.PmFastLstmStep,u0.i,u1.i)
   Protected *g.PmTensorLstmArgs=*s\G,width.i=4* *g\Hidden,unit.i,bbase.i=*s\BBase,bn.i=*s\Bn,gate.i,col.i
   Protected xproj.i=*s\XProj,rproj.i=*s\RProj,inputRow.i=*s\InputRow,state.i=*s\State,outRow.i=*s\OutRow
   Protected iv.f,ov.f,fv.f,cv.f,previous.f
+  Protected lb.l,la.l,ln.f,le.f,ld.f
   ; Fused step (Hidden a multiple of 4, u0 and u1 multiples of 4): this
   ; task's four column ranges of the recurrent product for batch row bn.
   ; Every column is a vector lane, as in the whole-row product (4H has no
@@ -435,8 +436,14 @@ Procedure PmFastLstmUnits(*s.PmFastLstmStep,u0.i,u1.i)
     fv+PeekF(xproj+(inputRow+2* *g\Hidden+unit)*4) : fv+PeekF(rproj+(bn*width+2* *g\Hidden+unit)*4)
     cv+PeekF(xproj+(inputRow+3* *g\Hidden+unit)*4) : cv+PeekF(rproj+(bn*width+3* *g\Hidden+unit)*4)
     previous=PeekF(*g\YC+(state+unit)*4)
-    cv=PmTensorSigmoidValue(fv)*previous+PmTensorSigmoidValue(iv)*PmTensorTanhValue(cv)
-    ov=PmTensorSigmoidValue(ov)*PmTensorTanhValue(cv)
+    PmLstmSigmoidInPlace(iv)
+    PmLstmSigmoidInPlace(ov)
+    PmLstmSigmoidInPlace(fv)
+    PmLstmTanhInPlace(cv)
+    PmLstmCellInPlace(cv, fv, previous, iv, cv)
+    previous=cv
+    PmLstmTanhInPlace(previous)
+    ov=ov*previous
     PokeF(*g\YC+(state+unit)*4,cv) : PokeF(*g\Y+(outRow+unit)*4,ov)
   Next
 EndProcedure
@@ -467,6 +474,7 @@ Procedure.i PmFastLstm(*g.PmTensorLstmArgs,Available.i)
   stepTasks=PmPoolTasks(*g\Hidden,#PMFAST_STEP_UNITS,4,@st\Chunk)
   ; One hand-off per step when the product can be cut at unit boundaries.
   fused=Bool(stepTasks>1 And *g\Hidden % 4=0)
+  If *g\SeqLens : FillMemory(*g\Y,*g\Sequence* *g\Directions* *g\Batch* *g\Hidden*4,0) : EndIf
   For i=0 To *g\Directions* *g\Batch* *g\Hidden-1
     iv=0 : cv=0
     If *g\InitialH : iv=PeekF(*g\InitialH+i*4) : EndIf

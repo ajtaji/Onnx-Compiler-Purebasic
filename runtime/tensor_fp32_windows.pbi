@@ -284,27 +284,6 @@ Procedure PmTensorLeakyReluSerial(*src, *dst, count.i, alpha.f)
   Wend
 EndProcedure
 
-Procedure.f PmTensorSigmoidValue(value.f)
-  Protected e.f
-  If value >= 0.0
-    e = Exp(0.0 - value)
-    ProcedureReturn 1.0 / (1.0 + e)
-  EndIf
-  e = Exp(value)
-  ProcedureReturn e / (1.0 + e)
-EndProcedure
-
-Procedure.f PmTensorTanhValue(value.f)
-  Protected e.f
-  CompilerIf #PMO_HOST_NAN_BUG = 1
-    If PmTensorIsNan(value) <> 0 : ProcedureReturn value : EndIf
-  CompilerEndIf
-  If value > 10.0 : ProcedureReturn 1.0 : EndIf
-  If value < -10.0 : ProcedureReturn -1.0 : EndIf
-  e = Exp(value + value)
-  ProcedureReturn (e - 1.0) / (e + 1.0)
-EndProcedure
-
 ; Sigmoid and Tanh, the operators (C6c-4): one binary32 formula on every
 ; target, each operation rounded once and the same way everywhere, with the
 ; correctly rounded Exp, so the Windows program and the Pi 4, Pico and Pico 2
@@ -315,8 +294,7 @@ EndProcedure
 ;   for a subnormal); |x| > 10: +-1; otherwise the binary32 nearest
 ;   (e - 1) / (e + 1), e = e^2|x| rounded to binary32 (e - 1 and e + 1 are
 ;   exact, so the quotient is rounded once); the sign of x.
-; The LSTM's activations (PmTensorSigmoidValue, PmTensorTanhValue) are not
-; these: they stay as they were.
+; The LSTM takes these formulas too (PmTensorSigmoidF, PmTensorTanhF).
 Procedure PmTensorSigmoidSerial(*src, *dst, count.i)
   Protected i.i
   Protected ps.i
@@ -3468,6 +3446,101 @@ Structure PmTensorLstmFloatFourArgs
   CValue.f
 EndStructure
 
+; The LSTM's gate activations: the operators' shared binary32 formulas
+; (Sigmoid and Tanh above, PmTensorSigmoidSerial and PmTensorTanhSerial), so
+; an LSTM gives the Pi 4's, Pico's and Pico 2's bits. They are macros, written
+; into the LSTM's per-unit loops (a call per value cost the runtime-dimension
+; LSTM a tenth of its time); the caller declares lb.l, la.l, ln.f, le.f and
+; ld.f. PmTensorSigmoidF, PmTensorTanhF and PmTensorLstmCell are the same text
+; as procedures.
+Macro PmLstmSigmoidInPlace(MV)
+  lb = PeekL(@MV)
+  If (lb & $7FFFFFFF) > $7F800000
+    PokeL(@MV, lb | $400000)
+  ElseIf lb >= 0
+    PokeL(@ln, lb | $80000000)
+    le = Exp(ln)
+    ld = 1.0 + le
+    MV = 1.0 / ld
+  Else
+    le = Exp(MV)
+    ld = 1.0 + le
+    MV = le / ld
+  EndIf
+EndMacro
+
+Macro PmLstmTanhInPlace(MV)
+  lb = PeekL(@MV)
+  la = lb & $7FFFFFFF
+  If la > $41200000
+    If la > $7F800000
+      PokeL(@MV, lb | $400000)
+    Else
+      PokeL(@MV, (lb & $80000000) | $3F800000)
+    EndIf
+  ElseIf la >= $39800000
+    ; e rounded to binary32; e - 1, e + 1 and their quotient in binary64
+    PokeL(@ln, la)
+    le = Exp(ln + ln)
+    MV = (le - 1.0) / (le + 1.0)
+    PokeL(@MV, PeekL(@MV) | (lb & $80000000))
+  EndIf
+EndMacro
+
+; The cell: c = f c(t-1) + i g, the two products and the sum each rounded to
+; binary32 (one statement each). The host compiler adds -0 and -0 as +0; the
+; sum's sign is restored, as IEEE 754 and every target have it.
+Macro PmLstmCellInPlace(MC, MF, MP, MI, MG)
+  ln = MF * MP
+  ld = MI * MG
+  MC = ln + ld
+  If PeekL(@MC) = 0 And (PeekL(@ln) & PeekL(@ld)) < 0
+    PokeL(@MC, $80000000)
+  EndIf
+EndMacro
+
+Procedure.f PmTensorSigmoidF(x.f)
+  Protected lb.l, la.l, ln.f, le.f, ld.f
+  PmLstmSigmoidInPlace(x)
+  ProcedureReturn x
+EndProcedure
+
+Procedure.f PmTensorTanhF(x.f)
+  Protected lb.l, la.l, ln.f, le.f, ld.f
+  PmLstmTanhInPlace(x)
+  ProcedureReturn x
+EndProcedure
+
+Procedure.f PmTensorLstmCell(fv.f, previous.f, iv.f, g.f)
+  Protected lb.l, la.l, ln.f, le.f, ld.f, c.f
+  PmLstmCellInPlace(c, fv, previous, iv, g)
+  ProcedureReturn c
+EndProcedure
+
+; A sequence's length: sequence_lens is INT32, as ONNX defines it (the
+; fixed-shape path read it as INT64), clamped to the sequence.
+Procedure.i PmTensorLstmValid(*g.PmTensorLstmArgs, bn.i)
+  Protected valid.i
+  valid = *g\Sequence
+  If *g\SeqLens <> 0
+    valid = PeekL(*g\SeqLens + bn * 4)
+    If valid < 0 : valid = 0 : EndIf
+    If valid > *g\Sequence : valid = *g\Sequence : EndIf
+  EndIf
+  ProcedureReturn valid
+EndProcedure
+
+; Y past a sequence's end is 0, as ONNX defines it.
+Procedure PmTensorLstmClearY(*g.PmTensorLstmArgs)
+  If *g\SeqLens <> 0
+    FillMemory(*g\Y, *g\Sequence * *g\Directions * *g\Batch * *g\Hidden * 4, 0)
+  EndIf
+EndProcedure
+
+; The four gates' dot products of one unit, from +0.0 over ascending index,
+; each product and each sum rounded to binary32 (as every target: the Pi 4's
+; four lanes, the Picos' one value at a time). On x64 the four gates are the
+; four lanes of one SSE register; MULPS and ADDPS round each lane once.
 Procedure PmTensorLstmFloatFour(*g.PmTensorLstmFloatFourArgs)
   Protected gate.i
   Protected index.i
@@ -3475,6 +3548,44 @@ Procedure PmTensorLstmFloatFour(*g.PmTensorLstmFloatFourArgs)
   Protected left.f
   Protected right.f
   Protected sum.f
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
+    Protected pa.i, pb.i, stride.i, n.i, out.i
+    pa = *g\A
+    stride = *g\Hidden * *g\Count * 4
+    pb = *g\B + *g\Unit * *g\Count * 4
+    n = *g\Count
+    out = @*g\IValue
+    !mov rax,[p.v_pa]
+    !mov rcx,[p.v_pb]
+    !mov r8,[p.v_stride]
+    !mov rdx,[p.v_n]
+    !xorps xmm0,xmm0
+    !test rdx,rdx
+    !jz pmlstmfloatfour_store
+    !pmlstmfloatfour_loop:
+    !movss xmm1,[rax]
+    !shufps xmm1,xmm1,0
+    !lea r9,[rcx+r8]
+    !lea r10,[r9+r8]
+    !lea r11,[r10+r8]
+    !movss xmm2,[rcx]
+    !movss xmm3,[r9]
+    !unpcklps xmm2,xmm3
+    !movss xmm3,[r10]
+    !movss xmm4,[r11]
+    !unpcklps xmm3,xmm4
+    !movlhps xmm2,xmm3
+    !mulps xmm2,xmm1
+    !addps xmm0,xmm2
+    !add rax,4
+    !add rcx,4
+    !dec rdx
+    !jnz pmlstmfloatfour_loop
+    !pmlstmfloatfour_store:
+    !mov r9,[p.v_out]
+    !movups [r9],xmm0
+    ProcedureReturn
+  CompilerEndIf
   gate = 0
   While gate < 4
     offset = gate : offset = offset * *g\Hidden
@@ -3483,7 +3594,8 @@ Procedure PmTensorLstmFloatFour(*g.PmTensorLstmFloatFourArgs)
     While index < *g\Count
       left = PmTensorGet(*g\A, index)
       right = PmTensorGet(*g\B, offset + index)
-      sum = sum + left * right
+      left = left * right
+      sum = sum + left
       index = index + 1
     Wend
     Select gate
@@ -3531,6 +3643,7 @@ Procedure PmTensorLstmUnits(*s.PmLstmStep, u0.i, u1.i)
   Protected unit.i, k.i, stateIndex.i, wBase.i, rBase.i, bBase.i, yIndex.i, leftPointer.i, rightPointer.i
   Protected iv.f, ov.f, fv.f, cv.f, previousC.f, newC.f
   Protected floatFour.PmTensorLstmFloatFourArgs
+  Protected lb.l, la.l, ln.f, le.f, ld.f
   unit = u0
   While unit < u1
             iv = 0.0 : ov = 0.0 : fv = 0.0 : cv = 0.0
@@ -3595,14 +3708,17 @@ Procedure PmTensorLstmUnits(*s.PmLstmStep, u0.i, u1.i)
             CompilerEndIf
             stateIndex = (dir * *g\Batch + bn) * *g\Hidden + unit
             previousC = PmTensorGet(*g\YC, stateIndex)
-            iv = PmTensorSigmoidValue(iv)
-            ov = PmTensorSigmoidValue(ov)
-            fv = PmTensorSigmoidValue(fv)
-            cv = PmTensorTanhValue(cv)
-            newC = fv * previousC + iv * cv
+            PmLstmSigmoidInPlace(iv)
+            PmLstmSigmoidInPlace(ov)
+            PmLstmSigmoidInPlace(fv)
+            PmLstmTanhInPlace(cv)
+            PmLstmCellInPlace(newC, fv, previousC, iv, cv)
             PmTensorPut(*g\YC, stateIndex, newC)
             yIndex = ((t * *g\Directions + dir) * *g\Batch + bn) * *g\Hidden + unit
-            PmTensorPut(*g\Y, yIndex, ov * PmTensorTanhValue(newC))
+            cv = newC
+            PmLstmTanhInPlace(cv)
+            ov = ov * cv
+            PmTensorPut(*g\Y, yIndex, ov)
             unit = unit + 1
   Wend
 EndProcedure
@@ -3656,6 +3772,7 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
   EndIf
   CompilerEndIf
 
+  PmTensorLstmClearY(*g)
   ; Initial state becomes the mutable final-state buffers.
   dir = 0
   While dir < *g\Directions
@@ -3687,8 +3804,7 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
     While timeStep < *g\Sequence
       bn = 0
       While bn < *g\Batch
-        valid = *g\Sequence
-        If *g\SeqLens <> 0 : valid = PmTensorGetI64(*g\SeqLens, bn) : EndIf
+        valid = PmTensorLstmValid(*g, bn)
         If dir = 0
           t = timeStep
         Else
@@ -3779,6 +3895,7 @@ Procedure PmI8LstmUnits(*s.PmI8LstmStep, u0.i, u1.i)
   Protected rElements.i=*g\Directions*width* *g\Hidden, bbase.i=dir*8* *g\Hidden
   Protected *r1=*s\R1, *r2=*s\R2, *xproj=*s\XProj, inputRow.i=*s\InputRow, state.i=*s\State, outRow.i=*s\OutRow
   Protected iv.f, ov.f, fv.f, cv.f, previous.f
+  Protected lb.l, la.l, ln.f, le.f, ld.f
   If n<=0 : ProcedureReturn : EndIf
   For gate=0 To 3
     row=gate* *g\Hidden+u0
@@ -3798,8 +3915,14 @@ Procedure PmI8LstmUnits(*s.PmI8LstmStep, u0.i, u1.i)
     fv+PeekF(*xproj+(inputRow+2* *g\Hidden+unit)*4) : fv+PmI8GateValue(*r1,*r2,2* *g\Hidden+unit,*g\RWide,*g\RScales,dir*width)
     cv+PeekF(*xproj+(inputRow+3* *g\Hidden+unit)*4) : cv+PmI8GateValue(*r1,*r2,3* *g\Hidden+unit,*g\RWide,*g\RScales,dir*width)
     previous=PeekF(*g\YC+(state+unit)*4)
-    cv=PmTensorSigmoidValue(fv)*previous+PmTensorSigmoidValue(iv)*PmTensorTanhValue(cv)
-    ov=PmTensorSigmoidValue(ov)*PmTensorTanhValue(cv)
+    PmLstmSigmoidInPlace(iv)
+    PmLstmSigmoidInPlace(ov)
+    PmLstmSigmoidInPlace(fv)
+    PmLstmTanhInPlace(cv)
+    PmLstmCellInPlace(cv, fv, previous, iv, cv)
+    previous=cv
+    PmLstmTanhInPlace(previous)
+    ov=ov*previous
     PokeF(*g\YC+(state+unit)*4,cv) : PokeF(*g\Y+(outRow+unit)*4,ov)
   Next
 EndProcedure
@@ -3818,6 +3941,7 @@ Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
   *xproj=AllocateMemory(width* *g\Sequence* *g\Batch*4+64) : *hq=AllocateMemory(*g\Hidden*2+64)
   *acc=AllocateMemory(width*4+64) : *r1=AllocateMemory(width*4+64) : *r2=AllocateMemory(width*4+64)
   If *xproj=0 Or *hq=0 Or *acc=0 Or *r1=0 Or *r2=0 : PmTensorInt8Fault=2 : ok=0 : EndIf
+  If ok : PmTensorLstmClearY(*g) : EndIf
   If ok
     For i=0 To *g\Directions* *g\Batch* *g\Hidden-1
       iv=0 : cv=0
@@ -3835,8 +3959,7 @@ Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
     EndIf
     For stepIndex=0 To *g\Sequence-1
       For bn=0 To *g\Batch-1
-        valid=*g\Sequence
-        If *g\SeqLens : valid=PeekQ(*g\SeqLens+bn*8) : EndIf
+        valid=PmTensorLstmValid(*g, bn)
         If stepIndex>=valid : Continue : EndIf
         t=stepIndex : If dir=1 : t=valid-1-stepIndex : EndIf
         inputRow=(t* *g\Batch+bn)*width

@@ -3817,8 +3817,7 @@ EndProcedure
 ;   for a subnormal); |x| > 10: +-1; otherwise the binary32 nearest
 ;   (e - 1) / (e + 1), e = e^2|x| rounded to binary32 (e - 1 and e + 1 are
 ;   exact, so the quotient is rounded once); the sign of x.
-; The LSTM's activations (PmTensorSigmoidValue, PmTensorTanhValue) are not
-; these: they stay as they were.
+; The LSTM takes these formulas too (PmTensorLstmAct).
 CompilerIf #PMO_USE_EXPLOG = 1
 ; Tanh's quotient: the bits of e (1 < e < 2^29, a binary32) in, the bits of
 ; the binary32 nearest (e - 1) / (e + 1) out (0 for e = 1). e - 1 and e + 1 are
@@ -7493,6 +7492,351 @@ Structure PmTensorLstmFloatFourArgs
   CValue.f
 EndStructure
 
+; The LSTM's gate activations: Sigmoid and Tanh by the operators' shared
+; binary32 formulas (PmTensorSigmoidF, PmTensorTanhF: the correctly rounded
+; Exp, every other operation rounded once), so an LSTM gives the Windows
+; program's bits on every target. op says what a block holds: 0 every value a
+; sigmoid, 1 every value a tanh, 2 each four values one unit's gates i, o and f
+; (sigmoid) and c (tanh). The Pi 4 takes them four lanes at a time
+; (PmTensorLstmActRunA64); the other targets one value at a time.
+Structure PmTensorLstmActLanes
+  L0.l
+  L1.l
+  L2.l
+  L3.l
+EndStructure
+
+Structure PmTensorLstmActBlock
+  L0.l
+  L1.l
+  L2.l
+  L3.l
+  L4.l
+  L5.l
+  L6.l
+  L7.l
+  L8.l
+  L9.l
+  L10.l
+  L11.l
+  L12.l
+  L13.l
+  L14.l
+  L15.l
+EndStructure
+
+CompilerIf #PMO_INT8_BACKEND = 1
+; Four values by the scalar functions: a block the four-lane kernel does not
+; round itself.
+Procedure PmTensorLstmActFour(*src.i, *dst.i, *mask.i)
+  Protected j.i
+  Protected x.f
+  Protected y.f
+  j = 0
+  While j < 4
+    PokeL(@x, PeekL(*src + j * 4))
+    If PeekL(*mask + j * 4) = 0
+      y = PmTensorSigmoidF(x)
+    Else
+      y = PmTensorTanhF(x)
+    EndIf
+    PokeL(*dst + j * 4, PeekL(@y))
+    j = j + 1
+  Wend
+EndProcedure
+
+; Four values at a time: the exponential's argument (-|x| for a sigmoid, 2|x|
+; for a tanh) in two pairs of binary64 lanes, k = its multiple of ln2 rounded
+; to the nearest integer, r = z - k ln2 (ln2 in two parts, fused
+; multiply-subtract, so the first is exact), e^r by its Taylor series to
+; r^11/11!, times 2^k. If any result's bits below binary32 precision lie
+; within 1024 binary64 units of a rounding midpoint, or any |x| is above 87
+; or a NaN, the block goes to PmTensorLstmActFour, the correctly rounded
+; integer method; otherwise the binary64 value rounds to the correctly rounded
+; e. Then each lane's formula: the sigmoid 1 / (1 + e) or e / (1 + e) in
+; binary32; the tanh (e - 1) / (e + 1) in binary64, rounded once to binary32
+; (e - 1 and e + 1 are exact), |x| itself below 2^-12, 1 above 10, with the
+; sign of x. *mask holds the four lanes' kinds (0 sigmoid, -1 tanh). count is
+; a multiple of four. Every binary32 argument was run through it in the
+; emulator against the correctly rounded formulas.
+;
+; FCVTL and FCVTN are written as their encodings (.word), as in
+; tensor_trig_a64.pmi. Only caller-saved registers are touched: x0..x12 and
+; v0..v7, v16..v31.
+Procedure PmTensorLstmActRunA64(*src.i, *dst.i, count.i, *mask.i)
+  ASM
+    cmp x2, #4
+    b.lt pmoLstmActDone
+pmoLstmActSetup:
+    adrp x9, pmolstmactk
+    add x9, x9, #:lo12:pmolstmactk
+    ld1 {v16.2d}, [x9], #16
+    ld1 {v17.2d}, [x9], #16
+    ld1 {v18.2d}, [x9], #16
+    ld1 {v19.2d}, [x9], #16
+    ld1 {v20.2d}, [x9], #16
+    ld1 {v21.2d}, [x9], #16
+    ld1 {v22.2d}, [x9], #16
+    ld1 {v23.2d}, [x9], #16
+    ld1 {v24.2d}, [x9], #16
+    ld1 {v25.2d}, [x9], #16
+    ld1 {v26.4s}, [x9], #16
+    ld1 {v27.4s}, [x9], #16
+    ld1 {v28.4s}, [x9], #16
+    ld1 {v29.4s}, [x9], #16
+    ld1 {v30.4s}, [x9]
+    ld1 {v31.4s}, [x3]
+    movz x12, #16368, lsl #48
+pmoLstmActLoop:
+    cmp x2, #4
+    b.lt pmoLstmActDone
+    ld1 {v0.4s}, [x0]
+    ; |x| <= 87 (a NaN fails the comparison)
+    fabs v1.4s, v0.4s
+    fcmge v2.4s, v27.4s, v1.4s
+    mvn v2.16b, v2.16b
+    umaxv s2, v2.4s
+    fmov w9, s2
+    cbnz w9, pmoLstmActGroup
+    ; z = -|x| (sigmoid) or 2|x| (tanh)
+    fneg v3.4s, v1.4s
+    fadd v4.4s, v1.4s, v1.4s
+    mov v5.16b, v31.16b
+    bsl v5.16b, v4.16b, v3.16b
+    ; fcvtl v6.2d, v5.2s ; fcvtl2 v7.2d, v5.4s
+    .word 0x0E6178A6
+    .word 0x4E6178A7
+    ; e^z, lanes 0 and 1
+    fmul v1.2d, v6.2d, v16.2d
+    frintn v1.2d, v1.2d
+    fmls v6.2d, v1.2d, v17.2d
+    fmls v6.2d, v1.2d, v18.2d
+    fcvtzs v1.2d, v1.2d
+    shl v1.2d, v1.2d, #52
+    dup v3.2d, v24.d[1]
+    dup v4.2d, v24.d[0]
+    fmla v4.2d, v3.2d, v6.2d
+    dup v3.2d, v23.d[1]
+    fmla v3.2d, v4.2d, v6.2d
+    dup v4.2d, v23.d[0]
+    fmla v4.2d, v3.2d, v6.2d
+    dup v3.2d, v22.d[1]
+    fmla v3.2d, v4.2d, v6.2d
+    dup v4.2d, v22.d[0]
+    fmla v4.2d, v3.2d, v6.2d
+    dup v3.2d, v21.d[1]
+    fmla v3.2d, v4.2d, v6.2d
+    dup v4.2d, v21.d[0]
+    fmla v4.2d, v3.2d, v6.2d
+    dup v3.2d, v20.d[1]
+    fmla v3.2d, v4.2d, v6.2d
+    dup v4.2d, v20.d[0]
+    fmla v4.2d, v3.2d, v6.2d
+    dup v3.2d, v19.d[1]
+    fmla v3.2d, v4.2d, v6.2d
+    dup v4.2d, v19.d[0]
+    fmla v4.2d, v3.2d, v6.2d
+    add v6.2d, v4.2d, v1.2d
+    ; e^z, lanes 2 and 3
+    fmul v1.2d, v7.2d, v16.2d
+    frintn v1.2d, v1.2d
+    fmls v7.2d, v1.2d, v17.2d
+    fmls v7.2d, v1.2d, v18.2d
+    fcvtzs v1.2d, v1.2d
+    shl v1.2d, v1.2d, #52
+    dup v3.2d, v24.d[1]
+    dup v4.2d, v24.d[0]
+    fmla v4.2d, v3.2d, v7.2d
+    dup v3.2d, v23.d[1]
+    fmla v3.2d, v4.2d, v7.2d
+    dup v4.2d, v23.d[0]
+    fmla v4.2d, v3.2d, v7.2d
+    dup v3.2d, v22.d[1]
+    fmla v3.2d, v4.2d, v7.2d
+    dup v4.2d, v22.d[0]
+    fmla v4.2d, v3.2d, v7.2d
+    dup v3.2d, v21.d[1]
+    fmla v3.2d, v4.2d, v7.2d
+    dup v4.2d, v21.d[0]
+    fmla v4.2d, v3.2d, v7.2d
+    dup v3.2d, v20.d[1]
+    fmla v3.2d, v4.2d, v7.2d
+    dup v4.2d, v20.d[0]
+    fmla v4.2d, v3.2d, v7.2d
+    dup v3.2d, v19.d[1]
+    fmla v3.2d, v4.2d, v7.2d
+    dup v4.2d, v19.d[0]
+    fmla v4.2d, v3.2d, v7.2d
+    add v7.2d, v4.2d, v1.2d
+    ; each result's 29 bits below binary32 precision against the midpoint
+    shl v1.2d, v6.2d, #35
+    fneg v1.2d, v1.2d
+    abs v1.2d, v1.2d
+    cmhi v1.2d, v25.2d, v1.2d
+    shl v3.2d, v7.2d, #35
+    fneg v3.2d, v3.2d
+    abs v3.2d, v3.2d
+    cmhi v3.2d, v25.2d, v3.2d
+    orr v1.16b, v1.16b, v3.16b
+    addp v1.2d, v1.2d, v1.2d
+    fmov x9, d1
+    cbnz x9, pmoLstmActGroup
+    ; fcvtn v1.2s, v6.2d ; fcvtn2 v1.4s, v7.2d: e, correctly rounded
+    .word 0x0E6168C1
+    .word 0x4E6168E1
+    ; sigmoid: (x < 0 ? e : 1) / (1 + e)
+    fadd v2.4s, v26.4s, v1.4s
+    sshr v3.4s, v0.4s, #31
+    bsl v3.16b, v1.16b, v26.16b
+    fdiv v2.4s, v3.4s, v2.4s
+    ; tanh: (e - 1) / (e + 1) in binary64
+    ; fcvtl v3.2d, v1.2s ; fcvtl2 v4.2d, v1.4s
+    .word 0x0E617823
+    .word 0x4E617824
+    dup v5.2d, x12
+    fsub v6.2d, v3.2d, v5.2d
+    fadd v3.2d, v3.2d, v5.2d
+    fdiv v6.2d, v6.2d, v3.2d
+    fsub v7.2d, v4.2d, v5.2d
+    fadd v4.2d, v4.2d, v5.2d
+    fdiv v7.2d, v7.2d, v4.2d
+    ; fcvtn v3.2s, v6.2d ; fcvtn2 v3.4s, v7.2d
+    .word 0x0E6168C3
+    .word 0x4E6168E3
+    and v4.16b, v0.16b, v30.16b
+    orr v3.16b, v3.16b, v4.16b
+    orr v5.16b, v26.16b, v4.16b
+    fabs v6.4s, v0.4s
+    cmgt v7.4s, v6.4s, v29.4s
+    bsl v7.16b, v5.16b, v3.16b
+    cmgt v5.4s, v28.4s, v6.4s
+    bsl v5.16b, v0.16b, v7.16b
+    ; each lane its own kind
+    mov v6.16b, v31.16b
+    bsl v6.16b, v5.16b, v2.16b
+    st1 {v6.4s}, [x1]
+    add x0, x0, #16
+    add x1, x1, #16
+    sub x2, x2, #4
+    b pmoLstmActLoop
+
+pmoLstmActGroup:
+    ; these four by the integer method; the call keeps nothing in the
+    ; caller-saved registers, so the constants are loaded again after it
+    stp x0, x1, [sp, #-32]!
+    stp x2, x3, [sp, #16]
+    mov x2, x3
+    bl pmtensorlstmactfour
+    ldp x2, x3, [sp, #16]
+    ldp x0, x1, [sp], #32
+    add x0, x0, #16
+    add x1, x1, #16
+    sub x2, x2, #4
+    cmp x2, #4
+    b.lt pmoLstmActDone
+    b pmoLstmActSetup
+pmoLstmActDone:
+  EndASM
+EndProcedure
+
+DataSection
+  pmoLstmActK:
+  Data.l $652B82FE,$3FF71547,$652B82FE,$3FF71547
+  Data.l $FEFA39EF,$3FE62E42,$FEFA39EF,$3FE62E42
+  Data.l $3B39803F,$3C7ABC9E,$3B39803F,$3C7ABC9E
+  Data.l $00000000,$3FF00000,$00000000,$3FF00000
+  Data.l $00000000,$3FE00000,$55555555,$3FC55555
+  Data.l $55555555,$3FA55555,$11111111,$3F811111
+  Data.l $16C16C17,$3F56C16C,$1A01A01A,$3F2A01A0
+  Data.l $1A01A01A,$3EFA01A0,$A556C734,$3EC71DE3
+  Data.l $B7789F5C,$3E927E4F,$67F544E4,$3E5AE645
+  Data.l $00000000,$00002000,$00000000,$00002000
+  Data.l $3F800000,$3F800000,$3F800000,$3F800000
+  Data.l $42AE0000,$42AE0000,$42AE0000,$42AE0000
+  Data.l $39800000,$39800000,$39800000,$39800000
+  Data.l $41200000,$41200000,$41200000,$41200000
+  Data.l $80000000,$80000000,$80000000,$80000000
+EndDataSection
+
+Procedure PmTensorLstmAct(*src.i, *dst.i, count.i, op.i)
+  Protected m.PmTensorLstmActLanes
+  Protected pad.PmTensorLstmActLanes
+  Protected full.i
+  Protected j.i
+  m\L0 = 0 : m\L1 = 0 : m\L2 = 0 : m\L3 = 0
+  If op = 1
+    m\L0 = -1 : m\L1 = -1 : m\L2 = -1
+  EndIf
+  If op >= 1
+    m\L3 = -1
+  EndIf
+  full = count >> 2
+  full = full << 2
+  If full > 0
+    PmTensorLstmActRunA64(*src, *dst, full, @m)
+  EndIf
+  If full < count
+    pad\L0 = 0 : pad\L1 = 0 : pad\L2 = 0 : pad\L3 = 0
+    j = full
+    While j < count
+      PokeL(@pad + (j - full) * 4, PeekL(*src + j * 4))
+      j = j + 1
+    Wend
+    PmTensorLstmActRunA64(@pad, @pad, 4, @m)
+    j = full
+    While j < count
+      PokeL(*dst + j * 4, PeekL(@pad + (j - full) * 4))
+      j = j + 1
+    Wend
+  EndIf
+EndProcedure
+CompilerElse
+Procedure PmTensorLstmAct(*src.i, *dst.i, count.i, op.i)
+  Protected j.i
+  Protected x.f
+  Protected y.f
+  j = 0
+  While j < count
+    PokeL(@x, PeekL(*src + j * 4))
+    If op = 1 Or (op = 2 And (j & 3) = 3)
+      y = PmTensorTanhF(x)
+    Else
+      y = PmTensorSigmoidF(x)
+    EndIf
+    PokeL(*dst + j * 4, PeekL(@y))
+    j = j + 1
+  Wend
+EndProcedure
+CompilerEndIf
+
+; A sequence's length: sequence_lens is INT32, as ONNX defines it (the
+; fixed-shape path read it as INT64), clamped to the sequence.
+Procedure.i PmTensorLstmValid(*g.PmTensorLstmArgs, bn.i)
+  Protected valid.i
+  valid = *g\Sequence
+  If *g\SeqLens <> 0
+    valid = PeekL(*g\SeqLens + bn * 4)
+    If valid < 0 : valid = 0 : EndIf
+    If valid > *g\Sequence : valid = *g\Sequence : EndIf
+  EndIf
+  ProcedureReturn valid
+EndProcedure
+
+; Y past a sequence's end is 0, as ONNX defines it.
+Procedure PmTensorLstmClearY(*g.PmTensorLstmArgs)
+  Protected i.i
+  Protected n.i
+  If *g\SeqLens = 0
+    ProcedureReturn
+  EndIf
+  n = *g\Sequence * *g\Directions * *g\Batch * *g\Hidden
+  i = 0
+  While i < n
+    PmTensorPut(*g\Y, i, 0.0)
+    i = i + 1
+  Wend
+EndProcedure
+
 Procedure PmTensorLstmFloatFour(*g.PmTensorLstmFloatFourArgs)
   CompilerIf #PMO_INT8_BACKEND = 1
   ASM
@@ -7553,7 +7897,8 @@ pmoLstmFloatFourStore:
     While index < *g\Count
       left = PmTensorGet(*g\A, index)
       right = PmTensorGet(*g\B, offset + index)
-      sum = sum + left * right
+      left = left * right
+      sum = sum + left
       index = index + 1
     Wend
     Select gate
@@ -7612,6 +7957,10 @@ Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
   Protected f1.f
   Protected f2.f
   Protected floatFour.PmTensorLstmFloatFourArgs
+  Protected n.i
+  Protected j.i
+  Protected gates.PmTensorLstmActBlock
+  Protected cells.PmTensorLstmActLanes
   width = 4 * *g\Hidden
   ww = 0 : If *g\WScales <> 0 : ww = *g\WWide : EndIf
   rw = 0 : If *g\RScales <> 0 : rw = *g\RWide : EndIf
@@ -7628,6 +7977,7 @@ Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
   rElements = *g\Directions * width * *g\Hidden
   qx = 127 : If ww <> 0 : qx = 32767 : EndIf
   qh = 127 : If rw <> 0 : qh = 32767 : EndIf
+  PmTensorLstmClearY(*g)
   i = 0
   While i < *g\Directions * *g\Batch * *g\Hidden
     iv = 0.0 : cv = 0.0
@@ -7642,8 +7992,7 @@ Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
     While stepIndex < *g\Sequence
       bn = 0
       While bn < *g\Batch
-        valid = *g\Sequence
-        If *g\SeqLens <> 0 : valid = PmTensorGetI64(*g\SeqLens, bn) : EndIf
+        valid = PmTensorLstmValid(*g, bn)
         If stepIndex < valid
           t = stepIndex
           If dir = 1 : t = valid - 1 - stepIndex : EndIf
@@ -7711,32 +8060,56 @@ Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
             Wend
           EndIf
           bbase = dir * 8 * *g\Hidden
+          ; four units at a time, as PmTensorLstm
           unit = 0
           While unit < *g\Hidden
-            iv = 0.0 : ov = 0.0 : fv = 0.0 : cv = 0.0
-            If *g\B <> 0
-              iv = PmTensorGet(*g\B, bbase + unit) + PmTensorGet(*g\B, bbase + 4 * *g\Hidden + unit)
-              ov = PmTensorGet(*g\B, bbase + *g\Hidden + unit) + PmTensorGet(*g\B, bbase + 5 * *g\Hidden + unit)
-              fv = PmTensorGet(*g\B, bbase + 2 * *g\Hidden + unit) + PmTensorGet(*g\B, bbase + 6 * *g\Hidden + unit)
-              cv = PmTensorGet(*g\B, bbase + 3 * *g\Hidden + unit) + PmTensorGet(*g\B, bbase + 7 * *g\Hidden + unit)
-            EndIf
-            iv = iv + PmI8GetF(gw + unit * 4)
-            iv = iv + PmI8GetF(gr + unit * 4)
-            ov = ov + PmI8GetF(gw + (*g\Hidden + unit) * 4)
-            ov = ov + PmI8GetF(gr + (*g\Hidden + unit) * 4)
-            fv = fv + PmI8GetF(gw + (2 * *g\Hidden + unit) * 4)
-            fv = fv + PmI8GetF(gr + (2 * *g\Hidden + unit) * 4)
-            cv = cv + PmI8GetF(gw + (3 * *g\Hidden + unit) * 4)
-            cv = cv + PmI8GetF(gr + (3 * *g\Hidden + unit) * 4)
-            previousC = PmI8GetF(*g\YC + (state + unit) * 4)
-            iv = PmTensorSigmoidValue(iv)
-            ov = PmTensorSigmoidValue(ov)
-            fv = PmTensorSigmoidValue(fv)
-            cv = PmTensorTanhValue(cv)
-            newC = fv * previousC + iv * cv
-            PmI8PutF(*g\YC + (state + unit) * 4, newC)
-            PmI8PutF(*g\Y + (outRow + unit) * 4, ov * PmTensorTanhValue(newC))
-            unit = unit + 1
+            n = *g\Hidden - unit
+            If n > 4 : n = 4 : EndIf
+            j = 0
+            While j < n
+              iv = 0.0 : ov = 0.0 : fv = 0.0 : cv = 0.0
+              If *g\B <> 0
+                iv = PmTensorGet(*g\B, bbase + unit + j) + PmTensorGet(*g\B, bbase + 4 * *g\Hidden + unit + j)
+                ov = PmTensorGet(*g\B, bbase + *g\Hidden + unit + j) + PmTensorGet(*g\B, bbase + 5 * *g\Hidden + unit + j)
+                fv = PmTensorGet(*g\B, bbase + 2 * *g\Hidden + unit + j) + PmTensorGet(*g\B, bbase + 6 * *g\Hidden + unit + j)
+                cv = PmTensorGet(*g\B, bbase + 3 * *g\Hidden + unit + j) + PmTensorGet(*g\B, bbase + 7 * *g\Hidden + unit + j)
+              EndIf
+              iv = iv + PmI8GetF(gw + (unit + j) * 4)
+              iv = iv + PmI8GetF(gr + (unit + j) * 4)
+              ov = ov + PmI8GetF(gw + (*g\Hidden + unit + j) * 4)
+              ov = ov + PmI8GetF(gr + (*g\Hidden + unit + j) * 4)
+              fv = fv + PmI8GetF(gw + (2 * *g\Hidden + unit + j) * 4)
+              fv = fv + PmI8GetF(gr + (2 * *g\Hidden + unit + j) * 4)
+              cv = cv + PmI8GetF(gw + (3 * *g\Hidden + unit + j) * 4)
+              cv = cv + PmI8GetF(gr + (3 * *g\Hidden + unit + j) * 4)
+              PmTensorPut(@gates, j * 4, iv) : PmTensorPut(@gates, j * 4 + 1, ov)
+              PmTensorPut(@gates, j * 4 + 2, fv) : PmTensorPut(@gates, j * 4 + 3, cv)
+              j = j + 1
+            Wend
+            PmTensorLstmAct(@gates, @gates, n * 4, 2)
+            j = 0
+            While j < n
+              previousC = PmI8GetF(*g\YC + (state + unit + j) * 4)
+              fv = PmTensorGet(@gates, j * 4 + 2)
+              newC = fv * previousC
+              iv = PmTensorGet(@gates, j * 4)
+              cv = PmTensorGet(@gates, j * 4 + 3)
+              cv = iv * cv
+              newC = newC + cv
+              PmI8PutF(*g\YC + (state + unit + j) * 4, newC)
+              PmTensorPut(@cells, j, newC)
+              j = j + 1
+            Wend
+            PmTensorLstmAct(@cells, @cells, n, 1)
+            j = 0
+            While j < n
+              ov = PmTensorGet(@gates, j * 4 + 1)
+              cv = PmTensorGet(@cells, j)
+              ov = ov * cv
+              PmI8PutF(*g\Y + (outRow + unit + j) * 4, ov)
+              j = j + 1
+            Wend
+            unit = unit + n
           Wend
           ; The completed step becomes h only after every recurrent read used h(t-1).
           unit = 0
@@ -7783,6 +8156,10 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
   Protected dotValue.f
   Protected dot.PmTensorDotInt8Args
   Protected floatFour.PmTensorLstmFloatFourArgs
+  Protected n.i
+  Protected j.i
+  Protected gates.PmTensorLstmActBlock
+  Protected cells.PmTensorLstmActLanes
   CompilerIf #PMO_USE_INT8 = 1
   If *g\WScales <> 0 Or *g\RScales <> 0
     If PmI8Lstm(*g) = 0 And PmTensorInt8Fault = 0 : PmTensorInt8Fault = 2 : EndIf
@@ -7790,6 +8167,7 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
   EndIf
   CompilerEndIf
 
+  PmTensorLstmClearY(*g)
   ; Initial state becomes the mutable final-state buffers.
   dir = 0
   While dir < *g\Directions
@@ -7821,8 +8199,7 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
     While step < *g\Sequence
       bn = 0
       While bn < *g\Batch
-        valid = *g\Sequence
-        If *g\SeqLens <> 0 : valid = PmTensorGetI64(*g\SeqLens, bn) : EndIf
+        valid = PmTensorLstmValid(*g, bn)
         If dir = 0
           t = step
         Else
@@ -7831,44 +8208,71 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
         If step < valid
           xIndex = (t * *g\Batch + bn) * *g\InputSize
           stateIndex = (dir * *g\Batch + bn) * *g\Hidden
+          ; Four units at a time: their gate pre-activations, then the
+          ; activations (PmTensorLstmAct), the cells, Tanh of the cells and
+          ; the outputs - each unit's operations in the one-unit order, one
+          ; binary32 rounding each.
           unit = 0
           While unit < *g\Hidden
-            iv = 0.0 : ov = 0.0 : fv = 0.0 : cv = 0.0
-            bBase = dir * 8 * *g\Hidden
-            If *g\B <> 0
-              iv = PmTensorGet(*g\B, bBase + unit) + PmTensorGet(*g\B, bBase + 4 * *g\Hidden + unit)
-              ov = PmTensorGet(*g\B, bBase + *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 5 * *g\Hidden + unit)
-              fv = PmTensorGet(*g\B, bBase + 2 * *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 6 * *g\Hidden + unit)
-              cv = PmTensorGet(*g\B, bBase + 3 * *g\Hidden + unit) + PmTensorGet(*g\B, bBase + 7 * *g\Hidden + unit)
-            EndIf
-            wBase = (dir * 4 * *g\Hidden) * *g\InputSize
+            n = *g\Hidden - unit
+            If n > 4 : n = 4 : EndIf
+            j = 0
+            While j < n
+              iv = 0.0 : ov = 0.0 : fv = 0.0 : cv = 0.0
+              bBase = dir * 8 * *g\Hidden
+              If *g\B <> 0
+                iv = PmTensorGet(*g\B, bBase + unit + j) + PmTensorGet(*g\B, bBase + 4 * *g\Hidden + unit + j)
+                ov = PmTensorGet(*g\B, bBase + *g\Hidden + unit + j) + PmTensorGet(*g\B, bBase + 5 * *g\Hidden + unit + j)
+                fv = PmTensorGet(*g\B, bBase + 2 * *g\Hidden + unit + j) + PmTensorGet(*g\B, bBase + 6 * *g\Hidden + unit + j)
+                cv = PmTensorGet(*g\B, bBase + 3 * *g\Hidden + unit + j) + PmTensorGet(*g\B, bBase + 7 * *g\Hidden + unit + j)
+              EndIf
+              wBase = (dir * 4 * *g\Hidden) * *g\InputSize
               leftPointer = *g\X : k = xIndex : k = k * 4 : leftPointer = leftPointer + k
               rightPointer = *g\W : k = wBase : k = k * 4 : rightPointer = rightPointer + k
               floatFour\A = leftPointer : floatFour\B = rightPointer
-              floatFour\Count = *g\InputSize : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
+              floatFour\Count = *g\InputSize : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit + j
               PmTensorLstmFloatFour(@floatFour)
               iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
               fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
-            stateIndex = (dir * *g\Batch + bn) * *g\Hidden
-            rBase = (dir * 4 * *g\Hidden) * *g\Hidden
+              stateIndex = (dir * *g\Batch + bn) * *g\Hidden
+              rBase = (dir * 4 * *g\Hidden) * *g\Hidden
               leftPointer = *g\YH : k = stateIndex : k = k * 4 : leftPointer = leftPointer + k
               rightPointer = *g\R : k = rBase : k = k * 4 : rightPointer = rightPointer + k
               floatFour\A = leftPointer : floatFour\B = rightPointer
-              floatFour\Count = *g\Hidden : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit
+              floatFour\Count = *g\Hidden : floatFour\Hidden = *g\Hidden : floatFour\Unit = unit + j
               PmTensorLstmFloatFour(@floatFour)
               iv = iv + floatFour\IValue : ov = ov + floatFour\OValue
               fv = fv + floatFour\FValue : cv = cv + floatFour\CValue
-            stateIndex = (dir * *g\Batch + bn) * *g\Hidden + unit
-            previousC = PmTensorGet(*g\YC, stateIndex)
-            iv = PmTensorSigmoidValue(iv)
-            ov = PmTensorSigmoidValue(ov)
-            fv = PmTensorSigmoidValue(fv)
-            cv = PmTensorTanhValue(cv)
-            newC = fv * previousC + iv * cv
-            PmTensorPut(*g\YC, stateIndex, newC)
-            yIndex = ((t * *g\Directions + dir) * *g\Batch + bn) * *g\Hidden + unit
-            PmTensorPut(*g\Y, yIndex, ov * PmTensorTanhValue(newC))
-            unit = unit + 1
+              PmTensorPut(@gates, j * 4, iv) : PmTensorPut(@gates, j * 4 + 1, ov)
+              PmTensorPut(@gates, j * 4 + 2, fv) : PmTensorPut(@gates, j * 4 + 3, cv)
+              j = j + 1
+            Wend
+            PmTensorLstmAct(@gates, @gates, n * 4, 2)
+            j = 0
+            While j < n
+              stateIndex = (dir * *g\Batch + bn) * *g\Hidden + unit + j
+              previousC = PmTensorGet(*g\YC, stateIndex)
+              fv = PmTensorGet(@gates, j * 4 + 2)
+              newC = fv * previousC
+              iv = PmTensorGet(@gates, j * 4)
+              cv = PmTensorGet(@gates, j * 4 + 3)
+              cv = iv * cv
+              newC = newC + cv
+              PmTensorPut(*g\YC, stateIndex, newC)
+              PmTensorPut(@cells, j, newC)
+              j = j + 1
+            Wend
+            PmTensorLstmAct(@cells, @cells, n, 1)
+            j = 0
+            While j < n
+              ov = PmTensorGet(@gates, j * 4 + 1)
+              cv = PmTensorGet(@cells, j)
+              ov = ov * cv
+              yIndex = ((t * *g\Directions + dir) * *g\Batch + bn) * *g\Hidden + unit + j
+              PmTensorPut(*g\Y, yIndex, ov)
+              j = j + 1
+            Wend
+            unit = unit + n
           Wend
           ; Copy the completed timestep only after all recurrent reads used H(t-1).
           unit = 0

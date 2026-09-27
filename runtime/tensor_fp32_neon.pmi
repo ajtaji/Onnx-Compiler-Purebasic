@@ -3774,6 +3774,7 @@ Procedure PmTensorLstmFp32Neon(*g.PmTensorLstmArgs, WT.i, RT.i, Dots.i, Stride.i
   wDots=Dots
   rDots=Dots+4*Stride*4
 
+  PmTensorLstmClearY(*g)
   ; Initial state becomes the mutable final-state buffers.
   dir = 0
   While dir < *g\Directions
@@ -3805,8 +3806,7 @@ Procedure PmTensorLstmFp32Neon(*g.PmTensorLstmArgs, WT.i, RT.i, Dots.i, Stride.i
     While step < *g\Sequence
       bn = 0
       While bn < *g\Batch
-        valid = *g\Sequence
-        If *g\SeqLens <> 0 : valid = PmTensorGetI64(*g\SeqLens, bn) : EndIf
+        valid = PmTensorLstmValid(*g, bn)
         If dir = 0
           t = step
         Else
@@ -3851,15 +3851,16 @@ Procedure PmTensorLstmFp32Neon(*g.PmTensorLstmArgs, WT.i, RT.i, Dots.i, Stride.i
             gate = gate + 1
           Wend
           ; The activations: i, o and f through the sigmoid, c through the
-          ; tanh, each four units at a time.
+          ; tanh, the operators' shared binary32 formulas, each four units
+          ; at a time (PmTensorLstmAct).
           k = 0
-          PmTensorSigmoidFp32Neon(wDots + k, wDots + k, *g\Hidden)
+          PmTensorLstmAct(wDots + k, wDots + k, *g\Hidden, 0)
           k = Stride : k = k * 4
-          PmTensorSigmoidFp32Neon(wDots + k, wDots + k, *g\Hidden)
+          PmTensorLstmAct(wDots + k, wDots + k, *g\Hidden, 0)
           k = 2 : k = k * Stride : k = k * 4
-          PmTensorSigmoidFp32Neon(wDots + k, wDots + k, *g\Hidden)
+          PmTensorLstmAct(wDots + k, wDots + k, *g\Hidden, 0)
           k = 3 : k = k * Stride : k = k * 4
-          PmTensorTanhFp32Neon(wDots + k, wDots + k, *g\Hidden)
+          PmTensorLstmAct(wDots + k, wDots + k, *g\Hidden, 1)
           ; The cell, then the output.  Tanh(newC) is written straight into
           ; Y and multiplied there by the output gate, so the timestep
           ; needs no scratch of its own.
@@ -3873,7 +3874,7 @@ Procedure PmTensorLstmFp32Neon(*g.PmTensorLstmArgs, WT.i, RT.i, Dots.i, Stride.i
           k = 2 : k = k * Stride : k = k * 4
           j = 3 : j = j * Stride : j = j * 4
           PmTensorLstmCellNeon(wDots + k, wDots, wDots + j, cPointer, *g\Hidden)
-          PmTensorTanhFp32Neon(cPointer, yPointer, *g\Hidden)
+          PmTensorLstmAct(cPointer, yPointer, *g\Hidden, 1)
           k = Stride : k = k * 4
           PmTensorLstmOutNeon(wDots + k, yPointer, *g\Hidden)
           ; Copy the completed timestep only after all recurrent reads used H(t-1).

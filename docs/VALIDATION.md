@@ -1670,6 +1670,107 @@ what a compiled program computes; only the sentences change.
 | Models (four models, fp32/fp16/bf16/int4, five targets), this change against `aebec1e` | All 80 emitted sources, packs and manifests and all 32 fixed-shape images byte-identical; the 16 runtime-dimension sources build; the four models' Windows outputs and all 30 outputs of their Pi 4, Pico and Pico 2 programs byte-identical |
 | Kokoro-82M, FP32 and INT8, for Windows | Source, pack and support files byte-identical; the output byte-identical |
 
+## The same bits on every target: the LSTM — September 26, 2026
+
+The LSTM now gives the Windows program's bits on the Pi 4, Pico and Pico 2,
+on both paths, FP32 and INT8. Before, it matched them only within the
+tolerance: its gate activations were each target's own, and Windows
+evaluated the cell and its serial dot products in binary64.
+
+- **The gates.** Sigmoid and Tanh are the operators' shared binary32
+  formulas of the fourth stage, over the correctly rounded Exp.
+- **The cell.** c = f c(t-1) + i g is two binary32 products and one binary32
+  sum. The output is o tanh(c).
+- **The dot products.** Each gate's dot product starts at +0.0, runs over
+  ascending index, and rounds each product and each sum to binary32. The
+  pre-activation is (bias W + bias R) + W x + R h, in that order.
+- **Windows.**
+  - The activations and the cell are written into the per-unit loops.
+  - The fixed-shape path's dot product is the four gates in the four lanes
+    of one SSE register: the same bits, and 4.5 times faster.
+  - The host compiler adds -0 and -0 as +0, so the cell restores the sign of
+    zero.
+- **The Pi 4.** The activations run four lanes at a time.
+  - The exponential's argument goes into two pairs of binary64 lanes. The
+    Taylor series of e^r runs to r^11/11!, after k ln2 is taken out.
+  - A result whose bits below binary32 precision lie within 1,024 binary64
+    units of a rounding midpoint is not rounded there: that block of four
+    goes to the correctly rounded integer method. So does any |x| above 87,
+    and any NaN.
+  - Then each lane's formula runs in binary32, with Tanh's quotient in
+    binary64.
+  - The fixed-shape path gives four units' gates to one call.
+- **The Pico and Pico 2.** The scalar functions of the fourth stage.
+
+**Checked on every argument.** The Pi 4's four-lane activations were run on
+all 2^32 binary32 arguments in the emulator, for Sigmoid and for Tanh.
+Windows' LSTM Sigmoid and Tanh were run on every argument too. Both agree
+with the fourth stage's hashes in all 4,096 blocks.
+
+**Found and fixed.** The fixed-shape path read `sequence_lens`, which ONNX
+defines as INT32, as INT64. With sequence lengths, a fixed-shape LSTM gave
+wrong answers or stopped with an access violation on Windows. It also left Y
+unwritten past a sequence's end, where ONNX defines 0. The emitter now
+marks the lengths as INT32, and every LSTM kernel zeroes Y first when
+lengths are given and clamps each length to the sequence.
+
+**Speed.** Instructions per request in the emulator:
+
+| LSTM | Pi 4 | Pico | Pico 2 |
+|---|---|---|---|
+| 64 inputs, 32 units, two directions, 4 steps, runtime dimensions | 1,601,773 → 1,621,370 (+1.2%) | 43,944,369 → 41,369,429 (−5.9%) | 13,448,394 → 13,715,588 (+2.0%) |
+| the same, fixed shape | 2,673,318 → 2,235,710 (−16%) | 43,907,162 → 41,421,823 (−5.7%) | 13,416,253 → 13,781,936 (+2.7%) |
+| 256 inputs, 96 units, two directions, 2 steps, runtime dimensions | 14,639,179 → 14,668,644 (+0.2%) | 230,275,059 → 227,252,503 (−1.3%) | 90,239,447 → 91,426,356 (+1.3%) |
+| the same, fixed shape | 15,806,608 → 15,149,771 (−4.2%) | 230,215,719 → 227,720,780 (−1.1%) | 90,185,545 → 91,913,311 (+1.9%) |
+
+On Windows, Kokoro's LSTM shape (640 inputs, 256 units, two directions,
+512 steps), best of nine:
+- the runtime-dimension path: 21 → 22 ms;
+- the fixed-shape path: 185 → 41 ms.
+
+Kokoro-82M on Windows, two runs of 15 requests each, old and new
+interleaved, median:
+
+| | first run | second run |
+|---|---|---|
+| FP32 | 1,263.6 → 1,267.2 ms | 1,260.6 → 1,264.0 ms |
+| INT8 | 998.9 → 1,000.0 ms | 1,006.2 → 1,001.6 ms |
+
+That is no measurable change.
+
+**Kokoro's output.** The output changes, since its six LSTMs now compute the
+shared formulas. Against ONNX Runtime (FP32):
+- the log-mel distance is 0.293 → 0.289 dB for FP32 and 0.589 → 0.607 dB for
+  INT8;
+- no duration changes, in either.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py` | 633 of 633 on Windows (both branches), Pi 4, Pico and Pico 2; `--mutants` 75 of 75 caught (the operator-set kernels; unchanged) |
+| `int8_kernel_check.py`: its LSTM cases, INT8 and their FP32 twins, now held to the Windows bits instead of 2e-6 relative | Windows, Pi 4, Pico and Pico 2: 51 of 51 cases bit-identical; the portable targets agree on every LSTM output; `--mutants` 17 of 17 caught |
+| `runtime_mutants.py`: the 54 before less the Windows Tanh guard (its procedure is gone: nothing calls it), and seven new: the Windows cell as one binary64 expression, the Windows cell's sign of zero, the Windows fixed-shape dot product's lanes, the gates' kinds on the targets, the Pi 4's lane kinds and its integer-method blocks, and sequence lengths read as INT64 | 60 of 60 as required |
+| `tests/node_suite/targeted_ops.py`: 1,187 cases - the 1,175 before; LSTM forward with initial states (a -0 cell among them), bidirectional with sequence lengths, 40 inputs, saturated gates (exponent arguments past the normal range), tiny pre-activations, and a cell of -0, on both paths | 1,187 of 1,187 as expected; `targeted_defaults`, `targeted_norm_small`, `targeted_control`, `targeted_optional_outputs` 148, 132, 41 and 14 as expected |
+| `ops_targets_gate.py`: those cases, `lstm_nan_guard`, and the NaN, specials, reduction, Where, Cast, Sigmoid, Tanh, Softmax, LayerNormalization, TfIdfVectorizer and BitShift cases, on the Pi 4, Pico and Pico 2 | 238 builds, 714 runs: 702 bit-identical to the Windows program, all 42 LSTM runs among them (the previous compiler: 0 of 42); 8 within the tolerance and named in `TOLERANCE_ONLY` and 4 INT64 runs refused on the Picos, as before |
+| `pi4_control_gate.py` | 29 of 41, as before |
+| Official node tests at opset 27 or lower, this change against the previous compiler | PASS 1,248 both |
+| Models (four models, fp32/fp16/bf16/int4, five targets), this change against `41fe090` | The two models without an LSTM: every emitted source, pack, manifest and fixed-shape image byte-identical, and their Windows and target outputs byte-identical. The two with one: their LSTM outputs change. The fixed-shape one's 20 emitted sources differ only by the `#PMO_USE_EXPLOG` line and its images differ; the runtime-dimension one's sources are byte-identical (its runtime support files carry the change). Their first layers, FP32 convolutions, already differed from the Windows bits on the targets before this change, so their outputs are not compared bit for bit there |
+| Kokoro-82M, FP32 and INT8, for Windows | Source and pack byte-identical; `tensor_fp32_windows.pbi`, `tensor_simd_windows.pbi` and `tensor_dynamic_windows.pbi` differ; the output changes, as above |
+
+Every support-file procedure this change touches (the emitted source changes only by the `#PMO_USE_EXPLOG` line, now 1 for a graph with an LSTM):
+
+| Support file | Procedure | |
+|---|---|---|
+| `tensor_fp32.pmi` | `PmTensorLstm`, `PmI8Lstm` | changed (four units at a time, the shared activations, the cell one operation per statement, sequence lengths INT32) |
+| `tensor_fp32.pmi` | `PmTensorLstmFloatFour` | changed (the product and the sum in two statements) |
+| `tensor_fp32.pmi` | `PmTensorLstmAct`, `PmTensorLstmActRunA64`, `PmTensorLstmActFour`, `PmTensorLstmValid`, `PmTensorLstmClearY` | added |
+| `tensor_fp32_neon.pmi` | `PmTensorLstmFp32Neon` | changed (the activations, sequence lengths, Y cleared) |
+| `tensor_fp32_windows.pbi` | `PmTensorLstmUnits`, `PmI8LstmUnits`, `PmTensorLstm`, `PmI8Lstm` | changed |
+| `tensor_fp32_windows.pbi` | `PmTensorLstmFloatFour` | changed (SSE, four gates in four lanes) |
+| `tensor_fp32_windows.pbi` | `PmTensorSigmoidF`, `PmTensorTanhF`, `PmTensorLstmCell`, `PmTensorLstmValid`, `PmTensorLstmClearY` | added (and the macros `PmLstmSigmoidInPlace`, `PmLstmTanhInPlace`, `PmLstmCellInPlace`) |
+| `tensor_fp32_windows.pbi` | `PmTensorSigmoidValue`, `PmTensorTanhValue` | removed (nothing calls them) |
+| `tensor_simd_windows.pbi` | `PmFastLstmUnits`, `PmFastLstm` | changed |
+| `tensor_dynamic_windows.pbi`, `tensor_dynamic_portable.pmi` | `DLstm` | changed (sequence lengths checked, no longer copied to INT64) |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.
@@ -1700,9 +1801,7 @@ what a compiled program computes; only the sentences change.
   holds it to the tolerance; every other base-runtime kernel it runs gives
   the Windows program's bits on every target
   ([the same bits on every target](#the-same-bits-on-every-target-first-stage-square-root-abs-negate-and-batchnormalization--september-25-2026),
-  four stages). The LSTM's own gate activations are not these kernels and keep
-  their speed, so an LSTM matches the Windows program on the targets within
-  the tolerance, not bit for bit.
+  four stages, and [the LSTM](#the-same-bits-on-every-target-the-lstm--september-26-2026)).
 - Windows x64 is the verified host. Linux/macOS hosting, other PureBasic
   versions, and alternate PureBasic backends are not certified by this export.
 - Five-target **generation** does not establish downstream bare-metal builds,

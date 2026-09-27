@@ -1294,6 +1294,59 @@ def cases() -> list[Case]:
     c.append(Case("lstm_nan_guard", [N("LSTM", ["x", "w", "r"], ["y", "yh"], hidden_size=3)], [("x", F, [3, 2, 2])],
                   [("y", F, [3, 1, 2, 3]), ("yh", F, [1, 2, 3])], {"x": lx},
                   [numpy_helper.from_array(lw, "w"), numpy_helper.from_array(lr, "r")], opset=14, oracle="ref"))
+    # LSTM, the same bits on every target: forward and bidirectional, sequence
+    # lengths, initial states (a -0 cell among them), hidden sizes on and off
+    # the four-lane width, long dot products, saturated gates (exp arguments
+    # past the normal range) and tiny pre-activations (tanh x = x), on both
+    # paths. onnxruntime is the oracle: the reference evaluator's LSTM takes
+    # no sequence lengths.
+    rng_ls = np.random.default_rng(4242)  # its own stream: the cases after these keep their data
+    def lstm_case(name, T, Bt, I, H, D, wscale=0.5, xscale=1.0, bias=True, lens=None, h0=False, c0=None, xfix=None):
+        W = (rng_ls.standard_normal((D, 4 * H, I)) * wscale).astype(np.float32)
+        R = (rng_ls.standard_normal((D, 4 * H, H)) * wscale).astype(np.float32)
+        inits = [init("W", W), init("R", R)]
+        ins = ["x", "W", "R"]
+        if bias or lens is not None or h0 or c0 is not None:
+            ins.append("B" if bias else "")
+            if bias:
+                inits.append(init("B", (rng_ls.standard_normal((D, 8 * H)) * wscale).astype(np.float32)))
+        if lens is not None or h0 or c0 is not None:
+            ins.append("L" if lens is not None else "")
+            if lens is not None:
+                inits.append(init("L", np.array(lens, np.int32)))
+        if h0 or c0 is not None:
+            ins.append("H0")
+            inits.append(init("H0", rng_ls.standard_normal((D, Bt, H)).astype(np.float32)))
+        if c0 is not None:
+            ins.append("C0")
+            inits.append(init("C0", c0.astype(np.float32)))
+        x = (rng_ls.standard_normal((T, Bt, I)) * xscale).astype(np.float32)
+        if xfix is not None:
+            xfix(x)
+        attrs = {"direction": "bidirectional"} if D == 2 else {}
+        c.append(Case(name, [N("LSTM", ins, ["Y", "Y_h", "Y_c"], hidden_size=H, **attrs)], [("x", F, [T, Bt, I])],
+                      [("Y", F, [T, D, Bt, H]), ("Y_h", F, [D, Bt, H]), ("Y_c", F, [D, Bt, H])], {"x": x}, inits,
+                      opset=14, oracle="ort", symbolic_axes=(0,)))
+    lstm_case("lstm_forward_states", 5, 2, 7, 5, 1, h0=True, c0=rng_ls.standard_normal((1, 2, 5)))
+    lstm_case("lstm_bidirectional_lens", 6, 3, 9, 8, 2, lens=[6, 2, 4], h0=True)
+    lstm_case("lstm_wide_rows", 3, 1, 40, 12, 2, wscale=0.2)
+    def lstm_big(x):
+        x[1, 0, :3] = [1.0e3, -1.0e3, 60.0]
+    lstm_case("lstm_saturated", 4, 1, 6, 4, 1, wscale=8.0, xfix=lstm_big)
+    lstm_zero_c = np.zeros((1, 2, 3)); lstm_zero_c[0, 0, :] = -0.0
+    def lstm_zero(x):
+        x[0, :, :] = 0.0
+        x[1, 0, :] = -0.0
+    lstm_case("lstm_tiny_preactivations", 4, 2, 5, 3, 1, wscale=1e-4, xscale=1e-3, bias=False, c0=lstm_zero_c, xfix=lstm_zero)
+    # a cell of -0: i = f = +0 (their gates far below zero), g = -1 and
+    # c(t-1) = -1, so f c + i g = -0 + -0, which is -0
+    zw = np.array([[[-1000.0], [1000.0], [-1000.0], [-1000.0]]], np.float32)
+    c.append(Case("lstm_negative_zero_cell", [N("LSTM", ["x", "W", "R", "B", "", "H0", "C0"], ["Y", "Y_h", "Y_c"], hidden_size=1)],
+                  [("x", F, [2, 1, 1])], [("Y", F, [2, 1, 1, 1]), ("Y_h", F, [1, 1, 1]), ("Y_c", F, [1, 1, 1])],
+                  {"x": np.ones((2, 1, 1), np.float32)},
+                  [init("W", zw), init("R", np.zeros((1, 4, 1), np.float32)), init("B", np.zeros((1, 8), np.float32)),
+                   init("H0", np.zeros((1, 1, 1), np.float32)), init("C0", np.full((1, 1, 1), -1.0, np.float32))],
+                  opset=14, oracle="ort", symbolic_axes=(0,)))
     # TfIdfVectorizer (C7): INT64 and INT32 inputs, [C] and [B, C], unigrams,
     # bigrams and trigrams, skips, TF, IDF and TFIDF with and without weights,
     # a repeated n-gram (counted at its last index), pool values beyond 32 bits;

@@ -1066,17 +1066,12 @@ Procedure DLstm(Y.i,YH.i,YC.i,X.i,W.i,R.i,B.i,Seq.i,IH.i,IC.i,Hidden.i,Direction
   If Dt(W)\Kind=3 Or Dt(R)\Kind=3 Or Dt(W)\Kind=33 Or Dt(R)\Kind=33
     If DFiniteTensor(X)=0 Or DFiniteTensor(IH)=0 Or DFiniteTensor(IC)=0 : ProcedureReturn : EndIf
     If (Dt(W)\Kind<>1 And Dt(W)\Scales=0) Or (Dt(R)\Kind<>1 And Dt(R)\Scales=0) Or g\InputSize>133144 Or g\Hidden>133144 : DFail("INT8 LSTM scales are missing or reduction is too large.") : ProcedureReturn : EndIf
+    ; the kernels read sequence_lens as INT32
     If Seq
-      seqBytes=g\Batch*8
-      If seqBytes>DLimit-DLive : DFail("LSTM sequence metadata exceeds available memory.") : ProcedureReturn : EndIf
-      seq64=AllocateMemory(seqBytes)
-      If seq64=0 : DFail("LSTM sequence metadata allocation failed.") : ProcedureReturn : EndIf
       For i=0 To g\Batch-1
         valid=PeekL(Dt(Seq)\Data+i*4)
-        If valid<0 Or valid>g\Sequence : FreeMemory(seq64) : DFail("LSTM sequence length is out of bounds.") : ProcedureReturn : EndIf
-        PokeQ(seq64+i*8,valid)
+        If valid<0 Or valid>g\Sequence : DFail("LSTM sequence length is out of bounds.") : ProcedureReturn : EndIf
       Next
-      DLive+seqBytes : DPeak=DMax(DPeak,DLive) : g\SeqLens=seq64
     EndIf
     DInt8Begin()
     If Dt(W)\Kind<>1 : g\WScales=Dt(W)\Scales : g\WWide=Bool(Dt(W)\Kind=33) : EndIf
@@ -1087,7 +1082,6 @@ Procedure DLstm(Y.i,YH.i,YC.i,X.i,W.i,R.i,B.i,Seq.i,IH.i,IC.i,Hidden.i,Direction
       PmTensorLstm(@g)
     EndIf
     DInt8End()
-    If seq64 : FreeMemory(seq64) : DLive-seqBytes : EndIf
   Else
     If PmFastLstm(@g,DLimit-DLive)=0 : DFail("LSTM scratch or sequence lengths exceed the model bounds.") : EndIf
   EndIf

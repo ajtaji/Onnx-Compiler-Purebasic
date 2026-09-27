@@ -2482,29 +2482,15 @@ Procedure DLstm()
       DFail("INT8 LSTM scales are missing or reduction is too large.")
       ProcedureReturn
     EndIf
+    ; the kernels read sequence_lens as INT32
     If Seq
-      seqBytes=g\Batch*8
-      If seqBytes>DLimit-DLive
-        DFail("LSTM sequence metadata exceeds available memory.")
-        ProcedureReturn
-      EndIf
-      seq64=DAcquire(seqBytes)
-      If seq64=0
-        DFail("LSTM sequence metadata allocation failed.")
-        ProcedureReturn
-      EndIf
       For i=0 To g\Batch-1
         valid=PeekL(Dt(Seq)\Data+i*4)
         If valid<0 Or valid>g\Sequence
-          DFree(seq64)
           DFail("LSTM sequence length is out of bounds.")
           ProcedureReturn
         EndIf
-        DWriteI64(seq64+i*8,valid)
       Next
-      DLive+seqBytes
-      DPeak=DMax(DPeak,DLive)
-      g\SeqLens=seq64
     EndIf
     If Dt(W)\Kind=1 And Dt(R)\Kind=1
       If DScratchBegin(g\X,g\InputSize,g\Hidden)
@@ -2520,10 +2506,6 @@ Procedure DLstm()
         PmFastLstm(@g)
         DInt8End()
       EndIf
-    EndIf
-    If seq64
-      DFree(seq64)
-      DLive-seqBytes
     EndIf
   Else
     PmFastLstm(@g)
