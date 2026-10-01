@@ -2006,6 +2006,51 @@ mutants in FASM lines (`conv-windows-mac-wide`, `convt-windows-mac-wide`,
 `lstm-windows-dot-lanes`); built with the C back end they no longer reach
 the code that runs, and need C-branch counterparts.
 
+## The Pico 2 log builds again, and log1p(-inf) is one NaN — October 1, 2026
+
+**The Pico 2's log.** PureMetal Forge now refuses inline assembly that writes
+r7, the procedure's frame base, outside a push of r7 and the pop that restores
+it in the same block. `PmTensorLogBits` (the Pico 2's correctly rounded log,
+`tensor_fp32.pmi`) pushes r7 at its start and pops it at its one exit, but in
+between it popped a pair of scratch words on each of two exclusive paths. The
+compiler reads a block's pushes and pops in order, so the second pop looked
+like the pop of r7, and every later write of r7 was refused. Every Pico 2
+build that links the log failed: 498 of the operator target gate's Pico 2
+runs, and `ops_kernel_check.py` on the Pico 2. The pair is now popped once,
+before the branch: neither path reads r2 or r6 before its pop, and a pop sets
+no flags, so the instructions compute exactly what they computed before. The
+other Pico 2 routines that write r7 (exp, the trigonometric functions, the
+INT8 dot) already push and pop it once, and build.
+
+**log1p(-inf).** `PmOpLog1p` (`tensor_ops.pmi`, every target) multiplies
+log(u) by t / (u - 1); for t = -inf both are NaNs: log(-inf) is 7FC00000 and
+-inf / -inf is the processor's default NaN. Every target's multiply returns
+its first operand, 7FC00000, and so does the definition. The Windows program
+is now built with the C back end, whose compiler may put either operand of a
+product first, and it put the default NaN first: FFC00000. A NaN log is now
+the result before the product, as every target computes it.
+
+Other plain float operations in `tensor_ops.pmi` can meet two NaNs too, and
+they are listed here rather than changed, since no gate reaches one: the
+product and sum steps of reductions and normalizations (ReduceProd, LpNorm,
+MeanVarianceNormalization, GroupNormalization, LRN, RMSNormalization,
+LogSoftmax's sum), dot products (Einsum, Det, the RNN and GRU, Attention,
+LinearAttention, QLinearMatMul, QLinearConv, DeformConv, Col2Im, DFT), and
+interpolation (RoiAlign, GridSample, Upsample, the pools' averages, CumProd,
+RotaryEmbedding). Each gives the targets' bits unless one operation meets two
+NaNs of different payloads. The element-wise folds (Sum, Mean, Min, Max) go
+through `PmOpAddF` and `PmOpFloatFold`, which test the first operand for NaN
+first, and are not affected.
+
+| Check | Result |
+|---|---|
+| `ops_kernel_check.py --mutants` | 633 of 633 on Windows, Windows with the older-compiler branch, Pi 4, Pico and Pico 2. Before: Windows 632 (log1p(-inf)) and the Pico 2 did not build. `--mutants` 75 of 75 caught |
+| `ops_targets_gate.py`, every targeted case | 940 cases, 2,820 runs: Pi 4, Pico and Pico 2 940 of 940 each, bit-identical to the Windows program (14 within the tolerance and named in `TOLERANCE_ONLY`; 26 INT64 runs refused on the Picos, as the INT64 contract requires; the 14 random-operator cases scored by their generator contract, as `targeted_ops.py` scores them, which the gate now does too). Before: the Pico 2 ran 428 of them, the other 498 runners did not build |
+| `runtime_mutants.py` | 67 of 67 as required, each caught by a wrong answer and none by a runner that did not build; the Pico 2 rounding mutants (exp, log, tanh) by 37, 34 and 54 wrong Pico 2 elements. 2 skipped, for the assembly back end only |
+| `pi4_control_gate.py` | 29 of 41, as before (the other 12 are refusal cases) |
+| `node_suite.py`, this change against the previous compiler, both built with the C back end | PASS 1,248, PASS_SHAPE 2, FAIL_NUMERIC 4, RUN_ERROR 8, REFUSED 488 both; the 1,254 Windows result files byte-identical; every emitted model source, pack and manifest identical |
+| `targeted_ops.py` (no re-imported cases), `targeted_control.py` | 1,012 of 1,012 and 41 of 41 as expected |
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.

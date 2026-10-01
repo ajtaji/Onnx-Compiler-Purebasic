@@ -555,6 +555,12 @@ Procedure.f PmOpLog1p(t.f)
   d = u - PmOpOne
   q = t / d
   l = PmOpLog(u)
+  ; a NaN log (t = -inf, where q is a NaN too) is the product, as every
+  ; target's multiply gives it (its first operand): a host whose compiler
+  ; may put either NaN first does not get to choose
+  If (PmOpBits(l) & $7FFFFFFF) > $7F800000
+    ProcedureReturn l
+  EndIf
   l = l * q
   ProcedureReturn l
 EndProcedure

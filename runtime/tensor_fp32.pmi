@@ -1080,12 +1080,16 @@ Procedure.i PmTensorLogBits(b.i)
     lsrs r3, r3, #9
     lsls r4, r6, #23
     lsrs r5, r6, #9
+    ; one pop for both signs, before the branch (r2 and r6 are not read
+    ; until after it): the compiler checks the push and pop of a block
+    ; that writes r7 in order, and a pop on each of two exclusive paths
+    ; reads to it as one pop too many
+    pop {r2, r6}
     cmp r7, #0
     bne pmlog_pneg
     negs r0, r0
     sbcs r4, r1
     sbcs r5, r3
-    pop {r2, r6}
     ldr r1, [r6, #0]
     adds r0, r0, r1
     ldr r1, [r6, #4]
@@ -1096,7 +1100,6 @@ Procedure.i PmTensorLogBits(b.i)
   pmlog_pneg:
     adds r4, r4, r1
     adcs r5, r3
-    pop {r2, r6}
     ldr r1, [r6, #0]
     subs r1, r1, r0
     ldr r3, [r6, #4]
