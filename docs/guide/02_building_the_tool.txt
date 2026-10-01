@@ -37,8 +37,8 @@ the one that ran. Chapter 11 shows exactly what differs.
 @SECTION What you need, and what you do not
 
 You need the host language's Windows **x64** compiler. That is the whole
-list. The tool has been built and verified with version 6.21 and its
-native assembly backend.
+list, and its C back end (`pbcompilerc.exe`) builds everything. The tool
+has been built and verified with version 6.41 and that back end.
 
 You do not need Python, an ONNX package, an ONNX Runtime library, a model
 file, or a PureMetal Forge installation. None of those are required to
@@ -79,7 +79,7 @@ The helper is a convenience, not a secret. It runs exactly these two
 commands, and so can you:
 
 @FRAG
-$pb = 'C:\Path\To\Compilers\pbcompiler.exe'
+$pb = 'C:\Path\To\Compilers\pbcompilerc.exe'
 New-Item -ItemType Directory -Force bin | Out-Null
 & $pb src/PureMetalOnnxCompiler.pb   /CONSOLE /THREAD /OPTIMIZER            /OUTPUT bin/PureMetalOnnxCompilerCLI.exe
 if ($LASTEXITCODE -ne 0) { throw 'CLI build failed' }
@@ -87,8 +87,8 @@ if ($LASTEXITCODE -ne 0) { throw 'CLI build failed' }
 if ($LASTEXITCODE -ne 0) { throw 'UI build failed' }
 @ENDFRAG
 
-In the IDE, the same thing: open each source, set the listed options, and
-use Create Executable with the matching output name.
+In the IDE, the same thing: open each source, select the C back end, set
+the listed options, and use Create Executable with the matching output name.
 
 The options are not decorative. `/CONSOLE` is what makes the CLI a console
 program instead of one that opens a window. `/THREAD` is required because

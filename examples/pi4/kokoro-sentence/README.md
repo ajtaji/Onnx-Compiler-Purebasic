@@ -69,7 +69,7 @@ that limit, not explained away.
 - **An Ethernet cable** from the Pi straight to a **Windows** PC. The monitor's
   network console and uploads run over it. The first-boot serial adapter is
   described in the Anvil skeleton's README.
-- On the PC: **Git**, **PureBasic 6.21 x64** (to build this compiler),
+- On the PC: **Git**, **PureBasic 6.41 x64**, its C back end (to build this compiler),
   **PureMetal Forge** from [puremetalforge.ajtaji.com](https://puremetalforge.ajtaji.com/)
   (to build the payload), and **Python 3** for the host tools. The Forge download
   also includes a ready-built copy of this compiler. The 2026-09-14 copy cannot
@@ -196,7 +196,7 @@ the other hand, needs `main`: the native packer could not build it before
 `b48cd05` (forum topic 871). So build both:
 
 ```powershell
-$pb = 'C:\Program Files\PureBasic\Compilers\pbcompiler.exe'   # your PureBasic 6.21 x64
+$pb = 'C:\Program Files\PureBasic\Compilers\pbcompilerc.exe'   # your PureBasic 6.41 x64, C back end
 Set-Location "$root\Onnx-Compiler-Purebasic"
 New-Item -ItemType Directory -Force bin | Out-Null
 & $pb src\PureMetalOnnxCompiler.pb /CONSOLE /THREAD /OPTIMIZER /OUTPUT bin\PureMetalOnnxCompilerCLI.exe

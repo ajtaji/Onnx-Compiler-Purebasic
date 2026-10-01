@@ -162,8 +162,8 @@ harness, in `tests/node_suite/results/`.
 
 @FRAG
 py -3.12 -m pip install onnx==1.22.0
-py -3.12 tests\node_suite\node_suite.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --from-commit HEAD
-py -3.12 tests\node_suite\node_suite.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --from-commit HEAD --self-check
+py -3.12 tests\node_suite\node_suite.py --pbcompiler "<install>\Compilers\pbcompilerc.exe" --from-commit HEAD
+py -3.12 tests\node_suite\node_suite.py --pbcompiler "<install>\Compilers\pbcompilerc.exe" --from-commit HEAD --self-check
 @ENDFRAG
 
 `--from-commit` builds the compiler from that commit, so a half-finished
@@ -193,7 +193,7 @@ from the specification text (its Conv auto_pad, its ScatterND max and min) the
 case says so and feeds it the specification's arithmetic instead.
 
 @FRAG
-py -3.12 tests\node_suite\targeted_defaults.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --cli bin\PureMetalOnnxCompilerCLI.exe
+py -3.12 tests\node_suite\targeted_defaults.py --pbcompiler "<install>\Compilers\pbcompilerc.exe" --cli bin\PureMetalOnnxCompilerCLI.exe
 targeted: 148 of 148 as expected
 @ENDFRAG
 
@@ -226,7 +226,7 @@ against the ONNX reference evaluator where it runs the model; where the two
 disagree the case is thrown out rather than scored.
 
 @FRAG
-py -3.12 tests\node_suite\targeted_control.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --cli bin\PureMetalOnnxCompilerCLI.exe --kitten kitten_tts_nano_v0_8.onnx
+py -3.12 tests\node_suite\targeted_control.py --pbcompiler "<install>\Compilers\pbcompilerc.exe" --cli bin\PureMetalOnnxCompilerCLI.exe --kitten kitten_tts_nano_v0_8.onnx
 control: 34 of 34 as expected
 @ENDFRAG
 
@@ -395,7 +395,7 @@ and scores them against the official outputs unchanged, beside its own cases
 for the forms the Kitten voice uses:
 
 @FRAG
-py -3.12 tests\node_suite\targeted_norm_small.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --cli bin\PureMetalOnnxCompilerCLI.exe
+py -3.12 tests\node_suite\targeted_norm_small.py --pbcompiler "<install>\Compilers\pbcompilerc.exe" --cli bin\PureMetalOnnxCompilerCLI.exe
 norm_small: 132 of 132 as expected
 @ENDFRAG
 
@@ -517,7 +517,7 @@ requires every output to equal the definition bit for bit; with
 `--mutants` it plants 72 defects and requires each to be caught:
 
 @FRAG
-py -3.12 ops_kernel_check.py --pbcompiler <pbcompiler.exe> --compiler PureMetalForge.exe --runtime <ONNX repository>\runtime --mutants
+py -3.12 ops_kernel_check.py --pbcompiler <pbcompilerc.exe> --compiler PureMetalForge.exe --runtime <ONNX repository>\runtime --mutants
 windows 604 of 604 cases as the definition
 windows-hostbug 604 of 604 cases as the definition
 pi4     604 of 604 cases as the definition
@@ -572,7 +572,7 @@ off, as the node-suite harness launches, and requires every exit to be the
 program's own. Seven planted defects must each turn it red:
 
 @FRAG
-py -3.12 mt_split_gate.py --pbcompiler <pbcompiler.exe> --runtime <ONNX repository>\runtime --mutants
+py -3.12 mt_split_gate.py --pbcompiler <pbcompilerc.exe> --runtime <ONNX repository>\runtime --mutants
 split: PASS
   CASES 144 x 8 configurations, 0 failures
 affinity: PASS

@@ -81,7 +81,7 @@ fits that mechanism; it has not been re-traced node by node.
 A Raspberry Pi 4 Model B with at least 4 GB: the runner's working memory
 ends at `$A0000000`. A FAT32 USB stick or SD card for Anvil; the run booted
 from a USB stick that also held the weight pack. An Ethernet cable straight
-to a Windows PC. On the PC: Git, PureBasic 6.21 x64 for this compiler,
+to a Windows PC. On the PC: Git, PureBasic 6.41 x64 (its C back end) for this compiler,
 PureMetal Forge from puremetalforge.ajtaji.com for the payload, and Python
 3 for the host tools, with pyserial for Anvil's upload tool. The Forge
 download also includes a ready-built copy of this compiler. The 2026-09-14
