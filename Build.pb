@@ -9,7 +9,8 @@ CompilerIf #PB_Compiler_Processor <> #PB_Processor_x64
 CompilerEndIf
 OpenConsole()
 Define root.s=GetPathPart(#PB_Compiler_File)
-Define compiler.s=#PB_Compiler_Home+"Compilers\pbcompiler.exe"
+; The C back end builds everything; the assembly back end is not used.
+Define compiler.s=#PB_Compiler_Home+"Compilers\pbcompilerc.exe"
 Define process.i,index.i,arguments.s,line.s,code.i
 Define source.s,output.s,flags.s
 Define deployment.s,releaseHost.s,settings.s=root+"build.local.ini"

@@ -124,19 +124,28 @@ Global PmPoolStopHook.PmPoolHookProc
 
 Procedure.i PmPoolXadd(*address, value.i)
   Protected pa.i = *address, v.i = value
-  !mov rcx,[p.v_pa]
-  !mov rax,[p.v_v]
-  !lock xadd [rcx],rax
-  !mov [p.v_v],rax
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+    ; The C back end takes C, not FASM: the same locked exchange-and-add.
+    !v_v = __atomic_fetch_add((long long *)v_pa, v_v, __ATOMIC_SEQ_CST);
+  CompilerElse
+    !mov rcx,[p.v_pa]
+    !mov rax,[p.v_v]
+    !lock xadd [rcx],rax
+    !mov [p.v_v],rax
+  CompilerEndIf
   ProcedureReturn v
 EndProcedure
 
 Procedure.i PmPoolXchg(*address, value.i)
   Protected pa.i = *address, v.i = value
-  !mov rcx,[p.v_pa]
-  !mov rax,[p.v_v]
-  !xchg [rcx],rax
-  !mov [p.v_v],rax
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+    !v_v = __atomic_exchange_n((long long *)v_pa, v_v, __ATOMIC_SEQ_CST);
+  CompilerElse
+    !mov rcx,[p.v_pa]
+    !mov rax,[p.v_v]
+    !xchg [rcx],rax
+    !mov [p.v_v],rax
+  CompilerEndIf
   ProcedureReturn v
 EndProcedure
 
@@ -253,8 +262,15 @@ Procedure PmPoolWorker(index.i)
     seen = PeekI(slot + #PMPOOL_TICKET)
     If PeekI(control + #PMPOOL_QUIT) : Break : EndIf
     cw = PeekI(control + #PMPOOL_CW) : mx = PeekI(control + #PMPOOL_MXCSR)
-    !fldcw word [p.v_cw]
-    !ldmxcsr dword [p.v_mx]
+    CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+      ; The C back end: the same two loads, each from a variable of the
+      ; instruction's own width (the language's locals are 64-bit).
+      !{ unsigned short pm_cw = (unsigned short)v_cw; __asm__ volatile ("fldcw %0" : : "m" (pm_cw)); }
+      !__builtin_ia32_ldmxcsr((unsigned int)v_mx);
+    CompilerElse
+      !fldcw word [p.v_cw]
+      !ldmxcsr dword [p.v_mx]
+    CompilerEndIf
     run = PeekI(control + #PMPOOL_PROC) : ctx = PeekI(control + #PMPOOL_CTX) : tasks = PeekI(control + #PMPOOL_TASKS)
     ; The wake-up is a tree: helper k wakes helpers 2k+1 and 2k+2, so the
     ; last of 31 is running after five hand-offs instead of thirty-one.
@@ -399,7 +415,13 @@ Procedure.i PmPoolStart()
   ; so a program that ends right after binding never ends under a worker
   ; that is still starting.
   While PeekI(*PmPoolControl + #PMPOOL_STARTED) < PmPoolCreated
-    !pause
+    CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+      ; _mm_pause: GCC also treats it as a memory barrier, so the count is
+      ; read again every time
+      !__builtin_ia32_pause();
+    CompilerElse
+      !pause
+    CompilerEndIf
     Delay(0)
   Wend
   PmPoolThreads = n : If PmPoolThreads > PmPoolCreated + 1 : PmPoolThreads = PmPoolCreated + 1 : EndIf
@@ -438,8 +460,13 @@ Procedure PmPoolRun(proc.i, *ctx, tasks.i)
   EndIf
   helpers = PmPoolThreads - 1 : If helpers > tasks - 1 : helpers = tasks - 1 : EndIf
   PmPoolSplitRuns + 1
-  !fnstcw word [p.v_cw]
-  !stmxcsr dword [p.v_mx]
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+    !{ unsigned short pm_cw; __asm__ volatile ("fnstcw %0" : "=m" (pm_cw)); v_cw = pm_cw; }
+    !v_mx = __builtin_ia32_stmxcsr();
+  CompilerElse
+    !fnstcw word [p.v_cw]
+    !stmxcsr dword [p.v_mx]
+  CompilerEndIf
   PokeI(control + #PMPOOL_PROC, proc) : PokeI(control + #PMPOOL_CTX, *ctx) : PokeI(control + #PMPOOL_TASKS, tasks)
   PokeI(control + #PMPOOL_CW, cw & $FFFF) : PokeI(control + #PMPOOL_MXCSR, mx & $FFFFFFFF)
   PokeI(control + #PMPOOL_NEXT, 0) : PokeI(control + #PMPOOL_PENDING, helpers)
@@ -454,7 +481,11 @@ Procedure PmPoolRun(proc.i, *ctx, tasks.i)
   ; THE JOIN: no output is read, and no scratch freed, before every helper
   ; has finished its last task.
   While PeekI(control + #PMPOOL_PENDING) > 0
-    !pause
+    CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+      !__builtin_ia32_pause();
+    CompilerElse
+      !pause
+    CompilerEndIf
     spins + 1
     If (spins & 4095) = 0 : Delay(0) : EndIf
   Wend

@@ -51,7 +51,148 @@ Structure PmTensorInstanceNormWork
   Epsilon.f
 EndStructure
 
-CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
+CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+
+; The C back end: the same scalar and four-lane SSE operations, on the same
+; operands in the same order - scalar steps as x86 builtins, four lanes as
+; GCC vector types, a NaN lane computed again by the scalar steps (THE C BACK
+; END, tensor_fp32_windows.pbi). The work block's fields are read and written
+; as binary32 in memory, never through the language's float expressions
+; (binary64 in this back end).
+; Work offsets: lanes 0-12, mean 16, scale 20, den 24, bias 28, count 32,
+; epsilon 36 (PmTensorInstanceNormWork).
+
+Procedure PmTensorInstanceNormLanes(*src, count.i, *work, squares.i)
+  Protected ps.i = *src, n.i = count, pw.i = *work, sq.i = squares
+  !{
+  !  typedef float pm_v4sf __attribute__((vector_size(16)));
+  !  const float *pm_s = (const float *)v_ps;
+  !  float *pm_w = (float *)v_pw;
+  !  pm_w[0] = 0.0f; pm_w[1] = 0.0f; pm_w[2] = 0.0f; pm_w[3] = 0.0f;
+  !  pm_v4sf pm_m = {pm_w[4]};
+  !  for (long long pm_k = 0; pm_k < v_n; pm_k++) {
+  !    pm_v4sf pm_x = {pm_s[pm_k]};
+  !    if (v_sq) { pm_x = __builtin_ia32_subss(pm_x, pm_m); pm_x = __builtin_ia32_mulss(pm_x, pm_x); }
+  !    pm_w[pm_k & 3] = __builtin_ia32_addss((pm_v4sf){pm_w[pm_k & 3]}, pm_x)[0];
+  !  }
+  !}
+EndProcedure
+
+Procedure PmFastInstanceNormLanes(*src, count.i, *work, squares.i)
+  Protected ps.i = *src, n.i = count, pw.i = *work, sq.i = squares
+  !{
+  !  typedef float pm_v4sf __attribute__((vector_size(16)));
+  !  typedef float pm_v4sf_u __attribute__((vector_size(16), aligned(1)));
+  !  const float *pm_s = (const float *)v_ps;
+  !  float *pm_w = (float *)v_pw;
+  !  __attribute__((target("tune=generic"))) long long pm_vector(const float *s, long long n, long long sq, float *w) {
+  !    float mean = w[4];
+  !    pm_v4sf m = {mean, mean, mean, mean}, acc = {0.0f, 0.0f, 0.0f, 0.0f};
+  !    long long k = 0;
+  !    for (; k + 4 <= n; k += 4) {
+  !      pm_v4sf x = *(const pm_v4sf_u *)(s + k);
+  !      if (sq) { x = x - m; x = x * x; }
+  !      acc = acc + x;
+  !    }
+  !    *(pm_v4sf_u *)w = acc;
+  !    if (__builtin_ia32_movmskps(__builtin_ia32_cmpunordps(acc, acc))) {
+  !      pm_v4sf m1 = {mean};
+  !      w[0] = 0.0f; w[1] = 0.0f; w[2] = 0.0f; w[3] = 0.0f;
+  !      for (long long j = 0; j < k; j++) {
+  !        pm_v4sf x = {s[j]};
+  !        if (sq) { x = __builtin_ia32_subss(x, m1); x = __builtin_ia32_mulss(x, x); }
+  !        w[j & 3] = __builtin_ia32_addss((pm_v4sf){w[j & 3]}, x)[0];
+  !      }
+  !    }
+  !    return k;
+  !  }
+  !  long long pm_k = pm_vector(pm_s, v_n, v_sq, pm_w);
+  !  pm_v4sf pm_m = {pm_w[4]};
+  !  for (; pm_k < v_n; pm_k++) {
+  !    pm_v4sf pm_x = {pm_s[pm_k]};
+  !    if (v_sq) { pm_x = __builtin_ia32_subss(pm_x, pm_m); pm_x = __builtin_ia32_mulss(pm_x, pm_x); }
+  !    pm_w[pm_k & 3] = __builtin_ia32_addss((pm_v4sf){pm_w[pm_k & 3]}, pm_x)[0];
+  !  }
+  !}
+EndProcedure
+
+Procedure PmTensorInstanceNormStats(*work, stage.i)
+  Protected pw.i = *work, st.i = stage
+  !{
+  !  typedef float pm_v4sf __attribute__((vector_size(16)));
+  !  float *pm_w = (float *)v_pw;
+  !  pm_v4sf pm_a = __builtin_ia32_addss((pm_v4sf){pm_w[0]}, (pm_v4sf){pm_w[1]});
+  !  pm_v4sf pm_b = __builtin_ia32_addss((pm_v4sf){pm_w[2]}, (pm_v4sf){pm_w[3]});
+  !  pm_a = __builtin_ia32_addss(pm_a, pm_b);
+  !  pm_a = __builtin_ia32_divss(pm_a, (pm_v4sf){pm_w[8]});
+  !  if (v_st == 0) pm_w[4] = pm_a[0];
+  !  else {
+  !    pm_a = __builtin_ia32_addss(pm_a, (pm_v4sf){pm_w[9]});
+  !    pm_w[6] = __builtin_ia32_sqrtss(pm_a)[0];
+  !  }
+  !}
+EndProcedure
+
+Procedure PmTensorInstanceNormAffine(*src, *dst, count.i, *work)
+  Protected ps.i = *src, pd.i = *dst, n.i = count, pw.i = *work
+  !{
+  !  typedef float pm_v4sf __attribute__((vector_size(16)));
+  !  const float *pm_s = (const float *)v_ps;
+  !  float *pm_d = (float *)v_pd;
+  !  const float *pm_w = (const float *)v_pw;
+  !  for (long long pm_k = 0; pm_k < v_n; pm_k++) {
+  !    pm_v4sf pm_t = __builtin_ia32_subss((pm_v4sf){pm_s[pm_k]}, (pm_v4sf){pm_w[4]});
+  !    pm_v4sf pm_u = __builtin_ia32_mulss((pm_v4sf){pm_w[5]}, pm_t);
+  !    pm_u = __builtin_ia32_divss(pm_u, (pm_v4sf){pm_w[6]});
+  !    pm_d[pm_k] = __builtin_ia32_addss(pm_u, (pm_v4sf){pm_w[7]})[0];
+  !  }
+  !}
+EndProcedure
+
+Procedure PmFastInstanceNormAffine(*src, *dst, count.i, *work)
+  Protected ps.i = *src, pd.i = *dst, n.i = count, pw.i = *work
+  !{
+  !  typedef float pm_v4sf __attribute__((vector_size(16)));
+  !  typedef float pm_v4sf_u __attribute__((vector_size(16), aligned(1)));
+  !  const float *pm_s = (const float *)v_ps;
+  !  float *pm_d = (float *)v_pd;
+  !  const float *pm_w = (const float *)v_pw;
+  !  __attribute__((noinline)) pm_v4sf pm_lanes(pm_v4sf x, const float *w) {
+  !    pm_v4sf r;
+  !    for (int l = 0; l < 4; l++) {
+  !      pm_v4sf t = __builtin_ia32_subss((pm_v4sf){x[l]}, (pm_v4sf){w[4]});
+  !      pm_v4sf u = __builtin_ia32_mulss((pm_v4sf){w[5]}, t);
+  !      u = __builtin_ia32_divss(u, (pm_v4sf){w[6]});
+  !      r[l] = __builtin_ia32_addss(u, (pm_v4sf){w[7]})[0];
+  !    }
+  !    return r;
+  !  }
+  !  __attribute__((target("tune=generic"))) long long pm_vector(const float *s, float *d, long long n, const float *w) {
+  !    pm_v4sf mean = {w[4], w[4], w[4], w[4]}, scale = {w[5], w[5], w[5], w[5]};
+  !    pm_v4sf den = {w[6], w[6], w[6], w[6]}, bias = {w[7], w[7], w[7], w[7]};
+  !    long long k = 0;
+  !    for (; k + 4 <= n; k += 4) {
+  !      pm_v4sf x = *(const pm_v4sf_u *)(s + k);
+  !      pm_v4sf t = x - mean;
+  !      pm_v4sf u = scale * t;
+  !      u = u / den;
+  !      pm_v4sf r = u + bias;
+  !      if (__builtin_ia32_movmskps(__builtin_ia32_cmpunordps(r, r))) r = pm_lanes(x, w);
+  !      *(pm_v4sf_u *)(d + k) = r;
+  !    }
+  !    return k;
+  !  }
+  !  long long pm_k = pm_vector(pm_s, pm_d, v_n, pm_w);
+  !  for (; pm_k < v_n; pm_k++) {
+  !    pm_v4sf pm_t = __builtin_ia32_subss((pm_v4sf){pm_s[pm_k]}, (pm_v4sf){pm_w[4]});
+  !    pm_v4sf pm_u = __builtin_ia32_mulss((pm_v4sf){pm_w[5]}, pm_t);
+  !    pm_u = __builtin_ia32_divss(pm_u, (pm_v4sf){pm_w[6]});
+  !    pm_d[pm_k] = __builtin_ia32_addss(pm_u, (pm_v4sf){pm_w[7]})[0];
+  !  }
+  !}
+EndProcedure
+
+CompilerElseIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
 
 ; Four lane sums of the plane (squares=0) or of (x - mean)^2 (squares=1),
 ; one element at a time: the scalar reference.

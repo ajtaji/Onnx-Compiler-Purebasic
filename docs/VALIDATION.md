@@ -130,8 +130,8 @@ onnx 1.22.0 package, which carries the corpus, and the x64 build compiler from
 
 ```powershell
 py -3.12 -m pip install onnx==1.22.0
-py -3.12 tests\node_suite\node_suite.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --from-commit HEAD
-py -3.12 tests\node_suite\node_suite.py --pbcompiler "<install>\Compilers\pbcompiler.exe" --from-commit HEAD --self-check
+py -3.12 tests\node_suite\node_suite.py --pbcompiler "<install>\Compilers\pbcompilerc.exe" --from-commit HEAD
+py -3.12 tests\node_suite\node_suite.py --pbcompiler "<install>\Compilers\pbcompilerc.exe" --from-commit HEAD --self-check
 ```
 
 `--from-commit` builds the compiler from that commit's `src/` and `runtime/`,
@@ -1889,6 +1889,123 @@ Every support-file procedure this change touches (the emitted sources are unchan
 | `tensor_simd_windows.pbi` | `PmFastConvTWeightsTask`, `PmFastConvTGatherTask`, `PmFastConvTPlaceTask` | added |
 | `tensor_simd_windows.pbi` | `PmFastScatterTask` | removed (nothing calls it) |
 
+## The C back end — September 30, 2026
+
+Everything is now built with PureBasic's C back end, `pbcompilerc.exe`: the
+compiler, the window, and every generated Windows program. The assembly back
+end is no longer used. The reason is a PureBasic 6.41 assembly-back-end
+defect: a string `ProcedureReturn` inside `Select` misaligns the stack.
+`Build.pb`, [Build](BUILD.md) and the node-suite scripts now name
+`pbcompilerc.exe`.
+
+**What had to change.** The C back end cannot compile FASM, and the Windows
+runtime had 793 lines of it. Each inline block now has a C branch first, the
+unchanged FASM after it, and the plain form, where there is one, last.
+
+| Support file | Procedures with a C branch |
+|---|---|
+| `tensor_fp32_windows.pbi` | `PmConvMac`, `PmConvTMac` (macros), `PmTensorHardScan`, `PmI8MaxBitsContig`, `PmI8MaxBitsColumns`, `PmI8RoundProduct`, `PmI8QuantColumnPair`, `PmI8QuantRowPairs`, `PmI8ChunkPlain`, `PmI8TileAll`, `PmI8Epilogue` (both paths), `PmI8DotRows`, `PmTensorGemmRows` (beta * C), `PmTensorLstmFloatFour` |
+| `tensor_simd_windows.pbi` | `PmFastReduceSerial`, `PmFastBinary`, `PmFastRow` (all three column paths), `PmFastFourRows` |
+| `tensor_norm_small_windows.pbi` | `PmTensorInstanceNormLanes`, `PmFastInstanceNormLanes`, `PmTensorInstanceNormStats`, `PmTensorInstanceNormAffine`, `PmFastInstanceNormAffine` |
+| `tensor_pool_windows.pbi` | `PmPoolXadd`, `PmPoolXchg` (GCC atomics), the x87 control word and MXCSR handed to the workers (`PmPoolRun`, `PmPoolWorker`), `pause` (`PmPoolStart`, `PmPoolRun`) |
+
+**How the C keeps the bits.**
+- Vector kernels are GCC vector types and x86 builtins. An AVX or AVX2
+  kernel is a nested C function with that target attribute, called where
+  the FASM ran. The host's GCC otherwise targets SSE3 without FMA, so it
+  never fuses a multiply and an add.
+- The plain branches could not be used. This back end evaluates the
+  language's float expressions in binary64, so `sum + x * w` rounds once
+  where the targets round twice.
+- Operand order. When both operands of an add or a multiply are NaNs, x86
+  returns the first one. C treats `+` and `*` as commutative, and GCC was
+  seen to emit either operand first, in scalar and in vector code alike.
+  So a scalar add or multiply is `__builtin_ia32_addss` or `_mulss`, whose
+  definition fixes the first operand. A vector add or multiply whose result
+  has a NaN lane computes that lane again with those scalar steps. Without a
+  NaN the order cannot change a bit.
+- SSE kernels are nested functions tuned `generic`; tuned for its default
+  2006 processor, GCC splits every unaligned 16-byte load in two. No 32-byte
+  vector is passed by value: Windows passes it through memory that this GCC
+  cannot align to 32 bytes, and a first attempt crashed that way.
+
+**Where the C back end gives other bits, and why.** These are in the
+language's own float code, not in any procedure above. Both are listed in
+the limitations below.
+- A signalling NaN copied by plain float code is quieted by the assembly
+  back end (it loads floats through the x87 stack) and kept by the C back
+  end. Of all 2^32 inputs, Relu, Floor, Round and Clip differ on exactly the
+  8,388,606 signalling NaNs. The targets keep them too.
+- When both operands of a plain float operation are NaNs, the assembly back
+  end returns the one with the larger significand (x87), and the C back end
+  the one GCC put first (SSE). In the kernel harness, 9 of 918,192 words
+  differ, all in `PmFastBinary`'s scalar tail, each with both operands NaN.
+
+**Checks.** The comparisons build the same source with `pbcompiler.exe` (the
+reference) and `pbcompilerc.exe`.
+
+| Check | Result |
+|---|---|
+| A kernel harness (private): every procedure in the table called directly, with and without AVX/AVX2, on NaNs with payloads (quiet and signalling, both signs), infinities, signed zeros, subnormals, extremes, the INT8 and INT16 rounding and saturation edges, full-range INT16 pairs and INT8 weights; whole `PmI8MatMul`, `PmI8Gemm`, `PmFastGemm` and `PmTensorConv1D` (FLOAT and INT8, narrow and wide); and the pool under each x87 and MXCSR rounding mode, serial against split | 7,014 records, 918,192 32-bit words (138,870 NaN, 58,148 subnormal, 233,424 zero): 0 differ in any C branch; 9 differ, each in `PmFastBinary`'s scalar tail with both operands NaN |
+| Every binary32 bit pattern (2^32) through Exp, Log, Sqrt, Abs, Neg, Sin, Cos, Atan, Sigmoid, Tanh, the runtime-dimension Sin and Atan, Relu, Floor, Round and Clip, on the pool | 12 of the 16 identical on every input; Relu, Floor, Round and Clip identical except the 8,388,606 signalling NaNs |
+| `node_suite.py`, every case, C back end | PASS 1,248, PASS_SHAPE 2, FAIL_NUMERIC 4, RUN_ERROR 8, REFUSED 488; every one of the 1,750 outcomes equal to the published record `2026-09-26b` |
+| The same, both back ends compared | 15,411 emitted files and 1,254 Windows result files (2,974,016 bytes): all byte-identical |
+| `targeted_ops.py`, `targeted_defaults.py`, `targeted_norm_small.py`, `targeted_control.py`, `targeted_optional_outputs.py`, C back end | 1,228, 148, 132, 41 and 14 as expected, as with the assembly back end |
+| The same, both back ends compared | 16,628 emitted files and 1,386 Windows result files (2,053,314 bytes): all byte-identical |
+| `targeted_optional_outputs.py --mutants`, C back end | 2 of 2 caught |
+| `node_suite.py --self-check`, C back end | 6 of 6. Check (iii) used Erf, which the validators now list; on either back end it failed for that reason alone, so it now uses OptionalHasElement |
+| The compiler built with each back end, on every targeted case and every target (Windows, Pi 4, UNO Q, Pico, Pico 2) | 1,563 models x 5 targets: 82,930 files, 4.9 GB, all byte-identical (the manifest's own output path aside) |
+| `dpoll_windows_gate.pb` (compiler repository), C back end | builds and passes (with the previous runtime it did not build) |
+| `mt_split_gate.py` (compiler repository), C back end | split: 144 cases x 8 configurations, 0 failures; exit: 180 of 180 clean; affinity: 64 checks, 0 failures once the gate's own `!pause` (`mt_affinity_gate_body.pbi`) is guarded for the C back end (without that it does not build). Mutants: 6 of the 7 red (`ignore-mask` red too once the gate builds); `end-at-unbind` stays green, with the assembly back end as well |
+
+**Speed**, one thread, the kernels themselves, best of seven, the better of
+two interleaved runs (µs; this PC has AVX2):
+
+| Kernel | assembly | C | C / assembly |
+|---|---:|---:|---:|
+| PmFastFourRows+PmFastRow 64x512x512 | 294.6 | 273.3 | 0.93 |
+| PmFastRow SSE 64x512x512 | 1,777.9 | 1,795.3 | 1.01 |
+| PmFastRow tail N=3, 512x512 rows | 251.5 | 259.6 | 1.03 |
+| PmFastBinary add 1M | 298.0 | 283.9 | 0.95 |
+| PmFastBinary mul 1M broadcast | 325.1 | 242.9 | 0.75 |
+| PmFastReduceSerial 1024x1024 | 364.1 | 356.2 | 0.98 |
+| PmTensorGemmRows (PmConvMac) 64x256x256 | 8,839.8 | 4,993.4 | 0.56 |
+| PmTensorMatMul2Serial (PmConvMac) 64x256x256 | 6,338.0 | 4,902.7 | 0.77 |
+| PmConvTMac 4M | 5,686.8 | 2,457.5 | 0.43 |
+| PmTensorLstmFloatFour 512 (x512 units) | 149.9 | 146.6 | 0.98 |
+| PmTensorHardScan 1M | 231.4 | 185.4 | 0.80 |
+| InstanceNorm ref 64 planes x 16384 | 1,408.8 | 1,435.8 | 1.02 |
+| InstanceNorm fast 64 planes x 16384 | 336.7 | 333.8 | 0.99 |
+| PmI8MaxBitsContig 1M | 56.3 | 47.1 | 0.84 |
+| PmI8MaxBitsColumns 512x2048 | 225.7 | 232.7 | 1.03 |
+| PmI8QuantColumnPair 64K x2 | 7.2 | 7.0 | 0.97 |
+| PmI8QuantRowPairs 64K | 5.9 | 5.2 | 0.88 |
+| PmI8TileAll 3 taps x 256 pairs (x64) | 49.3 | 49.7 | 1.01 |
+| PmI8Epilogue wide 2 rows (x4096) | 23.0 | 16.6 | 0.72 |
+| PmI8DotRows 512 rows x 512 | 4.5 | 4.1 | 0.91 |
+| PmI8TileAll plain (PmI8ChunkPlain) (x4) | 359.7 | 224.7 | 0.62 |
+| PmI8Epilogue plain wide 2 rows (x4096) | 474.8 | 245.6 | 0.52 |
+| PmI8MatMul 64x512x512 | 261.2 | 232.7 | 0.89 |
+| PmI8Gemm 64x512x512 | 761.9 | 340.2 | 0.45 |
+| PmTensorConv1D FLOAT 128x256 k3 (PmConvMac) | 38,265.2 | 16,807.6 | 0.44 |
+| PmTensorConv1D INT8 128x256 k3 | 145.9 | 153.7 | 1.05 |
+| PmTensorConv1D INT8 wide 128x256 k3 | 266.5 | 252.4 | 0.95 |
+
+The plain-code paths (`PmI8ChunkPlain`, the plain epilogue, `PmConvMac` and
+`PmConvTMac`) are faster because the FASM stored and reloaded its sum in
+memory at every step. A NaN in a vector result costs a scalar pass over
+that lane; an operator that meets no NaN never pays it.
+
+The gates of the compiler repository that build for the Pi 4, Pico and Pico
+2 (`ops_kernel_check.py`, `ops_targets_gate.py`, `runtime_mutants.py`,
+`pi4_control_gate.py`) were not run for this change. The compiler built
+with either back end writes byte-identical output for every target (above),
+so their inputs are unchanged. `runtime_mutants.py` plants five of its
+mutants in FASM lines (`conv-windows-mac-wide`, `convt-windows-mac-wide`,
+`windows-gemm-beta-wide`, `windows-product-tail-wide`,
+`lstm-windows-dot-lanes`); built with the C back end they no longer reach
+the code that runs, and need C-branch counterparts.
+
 ## Explicit limitations
 
 - This compiler implements a **validated subset**, not the entire ONNX specification.
@@ -1920,8 +2037,17 @@ Every support-file procedure this change touches (the emitted sources are unchan
   the Windows program's bits on every target
   ([the same bits on every target](#the-same-bits-on-every-target-first-stage-square-root-abs-negate-and-batchnormalization--september-25-2026),
   four stages, and [the LSTM](#the-same-bits-on-every-target-the-lstm--september-26-2026)).
-- Windows x64 is the verified host. Linux/macOS hosting, other PureBasic
-  versions, and alternate PureBasic backends are not certified by this export.
+- Windows x64 with PureBasic 6.41's C back end is the verified host.
+  Linux/macOS hosting, other PureBasic versions, and the assembly back end
+  are not certified by this export.
+- Built with the C back end, the language's own float code differs from the
+  assembly back end's x87 code in two NaN cases
+  ([the C back end](#the-c-back-end--september-30-2026)): a signalling
+  NaN copied through it is kept, not quieted (Relu, Floor, Round, Clip and
+  any other kernel that passes a value through), and when both operands of
+  one of its operations are NaNs the result is the operand the compiler put
+  first, not the one with the larger significand. Every kernel with a C
+  branch gives the assembly build's bits.
 - Five-target **generation** does not establish downstream bare-metal builds,
   bootability, hardware numerical accuracy, or timing. The later Pi 4 checks
   above cover only their named fixtures, not other boards or arbitrary models.

@@ -32,7 +32,7 @@ Cases whose name starts with refuse_ must end REFUSED with a sentence containing
 given text; run_refuse_ cases must end RUN_ERROR with it; everything else must PASS.
 
 Usage (repository root):
-  py -3.12 tests/node_suite/targeted_control.py --pbcompiler PATH [--cli PATH] [--kitten MODEL] [--only GLOB ...]
+  py -3.12 tests/node_suite/targeted_control.py --pbcompiler PATH\\pbcompilerc.exe [--cli PATH] [--kitten MODEL] [--only GLOB ...]
 """
 from __future__ import annotations
 

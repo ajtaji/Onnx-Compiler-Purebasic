@@ -11,7 +11,10 @@ Declare PmFastCopyWindow(*src,*dst,inWidth.i,start.i,count.i,stride.i)
 Procedure PmFastReduceSerial(*Src,*Dst,Outer.i,Width.i,Mean.i)
   Protected row.i,j.i,ps.i=*Src,length.i=Width,total.f,divisor.f=Width
   For row=0 To Outer-1
-    CompilerIf #PB_Compiler_Backend=#PB_Backend_Asm And #PB_Compiler_Processor=#PB_Processor_x64
+    CompilerIf #PB_Compiler_Backend=#PB_Backend_C
+      ; one binary32 sum from +0 in index order, as the FASM's addss chain
+      !{ typedef float pm_v4sf __attribute__((vector_size(16))); const float *pm_p = (const float *)v_ps; pm_v4sf pm_t = {0.0f}; for (long long pm_j = 0; pm_j < v_length; pm_j++) pm_t = __builtin_ia32_addss(pm_t, (pm_v4sf){pm_p[pm_j]}); v_total = pm_t[0]; }
+    CompilerElseIf #PB_Compiler_Backend=#PB_Backend_Asm And #PB_Compiler_Processor=#PB_Processor_x64
       !mov rax,[p.v_ps]
       !mov rdx,[p.v_length]
       !xorps xmm0,xmm0
@@ -77,7 +80,38 @@ EndProcedure
 Procedure PmFastBinary(*A,*B,*Dst,Count.i,AStride.i,BStride.i,Op.i)
   Protected i.i,pa.i=*A,pb.i=*B,pd.i=*Dst,astep.i=AStride,bstep.i=BStride,operation.i=Op
   Protected av.f,bv.f,value.f
-  CompilerIf #PB_Compiler_Backend=#PB_Backend_Asm And #PB_Compiler_Processor=#PB_Processor_x64
+  CompilerIf #PB_Compiler_Backend=#PB_Backend_C
+    ; four lanes a turn, a scalar operand broadcast: the FASM's loop. A NaN
+    ; lane of a sum or product is computed again in the FASM's operand order
+    ; (THE C BACK END, tensor_fp32_windows.pbi)
+    !{
+    !  typedef float pm_v4sf __attribute__((vector_size(16)));
+    !  typedef float pm_v4sf_u __attribute__((vector_size(16), aligned(1)));
+    !  __attribute__((target("tune=generic"))) long long pm_kernel(const char *pa, const char *pb, char *pd, long long n, long long as, long long bs, long long op) {
+    !    long long i = 0;
+    !    for (; i + 4 <= n; i += 4) {
+    !      pm_v4sf a, b, r;
+    !      if (as != 0) a = *(const pm_v4sf_u *)pa; else { float x = *(const float *)pa; a = (pm_v4sf){x, x, x, x}; }
+    !      if (bs != 0) b = *(const pm_v4sf_u *)pb; else { float x = *(const float *)pb; b = (pm_v4sf){x, x, x, x}; }
+    !      if (op == 0) r = a + b;
+    !      else if (op == 1) r = a - b;
+    !      else if (op == 2) r = a * b;
+    !      else r = a / b;
+    !      if ((op == 0 || op == 2) && __builtin_ia32_movmskps(__builtin_ia32_cmpunordps(r, r))) {
+    !        for (int l = 0; l < 4; l++) {
+    !          pm_v4sf x = {a[l]}, y = {b[l]};
+    !          r[l] = (op == 0 ? __builtin_ia32_addss(x, y) : __builtin_ia32_mulss(x, y))[0];
+    !        }
+    !      }
+    !      *(pm_v4sf_u *)pd = r;
+    !      pa += as * 16; pb += bs * 16; pd += 16;
+    !    }
+    !    return i;
+    !  }
+    !  long long pm_m = pm_kernel((const char *)v_pa, (const char *)v_pb, (char *)v_pd, v_count, v_astep, v_bstep, v_operation);
+    !  v_pa += v_astep * 4 * pm_m; v_pb += v_bstep * 4 * pm_m; v_pd += 4 * pm_m; v_i = pm_m;
+    !}
+  CompilerElseIf #PB_Compiler_Backend=#PB_Backend_Asm And #PB_Compiler_Processor=#PB_Processor_x64
     While i+4<=Count
       !mov rax,[p.v_pa]
       !mov rcx,[p.v_pb]
@@ -135,7 +169,68 @@ Procedure PmFastRow(*A,*B,*Dst,K.i,N.i,Bias.f,BWidth.i=0)
   Protected col.i,pa.i,pb.i,pd.i,stride.i=N*4,inner.i,sum.f
   Protected length.i=K,biasvalue.f=Bias
   If BWidth : stride=BWidth*4 : EndIf
-  CompilerIf #PB_Compiler_Backend=#PB_Backend_Asm And #PB_Compiler_Processor=#PB_Processor_x64
+  CompilerIf #PB_Compiler_Backend=#PB_Backend_C
+    ; sixteen columns a turn with AVX, then four with SSE: each lane its own
+    ; column, from the bias, product then sum, both binary32. A column that
+    ; comes out NaN is computed again one step at a time in the FASM's operand
+    ; order (THE C BACK END, tensor_fp32_windows.pbi)
+    If PmFastAvx
+      !{
+      !  typedef float pm_v8sf __attribute__((vector_size(32)));
+      !  typedef float pm_v8sf_u __attribute__((vector_size(32), aligned(1)));
+      !  __attribute__((target("avx"))) long long pm_kernel(const float *a, const char *b, char *d, long long stride, long long length, long long n, long long col, float bias) {
+      !    for (; col + 16 <= n; col += 16) {
+      !      const char *pb = b + col * 4;
+      !      pm_v8sf acc0 = {bias, bias, bias, bias, bias, bias, bias, bias}, acc1 = acc0;
+      !      for (long long k = 0; k < length; k++) {
+      !        float x = a[k];
+      !        pm_v8sf av = {x, x, x, x, x, x, x, x};
+      !        pm_v8sf p0 = av * *(const pm_v8sf_u *)pb;
+      !        acc0 = acc0 + p0;
+      !        pm_v8sf p1 = av * *(const pm_v8sf_u *)(pb + 32);
+      !        acc1 = acc1 + p1;
+      !        pb += stride;
+      !      }
+      !      *(pm_v8sf_u *)(d + col * 4) = acc0;
+      !      *(pm_v8sf_u *)(d + col * 4 + 32) = acc1;
+      !    }
+      !    return col;
+      !  }
+      !  v_col = pm_kernel((const float *)p_a, (const char *)p_b, (char *)p_dst, v_stride, v_length, v_n, v_col, v_biasvalue);
+      !}
+    EndIf
+    !{
+    !  typedef float pm_v4sf __attribute__((vector_size(16)));
+    !  typedef float pm_v4sf_u __attribute__((vector_size(16), aligned(1)));
+    !  __attribute__((target("tune=generic"))) long long pm_sse(const float *a, const char *b, char *d, long long stride, long long length, long long n, long long col, float bias) {
+    !    for (; col + 4 <= n; col += 4) {
+    !      const char *pb = b + col * 4;
+    !      pm_v4sf acc = {bias, bias, bias, bias};
+    !      for (long long k = 0; k < length; k++) {
+    !        float x = a[k];
+    !        pm_v4sf av = {x, x, x, x};
+    !        av = av * *(const pm_v4sf_u *)pb;
+    !        acc = acc + av;
+    !        pb += stride;
+    !      }
+    !      *(pm_v4sf_u *)(d + col * 4) = acc;
+    !    }
+    !    return col;
+    !  }
+    !  const float *pm_a = (const float *)p_a;
+    !  v_col = pm_sse(pm_a, (const char *)p_b, (char *)p_dst, v_stride, v_length, v_n, v_col, v_biasvalue);
+    !  for (long long pm_c = 0; pm_c < v_col; pm_c++) {
+    !    if (!__builtin_isnan(((const float *)p_dst)[pm_c])) continue;
+    !    const char *pm_b = (const char *)p_b + pm_c * 4;
+    !    pm_v4sf pm_s = {v_biasvalue};
+    !    for (long long pm_k = 0; pm_k < v_length; pm_k++) {
+    !      pm_s = __builtin_ia32_addss(pm_s, __builtin_ia32_mulss((pm_v4sf){pm_a[pm_k]}, (pm_v4sf){*(const float *)pm_b}));
+    !      pm_b += v_stride;
+    !    }
+    !    ((float *)p_dst)[pm_c] = pm_s[0];
+    !  }
+    !}
+  CompilerElseIf #PB_Compiler_Backend=#PB_Backend_Asm And #PB_Compiler_Processor=#PB_Processor_x64
     If PmFastAvx
       While col+16<=N
         pa=*A : pb=*B+col*4 : pd=*Dst+col*4
@@ -194,7 +289,22 @@ Procedure PmFastRow(*A,*B,*Dst,K.i,N.i,Bias.f,BWidth.i=0)
   ; the last N mod 4 columns: one lane each, every product and sum rounded
   ; to binary32 as in the vector lanes (the host compiler's own expression
   ; would keep the product wider)
-  CompilerIf #PB_Compiler_Backend=#PB_Backend_Asm And #PB_Compiler_Processor=#PB_Processor_x64
+  CompilerIf #PB_Compiler_Backend=#PB_Backend_C
+    !{
+    !  typedef float pm_v4sf __attribute__((vector_size(16)));
+    !  const float *pm_a = (const float *)p_a;
+    !  for (; v_col < v_n; v_col++) {
+    !    const char *pm_b = (const char *)p_b + v_col * 4;
+    !    pm_v4sf pm_acc = {v_biasvalue};
+    !    for (long long pm_k = 0; pm_k < v_length; pm_k++) {
+    !      pm_v4sf pm_p = __builtin_ia32_mulss((pm_v4sf){pm_a[pm_k]}, (pm_v4sf){*(const float *)pm_b});
+    !      pm_acc = __builtin_ia32_addss(pm_acc, pm_p);
+    !      pm_b += v_stride;
+    !    }
+    !    *(float *)((char *)p_dst + v_col * 4) = pm_acc[0];
+    !  }
+    !}
+  CompilerElseIf #PB_Compiler_Backend=#PB_Backend_Asm And #PB_Compiler_Processor=#PB_Processor_x64
     While col<N
       pa=*A : pb=*B+col*4 : pd=*Dst+col*4
       !mov rax,[p.v_pa]
@@ -389,7 +499,61 @@ Procedure PmFastFourRows(*A,*B,*Dst,K.i,N.i,*Bias,Width.i=-1)
   If *Bias
     bias0=PeekF(*Bias) : bias1=PeekF(*Bias+4) : bias2=PeekF(*Bias+8) : bias3=PeekF(*Bias+12)
   EndIf
-  CompilerIf #PB_Compiler_Backend=#PB_Backend_Asm And #PB_Compiler_Processor=#PB_Processor_x64
+  CompilerIf #PB_Compiler_Backend=#PB_Backend_C
+    ; the FASM's tile: four rows of A, sixteen columns of B, eight
+    ; accumulators, product then sum, both binary32 (AVX; the caller checks).
+    ; An output that comes out NaN is computed again as PmFastRow does.
+    !{
+    !  typedef float pm_v8sf __attribute__((vector_size(32)));
+    !  typedef float pm_v8sf_u __attribute__((vector_size(32), aligned(1)));
+    !  __attribute__((target("avx"))) long long pm_kernel(const float *a, const char *b, char *d, long long stride, long long length, long long width, long long col, const float *bias) {
+    !    for (; col + 16 <= width; col += 16) {
+    !      const char *pb = b + col * 4;
+    !      const float *a1 = a + length, *a2 = a1 + length, *a3 = a2 + length;
+    !      pm_v8sf c0 = {bias[0], bias[0], bias[0], bias[0], bias[0], bias[0], bias[0], bias[0]};
+    !      pm_v8sf c1 = {bias[1], bias[1], bias[1], bias[1], bias[1], bias[1], bias[1], bias[1]};
+    !      pm_v8sf c2 = {bias[2], bias[2], bias[2], bias[2], bias[2], bias[2], bias[2], bias[2]};
+    !      pm_v8sf c3 = {bias[3], bias[3], bias[3], bias[3], bias[3], bias[3], bias[3], bias[3]};
+    !      pm_v8sf c4 = c0, c5 = c1, c6 = c2, c7 = c3;
+    !      for (long long k = 0; k < length; k++) {
+    !        pm_v8sf b0 = *(const pm_v8sf_u *)pb, b1 = *(const pm_v8sf_u *)(pb + 32), x, p;
+    !        x = (pm_v8sf){a[k], a[k], a[k], a[k], a[k], a[k], a[k], a[k]};
+    !        p = x * b0; c0 = c0 + p; p = x * b1; c4 = c4 + p;
+    !        x = (pm_v8sf){a1[k], a1[k], a1[k], a1[k], a1[k], a1[k], a1[k], a1[k]};
+    !        p = x * b0; c1 = c1 + p; p = x * b1; c5 = c5 + p;
+    !        x = (pm_v8sf){a2[k], a2[k], a2[k], a2[k], a2[k], a2[k], a2[k], a2[k]};
+    !        p = x * b0; c2 = c2 + p; p = x * b1; c6 = c6 + p;
+    !        x = (pm_v8sf){a3[k], a3[k], a3[k], a3[k], a3[k], a3[k], a3[k], a3[k]};
+    !        p = x * b0; c3 = c3 + p; p = x * b1; c7 = c7 + p;
+    !        pb += stride;
+    !      }
+    !      char *pd = d + col * 4;
+    !      *(pm_v8sf_u *)pd = c0; *(pm_v8sf_u *)(pd + 32) = c4; pd += stride;
+    !      *(pm_v8sf_u *)pd = c1; *(pm_v8sf_u *)(pd + 32) = c5; pd += stride;
+    !      *(pm_v8sf_u *)pd = c2; *(pm_v8sf_u *)(pd + 32) = c6; pd += stride;
+    !      *(pm_v8sf_u *)pd = c3; *(pm_v8sf_u *)(pd + 32) = c7;
+    !    }
+    !    return col;
+    !  }
+    !  typedef float pm_v4sf __attribute__((vector_size(16)));
+    !  float pm_bias[4] = {v_bias0, v_bias1, v_bias2, v_bias3};
+    !  v_col = pm_kernel((const float *)p_a, (const char *)p_b, (char *)p_dst, v_stride, v_length, v_width, v_col, pm_bias);
+    !  for (int pm_r = 0; pm_r < 4; pm_r++) {
+    !    const float *pm_a = (const float *)p_a + pm_r * v_length;
+    !    float *pm_d = (float *)((char *)p_dst + pm_r * v_stride);
+    !    for (long long pm_c = 0; pm_c < v_col; pm_c++) {
+    !      if (!__builtin_isnan(pm_d[pm_c])) continue;
+    !      const char *pm_b = (const char *)p_b + pm_c * 4;
+    !      pm_v4sf pm_s = {pm_bias[pm_r]};
+    !      for (long long pm_k = 0; pm_k < v_length; pm_k++) {
+    !        pm_s = __builtin_ia32_addss(pm_s, __builtin_ia32_mulss((pm_v4sf){pm_a[pm_k]}, (pm_v4sf){*(const float *)pm_b}));
+    !        pm_b += v_stride;
+    !      }
+    !      pm_d[pm_c] = pm_s[0];
+    !    }
+    !  }
+    !}
+  CompilerElseIf #PB_Compiler_Backend=#PB_Backend_Asm And #PB_Compiler_Processor=#PB_Processor_x64
     While col+16<=Width
       pa=*A : pb=*B+col*4 : pd=*Dst+col*4
       !mov rax,[p.v_pa]

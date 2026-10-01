@@ -24,7 +24,7 @@ the forum 988 correction taken out again, once per path, runs that path's
 cases with it, and requires that the gate goes red.
 
 Usage (repository root):
-  py -3.12 tests/node_suite/targeted_optional_outputs.py --pbcompiler PATH [--cli PATH] [--mutants]
+  py -3.12 tests/node_suite/targeted_optional_outputs.py --pbcompiler PATH\\pbcompilerc.exe [--cli PATH] [--mutants]
 """
 from __future__ import annotations
 

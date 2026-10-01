@@ -18,7 +18,9 @@ needs a newer compiler than that, and its recipe says what differs.
 
 ## Requirements
 
-- PureBasic **Windows x64**. Tested with **6.21** and its native assembly backend.
+- PureBasic **Windows x64**, built with its **C back end** (`pbcompilerc.exe`).
+  Tested with **6.41**. Everything is built with the C back end; the runtime
+  keeps its assembly-backend branches, but they are no longer what is built.
 - A writable checkout directory.
 - No Python, ONNX package, ONNX Runtime DLL, model download, or PureMetal compiler.
 
@@ -41,15 +43,15 @@ Its compiler invocation must not be copied into model-generation or inference pa
 
 ## Option B — build the entry points directly
 
-In the PureBasic IDE, open each source listed above, enable its listed options,
-and use **Create Executable** with the corresponding output path. Create `bin/`
-if it does not exist. Keep the two executables together: the window launches
-the sibling CLI to perform generation.
+In the PureBasic IDE, open each source listed above, select the C back end,
+enable its listed options, and use **Create Executable** with the corresponding
+output path. Create `bin/` if it does not exist. Keep the two executables
+together: the window launches the sibling CLI to perform generation.
 
 Equivalent PowerShell, with the path adjusted to your installation:
 
 ```powershell
-$pb = 'C:\Path\To\PureBasic\Compilers\pbcompiler.exe'
+$pb = 'C:\Path\To\PureBasic\Compilers\pbcompilerc.exe'
 New-Item -ItemType Directory -Force bin | Out-Null
 & $pb src/PureMetalOnnxCompiler.pb /CONSOLE /THREAD /OPTIMIZER /OUTPUT bin/PureMetalOnnxCompilerCLI.exe
 if ($LASTEXITCODE -ne 0) { throw 'CLI build failed' }

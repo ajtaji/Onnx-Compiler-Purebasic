@@ -79,8 +79,33 @@ EndMacro
 ; compiler's own `sum + x * w` keeps the product wider and adds -0 and -0 as
 ; +0. PmConvMac: sum = sum + [px] * [pw] (the caller declares sum.f, px.i,
 ; pw.i). PmConvTMac: [pd] = [pd] + value * [pw] (value.f, pw.i, pd.i).
+;
+; THE C BACK END. Every inline-assembly block of the Windows runtime has a C
+; branch first (#PB_Backend_C), the FASM after it, and the plain form, where
+; there is one, last. In the generated C the language's locals are v_name and
+; its pointer parameters p_name (address-sized integers); the C casts them.
+; The C performs the FASM's operations, each rounded once to binary32, on the
+; same operands in the same order:
+;  * Vector kernels use GCC vector types and x86 builtins; an AVX or AVX2
+;    kernel is a nested C function with that target attribute, called where
+;    the FASM ran (the host's GCC otherwise targets SSE3, without FMA, so it
+;    never fuses a multiply and an add). An SSE kernel is a nested function
+;    tuned "generic": tuned for its default 2006 processor, GCC splits every
+;    unaligned 16-byte load in two. No 32-byte vector is ever passed by value:
+;    Windows passes it through memory that GCC cannot align to 32.
+;  * The language's own float expressions are no substitute: this back end
+;    evaluates them in binary64, so `sum + x * w` would round once, not twice.
+;  * Operand order. When both operands of an add or a multiply are NaNs, x86
+;    returns the first one; C calls + and * commutative and GCC emits either
+;    operand first. So a scalar add or multiply is __builtin_ia32_addss or
+;    _mulss (the first operand is the instruction's first, by the builtin's
+;    definition), and a vector add or multiply whose result has a NaN lane
+;    computes that lane again with those scalar steps. Without a NaN the
+;    order cannot change a bit; with one, the steps fix it.
 Macro PmConvMac
-  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+    !{ typedef float pm_v4sf __attribute__((vector_size(16))); pm_v4sf pm_p = __builtin_ia32_mulss((pm_v4sf){*(const float *)v_px}, (pm_v4sf){*(const float *)v_pw}); v_sum = __builtin_ia32_addss((pm_v4sf){v_sum}, pm_p)[0]; }
+  CompilerElseIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
     !mov rax,[p.v_px]
     !movss xmm1,[rax]
     !mov rax,[p.v_pw]
@@ -94,7 +119,9 @@ Macro PmConvMac
 EndMacro
 
 Macro PmConvTMac
-  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+    !{ typedef float pm_v4sf __attribute__((vector_size(16))); pm_v4sf pm_p = __builtin_ia32_mulss((pm_v4sf){v_value}, (pm_v4sf){*(const float *)v_pw}); *(float *)v_pd = __builtin_ia32_addss((pm_v4sf){*(const float *)v_pd}, pm_p)[0]; }
+  CompilerElseIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
     !movss xmm1,[p.v_value]
     !mov rax,[p.v_pw]
     !mulss xmm1,[rax]
@@ -444,7 +471,25 @@ Procedure.i PmTensorHardScan(*src, count.i, *args)
   ps = *src
   pc = *args
   i = 0
-  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+    If n4 > 0
+      !{
+      !  typedef int pm_v4si __attribute__((vector_size(16)));
+      !  typedef int pm_v4si_u __attribute__((vector_size(16), aligned(1)));
+      !  typedef char pm_v16qi __attribute__((vector_size(16)));
+      !  __attribute__((target("tune=generic"))) long long pm_kernel(const pm_v4si_u *s, const pm_v4si_u *a, long long n4) {
+      !    pm_v4si a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3], a4 = a[4], hit = {0, 0, 0, 0};
+      !    for (long long k = 0; k < n4; k++) {
+      !      pm_v4si x = s[k];
+      !      hit |= x == a0; hit |= x == a1; hit |= x == a2; hit |= x == a3; hit |= x == a4;
+      !    }
+      !    return __builtin_ia32_pmovmskb128((pm_v16qi)hit);
+      !  }
+      !  v_hit = pm_kernel((const pm_v4si_u *)v_ps, (const pm_v4si_u *)v_pc, v_n4);
+      !}
+    EndIf
+    i = n4 << 2
+  CompilerElseIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
     If n4 > 0
       !mov rax,[p.v_ps]
       !mov rcx,[p.v_n4]
@@ -1020,6 +1065,21 @@ Procedure.i PmI8MaxBitsContig(*src, count.i)
   Protected p.i=*src, n.i=count, best.i=0, v.i, blocks.i
   If PmI8Avx2 And n>=8
     blocks=n/8
+    CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+      !{
+      !  typedef int pm_v8si __attribute__((vector_size(32)));
+      !  typedef int pm_v8si_u __attribute__((vector_size(32), aligned(1)));
+      !  __attribute__((target("avx2"))) long long pm_kernel(const pm_v8si_u *s, long long blocks) {
+      !    pm_v8si m = {0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF};
+      !    pm_v8si best = {0, 0, 0, 0, 0, 0, 0, 0};
+      !    for (long long k = 0; k < blocks; k++) best = __builtin_ia32_pmaxud256(best, m & s[k]);
+      !    int r = best[0];
+      !    for (int j = 1; j < 8; j++) if (best[j] > r) r = best[j];
+      !    return r;
+      !  }
+      !  v_best = pm_kernel((const pm_v8si_u *)v_p, v_blocks);
+      !}
+    CompilerElse
     !mov rax,[p.v_p]
     !mov rcx,[p.v_blocks]
     !vpcmpeqd ymm1,ymm1,ymm1
@@ -1040,6 +1100,7 @@ Procedure.i PmI8MaxBitsContig(*src, count.i)
     !vmovd eax,xmm0
     !mov [p.v_best],rax
     !vzeroupper
+    CompilerEndIf
     p+blocks*32 : n-blocks*8
   EndIf
   While n>0
@@ -1054,6 +1115,22 @@ EndProcedure
 Procedure PmI8MaxBitsColumns(*src, rows.i, rowbytes.i, cols.i, *out)
   Protected c.i=0, r.i, v.i, best.i, base.i, blocks.i=cols/8, ps.i=*src, po.i=*out
   If PmI8Avx2 And blocks>0 And rows>0
+    CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+      !{
+      !  typedef int pm_v8si __attribute__((vector_size(32)));
+      !  typedef int pm_v8si_u __attribute__((vector_size(32), aligned(1)));
+      !  __attribute__((target("avx2"))) void pm_kernel(const char *s, pm_v8si_u *o, long long blocks, long long rowbytes, long long rows) {
+      !    pm_v8si m = {0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF};
+      !    for (long long b = 0; b < blocks; b++) {
+      !      pm_v8si best = {0, 0, 0, 0, 0, 0, 0, 0};
+      !      const char *p = s + b * 32;
+      !      for (long long r = 0; r < rows; r++) { best = __builtin_ia32_pmaxud256(best, m & *(const pm_v8si_u *)p); p += rowbytes; }
+      !      o[b] = best;
+      !    }
+      !  }
+      !  pm_kernel((const char *)v_ps, (pm_v8si_u *)v_po, v_blocks, v_rowbytes, v_rows);
+      !}
+    CompilerElse
     !mov r8,[p.v_ps]
     !mov r9,[p.v_po]
     !mov r10,[p.v_blocks]
@@ -1077,6 +1154,7 @@ Procedure PmI8MaxBitsColumns(*src, rows.i, rowbytes.i, cols.i, *out)
     !dec r10
     !jnz pmi8mcol_block
     !vzeroupper
+    CompilerEndIf
     c=blocks*8
   EndIf
   While c<cols
@@ -1108,9 +1186,13 @@ EndProcedure
 ; Round-half-even of one FP32 product (the MXCSR default), for the plain path.
 Procedure.i PmI8RoundProduct(x.f, inv.f)
   Protected v.f=x*inv, q.i
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+    !{ typedef float pm_v4sf __attribute__((vector_size(16))); v_q = __builtin_ia32_cvtss2si((pm_v4sf){v_v, 0.0f, 0.0f, 0.0f}); }
+  CompilerElse
   !cvtss2si eax,[p.v_v]
   !movsxd rax,eax
   !mov [p.v_q],rax
+  CompilerEndIf
   ProcedureReturn q
 EndProcedure
 
@@ -1119,6 +1201,32 @@ EndProcedure
 Procedure PmI8QuantColumnPair(*src0, *src1, cols.i, *inv, qmax.i, *dst)
   Protected c.i=0, blocks.i=cols/8, a.i, b.i, p0.i=*src0, p1.i=*src1, pi.i=*inv, pd.i=*dst, lim.i=qmax
   If PmI8Avx2 And blocks>0
+    CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+      !{
+      !  typedef float pm_v8sf __attribute__((vector_size(32)));
+      !  typedef float pm_v8sf_u __attribute__((vector_size(32), aligned(1)));
+      !  typedef int pm_v8si __attribute__((vector_size(32)));
+      !  typedef int pm_v8si_u __attribute__((vector_size(32), aligned(1)));
+      !  __attribute__((target("avx2"))) void pm_kernel(const pm_v8sf_u *s0, const pm_v8sf_u *s1, const pm_v8sf_u *inv, pm_v8si_u *d, long long blocks, int lim) {
+      !    pm_v8si hi = {lim, lim, lim, lim, lim, lim, lim, lim};
+      !    pm_v8si lo = (pm_v8si){0, 0, 0, 0, 0, 0, 0, 0} - hi;
+      !    pm_v8si low16 = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+      !    for (long long k = 0; k < blocks; k++) {
+      !      pm_v8sf f = inv[k];
+      !      pm_v8si a = __builtin_ia32_cvtps2dq256(f * s0[k]);
+      !      a = __builtin_ia32_pmaxsd256(__builtin_ia32_pminsd256(a, hi), lo) & low16;
+      !      if (s1) {
+      !        pm_v8si b = __builtin_ia32_cvtps2dq256(f * *s1);
+      !        b = __builtin_ia32_pmaxsd256(__builtin_ia32_pminsd256(b, hi), lo);
+      !        a |= (pm_v8si)((unsigned int __attribute__((vector_size(32))))b << 16);
+      !        s1++;
+      !      }
+      !      d[k] = a;
+      !    }
+      !  }
+      !  pm_kernel((const pm_v8sf_u *)v_p0, (const pm_v8sf_u *)v_p1, (const pm_v8sf_u *)v_pi, (pm_v8si_u *)v_pd, v_blocks, (int)v_lim);
+      !}
+    CompilerElse
     !mov r8,[p.v_p0]
     !mov r9,[p.v_p1]
     !mov r10,[p.v_pi]
@@ -1154,6 +1262,7 @@ Procedure PmI8QuantColumnPair(*src0, *src1, cols.i, *inv, qmax.i, *dst)
     !dec rcx
     !jnz pmi8qcp_loop
     !vzeroupper
+    CompilerEndIf
     c=blocks*8
   EndIf
   While c<cols
@@ -1174,6 +1283,25 @@ EndProcedure
 Procedure PmI8QuantRowPairs(*src, count.i, inv.f, qmax.i, *dst, dststride.i)
   Protected k.i=0, a.i, blocks.i=count/4, ps.i=*src, pd.i=*dst, fi.f=inv
   If blocks>0
+    CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+      !{
+      !  typedef float pm_v4sf __attribute__((vector_size(16)));
+      !  typedef float pm_v4sf_u __attribute__((vector_size(16), aligned(1)));
+      !  typedef int pm_v4si __attribute__((vector_size(16)));
+      !  __attribute__((target("tune=generic"))) void pm_kernel(const pm_v4sf_u *s, char *d, long long stride, long long blocks, float fi) {
+      !    pm_v4sf f = {fi, fi, fi, fi};
+      !    for (long long k = 0; k < blocks; k++) {
+      !      pm_v4si q = __builtin_ia32_cvtps2dq(s[k] * f);
+      !      pm_v4si w = (pm_v4si)__builtin_ia32_packssdw128(q, q);
+      !      int lo = w[0], hi = w[1];
+      !      __builtin_memcpy(d, &lo, 4);
+      !      __builtin_memcpy(d + stride, &hi, 4);
+      !      d += 2 * stride;
+      !    }
+      !  }
+      !  pm_kernel((const pm_v4sf_u *)v_ps, (char *)v_pd, v_dststride, v_blocks, v_fi);
+      !}
+    CompilerElse
     !mov r8,[p.v_ps]
     !mov r9,[p.v_pd]
     !mov r10,[p.v_dststride]
@@ -1192,6 +1320,7 @@ Procedure PmI8QuantRowPairs(*src, count.i, inv.f, qmax.i, *dst, dststride.i)
     !lea r9,[r9+r10*2]
     !dec rcx
     !jnz pmi8qrp_loop
+    CompilerEndIf
     k=blocks*4
   EndIf
   While k<count
@@ -1233,10 +1362,14 @@ Procedure PmI8ChunkPlain(pw.i, ws.i, px.i, xs.i, n.i, psc.i, pf.i)
         acc+PeekW(wv)*PeekW(xv)+PeekW(wv+2)*PeekW(xv+2)
       Next
       sv=PeekF(psc+p*4) : fv=PeekF(pf+(r*16+p)*4)
+      CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+        !{ typedef float pm_v4sf __attribute__((vector_size(16))); pm_v4sf pm_p = __builtin_ia32_mulss((pm_v4sf){(float)v_acc}, (pm_v4sf){v_sv}); v_fv = __builtin_ia32_addss(pm_p, (pm_v4sf){v_fv})[0]; }
+      CompilerElse
       !cvtsi2ss xmm0,dword [p.v_acc]
       !mulss xmm0,[p.v_sv]
       !addss xmm0,[p.v_fv]
       !movss [p.v_fv],xmm0
+      CompilerEndIf
       PokeF(pf+(r*16+p)*4,fv)
     Next
   Next
@@ -1257,6 +1390,77 @@ Procedure PmI8TileAll(*a.PmI8TileArgs)
     Next
     ProcedureReturn
   EndIf
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+    ; The same loop: eight INT32 accumulators (four weight rows x sixteen
+    ; positions), one vpmaddwd per weight row and half, one pair a turn;
+    ; each chunk flushed as float(acc) * S + F. The FASM takes an odd pair
+    ; first and then two pairs a turn: the sums are exact integers, so the
+    ; order of their additions cannot change them.
+    !{
+    !  typedef int pm_v8si __attribute__((vector_size(32)));
+    !  typedef int pm_v8si_u __attribute__((vector_size(32), aligned(1)));
+    !  typedef unsigned int pm_v8su __attribute__((vector_size(32)));
+    !  typedef short pm_v16hi __attribute__((vector_size(32)));
+    !  typedef short pm_v16hi_u __attribute__((vector_size(32), aligned(1)));
+    !  typedef float pm_v4sf __attribute__((vector_size(16)));
+    !  typedef float pm_v8sf __attribute__((vector_size(32)));
+    !  typedef float pm_v8sf_u __attribute__((vector_size(32), aligned(1)));
+    !  typedef struct { long long W, WStride, X, XStride, XTap, S, STap, Taps, Pairs, Flush, F; } pm_args;
+    !  __attribute__((noinline)) void pm_flush_lanes(const int *c, const float *s, float *f) {
+    !    for (int l = 0; l < 8; l++) {
+    !      pm_v4sf t = __builtin_ia32_mulss((pm_v4sf){(float)c[l]}, (pm_v4sf){s[l]});
+    !      f[l] = __builtin_ia32_addss(t, (pm_v4sf){f[l]})[0];
+    !    }
+    !  }
+    !  __attribute__((target("avx2"))) void pm_kernel(const pm_args *g) {
+    !    const char *w0 = (const char *)g->W, *w3 = w0 + 3 * g->WStride;
+    !    long long ws = g->WStride, xs = g->XStride;
+    !    pm_v8sf_u *f = (pm_v8sf_u *)g->F;
+    !    for (long long tap = 0; tap < g->Taps; tap++) {
+    !      const char *x = (const char *)(g->X + ((const long long *)g->XTap)[tap]);
+    !      const pm_v8sf_u *s = (const pm_v8sf_u *)(g->S + ((const long long *)g->STap)[tap]);
+    !      unsigned long long left = g->Pairs;
+    !      do {
+    !        unsigned long long n = g->Flush;
+    !        if (left < n) n = left;
+    !        left -= n;
+    !        pm_v8su c0 = {0, 0, 0, 0, 0, 0, 0, 0}, c1 = c0, c2 = c0, c3 = c0, c4 = c0, c5 = c0, c6 = c0, c7 = c0;
+    !        for (; n > 0; n--) {
+    !          pm_v16hi x0 = *(const pm_v16hi_u *)x, x1 = *(const pm_v16hi_u *)(x + 32), wv;
+    !          int wi;
+    !          __builtin_memcpy(&wi, w0, 4); wv = (pm_v16hi)(pm_v8si){wi, wi, wi, wi, wi, wi, wi, wi};
+    !          c0 += (pm_v8su)__builtin_ia32_pmaddwd256(wv, x0); c1 += (pm_v8su)__builtin_ia32_pmaddwd256(wv, x1);
+    !          __builtin_memcpy(&wi, w0 + ws, 4); wv = (pm_v16hi)(pm_v8si){wi, wi, wi, wi, wi, wi, wi, wi};
+    !          c2 += (pm_v8su)__builtin_ia32_pmaddwd256(wv, x0); c3 += (pm_v8su)__builtin_ia32_pmaddwd256(wv, x1);
+    !          __builtin_memcpy(&wi, w0 + 2 * ws, 4); wv = (pm_v16hi)(pm_v8si){wi, wi, wi, wi, wi, wi, wi, wi};
+    !          c4 += (pm_v8su)__builtin_ia32_pmaddwd256(wv, x0); c5 += (pm_v8su)__builtin_ia32_pmaddwd256(wv, x1);
+    !          __builtin_memcpy(&wi, w3, 4); wv = (pm_v16hi)(pm_v8si){wi, wi, wi, wi, wi, wi, wi, wi};
+    !          c6 += (pm_v8su)__builtin_ia32_pmaddwd256(wv, x0); c7 += (pm_v8su)__builtin_ia32_pmaddwd256(wv, x1);
+    !          x += xs; w0 += 4; w3 += 4;
+    !        }
+    !        pm_v8sf s0 = s[0], s1 = s[1], v;
+    !        v = __builtin_convertvector((pm_v8si)c0, pm_v8sf) * s0 + f[0];
+    !        if (__builtin_ia32_movmskps256(__builtin_ia32_cmpps256(v, v, 3))) { pm_v8si_u ct = (pm_v8si)c0; pm_v8sf_u st = s0; pm_flush_lanes((const int *)&ct, (const float *)&st, (float *)&f[0]); } else f[0] = v;
+    !        v = __builtin_convertvector((pm_v8si)c1, pm_v8sf) * s1 + f[1];
+    !        if (__builtin_ia32_movmskps256(__builtin_ia32_cmpps256(v, v, 3))) { pm_v8si_u ct = (pm_v8si)c1; pm_v8sf_u st = s1; pm_flush_lanes((const int *)&ct, (const float *)&st, (float *)&f[1]); } else f[1] = v;
+    !        v = __builtin_convertvector((pm_v8si)c2, pm_v8sf) * s0 + f[2];
+    !        if (__builtin_ia32_movmskps256(__builtin_ia32_cmpps256(v, v, 3))) { pm_v8si_u ct = (pm_v8si)c2; pm_v8sf_u st = s0; pm_flush_lanes((const int *)&ct, (const float *)&st, (float *)&f[2]); } else f[2] = v;
+    !        v = __builtin_convertvector((pm_v8si)c3, pm_v8sf) * s1 + f[3];
+    !        if (__builtin_ia32_movmskps256(__builtin_ia32_cmpps256(v, v, 3))) { pm_v8si_u ct = (pm_v8si)c3; pm_v8sf_u st = s1; pm_flush_lanes((const int *)&ct, (const float *)&st, (float *)&f[3]); } else f[3] = v;
+    !        v = __builtin_convertvector((pm_v8si)c4, pm_v8sf) * s0 + f[4];
+    !        if (__builtin_ia32_movmskps256(__builtin_ia32_cmpps256(v, v, 3))) { pm_v8si_u ct = (pm_v8si)c4; pm_v8sf_u st = s0; pm_flush_lanes((const int *)&ct, (const float *)&st, (float *)&f[4]); } else f[4] = v;
+    !        v = __builtin_convertvector((pm_v8si)c5, pm_v8sf) * s1 + f[5];
+    !        if (__builtin_ia32_movmskps256(__builtin_ia32_cmpps256(v, v, 3))) { pm_v8si_u ct = (pm_v8si)c5; pm_v8sf_u st = s1; pm_flush_lanes((const int *)&ct, (const float *)&st, (float *)&f[5]); } else f[5] = v;
+    !        v = __builtin_convertvector((pm_v8si)c6, pm_v8sf) * s0 + f[6];
+    !        if (__builtin_ia32_movmskps256(__builtin_ia32_cmpps256(v, v, 3))) { pm_v8si_u ct = (pm_v8si)c6; pm_v8sf_u st = s0; pm_flush_lanes((const int *)&ct, (const float *)&st, (float *)&f[6]); } else f[6] = v;
+    !        v = __builtin_convertvector((pm_v8si)c7, pm_v8sf) * s1 + f[7];
+    !        if (__builtin_ia32_movmskps256(__builtin_ia32_cmpps256(v, v, 3))) { pm_v8si_u ct = (pm_v8si)c7; pm_v8sf_u st = s1; pm_flush_lanes((const int *)&ct, (const float *)&st, (float *)&f[7]); } else f[7] = v;
+    !      } while (left != 0);
+    !    }
+    !  }
+    !  pm_kernel((const pm_args *)v_ap);
+    !}
+  CompilerElse
   !mov rax,[p.v_ap]
   !push rbx
   !push rsi
@@ -1437,6 +1641,7 @@ Procedure PmI8TileAll(*a.PmI8TileArgs)
   !pop rdi
   !pop rsi
   !pop rbx
+  CompilerEndIf
 EndProcedure
 
 ; E[c][p] = F[c][p] * wScale(c) (+ bias(c)); wide: (F[2c] + F[2c+1] / 254) * wScale(c).
@@ -1447,6 +1652,48 @@ Procedure PmI8Epilogue(*f, *e, rows.i, wide.i, *ws, *bias)
   Protected pf.i=*f, pe.i=*e, pw.i=*ws, pb.i=*bias, n.i=rows, wd.i=wide
   If rows<=0 : ProcedureReturn : EndIf
   If PmI8Avx2
+    CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+      !{
+      !  typedef float pm_v4sf __attribute__((vector_size(16)));
+      !  typedef float pm_v8sf __attribute__((vector_size(32)));
+      !  typedef float pm_v8sf_u __attribute__((vector_size(32), aligned(1)));
+      !  __attribute__((target("avx2"))) void pm_kernel(const float *f, pm_v8sf_u *e, const float *ws, const float *b, long long n, long long wd, float k) {
+      !    pm_v8sf kv = {k, k, k, k, k, k, k, k};
+      !    for (; n > 0; n--) {
+      !      pm_v8sf e0 = *(const pm_v8sf_u *)f, e1 = *(const pm_v8sf_u *)(f + 8);
+      !      if (wd) {
+      !        pm_v8sf r0 = *(const pm_v8sf_u *)(f + 16), r1 = *(const pm_v8sf_u *)(f + 24);
+      !        r0 = r0 / kv; r1 = r1 / kv;
+      !        e0 = e0 + r0; e1 = e1 + r1;
+      !      }
+      !      float w = *ws;
+      !      pm_v8sf wv = {w, w, w, w, w, w, w, w};
+      !      e0 = e0 * wv; e1 = e1 * wv;
+      !      if (b) {
+      !        float bb = *b;
+      !        pm_v8sf bv = {bb, bb, bb, bb, bb, bb, bb, bb};
+      !        e0 = bv + e0; e1 = bv + e1;
+      !      }
+      !      e[0] = e0; e[1] = e1;
+      !      if (__builtin_ia32_movmskps256(__builtin_ia32_cmpps256(e0, e0, 3)) | __builtin_ia32_movmskps256(__builtin_ia32_cmpps256(e1, e1, 3))) {
+      !        float *o = (float *)e;
+      !        for (int p = 0; p < 16; p++) {
+      !          pm_v4sf v = {f[p]};
+      !          if (wd) v = __builtin_ia32_addss(v, (pm_v4sf){f[16 + p] / k});
+      !          v = __builtin_ia32_mulss(v, (pm_v4sf){w});
+      !          if (b) v = __builtin_ia32_addss((pm_v4sf){*b}, v);
+      !          o[p] = v[0];
+      !        }
+      !      }
+      !      if (wd) f += 16;
+      !      if (b) b++;
+      !      f += 16; e += 2; ws++;
+      !    }
+      !  }
+      !  pm_kernel((const float *)v_pf, (pm_v8sf_u *)v_pe, (const float *)v_pw, (const float *)v_pb, v_n, v_wd, v_k);
+      !}
+      ProcedureReturn
+    CompilerElse
     !mov rax,[p.v_pf]
     !mov rdx,[p.v_pe]
     !mov r8,[p.v_pw]
@@ -1486,27 +1733,40 @@ Procedure PmI8Epilogue(*f, *e, rows.i, wide.i, *ws, *bias)
     !jnz pmi8epi_row
     !vzeroupper
     ProcedureReturn
+    CompilerEndIf
   EndIf
   For c=0 To rows-1
     w=PeekF(*ws+c*4) : b=0.0 : If *bias : b=PeekF(*bias+c*4) : EndIf
     For p=0 To 15
       If wide
         v=PeekF(*f+(2*c*16+p)*4) : v2=PeekF(*f+((2*c+1)*16+p)*4)
+        CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+          !{ typedef float pm_v4sf __attribute__((vector_size(16))); float pm_r = v_v2 / v_k; v_v = __builtin_ia32_addss((pm_v4sf){v_v}, (pm_v4sf){pm_r})[0]; }
+        CompilerElse
         !movss xmm1,[p.v_v2]
         !divss xmm1,[p.v_k]
         !movss xmm0,[p.v_v]
         !addss xmm0,xmm1
         !movss [p.v_v],xmm0
+        CompilerEndIf
       Else
         v=PeekF(*f+(c*16+p)*4)
       EndIf
+      CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+        !{ typedef float pm_v4sf __attribute__((vector_size(16))); v_v = __builtin_ia32_mulss((pm_v4sf){v_v}, (pm_v4sf){v_w})[0]; }
+      CompilerElse
       !movss xmm0,[p.v_v]
       !mulss xmm0,[p.v_w]
       !movss [p.v_v],xmm0
+      CompilerEndIf
       If *bias
+        CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+          !{ typedef float pm_v4sf __attribute__((vector_size(16))); v_v = __builtin_ia32_addss((pm_v4sf){v_b}, (pm_v4sf){v_v})[0]; }
+        CompilerElse
         !movss xmm0,[p.v_b]
         !addss xmm0,[p.v_v]
         !movss [p.v_v],xmm0
+        CompilerEndIf
       EndIf
       PokeF(*e+(c*16+p)*4,v)
     Next
@@ -1519,6 +1779,33 @@ EndProcedure
 Procedure PmI8DotRows(*w, rowbytes.i, rows.i, *x, count.i, *out)
   Protected r.i, k.i, blocks.i=count/16, pw.i=*w, px.i=*x, po.i=*out, tail.i=0, total.l
   If PmI8Avx2 And blocks>0 And rows>0
+    CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+      ; Exact INT32 sums: the order of the additions cannot change them.
+      !{
+      !  typedef int pm_v8si __attribute__((vector_size(32)));
+      !  typedef unsigned int pm_v8su __attribute__((vector_size(32)));
+      !  typedef unsigned int pm_v4su __attribute__((vector_size(16)));
+      !  typedef long long pm_v4di __attribute__((vector_size(32)));
+      !  typedef short pm_v16hi __attribute__((vector_size(32)));
+      !  typedef short pm_v16hi_u __attribute__((vector_size(32), aligned(1)));
+      !  typedef char pm_v16qi_u __attribute__((vector_size(16), aligned(1)));
+      !  __attribute__((target("avx2"))) void pm_kernel(const char *w, long long rowbytes, long long rows, const pm_v16hi_u *x, long long blocks, int *o) {
+      !    for (; rows > 0; rows--) {
+      !      pm_v8su acc = {0, 0, 0, 0, 0, 0, 0, 0};
+      !      for (long long k = 0; k < blocks; k++) {
+      !        pm_v16hi wv = __builtin_ia32_pmovsxbw256(*(const pm_v16qi_u *)(w + 16 * k));
+      !        acc += (pm_v8su)__builtin_ia32_pmaddwd256(wv, x[k]);
+      !      }
+      !      pm_v4su h = (pm_v4su)__builtin_ia32_extract128i256((pm_v4di)acc, 0) + (pm_v4su)__builtin_ia32_extract128i256((pm_v4di)acc, 1);
+      !      h += __builtin_shuffle(h, (pm_v4su){2, 3, 0, 1});
+      !      h += __builtin_shuffle(h, (pm_v4su){1, 0, 3, 2});
+      !      *o++ = (int)h[0];
+      !      w += rowbytes;
+      !    }
+      !  }
+      !  pm_kernel((const char *)v_pw, v_rowbytes, v_rows, (const pm_v16hi_u *)v_px, v_blocks, (int *)v_po);
+      !}
+    CompilerElse
     !mov r8,[p.v_pw]
     !mov r9,[p.v_po]
     !mov r10,[p.v_rows]
@@ -1548,6 +1835,7 @@ Procedure PmI8DotRows(*w, rowbytes.i, rows.i, *x, count.i, *out)
     !dec r10
     !jnz pmi8dot_row
     !vzeroupper
+    CompilerEndIf
     tail=blocks*16
   EndIf
   For r=0 To rows-1
@@ -2002,7 +2290,9 @@ Procedure PmTensorGemmRows(*g.PmTensorGemmArgs, first.i, last.i)
         EndIf
         ; sum + beta * c: the product and the sum each binary32
         px = *g\C + ic * 4
-        CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
+        CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+          !{ typedef float pm_v4sf __attribute__((vector_size(16))); pm_v4sf pm_p = __builtin_ia32_mulss((pm_v4sf){v_beta}, (pm_v4sf){*(const float *)v_px}); v_sum = __builtin_ia32_addss((pm_v4sf){v_sum}, pm_p)[0]; }
+        CompilerElseIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
           !movss xmm1,[p.v_beta]
           !mov rax,[p.v_px]
           !mulss xmm1,[rax]
@@ -3703,7 +3993,40 @@ Procedure PmTensorLstmFloatFour(*g.PmTensorLstmFloatFourArgs)
   Protected left.f
   Protected right.f
   Protected sum.f
-  CompilerIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
+  CompilerIf #PB_Compiler_Backend = #PB_Backend_C
+    Protected pa.i, pb.i, stride.i, n.i, out.i
+    pa = *g\A
+    stride = *g\Hidden * *g\Count * 4
+    pb = *g\B + *g\Unit * *g\Count * 4
+    n = *g\Count
+    out = @*g\IValue
+    !{
+    !  typedef float pm_v4sf __attribute__((vector_size(16)));
+    !  typedef float pm_v4sf_u __attribute__((vector_size(16), aligned(1)));
+    !  const float *pm_a = (const float *)v_pa;
+    !  const char *pm_b = (const char *)v_pb;
+    !  pm_v4sf pm_acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    !  for (long long pm_k = 0; pm_k < v_n; pm_k++) {
+    !    float pm_x = pm_a[pm_k];
+    !    pm_v4sf pm_av = {pm_x, pm_x, pm_x, pm_x};
+    !    const float *pm_w = (const float *)(pm_b + 4 * pm_k);
+    !    pm_v4sf pm_bv = {pm_w[0], *(const float *)((const char *)pm_w + v_stride), *(const float *)((const char *)pm_w + 2 * v_stride), *(const float *)((const char *)pm_w + 3 * v_stride)};
+    !    pm_bv = pm_bv * pm_av;
+    !    pm_acc = pm_acc + pm_bv;
+    !  }
+    !  for (int pm_l = 0; pm_l < 4; pm_l++) {
+    !    if (!__builtin_isnan(pm_acc[pm_l])) continue;
+    !    pm_v4sf pm_s = {0.0f};
+    !    for (long long pm_k = 0; pm_k < v_n; pm_k++) {
+    !      float pm_w = *(const float *)(pm_b + 4 * pm_k + pm_l * v_stride);
+    !      pm_s = __builtin_ia32_addss(pm_s, __builtin_ia32_mulss((pm_v4sf){pm_w}, (pm_v4sf){pm_a[pm_k]}));
+    !    }
+    !    pm_acc[pm_l] = pm_s[0];
+    !  }
+    !  *(pm_v4sf_u *)v_out = pm_acc;
+    !}
+    ProcedureReturn
+  CompilerElseIf #PB_Compiler_Backend = #PB_Backend_Asm And #PB_Compiler_Processor = #PB_Processor_x64
     Protected pa.i, pb.i, stride.i, n.i, out.i
     pa = *g\A
     stride = *g\Hidden * *g\Count * 4

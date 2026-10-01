@@ -35,7 +35,7 @@ in a sentence, to score a corpus whose onnx version or content hash differs
 from the pin below.
 
 Usage (from the repository root, with an interpreter that has onnx installed):
-  python tests/node_suite/node_suite.py --pbcompiler PATH\\pbcompiler.exe
+  python tests/node_suite/node_suite.py --pbcompiler PATH\\pbcompilerc.exe
   python tests/node_suite/node_suite.py --pbcompiler ... --cases "test_add*"
   python tests/node_suite/node_suite.py --pbcompiler ... --self-check
 """
@@ -894,16 +894,17 @@ def self_check(node_dir: Path, work: Path, tools: Tools, supported: set[str]) ->
           "%s %s" % (r["outcome"], r["detail"]))
 
     # (iii) an operator outside the validators' list
-    outside = "Erf"
+    # (Erf was the operator here until the validators listed it.)
+    outside = "OptionalHasElement"
     if outside in supported:
         check("(iii) operator outside the list", False, "%s is now listed; choose another operator for this check" % outside)
     else:
         g = helper.make_graph([helper.make_node(outside, ["x"], ["y"])], "outside",
                               [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [3, 4])],
-                              [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [3, 4])])
-        m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 13)])
-        m.ir_version = 7
-        write_case(base / "corpus" / "outside_operator", m, [x], [x])
+                              [helper.make_tensor_value_info("y", onnx.TensorProto.BOOL, [])])
+        m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 18)])
+        m.ir_version = 8
+        write_case(base / "corpus" / "outside_operator", m, [x], [np.array(True)])
         r = run_case(base / "corpus" / "outside_operator", "outside_operator", base / "run", tools, supported, keep=True)
         check("(iii) a model using %s" % outside, r["outcome"] == "REFUSED" and r.get("named_ops") == [outside],
               "%s %s (named: %s)" % (r["outcome"], r["detail"], r.get("named_ops")))
@@ -931,7 +932,8 @@ def compact_json(document: dict) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--pbcompiler", required=True, type=Path, help="the x64 build compiler (docs/BUILD.md names it)")
+    ap.add_argument("--pbcompiler", required=True, type=Path,
+                    help="the x64 build compiler, the C back end pbcompilerc.exe (docs/BUILD.md)")
     ap.add_argument("--cli", type=Path, help="use this compiler CLI instead of building one from src/")
     ap.add_argument("--from-commit", metavar="REV", help="build the compiler from this commit's src/ and runtime/ "
                     "instead of the working tree; published scores use this")

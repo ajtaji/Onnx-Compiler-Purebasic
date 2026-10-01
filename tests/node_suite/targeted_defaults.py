@@ -18,7 +18,7 @@ Cases whose name starts with refuse_ must end REFUSED, with a sentence that name
 the operator and the attribute; everything else must PASS.
 
 Usage (repository root):
-  py -3.12 tests/node_suite/targeted_defaults.py --pbcompiler PATH [--cli PATH] [--only GLOB ...]
+  py -3.12 tests/node_suite/targeted_defaults.py --pbcompiler PATH\\pbcompilerc.exe [--cli PATH] [--only GLOB ...]
 """
 from __future__ import annotations
 
