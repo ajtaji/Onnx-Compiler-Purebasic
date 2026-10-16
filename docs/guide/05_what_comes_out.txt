@@ -13,7 +13,7 @@ output\dense-int8.runtime\    the execution sources this model needs
 @ENDFRAG
 
 On a bare-metal target the source has that target's extension instead -
-`.pi4` for Pi 4 and UNO Q, `.pico`, `.pico2` - and the runtime folder holds
+`.pi4` for the Pi 4, `.unoq` for the UNO Q, `.pico`, `.pico2` - and the runtime folder holds
 different files. The shape is the same.
 
 @TRAP These four are **one artefact in four files**. The source contains

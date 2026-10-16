@@ -121,7 +121,7 @@ different lengths use the same initialized model and check their numerical resul
 |---|---|---|---|
 | `windows` | `.pb` | PureBasic x64 / Windows | CPU SIMD paths; no alternate inference engine. |
 | `pi4` | `.pi4` | PureMetal / AArch64 | NEON kernels, caller-owned memory. |
-| `unoq` | `.pi4` | PureMetal / AArch64 UEFI application | Same source dialect; integration belongs to the application. |
+| `unoq` | `.unoq` | PureMetal / AArch64 UEFI application | Same source dialect as the Pi 4, under the UNO Q's own extension (a UNO Q build refuses a `.pi4` library); integration belongs to the application. |
 | `pico` | `.pico` | PureMetal / RP2040 Cortex-M0+ | Small models only; RAM and flash checks. |
 | `pico2` | `.pico2` | PureMetal / RP2350 Cortex-M33 | Small models only; target-specific integer kernels. |
 

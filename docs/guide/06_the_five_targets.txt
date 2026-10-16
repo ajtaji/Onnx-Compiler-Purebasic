@@ -49,7 +49,9 @@ reference; where it does not, do not demand it.
 
 @SECTION Pi 4 and UNO Q
 
-Both emit the same 64-bit Arm dialect into a `.pi4` file. They differ in
+Both emit the same 64-bit Arm dialect, each under its own extension: `.pi4`
+for the Pi 4 and `.unoq` for the UNO Q (the PureMetal compiler takes the
+chip from the extension, and a UNO Q build refuses a `.pi4` library). They differ in
 how the program is launched: the Pi 4 profile is entered as a bare-metal
 payload with caller-supplied memory; the UNO Q profile is a 64-bit UEFI
 application, and the loader, the weight loading and the device I/O belong

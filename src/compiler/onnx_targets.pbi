@@ -85,7 +85,7 @@ Procedure PmoInitTargets()
     \Description = "PureMetal source for Arduino UNO Q Cortex-A53 UEFI"
     \SourceDialect = #PMO_SOURCE_PUREMETAL
     \Launch = #PMO_LAUNCH_UEFI_ESP
-    \SourceSuffix = ".pi4"
+    \SourceSuffix = ".unoq"   ; its own extension: the PureMetal compiler picks the chip from it (a .pi4 is refused by -t unoq)
     \MathInclude = "runtime/math/math_a64.pmi"
     \TensorInclude = "runtime/tensor_fp32.pmi"
     \AcceleratorInclude = "runtime/tensor_fp32_neon.pmi"

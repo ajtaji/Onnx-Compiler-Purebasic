@@ -955,7 +955,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
     CloseFile(file) : file=0
   EndIf
   If kokoroText
-    file=CreateFile(#PB_Any,prefix+".kokoro.pi4")
+    file=CreateFile(#PB_Any,prefix+".kokoro"+PmoTargets(targetIndex)\SourceSuffix)
     If file=0 : PmoDynamicError="Cannot create the resident Kokoro text adapter entry point." : Goto Failed : EndIf
     PmdLine(file,"; Include this source in the host application; bind assets and model once.")
     PmdLine(file,"; New text goes to PmKokoroTextRender at runtime. No board I/O is assumed.")
@@ -986,7 +986,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   SetJSONBoolean(AddJSONMember(object,"speech_ui"),speech)
   SetJSONBoolean(AddJSONMember(object,"kokoro_text"),kokoroText)
   If kokoroText
-    SetJSONString(AddJSONMember(object,"kokoro_entry_source"),prefix+".kokoro.pi4")
+    SetJSONString(AddJSONMember(object,"kokoro_entry_source"),prefix+".kokoro"+PmoTargets(targetIndex)\SourceSuffix)
     SetJSONString(AddJSONMember(object,"kokoro_assets"),"Caller-owned immutable base and optional extra pronunciation packs plus one PMVOICE; not embedded in source or included in model arena")
     SetJSONInteger(AddJSONMember(object,"kokoro_sample_rate"),24000)
     SetJSONInteger(AddJSONMember(object,"kokoro_max_phonemes"),510)

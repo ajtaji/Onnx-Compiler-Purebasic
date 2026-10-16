@@ -15,7 +15,8 @@
 ; on the board.
 ;
 ; This file includes no other library. Generated programs that use Exp,
-; Log, Pow or Sqr list RaspberryPi4/Lib/math.pi4 before this file.
+; Log, Pow or Sqr list a math core before this file (for A64, math_a64.pmi
+; in the ONNX source repository).
 ; ======================================================================
 
 ; The worker pool every parallel operator below runs on.

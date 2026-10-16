@@ -366,7 +366,7 @@ Procedure KsOpenText()
     If bytes>=2 And PeekU(buffer)=$FEFF
       text=PeekS(buffer+2,(bytes-2)/2,#PB_Unicode)
     Else
-      text=PeekS(buffer,bytes,#PB_UTF8)
+      text=PeekS(buffer,bytes,#PB_UTF8|#PB_ByteLength)
       If Left(text,1)=Chr($FEFF) : text=Mid(text,2) : EndIf
     EndIf
     If Len(text)>#KS_MAX_TEXT

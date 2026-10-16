@@ -175,7 +175,7 @@ Procedure.s PmoWireUtf8(*Slice.PmoWireSlice)
   If *Slice = 0 Or *Slice\Bytes <= 0
     ProcedureReturn ""
   EndIf
-  ProcedureReturn PeekS(*Slice\Data, *Slice\Bytes, #PB_UTF8)
+  ProcedureReturn PeekS(*Slice\Data, *Slice\Bytes, #PB_UTF8|#PB_ByteLength)
 EndProcedure
 
 Procedure.i PmoWireRequire(*Cursor.PmoWireCursor, Field.i, ExpectedWire.i, ActualWire.i)

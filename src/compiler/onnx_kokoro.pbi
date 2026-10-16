@@ -206,7 +206,7 @@ Procedure.i PmoKokoroPrepareInputs(ModelPath.s, Text.s, G2pPath.s, VoicePath.s,
   If PmoKokoroWriteNpy(StylePath, "<f4", "(1, 256)", *Style, #PMK_VOICE_WIDTH * 4) = 0 : Goto PmoKokoroPrepareFailed : EndIf
   If PmoKokoroWriteNpy(SpeedPath, "<f4", "(1,)", @Speed, 4) = 0 : Goto PmoKokoroPrepareFailed : EndIf
   *Prepared\InputIds = IdPath : *Prepared\Style = StylePath : *Prepared\Speed = SpeedPath
-  *Prepared\Phonemes = PeekS(*Phonemes, PhonemeBytes, #PB_UTF8)
+  *Prepared\Phonemes = PeekS(*Phonemes, PhonemeBytes, #PB_UTF8|#PB_ByteLength)
   *Prepared\TokenCount = TokenCount : *Prepared\VoiceRow = VoiceRow
   If *TextUtf8 : FreeMemory(*TextUtf8) : EndIf
   If *Phonemes : FreeMemory(*Phonemes) : EndIf

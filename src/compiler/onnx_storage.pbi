@@ -103,7 +103,7 @@ Procedure.i PmoStorageReduce(*Ir.PmoIrModel,Precision.s)
 EndProcedure
 
 Procedure PmoStorageEmit(File.i,Aarch64.i)
-  Protected source.s=PeekS(?PmoStorageDecoderStart,?PmoStorageDecoderEnd-?PmoStorageDecoderStart,#PB_UTF8)
+  Protected source.s=PeekS(?PmoStorageDecoderStart,?PmoStorageDecoderEnd-?PmoStorageDecoderStart,#PB_UTF8|#PB_ByteLength)
   If Aarch64 : source=ReplaceString(source,"PMO_STORAGE_FLOAT(q)","MathFFromInt(q)") : Else : source=ReplaceString(source,"PMO_STORAGE_FLOAT(q)","q") : EndIf
   WriteStringN(File,source,#PB_UTF8)
 EndProcedure
