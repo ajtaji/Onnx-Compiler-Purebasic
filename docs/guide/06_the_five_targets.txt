@@ -231,23 +231,19 @@ at most once per millisecond; the callback must never enter the model or
 allocate tensors. Pass zero to remove it before closing the model or I/O.
 The normal progress callback still owns cancellation and watchdog servicing.
 
-The Kitten nano Rosie integration returns the INT8 fixture in 24.177 seconds
-for 24.667 seconds of speech on a Pi 4 at 1.5 GHz. Its 592,000 samples remain
-byte-identical to the previous native INT8 implementation. The FP32 waveform
-retained its complete baseline in the earlier R18 proof. Independent LSTM directions and convolution
-position tiles can now use separate cores. Single-use multiply/add pairs avoid
-an intermediate pass while retaining separate multiplication and addition.
+The Kitten nano Rosie integration returns the INT8 fixture in 23.015 seconds
+for 24.667 seconds of speech on a Pi 4 at 1.5 GHz. All 592,000 native samples
+remain byte-identical. Convolution uses small position windows across output
+channels and interleaves independent integer rows while retaining reduction
+order. The current focused Pi proof passes 255 cases and 4,575,672 values.
 
-For sustained Bluetooth reading, include chunk production and SBC encoding.
-Prefetch can conceal a deficit. The measured 24-chunk reader ratio is
-1.01372 seconds of work per second of new speech. Sustained faster-than-real-time playback is still unachieved; initial prefetch conceals the remaining deficit.
-The circular queue uses Anvil's existing Bluetooth stack; the host prepares
-text inputs and the Pi generates audio. Boundary silence is conservatively
-shortened. See examples/pi4/kitten-book/README.md for the recipe and limits.
+For sustained reading, include complete chunk production and SBC encoding.
+The three 24-chunk chapter excerpts measured work/audio ratios of
+0.96403, 0.95064, 0.94096. All three measured excerpts generated faster than playback, with no recorded starvation.
+Initial prefetch is excluded, and ratios use the actual paced samples.
+See examples/pi4/kitten-book/README.md for the recipe, each result and limits.
 
-Weights-resident first-phrase inference measured 1.369 seconds for 'Hello'.
-Connection and audio buffering add to that. A subsecond interactive start has
-not been proven, and the example currently prefetches before connecting.
+Weights-resident short-phrase inference now measures 1.313 seconds for 'Hello'. The other four phrases measure 1.657, 2.074, 2.274, 3.523 seconds. These exclude speaker connection and buffering. A 0.5-1 second request-to-speech start has not been demonstrated. The current book reader prefetches two chunks before connecting; an interactive reader still needs a persistent model/connection and an opening-phrase scheduler. Kitten returns each complete waveform, so it currently cannot play part of a phrase while that phrase is still being generated.
 
 @SECTION Pico and Pico 2
 

@@ -2157,48 +2157,50 @@ reading remains unachieved.
 
 ## Pi 4 streaming speech runtime - October 19, 2026
 
-Seven shared runtime files split independent matrix, convolution, normalization,
-transpose, elementwise and random work across Anvil's cores. Workers own their
-scratch and complete reductions; operation order is preserved. Explicit overwrite
-allocation avoids redundant clearing while ordinary allocation and rounded slack
-retain zeroing. Adjacent single-use Mul/Add nodes share a pass without FMA,
-preserve add operand order, retain integer/generic fallbacks and release input
-storage before output allocation when needed. Fifty Kitten pairs use this path.
-
-A focused Pi 4 proof on Anvil build 328, 1.5 GHz, passed 171 cases and 3,965,472
-compared values on four cores. Cases include random boundaries, floating specials,
-integer casts, matrix tails, narrow/wide strided convolution and position tiles,
-broadcast maps, bidirectional FP32/INT8 LSTM, transpose tails and allocator bounds.
-Idle callbacks ran only on the primary. Nine host compiler scheduling controls
-cover graph outputs, repeated and later uses, nonadjacent nodes, reversed add
-operands, integer fallback and 32/64-bit emission.
-
-The final native INT8 fixture returns in 24.177 seconds for 24.667 seconds of
-speech. All 592,000 samples retain SHA-256
+The current native INT8 fixture returns in 23.015 s for 24.667 s of speech.
+Convolution fell from 8.059 to 6.925 s after cache windows and independent integer
+row scheduling. All 592,000 output samples retain SHA-256
 `e189ff65307cf74a1b6d100157db99cbbbd8460fad5783e7702bc7df1c057aff`.
-The earlier R18 captured-noise FP32 fixture retained its original 595,600 samples and SHA-256
-`cd1bd7badfeaae64bf1d2af105922fa3ef8bb0d307fbdbf13691b36ec0e27a72`.
-The separate captured-noise FP32 comparison against ONNX Runtime still fails its existing max-absolute/RMS limits (0.508064/0.013865, correlation 0.990424). Native waveform preservation does not resolve that comparison; no tolerances were changed.
+The latest full FP32 run returned in 34.336 s and retained all 595,600 original
+samples, SHA-256 `cd1bd7badfeaae64bf1d2af105922fa3ef8bb0d307fbdbf13691b36ec0e27a72`.
+Subsequent changes affect INT8 kernels and the player only. A focused four-core
+proof passed 255 cases / 4,575,672 values, including original-kernel comparisons
+at 18 reduction counts in both zero/accumulate and row/lane scale modes, plus
+narrow/wide grouped convolution windows. No secondary-core idle calls occurred.
+The separate captured-noise FP32 ONNX Runtime comparison still fails its existing
+max-absolute/RMS limits (0.508064/0.013865, correlation 0.990424). No tolerance changed.
 
-The 24-chunk production Bluetooth run sent 140.688 seconds of audio. Concurrent production took 128.014 seconds for 126.281 seconds of newly generated audio: 1.01372 seconds of work per second of speech. It recorded 0 starvation events, 0 receive errors and 0 secondary-core audio calls. Maximum audio-service gap was 51.571 ms. Sustained faster-than-real-time playback is still unachieved; initial prefetch conceals the remaining deficit.
+The reader prepares the next chunk while the primary core sends SBC through
+Anvil's existing A2DP stack. The host prepares text inputs, never rendered audio.
+Ratios below include complete chunk production during Bluetooth playback and
+use actual cropped audio samples; the initial two-chunk prefetch is excluded.
+Each run is shorter than five minutes. Text is taken from three distinct chapters
+of Alice's Adventures in Wonderland, including narration and short dialogue.
 
-Earlier long runs exposed a deficit and occasional pops despite smooth short
-prefetched runs. Leading/trailing quiet now retain at least 100/150 ms, with
-5 ms fades only on shortened edges. Interior pauses are preserved. Timing uses
-the resulting actual audio samples, so shortening silence cannot inflate the
-reported speed. The host supplies phonemes/style, never rendered audio.
+| Excerpt (24 chunks) | Concurrent production | New speech | Work/audio | Starvation |
+|---|---:|---:|---:|---:|
+| The Pool of Tears | 106.552 s | 110.527 s | 0.96403 | 0 |
+| A Mad Tea-Party | 100.790 s | 106.023 s | 0.95064 | 0 |
+| Alice's Evidence | 123.166 s | 130.894 s | 0.94096 | 0 |
 
-With weights resident, five short phrases took 1.369, 1.753, 2.202, 2.417 and 3.758 seconds of model execution. The shortest was 'Hello'; its paced audio lasts 1.397 seconds. These exclude Bluetooth connection and initial playback buffering. A 0.5-1 second request-to-speech start has not been demonstrated. The current reader prefetches two chunks before connecting; persistent connection and first-phrase scheduling remain needed for interactive startup. The complete-chunk ONNX interface supplies no partial waveform during inference.
+All three measured excerpts generated faster than playback, with no recorded starvation.
+
+Weights-resident short-phrase inference now measures 1.313 seconds for 'Hello'. The other four phrases measure 1.657, 2.074, 2.274, 3.523 seconds. These exclude speaker connection and buffering. A 0.5-1 second request-to-speech start has not been demonstrated. The current book reader prefetches two chunks before connecting; an interactive reader still needs a persistent model/connection and an opening-phrase scheduler. Kitten returns each complete waveform, so it currently cannot play part of a phrase while that phrase is still being generated.
+
+Earlier short prefetched runs concealed a sustained deficit. The listener
+reported clear speech, then occasional pops on a longer run, then unusual pauses.
+Boundary pacing now retains at least 100 ms leading / 150 ms trailing quiet and
+fades only shortened edges for 5 ms; interior pauses remain. The R25 readback
+connection went silent after a successful return. After USB confirmed the monitor
+was alive, a fresh network connection recovered counters without a reset:
+125.599 s work / 126.281 s speech (0.99460). The R26 PCM-copy experiment was silent
+because its DCopy source/destination arguments were reversed. It is rejected as
+playback evidence. R27 corrects the copy and validates SBC sync headers before
+transmission; the listener confirmed it audible and clear. R27 measured 0.99163.
+The final cache/scheduling kernels are combined with that corrected player.
 
 The normal release helper rebuilt, source-stamped, self-tested, timestamp-signed
-and installed the CLI/UI. The signed CLI reproduces all 12 hardware-proven INT8
-source/runtime/weight files byte for byte; 26 MathLib runtime files match.
-The language compiler did not change. UNO Q hardware and target emulation were
-not run. All board payloads returned to Anvil; no reset or boot-medium write.
-
-The subsequent R25 Bluetooth payload returned x0=0 after 163.339 seconds, then
-the network timing readback stopped responding. The host job was stopped and
-the board lease released with that unverified state; no reset was attempted.
-Its production ratio is NOT known and is not counted as a pass. The latest
-complete Bluetooth measurements above are R23. Final whole-wave FP32 rerun and
-the private PCM-copy candidate were not run after this console incident.
+and installed the CLI/UI. The signed CLI reproduces all 12 tested INT8 source,
+runtime and weight files byte for byte; all 26 MathLib runtime files match.
+No language compiler source changed. UNO Q hardware and target emulation were not
+run. No monitor reset, flash, boot-medium write or NES configuration change occurred.

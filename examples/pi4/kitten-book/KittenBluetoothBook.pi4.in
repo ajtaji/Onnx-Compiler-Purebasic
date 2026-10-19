@@ -482,7 +482,7 @@ EndProcedure
 Procedure BtPump()
   Protected now.i, gap.i, due.i, packet.i, i.i, k.i, at.i, nextAt.i, begin.i
   Protected sample.f, other.f
-  Protected pcm.i
+  Protected pcm.i, source.i, *pcmSource.f
   If BtRunning=0 Or BtFault : ProcedureReturn : EndIf
   now=KtTicks()
   If PmKernelCore()<>0 : BookIdleFaults=BookIdleFaults+1 : BtFault=1 : ProcedureReturn : EndIf
@@ -505,6 +505,27 @@ Procedure BtPump()
       If BtRead48/2+65>KtResultSamples And BtEof=0 : ProcedureReturn : EndIf
       If BtEof And BtRead48>=((KtResultSamples*2+383)/384)*384 : Break : EndIf
       begin=KtTicks()
+      at=BtRead48/2
+      source=at%(#KT_WAVE_BYTES/4)
+      If (BtRead48 & 1)=0 And at+65<=KtResultSamples And source+65<=#KT_WAVE_BYTES/4
+        ; A complete frame in one ring span: share each pair's source reads.
+        source=#KT_WAVE_BASE+source*4
+        For i=0 To 63
+          *pcmSource=source : sample=*pcmSource.f
+          *pcmSource=source+4 : other=*pcmSource.f
+          sample=sample*32767.0
+          If sample>32767.0 : sample=32767.0 : EndIf
+          If sample< -32768.0 : sample=-32768.0 : EndIf
+          pcm=Int(sample) : SbcPcm(i*2)=pcm
+          *pcmSource=source : sample=(*pcmSource.f+other)*0.5
+          sample=sample*32767.0
+          If sample>32767.0 : sample=32767.0 : EndIf
+          If sample< -32768.0 : sample=-32768.0 : EndIf
+          pcm=Int(sample) : SbcPcm(i*2+1)=pcm
+          source=source+4
+        Next
+        BtRead48=BtRead48+128
+      Else
       For i=0 To 127
         at=BtRead48/2
         sample=0.0
@@ -523,12 +544,14 @@ Procedure BtPump()
         pcm=Int(sample) : SbcPcm(i)=pcm
         BtRead48=BtRead48+1
       Next
+      EndIf
       SbcEncode()
-      For k=0 To 67 : BtFrames[BtHave*68+k]=SbcEncoded(k) : Next
+      DCopy(@SbcEncoded(0),@BtFrames[0]+BtHave*68,68)
       BtEncodeTicks=BtEncodeTicks+KtTicks()-begin
       BtHave=BtHave+1
     Wend
     If BtHave<>3 : ProcedureReturn : EndIf
+    If BtFrames[0]<>$9C Or BtFrames[68]<>$9C Or BtFrames[136]<>$9C : BtFault=4 : ProcedureReturn : EndIf
     If A2dpSend(@BtFrames[0],3)=0 : ProcedureReturn : EndIf
     BtSent=BtSent+3 : BtHave=0
     A2dpPoll()

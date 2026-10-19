@@ -2002,15 +2002,16 @@ Global Dim PmConvWorkParts.i[24]
 Procedure.i PmConvWorkWorker(*p.i)
   Protected *g.PmTensorConv1DArgs=PeekI(*p),bn.i=PeekI(*p+8),tile.i=PeekI(*p+16)
   Protected first.i=PeekI(*p+24),last.i=PeekI(*p+32)
-  Protected positions.i=(*g\OutWidth+15)/16,og.i=*g\OutChannels/ *g\Groups
-  Protected blocks.i=(og+3)/4,block.i,group.i,oc.i,ocLast.i,finish.i,pFirst.i,pLast.i
+  Protected og.i=*g\OutChannels/ *g\Groups,blocks.i=(og+3)/4
+  Protected group.i,oc.i,ocLast.i,finish.i,pFirst.i,pLast.i
   While first<last
-    block=first/positions : group=block/blocks
-    oc=group*og+(block % blocks)*4 : ocLast=oc+4
-    If ocLast>(group+1)*og : ocLast=(group+1)*og : EndIf
-    finish=(block+1)*positions : If finish>last : finish=last : EndIf
-    pFirst=(first % positions)*16 : pLast=(finish-block*positions)*16
-    If pLast>*g\OutWidth : pLast=*g\OutWidth : EndIf
+    ; Keep a small input-position window hot across all output channels.
+    group=(first/blocks)% *g\Groups
+    oc=group*og+(first%blocks)*4
+    finish=(first/blocks+1)*blocks : If finish>last : finish=last : EndIf
+    ocLast=oc+(finish-first)*4 : If ocLast>(group+1)*og : ocLast=(group+1)*og : EndIf
+    pFirst=(first/(blocks* *g\Groups))*256
+    pLast=pFirst+256 : If pLast>*g\OutWidth : pLast=*g\OutWidth : EndIf
     PmI8Conv1DNeonPositionRange(*g,bn,oc,ocLast,tile,pFirst,pLast)
     first=finish
   Wend
@@ -2021,9 +2022,9 @@ Procedure.i PmConvWorkParallel(*g.PmTensorConv1DArgs)
   If *g\Groups<=0 Or *g\OutWidth<256 Or *g\OutChannels<1 : ProcedureReturn 0 : EndIf
   og=*g\OutChannels/ *g\Groups
   If og<1 : ProcedureReturn 0 : EndIf
-  total=*g\Groups*((og+3)/4)*((*g\OutWidth+15)/16)
+  total=*g\Groups*((og+3)/4)*((*g\OutWidth+255)/256)
   parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
-  If parts<2 Or total<parts*16 : ProcedureReturn 0 : EndIf
+  If parts<2 Or total<parts : ProcedureReturn 0 : EndIf
   For i=0 To parts-1
     last=total*(i+1)/parts
     If *PmIdleCallback<>0

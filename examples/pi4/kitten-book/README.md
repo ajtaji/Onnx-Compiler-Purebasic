@@ -71,10 +71,8 @@ These slots are for the tested Pi 4 Anvil map; check another monitor's map
 before reusing them. The speaker firmware tested here is 63,806 bytes. Other
 firmware lengths require changing `HciLoadPatch` in the reader template.
 
-The tested stick already holds both weight packs. After storing the built
-reader, complete chapter and private configuration under these example names,
-launch them as follows; those three additional files were not installed during
-the recorded run because its console readback stopped responding:
+The tested stick holds the verified weight packs, reader, complete chapter and
+private speaker configuration under these names:
 
 ```text
 load 2:/models/KITTEN8.PMW 44000000
@@ -115,6 +113,14 @@ changes. UNO Q has not been hardware-tested for this update.
 
 ## Measured Pi 4 result
 
-The 24-chunk production Bluetooth run sent 140.688 seconds of audio. Concurrent production took 128.014 seconds for 126.281 seconds of newly generated audio: 1.01372 seconds of work per second of speech. It recorded 0 starvation events, 0 receive errors and 0 secondary-core audio calls. Maximum audio-service gap was 51.571 ms. Sustained faster-than-real-time playback is still unachieved; initial prefetch conceals the remaining deficit.
+| Excerpt (24 chunks) | Concurrent production | New speech | Work/audio | Starvation |
+|---|---:|---:|---:|---:|
+| The Pool of Tears | 106.552 s | 110.527 s | 0.96403 | 0 |
+| A Mad Tea-Party | 100.790 s | 106.023 s | 0.95064 | 0 |
+| Alice's Evidence | 123.166 s | 130.894 s | 0.94096 | 0 |
 
-With weights resident, five short phrases took 1.369, 1.753, 2.202, 2.417 and 3.758 seconds of model execution. The shortest was 'Hello'; its paced audio lasts 1.397 seconds. These exclude Bluetooth connection and initial playback buffering. A 0.5-1 second request-to-speech start has not been demonstrated. The current reader prefetches two chunks before connecting; persistent connection and first-phrase scheduling remain needed for interactive startup. The complete-chunk ONNX interface supplies no partial waveform during inference.
+All three measured excerpts generated faster than playback, with no recorded starvation.
+
+Weights-resident short-phrase inference now measures 1.313 seconds for 'Hello'. The other four phrases measure 1.657, 2.074, 2.274, 3.523 seconds. These exclude speaker connection and buffering. A 0.5-1 second request-to-speech start has not been demonstrated. The current book reader prefetches two chunks before connecting; an interactive reader still needs a persistent model/connection and an opening-phrase scheduler. Kitten returns each complete waveform, so it currently cannot play part of a phrase while that phrase is still being generated.
+
+The reader refuses SBC frames with an invalid sync header (playback fault 4).

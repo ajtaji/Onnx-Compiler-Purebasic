@@ -4921,42 +4921,42 @@ pmoI8TileK0:
     ld1r {v5.16b}, [x10], x14
     smull v6.8h, v0.8b, v4.8b
     smull2 v7.8h, v0.16b, v4.16b
+    ld1r {v2.16b}, [x11], x14
+    ld1r {v3.16b}, [x11], x14
     smlal v6.8h, v1.8b, v5.8b
     smlal2 v7.8h, v1.16b, v5.16b
+    smull v4.8h, v0.8b, v2.8b
+    smull2 v5.8h, v0.16b, v2.16b
     saddw v16.4s, v16.4s, v6.4h
     saddw2 v17.4s, v17.4s, v6.8h
+    smlal v4.8h, v1.8b, v3.8b
+    smlal2 v5.8h, v1.16b, v3.16b
     saddw v18.4s, v18.4s, v7.4h
     saddw2 v19.4s, v19.4s, v7.8h
-    ld1r {v4.16b}, [x11], x14
-    ld1r {v5.16b}, [x11], x14
-    smull v6.8h, v0.8b, v4.8b
-    smull2 v7.8h, v0.16b, v4.16b
-    smlal v6.8h, v1.8b, v5.8b
-    smlal2 v7.8h, v1.16b, v5.16b
-    saddw v20.4s, v20.4s, v6.4h
-    saddw2 v21.4s, v21.4s, v6.8h
-    saddw v22.4s, v22.4s, v7.4h
-    saddw2 v23.4s, v23.4s, v7.8h
+    saddw v20.4s, v20.4s, v4.4h
+    saddw2 v21.4s, v21.4s, v4.8h
+    saddw v22.4s, v22.4s, v5.4h
+    saddw2 v23.4s, v23.4s, v5.8h
     ld1r {v4.16b}, [x12], x14
     ld1r {v5.16b}, [x12], x14
     smull v6.8h, v0.8b, v4.8b
     smull2 v7.8h, v0.16b, v4.16b
+    ld1r {v2.16b}, [x13], x14
+    ld1r {v3.16b}, [x13], x14
     smlal v6.8h, v1.8b, v5.8b
     smlal2 v7.8h, v1.16b, v5.16b
+    smull v4.8h, v0.8b, v2.8b
+    smull2 v5.8h, v0.16b, v2.16b
     saddw v24.4s, v24.4s, v6.4h
     saddw2 v25.4s, v25.4s, v6.8h
+    smlal v4.8h, v1.8b, v3.8b
+    smlal2 v5.8h, v1.16b, v3.16b
     saddw v26.4s, v26.4s, v7.4h
     saddw2 v27.4s, v27.4s, v7.8h
-    ld1r {v4.16b}, [x13], x14
-    ld1r {v5.16b}, [x13], x14
-    smull v6.8h, v0.8b, v4.8b
-    smull2 v7.8h, v0.16b, v4.16b
-    smlal v6.8h, v1.8b, v5.8b
-    smlal2 v7.8h, v1.16b, v5.16b
-    saddw v28.4s, v28.4s, v6.4h
-    saddw2 v29.4s, v29.4s, v6.8h
-    saddw v30.4s, v30.4s, v7.4h
-    saddw2 v31.4s, v31.4s, v7.8h
+    saddw v28.4s, v28.4s, v4.4h
+    saddw2 v29.4s, v29.4s, v4.8h
+    saddw v30.4s, v30.4s, v5.4h
+    saddw2 v31.4s, v31.4s, v5.8h
     sub x3, x3, #2
     b pmoI8TileK0
 pmoI8TileK0One:
