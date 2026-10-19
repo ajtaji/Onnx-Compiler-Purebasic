@@ -2204,3 +2204,44 @@ and installed the CLI/UI. The signed CLI reproduces all 12 tested INT8 source,
 runtime and weight files byte for byte; all 26 MathLib runtime files match.
 No language compiler source changed. UNO Q hardware and target emulation were not
 run. No monitor reset, flash, boot-medium write or NES configuration change occurred.
+
+
+### Warm reply measurements, 2026-10-19 18:20
+
+The Pi 4 short-matrix dispatch now partitions output columns when M<32,
+N>=64 and M*K*N>=65536. Workers retain the original strides and sequential
+reductions; FP32 panels and full INT8 activation scratch are private. The
+INT8 path falls back to one copy when the arena cannot hold four copies.
+The signed release closure is 63d0470445bbcb54. Its emitted model/runtime/weights
+match the hardware-tested candidate byte for byte; all 26 runtime mirrors match.
+
+Focused silicon proof: 448 cases, 974145 comparisons, zero failures, four cores,
+202 primary idle callbacks and no secondary idle calls. Shapes cover M=1,2,3,
+7,11,17,31; K=3,17,65,257; N=64,65,79,129; FP32 finite/special inputs and both
+INT8 widths, direct kernels, dispatch and one-copy arena fallback.
+The four-request reference waveform remains SHA-256
+e189ff65307cf74a1b6d100157db99cbbbd8460fad5783e7702bc7df1c057aff.
+
+Paired five-phrase control/candidate inference seconds:
+1.310/1.246, 1.657/1.565, 2.070/1.926, 2.271/2.115, 3.524/3.519.
+All 1158712 captured audio bytes match. Reference four-request inference is
+22.986 seconds versus the preceding 23.015 seconds, effectively unchanged.
+
+A private resident-model session now streams silence between replies over
+one Bluetooth connection. All five replies completed with zero late events,
+receive errors or playback faults. The listener confirmed audible and clear.
+Fresh Hello: request-to-first-voice-packet 1.390 seconds; scheduled stream
+position 1.552 seconds. This is not an acoustic onset measurement and still
+misses the requested 0.5-1 second target. Other voice packets: 1.739, 2.155,
+2.336, 3.859 seconds. Warmup and Bluetooth setup are outside those request times.
+This session is an experiment, not yet a public resident reply interface.
+
+Runs in the current workspace: short-compare-r30/runs/20261019-181152;
+short-compare-r32/runs/20261019-181106;
+short-matrix-boundary/runs/20261019-181626;
+warm-replies-r32/runs/20261019-181226 (all under work/).
+Convolution window 64 and a zero-trig ambiguity shortcut gave no measurable
+benefit on the reference fixture and are not retained. A boundary-duration
+quality experiment is still private and unproven; do not count it as a result.
+TruckGPS directions are the interactive use case. Route lookahead/cache and
+fresh synthesis must be measured separately. No TruckGPS files changed.

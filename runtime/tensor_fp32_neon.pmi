@@ -4607,7 +4607,7 @@ Procedure PmTensorMatMul2ExactPackTail(b.i,pack.i,count.i,rowBytes.i,columns.i)
   Next
 EndProcedure
 
-Procedure PmTensorMatMul2ExactPackedNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i, *pack.i)
+Procedure PmTensorMatMul2ExactPackedColumnsNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i, *pack.i, first.i, last.i)
   Protected Dim tail.i(32)
   Protected take.i
   Protected rr.i
@@ -4628,8 +4628,8 @@ Procedure PmTensorMatMul2ExactPackedNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i, *pac
   t\Count=k
   t\ARowBytes=k*4
   t\DstRowBytes=n*4
-  col=0
-  While packColBlock>=16 And n-col>=16
+  col=first
+  While packColBlock>=16 And last-col>=16
     PmKernelIdle()
     PmTensorMatMul2ExactPackColumns(*b+col*4,*pack,k,n*4)
     t\B=*pack
@@ -4650,8 +4650,8 @@ Procedure PmTensorMatMul2ExactPackedNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i, *pac
   Wend
   ; Keep SIMD arithmetic for a partial final panel too. Stores go through
   ; a four-row stack tile, so only valid columns reach the caller's output.
-  If packColBlock>=16 And col<n
-    PmTensorMatMul2ExactPackTail(*b+col*4,*pack,k,n*4,n-col)
+  If packColBlock>=16 And col<last
+    PmTensorMatMul2ExactPackTail(*b+col*4,*pack,k,n*4,last-col)
     t\B=*pack : t\BRowBytes=64 : t\DstRowBytes=64
     row=0
     While row<m
@@ -4664,19 +4664,19 @@ Procedure PmTensorMatMul2ExactPackedNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i, *pac
         PmTensorMatMul2ExactOneBySixteen(@t)
       EndIf
       For rr=0 To take-1
-        For cc=0 To n-col-1
+        For cc=0 To last-col-1
           PokeL(*dst+((row+rr)*n+col+cc)*4,PeekL(@tail(0)+(rr*16+cc)*4))
         Next
       Next
       row=row+take
     Wend
-    col=n
+    col=last
     t\DstRowBytes=n*4
   EndIf
   ; The last fewer-than-sixteen columns are not worth a pack of their own and
   ; go through the same one-by-one body the unpacked driver uses for them.
   t\BRowBytes=n*4
-  While col<n
+  While col<last
     row=0
     While row<m
       t\A=*a+row*k*4
@@ -4687,6 +4687,9 @@ Procedure PmTensorMatMul2ExactPackedNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i, *pac
     Wend
     col+1
   Wend
+EndProcedure
+Procedure PmTensorMatMul2ExactPackedNeon(*a.i,*b.i,*dst.i,m.i,k.i,n.i,*pack.i)
+  PmTensorMatMul2ExactPackedColumnsNeon(*a,*b,*dst,m,k,n,*pack,0,n)
 EndProcedure
 
 ; Independent matrix rows keep their sequential reduction order on every core.
@@ -4728,6 +4731,31 @@ Procedure PmTensorMatMul2ParallelNeon(*a.i,*b.i,*dst.i,m.i,k.i,n.i,*pack.i,parts
     ; As with Conv, a refused job uses the same single-core implementation.
     PmTensorMatMul2ExactPackedNeon(*a,*b,*dst,m,k,n,*pack)
   EndIf
+EndProcedure
+
+
+; Short matrices can have fewer than eight four-row tiles while still
+; carrying substantial work across columns. Each worker owns whole aligned
+; output panels, the original row strides, and a private packed B panel.
+Global Dim PmMatMulColumnParts.i[36]
+Procedure.i PmMatMulColumnWorker(*p.i)
+  PmTensorMatMul2ExactPackedColumnsNeon(PeekI(*p),PeekI(*p+8),PeekI(*p+16),PeekI(*p+24),PeekI(*p+32),PeekI(*p+40),PeekI(*p+48),PeekI(*p+56),PeekI(*p+64))
+  ProcedureReturn 0
+EndProcedure
+Procedure PmTensorMatMul2ColumnsParallelNeon(*a.i,*b.i,*dst.i,m.i,k.i,n.i,*pack.i,parts.i)
+  Protected i.i,first.i=0,last.i,at.i,blocks.i=(n+15)/16
+  If parts>1
+    For i=0 To parts-1
+      last=n : If i<parts-1 : last=(blocks*(i+1)/parts)*16 : EndIf
+      at=i*9
+      PmMatMulColumnParts[at]=*a : PmMatMulColumnParts[at+1]=*b : PmMatMulColumnParts[at+2]=*dst
+      PmMatMulColumnParts[at+3]=m : PmMatMulColumnParts[at+4]=k : PmMatMulColumnParts[at+5]=n
+      PmMatMulColumnParts[at+6]=*pack+i*k*64 : PmMatMulColumnParts[at+7]=first : PmMatMulColumnParts[at+8]=last
+      first=last
+    Next
+    If pmSvcParRun(@PmMatMulColumnWorker,@PmMatMulColumnParts[0],72,parts)=#PMP_SVC_OK : ProcedureReturn : EndIf
+  EndIf
+  PmTensorMatMul2ExactPackedNeon(*a,*b,*dst,m,k,n,*pack)
 EndProcedure
 
 ; ======================================================================
@@ -5324,6 +5352,36 @@ Procedure.i PmI8MatMulParallelNeon(*g.PmI8MatMulArgs,parts.i,bytesPerPart.i)
   EndIf
   ProcedureReturn PmI8MatMul(*g)
 EndProcedure
+; Quantization is repeated into private full-row scratch, so workers share
+; only immutable inputs and never race on activation scales or output lanes.
+Global Dim PmI8ColumnMatrixParts.i[52]
+Procedure.i PmI8ColumnMatrixWorker(*p.i)
+  Protected g.PmI8MatMulArgs
+  g\A=PeekI(*p) : g\B=PeekI(*p+8) : g\Dst=PeekI(*p+16)
+  g\M=PeekI(*p+24) : g\K=PeekI(*p+32) : g\N=PeekI(*p+40)
+  g\Scales=PeekI(*p+48) : g\Wide=PeekI(*p+56) : g\Elements=PeekI(*p+64)
+  If PmI8MatMulColumnsScratch(@g,PeekI(*p+72),PeekI(*p+80),PeekI(*p+88),PeekI(*p+96))=0
+    PmTensorInt8Fault=1 : ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i PmI8MatMulColumnsParallelNeon(*g.PmI8MatMulArgs,parts.i,bytesPerPart.i)
+  Protected i.i,first.i=0,last.i,at.i,blocks.i=(*g\N+15)/16
+  If parts>1
+    For i=0 To parts-1
+      last=*g\N : If i<parts-1 : last=(blocks*(i+1)/parts)*16 : EndIf
+      at=i*13
+      PmI8ColumnMatrixParts[at]=*g\A : PmI8ColumnMatrixParts[at+1]=*g\B : PmI8ColumnMatrixParts[at+2]=*g\Dst
+      PmI8ColumnMatrixParts[at+3]=*g\M : PmI8ColumnMatrixParts[at+4]=*g\K : PmI8ColumnMatrixParts[at+5]=*g\N
+      PmI8ColumnMatrixParts[at+6]=*g\Scales : PmI8ColumnMatrixParts[at+7]=*g\Wide : PmI8ColumnMatrixParts[at+8]=*g\Elements
+      PmI8ColumnMatrixParts[at+9]=PmTensorInt8Scratch+i*bytesPerPart : PmI8ColumnMatrixParts[at+10]=bytesPerPart
+      PmI8ColumnMatrixParts[at+11]=first : PmI8ColumnMatrixParts[at+12]=last : first=last
+    Next
+    If pmSvcParRun(@PmI8ColumnMatrixWorker,@PmI8ColumnMatrixParts[0],104,parts)=#PMP_SVC_OK : ProcedureReturn Bool(PmTensorInt8Fault=0) : EndIf
+  EndIf
+  ProcedureReturn PmI8MatMul(*g)
+EndProcedure
+
 CompilerEndIf
 
 ; Four-by-four raw-word transpose; lane permutations do not alter float bits.
