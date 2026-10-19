@@ -639,10 +639,16 @@ Procedure PmFastGemm(A.i,B.i,Destination.i,M.i,K.i,N.i)
   CompilerIf #PMD_NATIVE_BYTES=8
     Protected bytes.i=0
     Protected pack.i=0
+    Protected parts.i=1
+    If M>=32 And K>0 And N>=16 And M*K*N>=65536
+      parts=PmParallelCores()
+      If parts<1 : parts=1 : EndIf
+      If parts>4 : parts=4 : EndIf
+    EndIf
     ; Below two row blocks the pack is read once and pays for nothing, and
     ; below sixteen columns there is no block to pack at all.
     If N>=16 And M>=8 And K>0
-      bytes=K*64
+      bytes=K*64*parts
       If bytes<=DLimit-DLive
         pack=DAcquire(bytes)
       EndIf
@@ -650,7 +656,7 @@ Procedure PmFastGemm(A.i,B.i,Destination.i,M.i,K.i,N.i)
     If pack
       DLive+bytes
       DPeak=DMax(DPeak,DLive)
-      PmTensorMatMul2ExactPackedNeon(A,B,Destination,M,K,N,pack)
+      PmTensorMatMul2ParallelNeon(A,B,Destination,M,K,N,pack,parts)
       DFree(pack)
       DLive-bytes
     Else

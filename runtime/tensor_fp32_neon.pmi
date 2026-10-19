@@ -4371,6 +4371,47 @@ Procedure PmTensorMatMul2ExactPackedNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i, *pac
   Wend
 EndProcedure
 
+; Independent matrix rows keep their sequential reduction order on every core.
+; Each worker owns its packed B panel; no allocator or tensor metadata is
+; accessed while the monitor executes the bounded parallel job.
+Global Dim PmMatMulParts.i[28]
+
+Procedure.i PmMatMulWorker(*p.i)
+  PmTensorMatMul2ExactPackedNeon(PeekI(*p),PeekI(*p+8),PeekI(*p+16),PeekI(*p+24),PeekI(*p+32),PeekI(*p+40),PeekI(*p+48))
+  ProcedureReturn 0
+EndProcedure
+
+Procedure PmTensorMatMul2ParallelNeon(*a.i,*b.i,*dst.i,m.i,k.i,n.i,*pack.i,parts.i)
+  Protected i.i
+  Protected first.i
+  Protected last.i
+  Protected at.i
+  Protected status.i
+  If parts<2
+    PmTensorMatMul2ExactPackedNeon(*a,*b,*dst,m,k,n,*pack)
+    ProcedureReturn
+  EndIf
+  first=0
+  For i=0 To parts-1
+    last=m
+    If i<parts-1 : last=(m*(i+1)/parts)/4*4 : EndIf
+    at=i*7
+    PmMatMulParts[at]=*a+first*k*4
+    PmMatMulParts[at+1]=*b
+    PmMatMulParts[at+2]=*dst+first*n*4
+    PmMatMulParts[at+3]=last-first
+    PmMatMulParts[at+4]=k
+    PmMatMulParts[at+5]=n
+    PmMatMulParts[at+6]=*pack+i*k*64
+    first=last
+  Next
+  status=pmSvcParRun(@PmMatMulWorker,@PmMatMulParts[0],56,parts)
+  If status<>#PMP_SVC_OK
+    ; As with Conv, a refused job uses the same single-core implementation.
+    PmTensorMatMul2ExactPackedNeon(*a,*b,*dst,m,k,n,*pack)
+  EndIf
+EndProcedure
+
 ; ======================================================================
 ; The STFT's radix-2 butterflies, four at a time.  Appended 2026-09-15.
 ; ----------------------------------------------------------------------

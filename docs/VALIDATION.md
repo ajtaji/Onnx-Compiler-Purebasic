@@ -2121,3 +2121,36 @@ and repeated requests. Then compare reduced precision on representative data.
 For bare metal, validate on the intended hardware before making correctness or
 performance claims. Keep model inputs and weights from trusted sources; format
 checks are not a substitute for an independent security audit.
+
+
+## AArch64 parallel matrix rows - October 19, 2026
+
+Runtime-dimension FP32 MatMul partitions independent output rows through
+Anvil's bounded parallel service. The original sequential reduction and
+packed kernel are unchanged; each worker owns its scratch panel.
+
+Pi 4, Anvil build 328, cache/MMU enabled, Kitten nano 0.8 FP32, Rosie,
+four requests (332 tokens total), captured noise, 595,600 samples at 24 kHz:
+
+| Measurement | Serial MatMul | Parallel MatMul |
+|---|---:|---:|
+| Model request execution, board counter | 66.534 s | 57.413 s |
+| MatMul nodes, board counter | 13.498 s | 4.362 s |
+| Payload entry to return, host | 68.931 s | 59.827 s |
+| Waveform SHA-256 | cd1bd7badfeaae64bf1d2af105922fa3ef8bb0d307fbdbf13691b36ec0e27a72 | identical |
+
+Nine direct four-core matrix cases (M=32..40, K=17..73 step 7,
+N=16..40 step 3) matched the serial packed kernel bit for bit, including
+signed zero, the smallest positive subnormal, infinity and a NaN payload.
+The returning diagnostic completed in 1.888 seconds with x0=0.
+Both speech runs returned x0=0, released their core leases and left the
+monitor available; no monitor flash, reset or boot-medium write occurred.
+Target emulation was not run because the Pi 4 was available. UNO Q was
+not hardware-tested in this session.
+
+This is a speed proof against the compiled baseline, not a new claim of
+ONNX Runtime waveform accuracy: the captured-noise baseline comparison
+has max absolute error 0.508064, RMS error 0.013865 and correlation
+0.990424. The existing maximum-error and RMS-error limits fail; they were
+not changed. At 57.413 seconds for 24.817 seconds of audio, real-time
+reading remains unachieved.

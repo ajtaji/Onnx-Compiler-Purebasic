@@ -149,6 +149,24 @@ counter and the elapsed time, never the number `PmOnnxAnvilEnter` handed
 back. That number is a report; the kernels ask again, later, when they need
 an answer.
 
+**Runtime-dimension FP32 matrix multiplication uses independent row partitions**
+when Anvil supplies multiple cores. The split starts at 32 rows, 16 columns
+and 65,536 multiply-add pairs. Each partition has its own packed weight
+panel (64 bytes per reduction element), allocated from the working arena
+before dispatch. Four-row boundaries preserve the existing vector tiles;
+the final partition owns the remaining rows. Each output retains the same
+sequential multiply/add order. A missing service, a refused dispatch or
+insufficient packing memory uses the existing single-core implementation.
+This does not allow concurrent requests to the generated model instance.
+
+The Pi 4 proof on 2026-10-19 used Anvil build 328, Kitten nano 0.8 FP32,
+the Rosie voice, four requests and captured random inputs. Model execution
+fell from 66.534 to 57.413 seconds for 595,600 samples at 24 kHz. MatMul
+node time fell from 13.498 to 4.362 seconds; the complete waveform remained
+byte-identical. This is still slower than real time. Nine additional
+four-core matrix cases covered row and column tails, signed zeros,
+subnormals, infinities and NaNs against the serial packed kernel.
+
 @SECTION What the Pi 4 has actually done
 
 This is a real workload on real silicon, and the conditions matter as much
