@@ -484,6 +484,40 @@ EndProcedure
 
 XIncludeFile "onnx_control_emit.pbi"
 
+; Combine adjacent single-use FLOAT multiply/add work in the AArch64
+; runtime. Both arithmetic instructions still round separately. The runtime
+; retains the original two-call fallback for other types and broadcast maps.
+Procedure PmdCombineMultiplyAdd(List Calls.s(),List ScheduleStatic.i(),Map Last.i(),Map Persistent.i())
+  Protected i.i,n.i=ListSize(Calls()),mulCall.s,addCall.s,t.i,a.i,b.i,y.i,c.i,order.i,releaseMask.i
+  For i=0 To n-2
+    SelectElement(ScheduleStatic(),i) : If ScheduleStatic()<>0 : Continue : EndIf
+    SelectElement(ScheduleStatic(),i+1) : If ScheduleStatic()<>0 : Continue : EndIf
+    SelectElement(Calls(),i) : mulCall=Calls()
+    SelectElement(Calls(),i+1) : addCall=Calls()
+    If Left(mulCall,8)<>"DBinary(" Or Right(mulCall,3)<>",2)" Or Left(addCall,8)<>"DBinary(" Or Right(addCall,3)<>",0)" : Continue : EndIf
+    t=Val(StringField(Mid(mulCall,9),1,","))
+    a=Val(StringField(Mid(mulCall,9),2,",")) : b=Val(StringField(Mid(mulCall,9),3,","))
+    y=Val(StringField(Mid(addCall,9),1,","))
+    If t<=0 Or a<=0 Or b<=0 Or y<=0 Or Last(Str(t))<>i+1 Or Persistent(Str(t)) : Continue : EndIf
+    If Val(StringField(Mid(addCall,9),2,","))=t
+      c=Val(StringField(Mid(addCall,9),3,",")) : order=0
+    ElseIf Val(StringField(Mid(addCall,9),3,","))=t
+      c=Val(StringField(Mid(addCall,9),2,",")) : order=1
+    Else
+      Continue
+    EndIf
+    If c<=0 Or c=t : Continue : EndIf
+    ; Keep inputs for the combined pass. The fallback releases these same
+    ; inputs at their original boundary before allocating the Add output.
+    releaseMask=0
+    If Last(Str(a))=i : releaseMask=releaseMask | 1 : Last(Str(a))=i+1 : EndIf
+    If Last(Str(b))=i : releaseMask=releaseMask | 2 : Last(Str(b))=i+1 : EndIf
+    SelectElement(Calls(),i) : Calls()="; Multiply evaluated with the following Add, with separate rounding."
+    SelectElement(Calls(),i+1)
+    Calls()="DMultiplyThenAdd("+Str(y)+","+Str(t)+","+Str(a)+","+Str(b)+","+Str(c)+","+Str(order)+","+Str(i)+","+Str(releaseMask)+")"
+  Next
+EndProcedure
+
 Procedure.i PmoDynamicCommand(ModelPath.s)
   ClearList(PmoOpsTableLines()) : PmoOpsTableCount = 0
   Protected model.PmoOnnxModel,ir.PmoIrModel,root.s=PmoCompileProjectRoot()
@@ -630,6 +664,9 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
     ForEach ir\QuantWeights()
       id+1 : ids(ir\QuantWeights()\ScaleName)=id : known(Str(id))=1 : persistent(Str(id))=1
     Next
+  EndIf
+  If PmdPortable And PmoTargets(targetIndex)\NativeIntegerBytes=8
+    PmdCombineMultiplyAdd(calls(),isstatic(),last(),persistent())
   EndIf
   If PmoStorageReduce(@ir,precision)=0 : PmoDynamicError=PmoQuantError : Goto Failed : EndIf
   If ir\DecodedWeightBytes>1024*1024*1024 : PmoDynamicError="Decoded resident weights exceed the working-memory limit. Reduced storage is not reduced execution RAM." : Goto Failed : EndIf

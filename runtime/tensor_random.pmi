@@ -127,7 +127,12 @@ EndProcedure
 ; Threefry-2x32-20. Rotations 13 15 26 6 / 17 29 16 24; key injection after
 ; every fourth round with the round-group number added to the second word.
 ; Result in PmRandomW0 / PmRandomW1.
-Procedure PmRandomThreefry(k0.i, k1.i, c0.i, c1.i)
+Structure PmRandomPair
+  Lo.l
+  Hi.l
+EndStructure
+
+Procedure PmRandomThreefryTo(k0.i,k1.i,c0.i,c1.i,*out.PmRandomPair)
   Protected k2.i
   Protected x0.i
   Protected x1.i
@@ -191,8 +196,15 @@ Procedure PmRandomThreefry(k0.i, k1.i, c0.i, c1.i)
   x1 = (((x1 << 6) & $FFFFFFFF) | ((x1 >> 26) & $3F)) ! x0
   x0 = (x0 + k2) & $FFFFFFFF
   x1 = (x1 + k0 + 5) & $FFFFFFFF
-  PmRandomW0 = x0
-  PmRandomW1 = x1 & $FFFFFFFF
+  *out\Lo = x0
+  *out\Hi = x1 & $FFFFFFFF
+EndProcedure
+
+Procedure PmRandomThreefry(k0.i,k1.i,c0.i,c1.i)
+  Protected words.PmRandomPair
+  PmRandomThreefryTo(k0,k1,c0,c1,@words)
+  PmRandomW0=words\Lo & $FFFFFFFF
+  PmRandomW1=words\Hi & $FFFFFFFF
 EndProcedure
 
 ; sqrt(x) for x > 0 by one fixed sequence: scale by exact powers of four
@@ -233,7 +245,7 @@ Procedure.f PmRandomSqrt(x.f)
 EndProcedure
 
 ; One standard normal variate from the two words in PmRandomW0/PmRandomW1.
-Procedure.f PmRandomNormalValue()
+Procedure.f PmRandomNormalWords(w0.i,w1.i)
   Protected m.i
   Protected e.i
   Protected v.i
@@ -256,7 +268,7 @@ Procedure.f PmRandomNormalValue()
   Protected c.f
   Protected sn.f
   Protected pick.f
-  m = ((PmRandomW0 >> 8) & $FFFFFF) + 1
+  m = ((w0 >> 8) & $FFFFFF) + 1
   e = 0
   v = m
   If v >= 65536
@@ -309,8 +321,8 @@ Procedure.f PmRandomNormalValue()
   Else
     r = 0.0
   EndIf
-  octant = (PmRandomW1 >> 29) & 7
-  j = (PmRandomW1 >> 8) & $1FFFFF
+  octant = (w1 >> 29) & 7
+  j = (w1 >> 8) & $1FFFFF
   If (octant & 1) <> 0
     j = $200000 - j
   EndIf
@@ -356,6 +368,10 @@ Procedure.f PmRandomNormalValue()
       pick = c
   EndSelect
   ProcedureReturn r * pick
+EndProcedure
+
+Procedure.f PmRandomNormalValue()
+  ProcedureReturn PmRandomNormalWords(PmRandomW0,PmRandomW1)
 EndProcedure
 
 ; Fill count FLOAT elements at dst for graph node `node`.
@@ -418,6 +434,52 @@ Procedure.i PmRandomNodeBits(dst.i, count.i, node.i, hasSeed.i, seedBits.i, kind
   PokeL(@p1, p1Bits)
   PokeL(@p2, p2Bits)
   ProcedureReturn PmRandomNode(dst, count, node, hasSeed, seedBits, kind, p1, p2)
+EndProcedure
+
+Procedure.i PmRandomNodeRangeBits(dst.i,first.i,count.i,node.i,hasSeed.i,seedBits.i,kind.i,p1Bits.i,p2Bits.i,request.i)
+  Protected words.PmRandomPair
+  Protected n0.i
+  Protected n1.i
+  Protected i.i
+  Protected m.i
+  Protected p1.f
+  Protected p2.f
+  Protected span.f
+  Protected u.f
+  Protected z.f
+  Protected value.f
+  If kind<0 Or kind>1 Or first<0 Or count<0
+    ProcedureReturn 0
+  EndIf
+  If (((first+count) >> 16) >> 16)<>0
+    ProcedureReturn 0
+  EndIf
+  PokeL(@p1,p1Bits) : PokeL(@p2,p2Bits)
+  If hasSeed<>0
+    PmRandomThreefryTo(seedBits,0,node,1,@words)
+  Else
+    PmRandomThreefryTo(PmRandomModelSeed,0,node,0,@words)
+  EndIf
+  n0=words\Lo & $FFFFFFFF : n1=words\Hi & $FFFFFFFF
+  span=p2-p1
+  i=0
+  While i<count
+    PmRandomThreefryTo(n0,n1,first+i,request,@words)
+    If kind=0
+      m=((words\Lo & $FFFFFFFF) >> 8) & $FFFFFF
+      u=m
+      u=u*PmRandomTwoM24
+      value=span*u
+      value=p1+value
+    Else
+      z=PmRandomNormalWords(words\Lo & $FFFFFFFF,words\Hi & $FFFFFFFF)
+      value=p2*z
+      value=p1+value
+    EndIf
+    PokeL(dst+i*4,PeekL(@value))
+    i=i+1
+  Wend
+  ProcedureReturn 1
 EndProcedure
 
 ; Bernoulli-15: element i of the output is 1 when u < x(i), where u is the

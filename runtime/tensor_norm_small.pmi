@@ -46,6 +46,12 @@ CompilerEndIf
 Procedure PmNsCopyBytes(*src.i, *dst.i, bytes.i)
   Protected i.i
   i = 0
+  If ((*src | *dst) & 3)=0
+    While i+4<=bytes
+      PokeL(*dst+i,PeekL(*src+i))
+      i=i+4
+    Wend
+  EndIf
   While i < bytes
     PokeA(*dst + i, PeekA(*src + i))
     i = i + 1
@@ -281,11 +287,10 @@ Structure PmTensorInstanceNormArgs
   Channels.i
   Spatial.i
   Fast.i
+  Epsilon.f
 EndStructure
 
-; One work block for every plane; nested structure fields are not available
-; on every target this file serves.
-Global PmNsInstanceNormWork.PmTensorInstanceNormWork
+; Each invocation owns its work block so independent planes may run concurrently.
 
 ; fast=0 runs the scalar reference; fast=1 the Advanced SIMD bodies on
 ; AArch64 (and the scalar reference elsewhere). The two write identical bits.
@@ -293,37 +298,39 @@ Procedure PmTensorInstanceNormPlanes(*g.PmTensorInstanceNormArgs)
   Protected n.i
   Protected c.i
   Protected plane.i
+  Protected work.PmTensorInstanceNormWork
+  PokeL(@work\Epsilon, PeekL(@*g\Epsilon))
   If *g\Spatial <= 0 Or *g\Batches <= 0 Or *g\Channels <= 0
     ProcedureReturn
   EndIf
-  PmNsInstanceNormWork\Count = *g\Spatial
+  work\Count = *g\Spatial
   n = 0
   While n < *g\Batches
     c = 0
     While c < *g\Channels
       plane = (n * *g\Channels + c) * *g\Spatial * 4
-      PokeL(@PmNsInstanceNormWork\Scale, PeekL(*g\Scale + c * 4))
-      PokeL(@PmNsInstanceNormWork\Bias, PeekL(*g\Bias + c * 4))
+      PokeL(@work\Scale, PeekL(*g\Scale + c * 4))
+      PokeL(@work\Bias, PeekL(*g\Bias + c * 4))
       CompilerIf #PMO_INT8_BACKEND = 1
       If *g\Fast <> 0
-        PmTensorInstanceNormLanesNeon(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 0)
-        PmTensorInstanceNormStats(@PmNsInstanceNormWork, 0)
-        PmTensorInstanceNormLanesNeon(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 1)
-        PmTensorInstanceNormStats(@PmNsInstanceNormWork, 1)
-        PmTensorInstanceNormAffineNeon(*g\Src + plane, *g\Dst + plane, *g\Spatial, @PmNsInstanceNormWork)
+        PmTensorInstanceNormLanesNeon(*g\Src + plane, *g\Spatial, @work, 0)
+        PmTensorInstanceNormStats(@work, 0)
+        PmTensorInstanceNormLanesNeon(*g\Src + plane, *g\Spatial, @work, 1)
+        PmTensorInstanceNormStats(@work, 1)
+        PmTensorInstanceNormAffineNeon(*g\Src + plane, *g\Dst + plane, *g\Spatial, @work)
       Else
-        PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 0)
-        PmTensorInstanceNormStats(@PmNsInstanceNormWork, 0)
-        PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 1)
-        PmTensorInstanceNormStats(@PmNsInstanceNormWork, 1)
-        PmTensorInstanceNormAffineScalar(*g\Src + plane, *g\Dst + plane, *g\Spatial, @PmNsInstanceNormWork)
+        PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @work, 0)
+        PmTensorInstanceNormStats(@work, 0)
+        PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @work, 1)
+        PmTensorInstanceNormStats(@work, 1)
+        PmTensorInstanceNormAffineScalar(*g\Src + plane, *g\Dst + plane, *g\Spatial, @work)
       EndIf
       CompilerElse
-      PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 0)
-      PmTensorInstanceNormStats(@PmNsInstanceNormWork, 0)
-      PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @PmNsInstanceNormWork, 1)
-      PmTensorInstanceNormStats(@PmNsInstanceNormWork, 1)
-      PmTensorInstanceNormAffineScalar(*g\Src + plane, *g\Dst + plane, *g\Spatial, @PmNsInstanceNormWork)
+      PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @work, 0)
+      PmTensorInstanceNormStats(@work, 0)
+      PmTensorInstanceNormLanesScalar(*g\Src + plane, *g\Spatial, @work, 1)
+      PmTensorInstanceNormStats(@work, 1)
+      PmTensorInstanceNormAffineScalar(*g\Src + plane, *g\Dst + plane, *g\Spatial, @work)
       CompilerEndIf
       c = c + 1
     Wend
@@ -331,30 +338,28 @@ Procedure PmTensorInstanceNormPlanes(*g.PmTensorInstanceNormArgs)
   Wend
 EndProcedure
 
-Global PmNsInstanceNorm.PmTensorInstanceNormArgs
-
-Procedure PmTensorInstanceNormRun(*src.i, *scale.i, *bias.i, *dst.i, batches.i, channels.i, spatial.i, epsilon.f)
-  PmNsInstanceNorm\Src = *src
-  PmNsInstanceNorm\Scale = *scale
-  PmNsInstanceNorm\Bias = *bias
-  PmNsInstanceNorm\Dst = *dst
-  PmNsInstanceNorm\Batches = batches
-  PmNsInstanceNorm\Channels = channels
-  PmNsInstanceNorm\Spatial = spatial
-  PokeL(@PmNsInstanceNormWork\Epsilon, PeekL(@epsilon))
-  PmTensorInstanceNormPlanes(@PmNsInstanceNorm)
+Procedure PmTensorInstanceNormRun(*src.i, *scale.i, *bias.i, *dst.i, batches.i, channels.i, spatial.i, epsilon.f, fast.i)
+  Protected args.PmTensorInstanceNormArgs
+  args\Fast = fast
+  args\Src = *src
+  args\Scale = *scale
+  args\Bias = *bias
+  args\Dst = *dst
+  args\Batches = batches
+  args\Channels = channels
+  args\Spatial = spatial
+  PokeL(@args\Epsilon, PeekL(@epsilon))
+  PmTensorInstanceNormPlanes(@args)
 EndProcedure
 
 ; The operator on the fastest body this target has.
 Procedure PmTensorInstanceNorm(*src.i, *scale.i, *bias.i, *dst.i, batches.i, channels.i, spatial.i, epsilon.f)
-  PmNsInstanceNorm\Fast = 1
-  PmTensorInstanceNormRun(*src, *scale, *bias, *dst, batches, channels, spatial, epsilon)
+  PmTensorInstanceNormRun(*src, *scale, *bias, *dst, batches, channels, spatial, epsilon, 1)
 EndProcedure
 
 ; The scalar reference, whatever the target.
 Procedure PmTensorInstanceNormScalar(*src.i, *scale.i, *bias.i, *dst.i, batches.i, channels.i, spatial.i, epsilon.f)
-  PmNsInstanceNorm\Fast = 0
-  PmTensorInstanceNormRun(*src, *scale, *bias, *dst, batches, channels, spatial, epsilon)
+  PmTensorInstanceNormRun(*src, *scale, *bias, *dst, batches, channels, spatial, epsilon, 0)
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -959,6 +964,10 @@ Procedure.i PmNsPadCoordinate(c.i, before.i, srcExtent.i, dstExtent.i, mode.i)
 EndProcedure
 
 Procedure.i PmTensorPad(*g.PmTensorPadArgs)
+  Protected runFirst.i=0
+  Protected runLast.i=0
+  Protected scan.i
+  Protected run.i
   Protected d.i
   Protected n.i
   Protected coord.i
@@ -1005,6 +1014,22 @@ Procedure.i PmTensorPad(*g.PmTensorPadArgs)
     PmNsSetWord(*g\Map, x, coord)
     x = x + 1
   Wend
+  ; Find the longest contiguous input run once. Padding/cropping usually
+  ; leaves almost a full row, which needs one raw copy instead of a map
+  ; lookup and element-sized copy for every value.
+  scan=0
+  While scan<width
+    run=scan
+    coord=PmNsWord(*g\Map,scan)
+    scan=scan+1
+    If coord>=0
+      While scan<width
+        If PmNsWord(*g\Map,scan)<>coord+scan-run : Break : EndIf
+        scan=scan+1
+      Wend
+      If scan-run>runLast-runFirst : runFirst=run : runLast=scan : EndIf
+    EndIf
+  Wend
   row = 0
   While row < rows
     n = row
@@ -1027,6 +1052,12 @@ Procedure.i PmTensorPad(*g.PmTensorPadArgs)
     Wend
     x = 0
     While x < width
+      If outside=0 And x=runFirst And runLast>runFirst
+        coord=PmNsWord(*g\Map,x)
+        PmNsCopyBytes(*g\Src+(source+coord)*size,*g\Dst+(row*width+x)*size,(runLast-runFirst)*size)
+        x=runLast
+        Continue
+      EndIf
       coord = PmNsWord(*g\Map, x)
       at = *g\Dst + (row * width + x) * size
       If outside <> 0 Or coord = -1

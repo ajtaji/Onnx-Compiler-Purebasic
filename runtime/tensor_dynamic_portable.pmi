@@ -35,6 +35,12 @@ Global *DProgressCallback
 Global DProgressActive.i
 
 Procedure.i DRejectProgressReentry()
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If PmIdleActive
+    DCancel=1 : DFail("Idle callback re-entered the model runtime.")
+    ProcedureReturn 1
+  EndIf
+  CompilerEndIf
   If DProgressActive<>0
     DCancel=1
     DFail("Progress callback re-entered the model runtime.")
@@ -55,6 +61,9 @@ EndProcedure
 Procedure.i DPoll(Phase.i,Node.i)
   Protected keepGoing.i
   If DCancel<>0 : ProcedureReturn 0 : EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  PmKernelIdle()
+  CompilerEndIf
   If *DProgressCallback=0 : ProcedureReturn 1 : EndIf
   If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
   DProgressActive=1
@@ -185,6 +194,13 @@ EndProcedure
 Procedure DCopy(Source.i,Destination.i,Bytes.i)
   Protected i.i=0
   i=0
+  ; Aligned words preserve the forward byte-copy contract on every target.
+  If ((Source | Destination) & 3)=0
+    While i+4<=Bytes
+      PokeL(Destination+i,PeekL(Source+i))
+      i=i+4
+    Wend
+  EndIf
   While i<Bytes
     PokeA(Destination+i,PeekA(Source+i))
     i=i+1
@@ -224,7 +240,7 @@ Procedure.i DHeapBind(Address.i,Bytes.i)
   PokeL(DHeap+4,0)
   ProcedureReturn 1
 EndProcedure
-Procedure.i DAcquire(Bytes.i)
+Procedure.i DAcquireCore(Bytes.i,clear.i)
   Protected offset.i=0
   Protected span.i=0
   Protected needed.i=0
@@ -259,13 +275,25 @@ Procedure.i DAcquire(Bytes.i)
       ; skips those stores rather than writing zeros over them - and the
       ; rounding slack past the requested length is zeroed too so that a
       ; vector kernel reading a tail never meets a stale bit pattern.
-      DZero(address,span-16)
+      If clear
+        DZero(address,span-16)
+      Else
+        ; Full-overwrite kernels own every requested byte. Keep the rounded
+        ; tail zero for kernels whose vector loads may inspect that slack.
+        DZero(address+Bytes,span-16-Bytes)
+      EndIf
       ProcedureReturn address
     EndIf
     offset=offset+span
   Wend
   DFail("Request cannot fit in the remaining contiguous arena memory.")
   ProcedureReturn 0
+EndProcedure
+Procedure.i DAcquire(Bytes.i)
+  ProcedureReturn DAcquireCore(Bytes,1)
+EndProcedure
+Procedure.i DAcquireOverwrite(Bytes.i)
+  ProcedureReturn DAcquireCore(Bytes,0)
 EndProcedure
 Procedure DFree(Address.i)
   Protected offset.i=0
@@ -336,7 +364,7 @@ Procedure DRelease(Id.i)
     DDims(Id*8+i)=0
   Next
 EndProcedure
-Procedure.i DAlloc(Id.i,Kind.i,Rank.i,DimsAddress.i)
+Procedure.i DAllocCore(Id.i,Kind.i,Rank.i,DimsAddress.i,clear.i)
   Protected i.i=0
   Protected count.i=0
   Protected extent.i=0
@@ -375,7 +403,7 @@ Procedure.i DAlloc(Id.i,Kind.i,Rank.i,DimsAddress.i)
   If bytes>DLimit-DLive
     ProcedureReturn DFail("Request exceeds its working-memory limit.")
   EndIf
-  Dt(Id)\Data=DAcquire(bytes)
+  Dt(Id)\Data=DAcquireCore(bytes,clear)
   If Dt(Id)\Data=0
     ProcedureReturn 0
   EndIf
@@ -391,6 +419,14 @@ Procedure.i DAlloc(Id.i,Kind.i,Rank.i,DimsAddress.i)
   Next
   ProcedureReturn 1
 EndProcedure
+Procedure.i DAlloc(Id.i,Kind.i,Rank.i,DimsAddress.i)
+  ProcedureReturn DAllocCore(Id,Kind,Rank,DimsAddress,1)
+EndProcedure
+; Internal use only: the caller must write all logical output bytes before
+; exposing the tensor. Ordinary allocation retains its zero-fill contract.
+Procedure.i DAllocOverwrite(Id.i,Kind.i,Rank.i,DimsAddress.i)
+  ProcedureReturn DAllocCore(Id,Kind,Rank,DimsAddress,0)
+EndProcedure
 Procedure.i DShape(Id.i,Kind.i,Rank.i,d0.i,d1.i,d2.i,d3.i)
   Protected Dim dims.i(8)
   DZero(@dims(0),8*#PMD_NATIVE_BYTES)
@@ -403,6 +439,19 @@ Procedure.i DShape(Id.i,Kind.i,Rank.i,d0.i,d1.i,d2.i,d3.i)
   dims(3)=d3
   ProcedureReturn DAlloc(Id,Kind,Rank,@dims(0))
 EndProcedure
+Procedure.i DShapeOverwrite(Id.i,Kind.i,Rank.i,d0.i,d1.i,d2.i,d3.i)
+  Protected Dim dims.i(8)
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Rank>4
+    ProcedureReturn DFail("Use DAlloc with eight dimensions for tensor rank above four.")
+  EndIf
+  dims(0)=d0
+  dims(1)=d1
+  dims(2)=d2
+  dims(3)=d3
+  ProcedureReturn DAllocOverwrite(Id,Kind,Rank,@dims(0))
+EndProcedure
+
 Procedure.i DInt(Id.i,Index.i)
   If Id<=0 Or Id>#PMD_TENSOR_COUNT
     DFail("Invalid integer tensor ID.")
@@ -512,6 +561,21 @@ Procedure.i DInt8Begin(Bytes.i)
   DPeak=DMax(DPeak,DLive)
   ProcedureReturn 1
 EndProcedure
+Procedure.i DInt8BeginOverwrite(Bytes.i)
+  PmTensorInt8Fault=0
+  If Bytes<0 Or Bytes>DLimit-DLive
+    ProcedureReturn DFail("INT8 working memory for this operator exceeds the available arena. Raise the model's working memory limit; that is the first thing to check.")
+  EndIf
+  PmTensorInt8Scratch=DAcquireOverwrite(Bytes)
+  If PmTensorInt8Scratch=0
+    ProcedureReturn 0
+  EndIf
+  PmTensorInt8ScratchBytes=Bytes
+  DLive=DLive+Bytes
+  DPeak=DMax(DPeak,DLive)
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i DInt8End()
   If PmTensorInt8Scratch
     DFree(PmTensorInt8Scratch)
@@ -588,11 +652,7 @@ Procedure PmFastBinary(A.i,B.i,Destination.i,Count.i,AStride.i,BStride.i,Op.i)
   ; that it is a whole number with |y| <= 64 - the case where Pow is repeated
   ; binary32 squaring, which is the same arithmetic per lane.  Every other
   ; exponent keeps the scalar Pow in DBinary; nothing is approximated here.
-  If Op=4
-    PmTensorPowIntFp32Neon(A,B,Destination,Count,AStride)
-  Else
-    PmTensorBinaryFp32Neon(A,B,Destination,Count,AStride,BStride,Op)
-  EndIf
+  PmTensorBinaryParallelNeon(A,B,Destination,Count,AStride,BStride,Op)
   CompilerElse
   Protected i.i=0
   Protected av.f=0.0
@@ -788,7 +848,7 @@ Procedure PmFastLstm(*g.PmTensorLstmArgs)
     stride=(*g\Hidden+3) & -4
     wtBytes=planes * stride * *g\InputSize * 4
     rtBytes=planes * stride * *g\Hidden * 4
-    sumBytes=8 * stride * 4
+    sumBytes=*g\Directions * 8 * stride * 4
     total=wtBytes+rtBytes+sumBytes
     If total>DLimit-DLive
       DFail("The LSTM cannot reserve working memory for its transposed weight copy, which is Directions*4*Hidden*(InputSize+Hidden)*4 bytes plus 32*Hidden bytes of gate sums. Raise the model's working memory limit, which is the first thing to check, or export this graph for a smaller hidden size.")
@@ -813,6 +873,12 @@ Procedure PmFastLstm(*g.PmTensorLstmArgs)
     DFree(rt)
     DFree(wt)
     DLive-total
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+  CompilerIf #PMD_NATIVE_BYTES=8 And #PMO_USE_INT8=1
+  If *g\WScales<>0 Or *g\RScales<>0
+    PmI8LstmParallelNeon(*g)
     ProcedureReturn
   EndIf
   CompilerEndIf
@@ -854,6 +920,13 @@ Procedure.i DLike(Y.i,A.i,Kind.i)
   EndIf
   ProcedureReturn DAlloc(Y,Kind,Dt(A)\Rank,@DDims((A)*8+(0)))
 EndProcedure
+Procedure.i DLikeOverwrite(Y.i,A.i,Kind.i)
+  If Kind=0
+    Kind=Dt(A)\Kind
+  EndIf
+  ProcedureReturn DAllocOverwrite(Y,Kind,Dt(A)\Rank,@DDims((A)*8+(0)))
+EndProcedure
+
 
 Procedure.i DBroadcastIndex(Index.i,Y.i,A.i)
   Protected ax.i=0
@@ -907,7 +980,7 @@ Procedure.i DBroadcast(Y.i,A.i,B.i,Kind.i)
       dims(i)=ad
     EndIf
   Next
-  ProcedureReturn DAlloc(Y,Kind,rank,@dims(0))
+  ProcedureReturn DAllocOverwrite(Y,Kind,rank,@dims(0))
 EndProcedure
 
 ; Pow(x,y) picks its algorithm from y ALONE - see math_a64.pmi:2184 and the
@@ -942,6 +1015,84 @@ Procedure.i DPowWholeExponent(y.f)
     ProcedureReturn 0
   EndIf
   ProcedureReturn 1
+EndProcedure
+
+Procedure PmBroadcastRowsRange(Y.i,A.i,B.i,Op.i,width.i,astep.i,bstep.i,first.i,last.i)
+  Protected row.i
+  Protected i.i
+  Protected ai.i
+  Protected bi.i
+  Protected arow.i=-1,brow.i=-1,adata.i=Dt(A)\Data,bdata.i=Dt(B)\Data,ydata.i=Dt(Y)\Data
+  Protected acols.i=1,bcols.i=1,rows.i=Dt(Y)\Count/width
+  If astep : acols=width : EndIf
+  If bstep : bcols=width : EndIf
+  If Dt(A)\Count=acols : arow=0 : ElseIf Dt(A)\Count=rows*acols : arow=acols : EndIf
+  If Dt(B)\Count=bcols : brow=0 : ElseIf Dt(B)\Count=rows*bcols : brow=bcols : EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected Dim packed.i(10)
+  Protected take.i
+  If arow>=0 And brow>=0 And Op<=3
+    packed(3)=width : packed(4)=astep : packed(5)=bstep : packed(6)=Op
+    packed(7)=arow*4 : packed(8)=brow*4
+    row=first
+    While row<last
+      take=last-row : If take>4096 : take=4096 : EndIf
+      PmKernelIdle()
+      packed(0)=adata+row*arow*4 : packed(1)=bdata+row*brow*4
+      packed(2)=ydata+row*width*4 : packed(9)=take
+      PmTensorBinaryRowsFp32Neon(@packed(0))
+      row=row+take
+    Wend
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+  For row=first To last-1
+    i=row*width
+    If arow>=0 : ai=row*arow : Else : ai=DBroadcastIndex(i,Y,A) : EndIf
+    If brow>=0 : bi=row*brow : Else : bi=DBroadcastIndex(i,Y,B) : EndIf
+    CompilerIf #PMD_NATIVE_BYTES=8
+    If Op=4
+      PmTensorPowIntFp32Neon(adata+ai*4,bdata+bi*4,ydata+i*4,width,astep)
+    Else
+      PmTensorBinaryFp32Neon(adata+ai*4,bdata+bi*4,ydata+i*4,width,astep,bstep,Op)
+    EndIf
+    CompilerElse
+    PmFastBinary(adata+ai*4,bdata+bi*4,ydata+i*4,width,astep,bstep,Op)
+    CompilerEndIf
+  Next
+EndProcedure
+CompilerIf #PMD_NATIVE_BYTES=8
+Global Dim PmBroadcastParts.i[36]
+Procedure.i PmBroadcastWorker(*p.i)
+  PmBroadcastRowsRange(PeekI(*p),PeekI(*p+8),PeekI(*p+16),PeekI(*p+24),PeekI(*p+32),PeekI(*p+40),PeekI(*p+48),PeekI(*p+56),PeekI(*p+64))
+  ProcedureReturn 0
+EndProcedure
+CompilerEndIf
+Procedure PmBroadcastRows(Y.i,A.i,B.i,Op.i,width.i,astep.i,bstep.i)
+  Protected rows.i=Dt(Y)\Count/width
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected parts.i=1
+  Protected i.i
+  Protected first.i=0
+  Protected last.i
+  Protected at.i
+  If rows>=8 And Dt(Y)\Count>=32768
+    parts=PmParallelCores()
+    If parts>4 : parts=4 : EndIf
+  EndIf
+  If parts>1
+    For i=0 To parts-1
+      last=rows*(i+1)/parts : at=i*9
+      PmBroadcastParts[at]=Y : PmBroadcastParts[at+1]=A : PmBroadcastParts[at+2]=B
+      PmBroadcastParts[at+3]=Op : PmBroadcastParts[at+4]=width
+      PmBroadcastParts[at+5]=astep : PmBroadcastParts[at+6]=bstep
+      PmBroadcastParts[at+7]=first : PmBroadcastParts[at+8]=last
+      first=last
+    Next
+    If pmSvcParRun(@PmBroadcastWorker,@PmBroadcastParts[0],72,parts)=#PMP_SVC_OK : ProcedureReturn : EndIf
+  EndIf
+  CompilerEndIf
+  PmBroadcastRowsRange(Y,A,B,Op,width,astep,bstep,0,rows)
 EndProcedure
 
 Procedure DBinary(Y.i,A.i,B.i,Op.i)
@@ -1005,12 +1156,7 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
     If Dt(B)\Rank
       bstep=Bool(DDims((B)*8+(Dt(B)\Rank-1))<>1)
     EndIf
-    For row=0 To Dt(Y)\Count/width-1
-      i=row*width
-      ai=DBroadcastIndex(i,Y,A)
-      bi=DBroadcastIndex(i,Y,B)
-      PmFastBinary(Dt(A)\Data+ai*4,Dt(B)\Data+bi*4,Dt(Y)\Data+i*4,width,astep,bstep,Op)
-    Next
+    PmBroadcastRows(Y,A,B,Op,width,astep,bstep)
     ProcedureReturn
   EndIf
   ; Pow with one broadcast exponent that is NOT a whole number in [-64,64]:
@@ -1021,6 +1167,21 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
     bv=DReadF(Dt(B)\Data)
     For i=0 To Dt(Y)\Count-1
       DWriteF(Dt(Y)\Data+i*4,Pow(DReadF(Dt(A)\Data+i*4),bv))
+    Next
+    ProcedureReturn
+  EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If Op>=5 And Op<=9 And Dt(A)\Kind=1 And Dt(B)\Kind=1 And (Dt(A)\Count=1 Or Dt(A)\Count=Dt(Y)\Count) And (Dt(B)\Count=1 Or Dt(B)\Count=Dt(Y)\Count)
+    PmTensorCompareFp32Neon(Dt(A)\Data,Dt(B)\Data,Dt(Y)\Data,Dt(Y)\Count,Bool(Dt(A)\Count<>1),Bool(Dt(B)\Count<>1),Op)
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+  If Op=9 And Dt(A)\Kind=9 And Dt(B)\Kind=9 And (Dt(A)\Count=1 Or Dt(A)\Count=Dt(Y)\Count) And (Dt(B)\Count=1 Or Dt(B)\Count=Dt(Y)\Count)
+    ai=Dt(A)\Data : bi=Dt(B)\Data
+    astep=Bool(Dt(A)\Count<>1) : bstep=Bool(Dt(B)\Count<>1)
+    For i=0 To Dt(Y)\Count-1
+      PokeA(Dt(Y)\Data+i,Bool(PeekA(ai)<>0 And PeekA(bi)<>0))
+      ai+astep : bi+bstep
     Next
     ProcedureReturn
   EndIf
@@ -1132,12 +1293,222 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
   Next
 EndProcedure
 
+; Internal schedule optimization: T must have no consumer except this Add.
+; Its descriptor supplies the original intermediate broadcast shape; its
+; storage is never read by the fast path and is released by the schedule.
+CompilerIf #PMD_NATIVE_BYTES=8
+Global Dim PmMultiplyAddParts.i[52]
+Procedure.i PmMultiplyAddWorker(*p.i)
+  Protected Dim local.i(13)
+  Protected i.i,rows.i=PeekI(*p+88),take.i,limit.i=8192/PeekI(*p+32)
+  If limit<1 : limit=1 : EndIf
+  For i=0 To 12 : local(i)=PeekI(*p+i*8) : Next
+  While rows>0
+    take=rows : If take>limit : take=limit : EndIf
+    local(11)=take
+    PmKernelIdle()
+    PmTensorMultiplyThenAddRows(@local(0))
+    local(0)=local(0)+take*local(8) : local(1)=local(1)+take*local(9)
+    local(2)=local(2)+take*local(10) : local(3)=local(3)+take*local(4)*4
+    rows=rows-take
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure DMultiplyThenAdd(Y.i,T.i,A.i,B.i,C.i,reverse.i,mulNode.i,releaseMask.i)
+  Protected addNode.i=DNode,width.i,rows.i,flat.i=0,parts.i=1,i.i,j.i,first.i,last.i,at.i
+  Protected Dim input.i(3)
+  Protected Dim steps.i(3)
+  Protected Dim outer.i(3)
+  Protected cols.i,id.i,total.i,axis.i,ta.i,td.i,cd.i,expanded.i=0
+  DNode=mulNode
+  If Dt(A)\Kind<>1 Or Dt(B)\Kind<>1 Or Dt(C)\Kind<>1
+    DBinary(T,A,B,2)
+    If DError<>0 : ProcedureReturn : EndIf
+    If (releaseMask & 1)<>0 : DRelease(A) : EndIf
+    If (releaseMask & 2)<>0 : DRelease(B) : EndIf
+    DNode=addNode
+    If reverse : DBinary(Y,C,T,0) : Else : DBinary(Y,T,C,0) : EndIf
+    ProcedureReturn
+  EndIf
+  If DBroadcast(T,A,B,1)=0 : ProcedureReturn : EndIf
+  ; When C expands the intermediate, preserve the original materialization
+  ; and release boundary. Otherwise discard only T's storage: Y can reuse
+  ; that block, so retaining A/B cannot raise the original allocation peak.
+  For axis=0 To Dt(C)\Rank-1
+    ta=axis+Dt(T)\Rank-Dt(C)\Rank : td=1
+    If ta>=0 : td=DDims(T*8+ta) : EndIf
+    cd=DDims(C*8+axis)
+    If cd<>1 And cd<>td : expanded=1 : EndIf
+  Next
+  If expanded
+    DBinary(T,A,B,2)
+    If DError<>0 : ProcedureReturn : EndIf
+    If (releaseMask & 1)<>0 : DRelease(A) : EndIf
+    If (releaseMask & 2)<>0 : DRelease(B) : EndIf
+    DNode=addNode
+    If reverse : DBinary(Y,C,T,0) : Else : DBinary(Y,T,C,0) : EndIf
+    ProcedureReturn
+  EndIf
+  DFree(Dt(T)\Data) : DLive=DLive-Dt(T)\Bytes
+  Dt(T)\Data=0 : Dt(T)\Owned=0 : Dt(T)\Bytes=0
+  DNode=addNode
+  If DBroadcast(Y,T,C,1)=0 : ProcedureReturn : EndIf
+  total=Dt(Y)\Count : If total=0 : ProcedureReturn : EndIf
+  input(0)=A : input(1)=B : input(2)=C
+  flat=1
+  For j=0 To 2
+    id=input(j)
+    If Dt(id)\Count<>1 And Dt(id)\Count<>total : flat=0 : EndIf
+  Next
+  width=total : rows=1
+  If flat=0
+    width=1 : If Dt(Y)\Rank : width=DDims(Y*8+Dt(Y)\Rank-1) : EndIf
+    rows=total/width
+  EndIf
+  For j=0 To 2
+    id=input(j) : steps(j)=0 : outer(j)=0
+    If flat
+      steps(j)=Bool(Dt(id)\Count<>1)
+    Else
+      If Dt(id)\Rank : steps(j)=Bool(DDims(id*8+Dt(id)\Rank-1)<>1) : EndIf
+      cols=1 : If steps(j) : cols=width : EndIf
+      If Dt(id)\Count=cols
+        outer(j)=0
+      ElseIf Dt(id)\Count=rows*cols
+        outer(j)=cols
+      Else
+        ; Preserve the original general broadcast and its intermediate.
+        DRelease(Y) : DBinary(T,A,B,2)
+        If DError<>0 : DNode=mulNode : ProcedureReturn : EndIf
+        If (releaseMask & 1)<>0 : DRelease(A) : EndIf
+        If (releaseMask & 2)<>0 : DRelease(B) : EndIf
+        If reverse : DBinary(Y,C,T,0) : Else : DBinary(Y,T,C,0) : EndIf
+        ProcedureReturn
+      EndIf
+    EndIf
+  Next
+  If total>=32768 And (flat Or rows>=8)
+    parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
+  EndIf
+  first=0
+  For i=0 To parts-1
+    last=rows*(i+1)/parts
+    If flat : last=total*(i+1)/parts : EndIf
+    at=i*13
+    For j=0 To 2
+      PmMultiplyAddParts[at+j]=Dt(input(j))\Data+first*outer(j)*4
+      If flat : PmMultiplyAddParts[at+j]=Dt(input(j))\Data+first*steps(j)*4 : EndIf
+      PmMultiplyAddParts[at+5+j]=steps(j)
+      PmMultiplyAddParts[at+8+j]=outer(j)*4
+    Next
+    PmMultiplyAddParts[at+3]=Dt(Y)\Data+first*width*4
+    PmMultiplyAddParts[at+4]=width : PmMultiplyAddParts[at+11]=last-first
+    If flat
+      PmMultiplyAddParts[at+3]=Dt(Y)\Data+first*4
+      PmMultiplyAddParts[at+4]=last-first : PmMultiplyAddParts[at+11]=1
+    EndIf
+    PmMultiplyAddParts[at+12]=reverse
+    first=last
+  Next
+  If parts>1
+    If pmSvcParRun(@PmMultiplyAddWorker,@PmMultiplyAddParts[0],104,parts)=#PMP_SVC_OK : ProcedureReturn : EndIf
+    ; Recompute all partitions after a refused parallel job.
+  EndIf
+  For i=0 To parts-1 : PmMultiplyAddWorker(@PmMultiplyAddParts[i*13]) : Next
+EndProcedure
+CompilerEndIf
+
+Procedure PmUnaryRange(Source.i,Destination.i,Count.i,Op.i,Alpha.f)
+  Protected done.i
+  Select Op
+    Case 0
+      PmTensorUnaryMath(Source,Destination,Count,Op)
+    Case 1
+      PmTensorUnaryMath(Source,Destination,Count,Op)
+    Case 3
+      PmTensorUnaryMath(Source,Destination,Count,Op)
+    Case 4
+      PmTensorUnaryMath(Source,Destination,Count,Op)
+    Case 2
+      PmFastSqrt(Source,Destination,Count)
+    Case 5
+      PmFastTrig(Source,Destination,Count,Op-5)
+    Case 6
+      PmFastTrig(Source,Destination,Count,Op-5)
+    Case 7
+      PmFastTrig(Source,Destination,Count,Op-5)
+    Case 8
+      PmFastSigmoid(Source,Destination,Count)
+    Case 9
+      PmFastTanh(Source,Destination,Count)
+    Case 10
+      CompilerIf #PMD_NATIVE_BYTES=8
+      done=PmTensorFloorFourNeon(Source,Destination,Count)
+      PmTensorFloor(Source+done*4,Destination+done*4,Count-done)
+      CompilerElse
+      PmTensorFloor(Source,Destination,Count)
+      CompilerEndIf
+    Case 11
+      PmTensorRoundEven(Source,Destination,Count)
+    Case 12
+      PmTensorLeakyRelu(Source,Destination,Count,Alpha)
+  EndSelect
+EndProcedure
+
+CompilerIf #PMD_NATIVE_BYTES=8
+Global Dim PmUnaryParts.i[20]
+Procedure.i PmUnaryWorker(*p.i)
+  Protected first.i=0
+  Protected count.i=PeekI(*p+16)
+  Protected take.i
+  While first<count
+    take=count-first : If take>8192 : take=8192 : EndIf
+    PmKernelIdle()
+    PmUnaryRange(PeekI(*p)+first*4,PeekI(*p+8)+first*4,take,PeekI(*p+24),DReadF(*p+32))
+    first=first+take
+  Wend
+  ProcedureReturn 0
+EndProcedure
+CompilerEndIf
+
+Procedure PmUnaryDispatch(Source.i,Destination.i,Count.i,Op.i,Alpha.f)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected parts.i=1
+  Protected i.i
+  Protected first.i=0
+  Protected last.i
+  Protected at.i
+  If Count>=16384
+    parts=PmParallelCores()
+    If parts>4 : parts=4 : EndIf
+  EndIf
+  If parts>1
+    For i=0 To parts-1
+      last=Count
+      If i<parts-1 : last=(Count*(i+1)/parts)/16*16 : EndIf
+      at=i*5
+      PmUnaryParts[at]=Source+first*4
+      PmUnaryParts[at+1]=Destination+first*4
+      PmUnaryParts[at+2]=last-first
+      PmUnaryParts[at+3]=Op
+      DWriteF(@PmUnaryParts[at+4],Alpha)
+      first=last
+    Next
+    If pmSvcParRun(@PmUnaryWorker,@PmUnaryParts[0],40,parts)=#PMP_SVC_OK
+      ProcedureReturn
+    EndIf
+  EndIf
+  CompilerEndIf
+  PmUnaryRange(Source,Destination,Count,Op,Alpha)
+EndProcedure
+
 Procedure DUnary(Y.i,A.i,Op.i,Alpha.f)
   If Dt(A)\Kind<>1
     DFail("This unary kernel requires FLOAT input.")
     ProcedureReturn
   EndIf
-  If DLike(Y,A,0)=0
+  If DLikeOverwrite(Y,A,0)=0
     ProcedureReturn
   EndIf
   ; PmTensorUnaryMath owns its op set and refuses anything outside 0 Exp,
@@ -1147,37 +1518,11 @@ Procedure DUnary(Y.i,A.i,Op.i,Alpha.f)
   ; so a refusal on one node is never read as a refusal on the next; only the
   ; unary-math kernel below ever clears it.
   PmTensorUnaryMathOk=1
-  Select Op
-    Case 0
-      PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
-    Case 1
-      PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
-    Case 2
-      PmFastSqrt(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
-    Case 3
-      PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
-    Case 4
-      PmTensorUnaryMath(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op)
-    Case 5
-      PmFastTrig(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op-5)
-    Case 6
-      PmFastTrig(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op-5)
-    Case 7
-      PmFastTrig(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op-5)
-    Case 8
-      PmFastSigmoid(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
-    Case 9
-      PmFastTanh(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
-    Case 10
-      PmTensorFloor(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
-    Case 11
-      PmTensorRoundEven(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count)
-    Case 12
-      PmTensorLeakyRelu(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Alpha)
-    Default
+  If Op<0 Or Op>12
       DFail("Unsupported unary operation code: this dispatcher routes 0 Exp, 1 Log, 2 Sqrt, 3 Abs, 4 Neg, 5 Sin, 6 Cos, 7 Atan, 8 Sigmoid, 9 Tanh, 10 Floor, 11 Round and 12 LeakyRelu only. Check the operator the model emitted for this node.")
       ProcedureReturn
-  EndSelect
+  EndIf
+  PmUnaryDispatch(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Count,Op,Alpha)
   If PmTensorUnaryMathOk=0
     DFail("Unsupported unary math operation code: this kernel computes 0 Exp, 1 Log, 2 Sqrt, 3 Abs and 4 Neg only. Check the operator the model emitted for this node.")
   EndIf
@@ -1186,9 +1531,19 @@ EndProcedure
 Procedure DCast(Y.i,A.i,Kind.i)
   Protected i.i=0
   Protected value.i=0
-  If DLike(Y,A,Kind)=0
+  If DLikeOverwrite(Y,A,Kind)=0
     ProcedureReturn
   EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If (Dt(A)\Kind=2 Or Dt(A)\Kind=3 Or Dt(A)\Kind=6 Or Dt(A)\Kind=9) And Kind=1
+    PmTensorCastIntFloatNeon(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count,Dt(A)\Kind)
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind=7 And Kind=1
+    PmTensorCastI64FloatNeon(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count)
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
   For i=0 To Dt(A)\Count-1
     If Dt(A)\Kind<>1 And Kind<>1
       value=DInt(A,i)
@@ -1345,6 +1700,17 @@ Procedure DTranspose(Y.i,A.i,Perm.i)
   Protected Dim axes.i(8)
   Protected Dim strides.i(8)
   Protected Dim seen.i(8)
+  Protected contiguous.i=1
+  Protected tail.i
+  Protected batch.i
+  Protected height.i
+  Protected width.i
+  Protected rows.i
+  Protected col.i
+  Protected row.i
+  Protected sp.i
+  Protected dp.i
+  Protected simple.i=1
   Protected i.i=0
   Protected j.i=0
   Protected n.i=0
@@ -1374,7 +1740,53 @@ Procedure DTranspose(Y.i,A.i,Perm.i)
     dims(i)=DDims((A)*8+(axes(i)))
     strides(i)=DProduct(A,axes(i)+1,rank-1)
   Next
-  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0
+  If DAllocOverwrite(Y,Dt(A)\Kind,rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  If rank>=2 And size=4
+    If axes(rank-2)<>rank-1 Or axes(rank-1)<>rank-2 : simple=0 : EndIf
+    For j=0 To rank-3
+      If axes(j)<>j : simple=0 : EndIf
+    Next
+    If simple
+      height=DDims((A)*8+(rank-2)) : width=DDims((A)*8+(rank-1))
+      If height>0 And width>0
+        rows=Dt(A)\Count/(height*width)
+        For batch=0 To rows-1
+          CompilerIf #PMD_NATIVE_BYTES=8
+          PmTransposeMatrixWords(Dt(A)\Data+batch*height*width*4,Dt(Y)\Data+batch*height*width*4,height,width)
+          CompilerElse
+          For col=0 To width-1
+            sp=Dt(A)\Data+(batch*height*width+col)*4
+            dp=Dt(Y)\Data+(batch*height*width+col*height)*4
+            For row=0 To height-1
+              PokeL(dp,PeekL(sp))
+              sp+width*4 : dp+4
+            Next
+          Next
+          CompilerEndIf
+        Next
+      EndIf
+      ProcedureReturn
+    EndIf
+  EndIf
+  ; Unchanged trailing axes form one contiguous run. Copy that run once;
+  ; only the permuted prefix needs coordinate division.
+  tail=rank-1
+  While tail>=0
+    If axes(tail)<>tail : Break : EndIf
+    contiguous=contiguous*dims(tail)
+    tail-1
+  Wend
+  If contiguous>1
+    For i=0 To Dt(Y)\Count-1 Step contiguous
+      n=i/contiguous : src=0
+      For j=tail To 0 Step -1
+        coord=n%dims(j) : n/dims(j)
+        src+coord*strides(j)
+      Next
+      DCopy(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,contiguous*size)
+    Next
     ProcedureReturn
   EndIf
   For i=0 To Dt(Y)\Count-1
@@ -1558,7 +1970,7 @@ Procedure DSlice(Y.i,A.i,Starts.i,Ends.i,Axes.i,Steps.i)
     start(ax)=s
     stepv(ax)=st
   Next
-  If DAlloc(Y,Dt(A)\Kind,Dt(A)\Rank,@dims(0))=0
+  If DAllocOverwrite(Y,Dt(A)\Kind,Dt(A)\Rank,@dims(0))=0
     ProcedureReturn
   EndIf
   For i=0 To Dt(Y)\Count-1
@@ -1713,6 +2125,14 @@ Procedure DRange(Y.i,A.i,B.i,C.i)
 EndProcedure
 
 Procedure DWhere(Y.i,Cond.i,A.i,B.i)
+  Protected ci.i
+  Protected ap.i
+  Protected bp.i
+  Protected cp.i
+  Protected dp.i
+  Protected astep.i
+  Protected bstep.i
+  Protected cstep.i
   Protected i.i=0
   Protected src.i=0
   Protected index.i=0
@@ -1748,7 +2168,24 @@ Procedure DWhere(Y.i,Cond.i,A.i,B.i)
     Next
     dims(i)=e
   Next
-  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0
+  If DAllocOverwrite(Y,Dt(A)\Kind,rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  If Dt(Cond)\Kind=9 And (Dt(Cond)\Count=1 Or Dt(Cond)\Count=Dt(Y)\Count) And (Dt(A)\Count=1 Or Dt(A)\Count=Dt(Y)\Count) And (Dt(B)\Count=1 Or Dt(B)\Count=Dt(Y)\Count)
+    ap=Dt(A)\Data : bp=Dt(B)\Data : cp=Dt(Cond)\Data : dp=Dt(Y)\Data
+    astep=Bool(Dt(A)\Count<>1)*size
+    bstep=Bool(Dt(B)\Count<>1)*size
+    cstep=Bool(Dt(Cond)\Count<>1)
+    For i=0 To Dt(Y)\Count-1
+      src=bp
+      If PeekA(cp)<>0 : src=ap : EndIf
+      If size=4
+        PokeL(dp,PeekL(src))
+      Else
+        DCopy(src,dp,size)
+      EndIf
+      ap+astep : bp+bstep : cp+cstep : dp+size
+    Next
     ProcedureReturn
   EndIf
   For i=0 To Dt(Y)\Count-1
@@ -1849,6 +2286,32 @@ Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
   Next
 EndProcedure
 
+Procedure.i DMatMulInt8(*g.PmI8MatMulArgs)
+  Protected parts.i=1
+  Protected bytesPerPart.i
+  Protected bytes.i
+  Protected ok.i
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If *g\M>=32 And *g\N>=16 And *g\M* *g\K* *g\N>=65536
+    parts=PmParallelCores()
+    If parts>4 : parts=4 : EndIf
+  EndIf
+  CompilerEndIf
+  bytes=PmI8ScratchBytes(*g\M* *g\K,*g\M,*g\Wide)
+  If parts>1
+    bytesPerPart=PmI8ScratchBytes(((*g\M+parts-1)/parts+4)* *g\K,(*g\M+parts-1)/parts+4,*g\Wide)
+    bytes=bytesPerPart*parts
+  EndIf
+  If DInt8Begin(bytes)=0 : ProcedureReturn 0 : EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+    ok=PmI8MatMulParallelNeon(*g,parts,bytesPerPart)
+  CompilerElse
+    ok=PmI8MatMul(*g)
+  CompilerEndIf
+  If ok=0 And PmTensorInt8Fault=0 : PmTensorInt8Fault=2 : EndIf
+  ProcedureReturn DInt8End()
+EndProcedure
+
 Procedure DMatMul(Y.i,A.i,B.i)
   Protected Dim dims.i(8)
   Protected rank.i=DMax(Dt(A)\Rank,Dt(B)\Rank)
@@ -1914,7 +2377,7 @@ Procedure DMatMul(Y.i,A.i,B.i)
   Next
   dims(rank-2)=m
   dims(rank-1)=n
-  If DAlloc(Y,1,rank,@dims(0))=0
+  If DAllocCore(Y,1,rank,@dims(0),Bool(k=0))=0
     ProcedureReturn
   EndIf
   For batch=0 To batches-1
@@ -1943,15 +2406,9 @@ Procedure DMatMul(Y.i,A.i,B.i)
     Next
     If Dt(B)\Kind=3 Or Dt(B)\Kind=33
       mm\Wide=Bool(Dt(B)\Kind=33)
-      If DInt8Begin(PmI8ScratchBytes(m*k,m,mm\Wide))=0
-        ProcedureReturn
-      EndIf
       mm\A=Dt(A)\Data+aoff*4 : mm\B=Dt(B)\Data+boff : mm\Dst=Dt(Y)\Data+batch*m*n*4
       mm\M=m : mm\K=k : mm\N=n : mm\Scales=Dt(B)\Scales : mm\Elements=Dt(B)\Count
-      If PmI8MatMul(@mm)=0 And PmTensorInt8Fault=0
-        PmTensorInt8Fault=2
-      EndIf
-      If DInt8End()=0
+      If DMatMulInt8(@mm)=0
         ProcedureReturn
       EndIf
     Else
@@ -2173,6 +2630,45 @@ Procedure DReduceNoopEmpty(Y.i,A.i,Axes.i,Keep.i,Mean.i)
   DReduce(Y,A,Axes,Keep,Mean)
 EndProcedure
 
+Procedure PmNormRowsRange(src.i,scale.i,bias.i,dst.i,rows.i,width.i,epsilon.f,op.i)
+  If op=0
+    PmTensorSoftmaxLast(src,dst,rows,width)
+  Else
+    PmTensorLayerNormLast(src,scale,bias,dst,rows,width,epsilon)
+  EndIf
+EndProcedure
+CompilerIf #PMD_NATIVE_BYTES=8
+Global Dim PmNormParts.i[32]
+Procedure.i PmNormWorker(*p.i)
+  PmNormRowsRange(PeekI(*p),PeekI(*p+8),PeekI(*p+16),PeekI(*p+24),PeekI(*p+32),PeekI(*p+40),DReadF(*p+48),PeekI(*p+56))
+  ProcedureReturn 0
+EndProcedure
+CompilerEndIf
+Procedure PmNormRows(src.i,scale.i,bias.i,dst.i,rows.i,width.i,epsilon.f,op.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected parts.i=1
+  Protected i.i
+  Protected first.i=0
+  Protected last.i
+  Protected at.i
+  If rows>=8 And rows*width>=16384
+    parts=PmParallelCores()
+    If parts>4 : parts=4 : EndIf
+  EndIf
+  If parts>1
+    For i=0 To parts-1
+      last=rows*(i+1)/parts : at=i*8
+      PmNormParts[at]=src+first*width*4 : PmNormParts[at+1]=scale : PmNormParts[at+2]=bias
+      PmNormParts[at+3]=dst+first*width*4 : PmNormParts[at+4]=last-first : PmNormParts[at+5]=width
+      DWriteF(@PmNormParts[at+6],epsilon) : PmNormParts[at+7]=op
+      first=last
+    Next
+    If pmSvcParRun(@PmNormWorker,@PmNormParts[0],64,parts)=#PMP_SVC_OK : ProcedureReturn : EndIf
+  EndIf
+  CompilerEndIf
+  PmNormRowsRange(src,scale,bias,dst,rows,width,epsilon,op)
+EndProcedure
+
 Procedure DSoftmax(Y.i,A.i,Axis.i)
   Protected width.i=0
   If Dt(A)\Rank<1 Or Dt(A)\Kind<>1
@@ -2187,8 +2683,8 @@ Procedure DSoftmax(Y.i,A.i,Axis.i)
     DFail("Softmax requires a nonempty final axis.")
     ProcedureReturn
   EndIf
-  If DLike(Y,A,0)
-    PmTensorSoftmaxLast(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count/width,width)
+  If DLikeOverwrite(Y,A,0)
+    PmNormRows(Dt(A)\Data,0,0,Dt(Y)\Data,Dt(A)\Count/width,width,0.0,0)
   EndIf
 EndProcedure
 
@@ -2207,8 +2703,8 @@ Procedure DLayerNorm(Y.i,A.i,Scale.i,Bias.i,Epsilon.f)
     DFail("Layer normalization bias width mismatch.")
     ProcedureReturn
   EndIf
-  If DLike(Y,A,0)
-    PmTensorLayerNormLast(Dt(A)\Data,Dt(Scale)\Data,Dt(Bias)\Data,Dt(Y)\Data,Dt(A)\Count/width,width,Epsilon)
+  If DLikeOverwrite(Y,A,0)
+    PmNormRows(Dt(A)\Data,Dt(Scale)\Data,Dt(Bias)\Data,Dt(Y)\Data,Dt(A)\Count/width,width,Epsilon,1)
   EndIf
 EndProcedure
 
@@ -2260,6 +2756,7 @@ Procedure DClip(Y.i,A.i,Lo.i,Hi.i)
 EndProcedure
 
 Procedure DConv()
+  Protected allocated.i
   Protected Y.i=DCall(0)
   Protected A.i=DCall(1)
   Protected W.i=DCall(2)
@@ -2293,7 +2790,12 @@ Procedure DConv()
     DFail("Conv bias width mismatch.")
     ProcedureReturn
   EndIf
-  If DShape(Y,1,3,g\Batches,g\OutChannels,g\OutWidth,0)=0
+  If g\InChannels>0 And g\InWidth>0 And g\Kernel>0 And Dilation>0
+    allocated=DShapeOverwrite(Y,1,3,g\Batches,g\OutChannels,g\OutWidth,0)
+  Else
+    allocated=DShape(Y,1,3,g\Batches,g\OutChannels,g\OutWidth,0)
+  EndIf
+  If allocated=0
     ProcedureReturn
   EndIf
   g\Src=Dt(A)\Data
@@ -2310,7 +2812,12 @@ Procedure DConv()
       ProcedureReturn
     EndIf
     g\Wide=Bool(Dt(W)\Kind=33)
-    If DInt8Begin(PmI8ConvScratchBytes(@g))=0
+    If g\InChannels>0 And g\InWidth>0 And g\Kernel>0 And Dilation>0
+      allocated=DInt8BeginOverwrite(PmI8ConvScratchBytes(@g))
+    Else
+      allocated=DInt8Begin(PmI8ConvScratchBytes(@g))
+    EndIf
+    If allocated=0
       ProcedureReturn
     EndIf
     g\WeightScales=Dt(W)\Scales
@@ -2328,6 +2835,7 @@ Procedure DConv()
 EndProcedure
 
 Procedure DConvTranspose()
+  Protected allocated.i
   Protected Y.i=DCall(0)
   Protected A.i=DCall(1)
   Protected W.i=DCall(2)
@@ -2362,7 +2870,12 @@ Procedure DConvTranspose()
     DFail("Transposed Conv bias width mismatch.")
     ProcedureReturn
   EndIf
-  If DShape(Y,1,3,g\Batches,g\OutChannels,g\OutWidth,0)=0
+  If g\InChannels>0 And g\InWidth>0 And g\Kernel>0 And Dilation>0
+    allocated=DShapeOverwrite(Y,1,3,g\Batches,g\OutChannels,g\OutWidth,0)
+  Else
+    allocated=DShape(Y,1,3,g\Batches,g\OutChannels,g\OutWidth,0)
+  EndIf
+  If allocated=0
     ProcedureReturn
   EndIf
   g\Src=Dt(A)\Data
@@ -2376,6 +2889,37 @@ Procedure DConvTranspose()
   If PmFastConvTranspose(@g,DLimit-DLive)=0
     DFail("Transposed convolution scratch exceeds available working memory.")
   EndIf
+EndProcedure
+
+CompilerIf #PMD_NATIVE_BYTES=8
+Global Dim PmResizeParts.i[32]
+Procedure.i PmResizeWorker(*p.i)
+  PmTensorResize1D(PeekI(*p),PeekI(*p+8),PeekI(*p+16),PeekI(*p+24),PeekI(*p+32),PeekI(*p+40),PeekI(*p+48),DReadF(*p+56))
+  ProcedureReturn 0
+EndProcedure
+CompilerEndIf
+Procedure PmResizeRows(src.i,dst.i,rows.i,inWidth.i,outWidth.i,mode.i,coordinate.i,scale.f)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected parts.i=1
+  Protected i.i
+  Protected first.i=0
+  Protected last.i
+  Protected at.i
+  If rows>=8 And rows*outWidth>=16384
+    parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
+  EndIf
+  If parts>1
+    For i=0 To parts-1
+      last=rows*(i+1)/parts : at=i*8
+      PmResizeParts[at]=src+first*inWidth*4 : PmResizeParts[at+1]=dst+first*outWidth*4
+      PmResizeParts[at+2]=last-first : PmResizeParts[at+3]=inWidth : PmResizeParts[at+4]=outWidth
+      PmResizeParts[at+5]=mode : PmResizeParts[at+6]=coordinate : DWriteF(@PmResizeParts[at+7],scale)
+      first=last
+    Next
+    If pmSvcParRun(@PmResizeWorker,@PmResizeParts[0],64,parts)=#PMP_SVC_OK : ProcedureReturn : EndIf
+  EndIf
+  CompilerEndIf
+  PmTensorResize1D(src,dst,rows,inWidth,outWidth,mode,coordinate,scale)
 EndProcedure
 
 Procedure DResize(Y.i,A.i,Scales.i,Sizes.i,Mode.i,Coordinate.i)
@@ -2407,8 +2951,8 @@ Procedure DResize(Y.i,A.i,Scales.i,Sizes.i,Mode.i,Coordinate.i)
   If Scales
     scale=DGet(Scales,last)
   EndIf
-  If DAlloc(Y,1,Dt(A)\Rank,@dims(0))
-    PmTensorResize1D(Dt(A)\Data,Dt(Y)\Data,DProduct(A,0,last-1),DDims((A)*8+(last)),dims(last),Mode,Coordinate,scale)
+  If DAllocOverwrite(Y,1,Dt(A)\Rank,@dims(0))
+    PmResizeRows(Dt(A)\Data,Dt(Y)\Data,DProduct(A,0,last-1),DDims((A)*8+(last)),dims(last),Mode,Coordinate,scale)
   EndIf
 EndProcedure
 
@@ -2508,7 +3052,12 @@ Procedure DLstm()
     Else
       g\WScales=Dt(W)\Scales : g\WWide=Bool(Dt(W)\Kind=33)
       g\RScales=Dt(R)\Scales : g\RWide=Bool(Dt(R)\Kind=33)
-      If DInt8Begin(PmI8LstmScratchBytes(g\InputSize,g\Hidden,g\WWide,g\RWide))
+      CompilerIf #PMD_NATIVE_BYTES=8
+      i=g\Directions
+      CompilerElse
+      i=1
+      CompilerEndIf
+      If DInt8Begin(PmI8LstmScratchBytes(g\InputSize,g\Hidden,g\WWide,g\RWide)*i)
         PmFastLstm(@g)
         DInt8End()
       EndIf

@@ -12,7 +12,108 @@
 
 Global Dim PmRandomDims.i(8)
 
+CompilerIf #PMD_NATIVE_BYTES=8
+Global Dim PmRandomParts.i[40]
+Global Dim PmRandomConstants.l[22]
+Procedure.i PmRandomRangeA64(dst.i,first.i,count.i,node.i,hasSeed.i,seedBits.i,kind.i,p1Bits.i,p2Bits.i,request.i)
+  Protected words.PmRandomPair
+  Protected n0.i
+  Protected n1.i
+  Protected i.i
+  Protected m.i
+  Protected p1.f
+  Protected p2.f
+  Protected span.f
+  Protected u.f
+  Protected z.f
+  Protected value.f
+  PokeL(@p1,p1Bits) : PokeL(@p2,p2Bits)
+  If hasSeed
+    PmRandomThreefryA64(seedBits,0,node,1,@words)
+  Else
+    PmRandomThreefryA64(PmRandomModelSeed,0,node,0,@words)
+  EndIf
+  n0=words\Lo & $FFFFFFFF : n1=words\Hi & $FFFFFFFF
+  span=p2-p1
+  For i=0 To count-1
+    If (i & 1023)=0 : PmKernelIdle() : EndIf
+    PmRandomThreefryA64(n0,n1,first+i,request,@words)
+    If kind=0
+      m=((words\Lo & $FFFFFFFF)>>8)&$FFFFFF : u=m : u=u*PmRandomTwoM24
+      value=span*u : value=p1+value
+    Else
+      PokeL(@z,PmRandomNormalBitsA64(words\Lo,words\Hi,@PmRandomConstants[0]))
+      value=p2*z : value=p1+value
+    EndIf
+    PokeL(dst+i*4,PeekL(@value))
+  Next
+  ProcedureReturn 1
+EndProcedure
+Procedure.i PmRandomWorker(*p.i)
+  If PmRandomRangeA64(PeekI(*p),PeekI(*p+8),PeekI(*p+16),PeekI(*p+24),PeekI(*p+32),PeekI(*p+40),PeekI(*p+48),PeekI(*p+56),PeekI(*p+64),PeekI(*p+72))=0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+CompilerEndIf
+
 Procedure.i DRandomFill(Y.i,Node.i,HasSeed.i,SeedBits.i,Kind.i,P1Bits.i,P2Bits.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected parts.i=1
+  Protected count.i=Dt(Y)\Count
+  Protected first.i=0
+  Protected last.i
+  Protected i.i
+  Protected at.i
+  If count>=16384 And ((count >> 16) >> 16)=0
+    parts=PmParallelCores()
+    If parts>4 : parts=4 : EndIf
+  EndIf
+  If parts>1
+    PmRandomInit()
+    PmRandomConstants[0]=PeekL(@PmRandomTwoM24)
+    PmRandomConstants[1]=PeekL(@PmRandomLn2)
+    PmRandomConstants[2]=PeekL(@PmRandomSqrt2)
+    PmRandomConstants[3]=PeekL(@PmRandomTheta)
+    PmRandomConstants[4]=PeekL(@PmRandomC3)
+    PmRandomConstants[5]=PeekL(@PmRandomC5)
+    PmRandomConstants[6]=PeekL(@PmRandomC7)
+    PmRandomConstants[7]=PeekL(@PmRandomC9)
+    PmRandomConstants[8]=PeekL(@PmRandomH6)
+    PmRandomConstants[9]=PeekL(@PmRandomH24)
+    PmRandomConstants[10]=PeekL(@PmRandomH120)
+    PmRandomConstants[11]=PeekL(@PmRandomH720)
+    PmRandomConstants[12]=PeekL(@PmRandomH5040)
+    PmRandomConstants[13]=PeekL(@PmRandomH40320)
+    PmRandomConstants[14]=PeekL(@PmRandomH362880)
+    PmRandomConstants[15]=PeekL(@PmRandomH3628800)
+    PmRandomConstants[16]=$3F800000
+    PmRandomConstants[17]=$3F000000
+    PmRandomConstants[18]=$3E800000
+    PmRandomConstants[19]=$40800000
+    PmRandomConstants[20]=$3EC00000
+    PmRandomConstants[21]=$3F400000
+    For i=0 To parts-1
+      last=count
+      If i<parts-1 : last=(count*(i+1)/parts)/16*16 : EndIf
+      at=i*10
+      PmRandomParts[at]=Dt(Y)\Data+first*4
+      PmRandomParts[at+1]=first
+      PmRandomParts[at+2]=last-first
+      PmRandomParts[at+3]=Node
+      PmRandomParts[at+4]=HasSeed
+      PmRandomParts[at+5]=SeedBits
+      PmRandomParts[at+6]=Kind & 1
+      PmRandomParts[at+7]=P1Bits
+      PmRandomParts[at+8]=P2Bits
+      PmRandomParts[at+9]=PmRandomRequest
+      first=last
+    Next
+    If pmSvcParRun(@PmRandomWorker,@PmRandomParts[0],80,parts)=#PMP_SVC_OK
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  CompilerEndIf
   If PmRandomNodeBits(Dt(Y)\Data,Dt(Y)\Count,Node,HasSeed,SeedBits,Kind & 1,P1Bits,P2Bits)=0
     ProcedureReturn DFail("A random tensor has more than 4294967295 elements; the generator numbers elements with 32 bits. Check the shape feeding this node.")
   EndIf
@@ -29,7 +130,7 @@ Procedure DRandomLike(Y.i,A.i,Node.i,HasSeed.i,SeedBits.i,Kind.i,P1Bits.i,P2Bits
     EndIf
     ProcedureReturn
   EndIf
-  If DLike(Y,A,1)=0
+  If DLikeOverwrite(Y,A,1)=0
     ProcedureReturn
   EndIf
   DRandomFill(Y,Node,HasSeed,SeedBits,Kind,P1Bits,P2Bits)
@@ -38,7 +139,7 @@ EndProcedure
 ; RandomUniform / RandomNormal: the shape attribute, copied into PmRandomDims
 ; by the generated lines before the call.
 Procedure DRandomShape(Y.i,Rank.i,Node.i,HasSeed.i,SeedBits.i,Kind.i,P1Bits.i,P2Bits.i)
-  If DAlloc(Y,1,Rank,@PmRandomDims(0))=0
+  If DAllocOverwrite(Y,1,Rank,@PmRandomDims(0))=0
     ProcedureReturn
   EndIf
   DRandomFill(Y,Node,HasSeed,SeedBits,Kind,P1Bits,P2Bits)

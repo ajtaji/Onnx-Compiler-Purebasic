@@ -1,0 +1,714 @@
+; Kitten nano 0.8 book reader for the Anvil Pi 4 payload ABI.
+; The host supplies phonemes/style/speed in KTBK0001; the Pi synthesizes all
+; audio on four cores while its primary core sends SBC through Anvil A2DP.
+; Build with --wants-services, --entry-returns and the documented memory map.
+; The supplied Bluetooth configuration and saved bond remain private.
+EnableFloatingPoint
+XIncludeFile "@ANVIL_ROOT@/RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "@MODEL_SOURCE@"
+XIncludeFile "@ANVIL_ROOT@/RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "@ANVIL_ROOT@/RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "@ANVIL_ROOT@/RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "@ANVIL_ROOT@/RaspberryPi4/Lib/bt_uart.pi4"
+XIncludeFile "@ANVIL_ROOT@/RaspberryPi4/Board/hw_bt_payload.pi4"
+XIncludeFile "@ANVIL_ROOT@/Anvil/Net/hci.pbi"
+XIncludeFile "@ANVIL_ROOT@/Anvil/Audio/sbc.pbi"
+XIncludeFile "@ANVIL_ROOT@/Anvil/Net/l2cap.pbi"
+XIncludeFile "@ANVIL_ROOT@/Anvil/Net/a2dp.pbi"
+#KT_CHUNKS=4
+#KT_TRIM=5000
+#KT_SPEED_BITS=$3F4CCCCD
+
+#KT_PMW_BASE=$44000000
+#KT_NOISE_BASE=$54000000
+#KT_ARENA_BASE=$60000000
+#KT_ARENA_BYTES=1073741824
+#KT_WAVE_BASE=$57000000
+; Twelve MiB circular queue, separate from node timings and trace.
+#KT_WAVE_BYTES=$00C00000
+#KT_STACK_LOW=$07EF0000
+#KT_STACK_CANARY=$4B4F4B4F
+#KT_TIMEOUT_SECONDS=240
+; Optional node cancellation for bounded diagnostics.
+#KT_STOP_AFTER_NODE=0
+; Three graph inputs; random tensors are produced by the emitted runtime.
+#KT_INPUT_IDS=0
+#KT_INPUT_STYLE=1
+#KT_INPUT_SPEED=2
+#KT_INPUT_UNIFORM=3
+#KT_INPUT_NORMAL=4
+#KT_OUTPUT_WAVEFORM=0
+#KT_OUTPUT_DURATION=1
+#KT_SVC_MAGIC=$53564E41
+#KT_SVC_ABI_MAJOR=1
+#KT_SVC_HEADER_BYTES=16
+#KT_SVC_SLOT_COUNT_OFFSET=12
+#KT_SVC_PET_SLOT=6
+#KT_MMU_TABLE_BASE=$02000000
+#KT_DSI_NC_LOW=$08A00000
+#KT_DSI_NC_HIGH=$09200000
+#KT_TRACE_BASE=$57E00000
+#KT_TRACE_BYTES=256
+#KT_NODE_TICKS_BASE=$57D00000
+#KT_NODE_TICKS_ROW_BYTES=32768
+; One row per chunk, row K-1 for chunk K.
+#KT_NODE_TICKS_BYTES=131072
+#KT_TRACE_MAGIC=$4352544B ; KTRC
+#KT_TRACE_VERSION=1
+#KT_TRACE_COLD=1
+#KT_TRACE_BEFORE_MMU=2
+#KT_TRACE_BEFORE_BIND=3
+#KT_TRACE_AFTER_BIND=4
+#KT_TRACE_AFTER_ASSETS=5
+#KT_TRACE_CALLBACK_BEFORE_PET=6
+#KT_TRACE_CALLBACK_AFTER_PET=7
+#KT_TRACE_CHUNK_DONE=8
+#KT_TRACE_FINAL=9
+
+Global KtResultMagic.l
+Global KtResultVersion.l
+Global KtResultStatus.l
+Global KtResultRequests.l
+Global KtResultHz.i
+Global KtResultTotalTicks.i
+Global KtResultPmwFirst.l
+Global KtResultPmwLast.l
+Global KtResultPmwStable.l
+Global KtResultModelBindError.i
+Global KtResultNoiseCrc.l
+Global KtResultTicks1.i
+Global KtResultTicks2.i
+Global KtResultTicks3.i
+Global KtResultTicks4.i
+Global KtResultSamples1.i
+Global KtResultSamples2.i
+Global KtResultSamples3.i
+Global KtResultSamples4.i
+Global KtResultFrames1.i
+Global KtResultFrames2.i
+Global KtResultFrames3.i
+Global KtResultFrames4.i
+Global KtResultDError1.i
+Global KtResultDError2.i
+Global KtResultDError3.i
+Global KtResultDError4.i
+Global KtResultHeapPeak1.i
+Global KtResultHeapPeak2.i
+Global KtResultHeapPeak3.i
+Global KtResultHeapPeak4.i
+Global KtResultSamples.i
+Global KtResultBytes.i
+Global KtResultHash.l
+Global KtResultMin.l
+Global KtResultMax.l
+Global KtResultHeapUsedBeforeClose.i
+Global KtResultHeapUsedAfterClose.i
+Global KtResultModelReadyAfterClose.i
+Global KtResultStackCanary.l
+Global KtSvcTable.i
+; What PmOnnxAnvilEnter answered when it was called. It is asked before this
+; payload builds its own tables, so it can read 1 on a four-core board; the
+; evidence the split ran is the service's dispatch counter, never this.
+Global KtParallelCores.i
+Global *KtSvcPet
+Global KtProgressStart.i
+Global KtProgressLast.i
+Global KtResultProgressCalls.i
+Global KtResultProgressPhase.i
+Global KtResultProgressNode.i
+Global KtResultProgressMaxGap.i
+Global KtResultProgressTimedOut.i
+Global KtResultServiceStatus.i
+Global KtTimingRequest.i
+#KT_TIMING_DEPTH=8
+Global KtTimingDepth.i
+Global Dim KtTimingNodes.i(#KT_TIMING_DEPTH)
+Global Dim KtTimingStarts.i(#KT_TIMING_DEPTH)
+Global KtResultTimingOverflow.i
+Global KtResultTimingMismatch.i
+Global KtMmuOwned.i
+Global KtResultMmuBuild.i
+Global KtResultMmuBefore.i
+Global KtResultMmuCached.i
+Global KtResultMmuAfter.i
+Global KtTraceCounter.i
+Global KtWaveUsed.i
+Global KtResultStoppedAt.i
+Global KtNoiseCrcWord.i
+
+Procedure KtCaptureX0()
+  ASM
+    adrp x1, global_ktsvctable
+    add  x1, x1, #:lo12:global_ktsvctable
+    str  x0, [x1]
+  EndASM
+EndProcedure
+
+Procedure.i KtTicks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i KtHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i KtExpired(start.i)
+  ProcedureReturn Bool(KtTicks()-start>KtResultHz*#KT_TIMEOUT_SECONDS)
+EndProcedure
+
+; NESTED BRACKETS. A Loop or If node's body is emitted with its own DPoll
+; brackets inside the outer node's bracket, and a Loop body runs once per
+; token. So the brackets are kept on a small stack, a node's time is ADDED to
+; its slot rather than written over it (the last iteration alone would
+; otherwise be all that survives), and an outer node's time includes its body.
+; A family sum must therefore not add a control node to its own body's nodes.
+Procedure KtRecordNodeTicks(phase.i,node.i,now.i)
+  Protected where.i
+  If KtTimingRequest<1 Or KtTimingRequest>#KT_CHUNKS Or node<0 Or node>=#PMD_NODE_COUNT
+    ProcedureReturn
+  EndIf
+  If phase=#PMD_PROGRESS_NODE_BEFORE
+    If KtTimingDepth<#KT_TIMING_DEPTH
+      KtTimingNodes(KtTimingDepth)=node
+      KtTimingStarts(KtTimingDepth)=now
+    Else
+      KtResultTimingOverflow=KtResultTimingOverflow+1
+    EndIf
+    KtTimingDepth=KtTimingDepth+1
+  ElseIf phase=#PMD_PROGRESS_NODE_AFTER
+    If KtTimingDepth>0
+      KtTimingDepth=KtTimingDepth-1
+      If KtTimingDepth<#KT_TIMING_DEPTH
+        If KtTimingNodes(KtTimingDepth)=node
+          where=#KT_NODE_TICKS_BASE+(KtTimingRequest-1)*#KT_NODE_TICKS_ROW_BYTES+node*8
+          PokeI(where,PeekI(where)+now-KtTimingStarts(KtTimingDepth))
+        Else
+          KtResultTimingMismatch=KtResultTimingMismatch+1
+        EndIf
+      EndIf
+    Else
+      KtResultTimingMismatch=KtResultTimingMismatch+1
+    EndIf
+  EndIf
+EndProcedure
+
+Procedure.i KtServiceHeader32(offset.i)
+  ProcedureReturn PeekA(KtSvcTable+offset) | (PeekA(KtSvcTable+offset+1)<<8) | (PeekA(KtSvcTable+offset+2)<<16) | (PeekA(KtSvcTable+offset+3)<<24)
+EndProcedure
+
+Procedure.i KtBindServices()
+  Protected slots.i
+  If KtSvcTable=0 : ProcedureReturn 0 : EndIf
+  If KtServiceHeader32(0)<>#KT_SVC_MAGIC : ProcedureReturn 0 : EndIf
+  If KtServiceHeader32(4)<>#KT_SVC_ABI_MAJOR : ProcedureReturn 0 : EndIf
+  slots=KtServiceHeader32(#KT_SVC_SLOT_COUNT_OFFSET)
+  If slots<=#KT_SVC_PET_SLOT : ProcedureReturn 0 : EndIf
+  *KtSvcPet=PeekI(KtSvcTable+#KT_SVC_HEADER_BYTES+#KT_SVC_PET_SLOT*8)
+  ; The host's half of the four-core contract: without this call every
+  ; convolution takes the single-core path and still produces the same bytes.
+  KtParallelCores=PmOnnxAnvilEnter(KtSvcTable)
+  ProcedureReturn Bool(*KtSvcPet<>0)
+EndProcedure
+
+Procedure KtTrace(stage.i,phase.i,node.i)
+  Protected now.i=KtTicks()
+  KtTraceCounter=KtTraceCounter+1
+  PokeL(#KT_TRACE_BASE+0,#KT_TRACE_MAGIC)
+  PokeL(#KT_TRACE_BASE+4,#KT_TRACE_VERSION)
+  PokeL(#KT_TRACE_BASE+8,stage)
+  PokeL(#KT_TRACE_BASE+12,KtTraceCounter)
+  PokeI(#KT_TRACE_BASE+16,phase)
+  PokeI(#KT_TRACE_BASE+24,node)
+  PokeI(#KT_TRACE_BASE+32,now)
+  If KtProgressStart<>0
+    PokeI(#KT_TRACE_BASE+40,now-KtProgressStart)
+  Else
+    PokeI(#KT_TRACE_BASE+40,0)
+  EndIf
+  PokeI(#KT_TRACE_BASE+48,DError)
+  PokeI(#KT_TRACE_BASE+56,DCancel)
+  PokeI(#KT_TRACE_BASE+64,KtResultServiceStatus)
+  PokeI(#KT_TRACE_BASE+72,KtResultStatus)
+  PokeI(#KT_TRACE_BASE+80,KtResultRequests)
+  PokeI(#KT_TRACE_BASE+88,KtTimingRequest)
+  PokeI(#KT_TRACE_BASE+96,KtWaveUsed)
+  PokeI(#KT_TRACE_BASE+104,KtResultTicks1)
+  PokeI(#KT_TRACE_BASE+112,KtResultTicks2)
+  PokeI(#KT_TRACE_BASE+120,KtResultTicks3)
+  PokeI(#KT_TRACE_BASE+128,KtResultTicks4)
+  If KtMmuOwned
+    MmuCleanRange(#KT_TRACE_BASE,#KT_TRACE_BYTES)
+  Else
+    MmuBarrier()
+  EndIf
+EndProcedure
+
+Procedure.i KtProgress(phase.i,node.i)
+  Protected now.i=KtTicks()
+  If KtProgressStart=0 Or now-KtProgressStart>KtResultHz*#KT_TIMEOUT_SECONDS
+    KtResultProgressTimedOut=1 : ProcedureReturn 0
+  EndIf
+  If now-KtProgressLast>KtResultHz/50
+    KtSvcPet() : KtProgressLast=now
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; A model input the runner owns: allocated in the arena and filled from the
+; baked request. Returns 0 when the arena refused it.
+Procedure.i KtInputI64(slot.i,*values,count.i)
+  Protected id.i=PmModelInput(slot)
+  Protected Dim dims.i(8)
+  Protected i.i
+  dims(0)=1
+  dims(1)=count
+  If DAlloc(id,7,2,@dims(0))=0 : ProcedureReturn 0 : EndIf
+  i=0
+  While i<count
+    PokeI(Dt(id)\Data+i*8,PeekI(*values+i*8))
+    i=i+1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i KtInputF32(slot.i,*bits,rank.i,d0.i,d1.i,d2.i)
+  Protected id.i=PmModelInput(slot)
+  Protected Dim dims.i(8)
+  Protected i.i
+  dims(0)=d0
+  dims(1)=d1
+  dims(2)=d2
+  If DAlloc(id,1,rank,@dims(0))=0 : ProcedureReturn 0 : EndIf
+  i=0
+  While i<Dt(id)\Count
+    PokeL(Dt(id)\Data+i*4,PeekL(*bits+i*4))
+    i=i+1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; The noise is 24.7 MB and already resident and checked, so the normal tensor
+; BORROWS it rather than copying it into the arena: Owned stays 0, so no
+; release ever hands that address to the arena allocator.
+Procedure.i KtInputBorrowF32(slot.i,address.i,d0.i,d1.i,d2.i)
+  Protected id.i=PmModelInput(slot)
+  DRelease(id)
+  Dt(id)\Data=address
+  Dt(id)\Kind=1
+  Dt(id)\Rank=3
+  Dt(id)\Count=d0*d1*d2
+  Dt(id)\Bytes=d0*d1*d2*4
+  Dt(id)\Owned=0
+  DDims(id*8+0)=d0
+  DDims(id*8+1)=d1
+  DDims(id*8+2)=d2
+  ProcedureReturn 1
+EndProcedure
+
+; One chunk: fill graph inputs, execute, validate shape/duration and append
+; the trimmed waveform to the circular queue.
+; Returns 0, or a code that says which step refused.
+Global BookIdleCalls.i,BookIdleLast.i,BookIdleMaxGap.i,BookIdleFaults.i,BookIdleCores.i
+Global BookTotalTicks.i,BookConcurrentTicks.i,BookConcurrentSamples.i,BookTrimmedSamples.i
+Global BtRunning.i,BtFault.i,BtRead48.i,BtSent.i,BtHave.i,BtStartTicks.i,BtEof.i
+Global BtLate.i,BtLateEvents.i,BtMaxLate.i,BtEncodeTicks.i,BtError.i,BtStage.i
+Global Dim BtFrames.a[256]
+
+Declare BtPump()
+
+Procedure.i KtChunk(k.i)
+  Protected bookBegin.i=KtTicks(),head.i,firstCopy.i,elapsed.i
+  Protected firstActive.i=-1,lastActive.i=-1,cropStart.i=0,originalKeep.i,endAt.i
+  Protected record.i=$52000000+64+(k-1)*32
+  Protected packedBytes.i=PeekI($52000010),tokenOffset.i,styleOffset.i
+  Protected *tokenData
+  Protected tokens.i
+  Protected *styleData
+  Protected rawSamples.i
+  Protected frames.i
+  Protected uniformOffset.i
+  Protected normalOffset.i
+  Protected speed.l=#KT_SPEED_BITS
+  Protected started.i
+  Protected ticks.i
+  Protected id.i
+  Protected dur.i
+  Protected count.i
+  Protected keep.i
+  Protected i.i
+  Protected bits.l
+  Protected sample.f
+  Protected sum.i
+  tokens=PeekI(record+8)
+  tokenOffset=PeekI(record) : styleOffset=PeekI(record+16)
+  If tokens<3 Or tokens>512 Or tokenOffset<64+PeekI($52000008)*32 Or tokenOffset>packedBytes-tokens*8 : ProcedureReturn 1 : EndIf
+  If styleOffset<64+PeekI($52000008)*32 Or styleOffset>packedBytes-1024 : ProcedureReturn 1 : EndIf
+  *tokenData=$52000000+tokenOffset
+  *styleData=$52000000+styleOffset
+  speed=PeekL(record+24)
+  If tokens<3 Or tokens>512 : ProcedureReturn 1 : EndIf
+  KtProgressStart=KtTicks()
+  PmModelResetRequest()
+  If KtInputI64(#KT_INPUT_IDS,*tokenData,tokens)=0 : ProcedureReturn 1 : EndIf
+  If KtInputF32(#KT_INPUT_STYLE,*styleData,2,1,256,0)=0 : ProcedureReturn 1 : EndIf
+  If KtInputF32(#KT_INPUT_SPEED,@speed,1,1,0,0)=0 : ProcedureReturn 1 : EndIf
+  KtTimingRequest=k
+  KtTimingDepth=0
+  started=KtTicks()
+  i=PmModelExecute()
+  ticks=KtTicks()-started
+  KtTimingRequest=0
+  If k<=128
+  PokeI($58002000+(k-1)*32,k)
+  PokeI($58002008+(k-1)*32,ticks)
+  EndIf
+  If k=1
+    KtResultTicks1=ticks : KtResultDError1=DError : KtResultHeapPeak1=DHeapPeak
+  ElseIf k=2
+    KtResultTicks2=ticks : KtResultDError2=DError : KtResultHeapPeak2=DHeapPeak
+  ElseIf k=3
+    KtResultTicks3=ticks : KtResultDError3=DError : KtResultHeapPeak3=DHeapPeak
+  Else
+    KtResultTicks4=ticks : KtResultDError4=DError : KtResultHeapPeak4=DHeapPeak
+  EndIf
+  If i=0 : ProcedureReturn 2 : EndIf
+  id=PmModelOutput(#KT_OUTPUT_WAVEFORM)
+  dur=PmModelOutput(#KT_OUTPUT_DURATION)
+  If id<=0 Or Dt(id)\Kind<>1 Or Dt(id)\Rank<>1 Or Dt(id)\Data=0 : ProcedureReturn 3 : EndIf
+  count=Dt(id)\Count
+  If k=1
+    KtResultSamples1=count
+  ElseIf k=2
+    KtResultSamples2=count
+  ElseIf k=3
+    KtResultSamples3=count
+  Else
+    KtResultSamples4=count
+  EndIf
+  ; Validate generated duration before accepting any output samples.
+  If count<=#KT_TRIM : ProcedureReturn 5 : EndIf
+  If dur<=0 Or Dt(dur)\Kind<>7 Or Dt(dur)\Count<>tokens : ProcedureReturn 6 : EndIf
+  sum=0
+  i=0
+  While i<tokens
+    sum=sum+PeekI(Dt(dur)\Data+i*8)
+    i=i+1
+  Wend
+  If k=1
+    KtResultFrames1=sum
+  ElseIf k=2
+    KtResultFrames2=sum
+  ElseIf k=3
+    KtResultFrames3=sum
+  Else
+    KtResultFrames4=sum
+  EndIf
+  If sum*600<>count : ProcedureReturn 6 : EndIf
+  If k<=128
+  PokeI($58002010+(k-1)*32,count-#KT_TRIM)
+  PokeI($58002018+(k-1)*32,BtEncodeTicks)
+  EndIf
+  keep=count-#KT_TRIM
+  If keep<=0 Or keep*4>#KT_WAVE_BYTES : ProcedureReturn 7 : EndIf
+  While BtRunning And KtResultSamples-BtRead48/2+keep>#KT_WAVE_BYTES/4
+    BtPump()
+    If *KtSvcPet<>0 : KtSvcPet() : EndIf
+    If BtFault : ProcedureReturn 8 : EndIf
+  Wend
+  ; Validate raw FP32 bits before publishing the chunk, then copy in at most
+  ; two contiguous spans. The consumer cannot read unpublished samples.
+  originalKeep=keep
+  For i=0 To keep-1
+    bits=PeekL(Dt(id)\Data+i*4)
+    If (bits & $7F800000)=$7F800000 : ProcedureReturn 4 : EndIf
+    ; 0.0001 amplitude: retain 100 ms before and 150 ms after activity.
+    If (bits & $7FFFFFFF)>$38D1B717
+      If firstActive<0 : firstActive=i : EndIf
+      lastActive=i
+    EndIf
+  Next
+  If firstActive>=0
+    cropStart=firstActive-2400 : If cropStart<0 : cropStart=0 : EndIf
+    endAt=lastActive+3601 : If endAt>keep : endAt=keep : EndIf
+    keep=endAt-cropStart
+    BookTrimmedSamples=BookTrimmedSamples+originalKeep-keep
+    ; Five millisecond fades only at edited edges keep joins click-free.
+    If cropStart>0
+      For i=0 To 119
+        sample=PmTensorGet(Dt(id)\Data,cropStart+i)*(i/120.0)
+        PmTensorPut(Dt(id)\Data,cropStart+i,sample)
+      Next
+    EndIf
+    If endAt<originalKeep
+      For i=0 To 119
+        sample=PmTensorGet(Dt(id)\Data,endAt-120+i)*((119-i)/120.0)
+        PmTensorPut(Dt(id)\Data,endAt-120+i,sample)
+      Next
+    EndIf
+  EndIf
+  If k<=128 : PokeI($58002010+(k-1)*32,keep) : EndIf
+  head=KtWaveUsed % #KT_WAVE_BYTES
+  firstCopy=keep*4 : If firstCopy>#KT_WAVE_BYTES-head : firstCopy=#KT_WAVE_BYTES-head : EndIf
+  DCopy(Dt(id)\Data+cropStart*4,#KT_WAVE_BASE+head,firstCopy)
+  If firstCopy<keep*4 : DCopy(Dt(id)\Data+cropStart*4+firstCopy,#KT_WAVE_BASE,keep*4-firstCopy) : EndIf
+  KtWaveUsed=KtWaveUsed+keep*4 : KtResultSamples=KtResultSamples+keep
+  elapsed=KtTicks()-bookBegin : BookTotalTicks=BookTotalTicks+elapsed
+  If BtRunning
+    BookConcurrentTicks=BookConcurrentTicks+elapsed
+    BookConcurrentSamples=BookConcurrentSamples+keep
+  EndIf
+  KtResultBytes=KtWaveUsed
+  KtResultRequests=KtResultRequests+1
+  KtTrace(#KT_TRACE_CHUNK_DONE,0,k)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure BtReport()
+  PokeI($58001000,BtStage) : PokeI($58001008,BtError) : PokeI($58001010,BtFault)
+  PokeI($58001018,A2dpFailStep()) : PokeI($58001020,A2dpFailCode()) : PokeI($58001028,HciLinkStatus())
+  PokeI($58001030,HciRxErrors()) : PokeI($58001038,A2dpPackets()) : PokeI($58001040,BtSent)
+  PokeI($58001048,BtRead48) : PokeI($58001050,BtLateEvents) : PokeI($58001058,BtMaxLate)
+  PokeI($58001060,BtEncodeTicks) : PokeI($58001068,BookIdleMaxGap) : PokeI($58001070,BookIdleFaults)
+  PokeI($58001078,HciKeysGiven()) : PokeI($58001080,HciKeysNew())
+  PokeI($58001088,BookTotalTicks) : PokeI($58001090,BookConcurrentTicks) : PokeI($58001098,BookConcurrentSamples)
+  PokeI($580010A0,BookTrimmedSamples) : PokeI($580010A8,KtResultHz)
+  PokeI($580010B0,BookIdleCores) : PokeI($580010B8,KtResultRequests)
+EndProcedure
+
+Procedure BtPump()
+  Protected now.i, gap.i, due.i, packet.i, i.i, k.i, at.i, nextAt.i, begin.i
+  Protected sample.f, other.f
+  Protected pcm.i
+  If BtRunning=0 Or BtFault : ProcedureReturn : EndIf
+  now=KtTicks()
+  If PmKernelCore()<>0 : BookIdleFaults=BookIdleFaults+1 : BtFault=1 : ProcedureReturn : EndIf
+  If BookIdleLast
+    gap=now-BookIdleLast
+    If gap>BookIdleMaxGap : BookIdleMaxGap=gap : PokeI($58000020,DNode) : EndIf
+  EndIf
+  BookIdleLast=now : BookIdleCalls=BookIdleCalls+1
+  If A2dpPoll()<>#A2DP_STREAMING : BtFault=2 : ProcedureReturn : EndIf
+  due=(now-BtStartTicks)*375/KtResultHz
+  If BtSent>0 And due>BtSent And (BtEof=0 Or BtSent<((KtResultSamples*2+383)/384)*3)
+    If BtLate=0 : BtLateEvents=BtLateEvents+1 : EndIf
+    BtLate=1
+    If due-BtSent>BtMaxLate : BtMaxLate=due-BtSent : EndIf
+  Else
+    BtLate=0
+  EndIf
+  For packet=0 To 3
+    While BtHave<3 And BtSent+BtHave<due+128
+      If BtRead48/2+65>KtResultSamples And BtEof=0 : ProcedureReturn : EndIf
+      If BtEof And BtRead48>=((KtResultSamples*2+383)/384)*384 : Break : EndIf
+      begin=KtTicks()
+      For i=0 To 127
+        at=BtRead48/2
+        sample=0.0
+        If at<KtResultSamples
+          sample=PmTensorGet(#KT_WAVE_BASE,(at%(#KT_WAVE_BYTES/4)))
+          If (BtRead48 & 1)<>0 And at+1<KtResultSamples
+            nextAt=(at+1)%(#KT_WAVE_BYTES/4)
+            other=PmTensorGet(#KT_WAVE_BASE,nextAt)
+            sample=(sample+other)*0.5
+          EndIf
+        EndIf
+        If sample<>sample : BtFault=3 : ProcedureReturn : EndIf
+        sample=sample*32767.0
+        If sample>32767.0 : sample=32767.0 : EndIf
+        If sample< -32768.0 : sample=-32768.0 : EndIf
+        pcm=Int(sample) : SbcPcm(i)=pcm
+        BtRead48=BtRead48+1
+      Next
+      SbcEncode()
+      For k=0 To 67 : BtFrames[BtHave*68+k]=SbcEncoded(k) : Next
+      BtEncodeTicks=BtEncodeTicks+KtTicks()-begin
+      BtHave=BtHave+1
+    Wend
+    If BtHave<>3 : ProcedureReturn : EndIf
+    If A2dpSend(@BtFrames[0],3)=0 : ProcedureReturn : EndIf
+    BtSent=BtSent+3 : BtHave=0
+    A2dpPoll()
+  Next
+EndProcedure
+
+Procedure.i BtStart()
+  Protected state.i, i.i
+  BtStage=1
+  If PeekL($53010040)<>$52454550 : BtError=1 : ProcedureReturn 0 : EndIf
+  If MailboxInit()=0 : BtError=2 : ProcedureReturn 0 : EndIf
+  If HciOpen()=0 : BtError=3 : ProcedureReturn 0 : EndIf
+  If HciLoadPatch($53000000,63806)=0 : BtError=4 : ProcedureReturn 0 : EndIf
+  If HciSetBaud(3000000)=0 : BtError=5 : ProcedureReturn 0 : EndIf
+  If HciReadLocalVersion()=0 Or HciReadBdAddr()=0 Or HciReadBufferSize()=0 : BtError=6 : ProcedureReturn 0 : EndIf
+  If PeekL($53010030)=$52444441
+    If HciWriteBdAddr($53010034)=0 : BtError=7 : ProcedureReturn 0 : EndIf
+  EndIf
+  If HciLinkSetup()=0 : BtError=8 : ProcedureReturn 0 : EndIf
+  If PeekL($53010000)=$444E4F42
+    For i=0 To 5
+      If PeekA($53010004+i)<>PeekA($53010044+5-i) : BtError=9 : ProcedureReturn 0 : EndIf
+    Next
+    HciLinkKeySet($53010004)
+  EndIf
+  SbcStereo=1
+  BtStage=2
+  If A2dpBegin($53010044,1)=0 : BtError=10 : ProcedureReturn 0 : EndIf
+  Repeat
+    state=A2dpPoll()
+    If *KtSvcPet<>0 : KtSvcPet() : EndIf
+  Until state=#A2DP_STREAMING Or state=#A2DP_FAILED
+  If state<>#A2DP_STREAMING : BtError=11 : ProcedureReturn 0 : EndIf
+  BtStage=3 : BtStartTicks=KtTicks() : BookIdleLast=0 : BtRunning=1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure BtStop()
+  Protected untilTick.i
+  PmSetIdleCallback(0)
+  BtRunning=0
+  BtReport()
+  If HciLinkKeyGet($53010004)<>0 : PokeL($53010000,$444E4F42) : EndIf
+  A2dpEnd()
+  untilTick=KtTicks()+KtResultHz/20
+  While KtTicks()<untilTick
+    HciPoll()
+    If *KtSvcPet<>0 : KtSvcPet() : EndIf
+  Wend
+  HciClose()
+EndProcedure
+
+Procedure.i KtFinish(status.i)
+  BtStop()
+  KtResultHeapUsedBeforeClose=DHeapUsed
+  PmModelResetRequest()
+  PmModelClose()
+  DSetProgressCallback(0)
+  KtResultHeapUsedAfterClose=DHeapUsed
+  KtResultModelReadyAfterClose=PmModelReady
+  KtResultPmwStable=Bool(PeekL(#KT_PMW_BASE)=KtResultPmwFirst And PeekL(#KT_PMW_BASE+#PMO_WEIGHT_FILE_BYTES-4)=KtResultPmwLast)
+  KtResultStackCanary=PeekL(#KT_STACK_LOW)
+  If status=0 And KtResultHeapUsedAfterClose<>0 : status=90 : EndIf
+  If status=0 And KtResultModelReadyAfterClose<>0 : status=91 : EndIf
+  If status=0 And KtResultPmwStable=0 : status=93 : EndIf
+  If status=0 And KtResultStackCanary<>#KT_STACK_CANARY : status=94 : EndIf
+  KtResultMmuCached=MmuSctlr()
+  If KtMmuOwned
+    MmuDisableCachedFlushed()
+    KtMmuOwned=0
+  EndIf
+  KtResultMmuAfter=MmuSctlr()
+  If status=0 And MmuEnabled()<>0 : status=95 : EndIf
+  KtResultStatus=status
+  KtTrace(#KT_TRACE_FINAL,KtResultProgressPhase,KtResultProgressNode)
+  ASM
+    dmb ish
+  EndASM
+  ProcedureReturn status
+EndProcedure
+
+Procedure.i Main()
+  Protected started.i
+  Protected status.i,petTick.i,limit.i
+  ; --wants-services puts the service table in x0. This must stay first.
+  KtCaptureX0()
+  KtResultMagic=$4252544B ; KTRB
+  KtResultVersion=1
+  KtResultStatus=-1
+  KtResultRequests=0
+  KtTimingRequest=0
+  KtTimingDepth=0
+  KtTraceCounter=0
+  KtWaveUsed=0
+  status=0
+  While status<#KT_NODE_TICKS_BYTES
+    PokeA(#KT_NODE_TICKS_BASE+status,0)
+    status=status+1
+  Wend
+  status=0
+  While status<#KT_TRACE_BYTES
+    PokeA(#KT_TRACE_BASE+status,0)
+    status=status+1
+  Wend
+  KtTrace(#KT_TRACE_COLD,0,-1)
+  KtResultHz=KtHz()
+  PokeL(#KT_STACK_LOW,#KT_STACK_CANARY)
+  KtResultPmwFirst=PeekL(#KT_PMW_BASE)
+  KtResultPmwLast=PeekL(#KT_PMW_BASE+#PMO_WEIGHT_FILE_BYTES-4)
+  If KtResultHz<=0 : ProcedureReturn KtFinish(1) : EndIf
+  If #PMD_NODE_COUNT*8>#KT_NODE_TICKS_ROW_BYTES : ProcedureReturn KtFinish(10) : EndIf
+  If KtBindServices()=0
+    KtResultServiceStatus=1
+    ProcedureReturn KtFinish(5)
+  EndIf
+  KtTrace(#KT_TRACE_BEFORE_MMU,0,-1)
+  KtResultMmuBefore=MmuSctlr()
+  If (MmuEl()<>2 And MmuEl()<>3) Or MmuBuildable()=0 Or MmuStubEntered()=0
+    KtResultServiceStatus=3
+    ProcedureReturn KtFinish(7)
+  EndIf
+  MmuClearNc()
+  MmuAddNc(#KT_DSI_NC_LOW,#KT_DSI_NC_HIGH)
+  KtResultMmuBuild=MmuBuildTables(#KT_MMU_TABLE_BASE)
+  If KtResultMmuBuild<>0
+    KtResultServiceStatus=4
+    ProcedureReturn KtFinish(8)
+  EndIf
+  MmuEnableCached()
+  If (MmuSctlr() & #MMU_SCTLR_MCI)<>#MMU_SCTLR_MCI
+    KtMmuOwned=1
+    KtResultServiceStatus=5
+    ProcedureReturn KtFinish(9)
+  EndIf
+  KtMmuOwned=1
+  KtProgressStart=KtTicks()
+  KtProgressLast=KtProgressStart
+  If DSetProgressCallback(@KtProgress)=0
+    KtResultServiceStatus=2
+    ProcedureReturn KtFinish(6)
+  EndIf
+  ; Bind the caller-owned weight pack and inference arena.
+  KtTrace(#KT_TRACE_BEFORE_BIND,#PMD_PROGRESS_BIND_BEFORE,-1)
+  If PmModelBindMemory(#KT_PMW_BASE,#PMO_WEIGHT_FILE_BYTES,#KT_ARENA_BASE,#KT_ARENA_BYTES)=0
+    KtResultModelBindError=DError
+    ProcedureReturn KtFinish(3)
+  EndIf
+  KtTrace(#KT_TRACE_AFTER_BIND,#PMD_PROGRESS_BIND_AFTER,-1)
+  If PeekL($52000000)<>$4B42544B Or PeekL($52000004)<>$31303030 Or PeekI($52000018)<>64 : ProcedureReturn KtFinish(12) : EndIf
+  If PeekI($52000010)<64 Or PeekI($52000010)>$01000000 : ProcedureReturn KtFinish(12) : EndIf
+  If PeekI($52000008)<2 Or PeekI($52000008)>(PeekI($52000010)-64)/32 : ProcedureReturn KtFinish(12) : EndIf
+  limit=PeekI($52000020)
+  If limit=0 : limit=PeekI($52000008) : EndIf
+  If limit<2 Or limit>PeekI($52000008) : ProcedureReturn KtFinish(13) : EndIf
+  started=KtTicks()
+  KtResultStoppedAt=-1
+  BookIdleCores=PmParallelCores()
+  status=KtChunk(1) : If status<>0 : ProcedureReturn KtFinish(100+status) : EndIf
+  status=KtChunk(2) : If status<>0 : ProcedureReturn KtFinish(200+status) : EndIf
+  If BtStart()=0 : ProcedureReturn KtFinish(700+BtError) : EndIf
+  PmSetIdleCallback(@BtPump)
+  BtPump()
+  status=3
+  While status<=limit
+    If KtChunk(status)<>0 Or BtFault : ProcedureReturn KtFinish(800+status) : EndIf
+    status=status+1
+  Wend
+  BtEof=1
+  Repeat
+    PmKernelIdle()
+    If KtTicks()-petTick>KtResultHz/20
+      If *KtSvcPet<>0 : KtSvcPet() : EndIf
+      petTick=KtTicks()
+    EndIf
+    If BtFault : ProcedureReturn KtFinish(900+BtFault) : EndIf
+  Until BtSent>=((KtResultSamples*2+383)/384)*3 And (KtTicks()-BtStartTicks)*375/KtResultHz>=BtSent+75
+  BtStage=4
+  KtResultTotalTicks=KtTicks()-started
+  PmSetIdleCallback(0)
+  PokeI($58000000,BookIdleCalls) : PokeI($58000008,BookIdleMaxGap) : PokeI($58000010,BookIdleFaults)
+  PokeI($58000018,BookIdleCores)
+  ProcedureReturn KtFinish(0)
+EndProcedure

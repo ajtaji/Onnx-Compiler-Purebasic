@@ -42,6 +42,56 @@ EndProcedure
 
 ; InstanceNormalization-6: y = scale * (x - mean) / sqrt(variance + epsilon) + B
 ; per instance per channel over an (N x C x D1 ... Dn) FLOAT input.
+CompilerIf #PMD_NATIVE_BYTES=8
+Global Dim PmInstanceParts.i[36]
+Procedure.i PmInstanceWorker(*p.i)
+  Protected src.i=PeekI(*p)
+  Protected scale.i=PeekI(*p+8)
+  Protected bias.i=PeekI(*p+16)
+  Protected dst.i=PeekI(*p+24)
+  Protected channels.i=PeekI(*p+32)
+  Protected spatial.i=PeekI(*p+40)
+  Protected first.i=PeekI(*p+48)
+  Protected last.i=PeekI(*p+56)
+  Protected epsilon.f=DReadF(*p+64)
+  Protected channel.i
+  Protected count.i
+  While first<last
+    channel=first%channels
+    count=channels-channel
+    If count>last-first : count=last-first : EndIf
+    PmTensorInstanceNorm(src+first*spatial*4,scale+channel*4,bias+channel*4,dst+first*spatial*4,1,count,spatial,epsilon)
+    first+count
+  Wend
+  ProcedureReturn 0
+EndProcedure
+CompilerEndIf
+Procedure PmInstanceRows(src.i,scale.i,bias.i,dst.i,batches.i,channels.i,spatial.i,epsilon.f)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected rows.i=batches*channels
+  Protected parts.i=1
+  Protected i.i
+  Protected first.i=0
+  Protected last.i
+  Protected at.i
+  If rows>=8 And rows*spatial>=16384
+    parts=PmParallelCores()
+    If parts>4 : parts=4 : EndIf
+  EndIf
+  If parts>1
+    For i=0 To parts-1
+      last=rows*(i+1)/parts : at=i*9
+      PmInstanceParts[at]=src : PmInstanceParts[at+1]=scale : PmInstanceParts[at+2]=bias : PmInstanceParts[at+3]=dst
+      PmInstanceParts[at+4]=channels : PmInstanceParts[at+5]=spatial
+      PmInstanceParts[at+6]=first : PmInstanceParts[at+7]=last : DWriteF(@PmInstanceParts[at+8],epsilon)
+      first=last
+    Next
+    If pmSvcParRun(@PmInstanceWorker,@PmInstanceParts[0],72,parts)=#PMP_SVC_OK : ProcedureReturn : EndIf
+  EndIf
+  CompilerEndIf
+  PmTensorInstanceNorm(src,scale,bias,dst,batches,channels,spatial,epsilon)
+EndProcedure
+
 Procedure DInstanceNorm(Y.i,A.i,Scale.i,Bias.i,Epsilon.f)
   Protected channels.i=0
   If A=0 Or Scale=0 Or Bias=0
@@ -61,10 +111,10 @@ Procedure DInstanceNorm(Y.i,A.i,Scale.i,Bias.i,Epsilon.f)
     DFail("InstanceNormalization scale and B must each be one-dimensional with C elements.")
     ProcedureReturn
   EndIf
-  If DLike(Y,A,0)=0
+  If DLikeOverwrite(Y,A,0)=0
     ProcedureReturn
   EndIf
-  PmTensorInstanceNorm(Dt(A)\Data,Dt(Scale)\Data,Dt(Bias)\Data,Dt(Y)\Data,DDims((A)*8+(0)),channels,DProduct(A,2,Dt(A)\Rank-1),Epsilon)
+  PmInstanceRows(Dt(A)\Data,Dt(Scale)\Data,Dt(Bias)\Data,Dt(Y)\Data,DDims((A)*8+(0)),channels,DProduct(A,2,Dt(A)\Rank-1),Epsilon)
 EndProcedure
 
 ; TopK-11: the k largest (or smallest) elements along Axis and their INT64
@@ -449,7 +499,7 @@ Procedure DPadAxes(Y.i,A.i,Pads.i,Value.i,Axes.i,Mode.i)
       ProcedureReturn
     EndIf
   EndIf
-  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0
+  If DAllocOverwrite(Y,Dt(A)\Kind,rank,@dims(0))=0
     ProcedureReturn
   EndIf
   If rank>0

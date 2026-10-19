@@ -2154,3 +2154,51 @@ has max absolute error 0.508064, RMS error 0.013865 and correlation
 0.990424. The existing maximum-error and RMS-error limits fail; they were
 not changed. At 57.413 seconds for 24.817 seconds of audio, real-time
 reading remains unachieved.
+
+## Pi 4 streaming speech runtime - October 19, 2026
+
+Seven shared runtime files split independent matrix, convolution, normalization,
+transpose, elementwise and random work across Anvil's cores. Workers own their
+scratch and complete reductions; operation order is preserved. Explicit overwrite
+allocation avoids redundant clearing while ordinary allocation and rounded slack
+retain zeroing. Adjacent single-use Mul/Add nodes share a pass without FMA,
+preserve add operand order, retain integer/generic fallbacks and release input
+storage before output allocation when needed. Fifty Kitten pairs use this path.
+
+A focused Pi 4 proof on Anvil build 328, 1.5 GHz, passed 171 cases and 3,965,472
+compared values on four cores. Cases include random boundaries, floating specials,
+integer casts, matrix tails, narrow/wide strided convolution and position tiles,
+broadcast maps, bidirectional FP32/INT8 LSTM, transpose tails and allocator bounds.
+Idle callbacks ran only on the primary. Nine host compiler scheduling controls
+cover graph outputs, repeated and later uses, nonadjacent nodes, reversed add
+operands, integer fallback and 32/64-bit emission.
+
+The final native INT8 fixture returns in 24.177 seconds for 24.667 seconds of
+speech. All 592,000 samples retain SHA-256
+`e189ff65307cf74a1b6d100157db99cbbbd8460fad5783e7702bc7df1c057aff`.
+The earlier R18 captured-noise FP32 fixture retained its original 595,600 samples and SHA-256
+`cd1bd7badfeaae64bf1d2af105922fa3ef8bb0d307fbdbf13691b36ec0e27a72`.
+The separate captured-noise FP32 comparison against ONNX Runtime still fails its existing max-absolute/RMS limits (0.508064/0.013865, correlation 0.990424). Native waveform preservation does not resolve that comparison; no tolerances were changed.
+
+The 24-chunk production Bluetooth run sent 140.688 seconds of audio. Concurrent production took 128.014 seconds for 126.281 seconds of newly generated audio: 1.01372 seconds of work per second of speech. It recorded 0 starvation events, 0 receive errors and 0 secondary-core audio calls. Maximum audio-service gap was 51.571 ms. Sustained faster-than-real-time playback is still unachieved; initial prefetch conceals the remaining deficit.
+
+Earlier long runs exposed a deficit and occasional pops despite smooth short
+prefetched runs. Leading/trailing quiet now retain at least 100/150 ms, with
+5 ms fades only on shortened edges. Interior pauses are preserved. Timing uses
+the resulting actual audio samples, so shortening silence cannot inflate the
+reported speed. The host supplies phonemes/style, never rendered audio.
+
+With weights resident, five short phrases took 1.369, 1.753, 2.202, 2.417 and 3.758 seconds of model execution. The shortest was 'Hello'; its paced audio lasts 1.397 seconds. These exclude Bluetooth connection and initial playback buffering. A 0.5-1 second request-to-speech start has not been demonstrated. The current reader prefetches two chunks before connecting; persistent connection and first-phrase scheduling remain needed for interactive startup. The complete-chunk ONNX interface supplies no partial waveform during inference.
+
+The normal release helper rebuilt, source-stamped, self-tested, timestamp-signed
+and installed the CLI/UI. The signed CLI reproduces all 12 hardware-proven INT8
+source/runtime/weight files byte for byte; 26 MathLib runtime files match.
+The language compiler did not change. UNO Q hardware and target emulation were
+not run. All board payloads returned to Anvil; no reset or boot-medium write.
+
+The subsequent R25 Bluetooth payload returned x0=0 after 163.339 seconds, then
+the network timing readback stopped responding. The host job was stopped and
+the board lease released with that unverified state; no reset was attempted.
+Its production ratio is NOT known and is not counted as a pass. The latest
+complete Bluetooth measurements above are R23. Final whole-wave FP32 rerun and
+the private PCM-copy candidate were not run after this console incident.

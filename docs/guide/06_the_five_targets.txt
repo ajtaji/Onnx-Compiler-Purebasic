@@ -216,6 +216,39 @@ reproduces its payload byte for byte.
 They are one graph, one board, one clock, one set of texts. What they
 establish is that the kernels moved and the output did not.
 
+@SECTION Streaming speech while the model runs
+
+The AArch64 runtime can split independent output rows, channels and elements
+across Anvil's cores without splitting a floating-point reduction. This now
+covers matrix tails, INT8 matrix rows and convolution input quantization,
+transposed-convolution channels, normalization rows, unary and binary work,
+and counter-indexed random draws. Large transpose swaps use tiled SIMD.
+Scratch and argument blocks are private to each worker.
+
+An application can install PmSetIdleCallback(@callback) to service audio or
+other bounded I/O inside long kernels. Only the primary core invokes it,
+at most once per millisecond; the callback must never enter the model or
+allocate tensors. Pass zero to remove it before closing the model or I/O.
+The normal progress callback still owns cancellation and watchdog servicing.
+
+The Kitten nano Rosie integration returns the INT8 fixture in 24.177 seconds
+for 24.667 seconds of speech on a Pi 4 at 1.5 GHz. Its 592,000 samples remain
+byte-identical to the previous native INT8 implementation. The FP32 waveform
+retained its complete baseline in the earlier R18 proof. Independent LSTM directions and convolution
+position tiles can now use separate cores. Single-use multiply/add pairs avoid
+an intermediate pass while retaining separate multiplication and addition.
+
+For sustained Bluetooth reading, include chunk production and SBC encoding.
+Prefetch can conceal a deficit. The measured 24-chunk reader ratio is
+1.01372 seconds of work per second of new speech. Sustained faster-than-real-time playback is still unachieved; initial prefetch conceals the remaining deficit.
+The circular queue uses Anvil's existing Bluetooth stack; the host prepares
+text inputs and the Pi generates audio. Boundary silence is conservatively
+shortened. See examples/pi4/kitten-book/README.md for the recipe and limits.
+
+Weights-resident first-phrase inference measured 1.369 seconds for 'Hello'.
+Connection and audio buffering add to that. A subsecond interactive start has
+not been proven, and the example currently prefetches before connecting.
+
 @SECTION Pico and Pico 2
 
 Two microcontroller profiles, for small models. The weights are embedded

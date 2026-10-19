@@ -5709,7 +5709,7 @@ EndProcedure
 CompilerEndIf
 
 ; Returns 0 on a fault (PmTensorInt8Fault says which), 1 otherwise.
-Procedure.i PmI8MatMul(*g.PmI8MatMulArgs)
+Procedure.i PmI8MatMulScratch(*g.PmI8MatMulArgs,scratch.i,scratchBytes.i)
   Protected es.i
   Protected qmax.i
   Protected need.i
@@ -5727,15 +5727,18 @@ Procedure.i PmI8MatMul(*g.PmI8MatMulArgs)
   es = 1 + *g\Wide
   qmax = 127 : If *g\Wide <> 0 : qmax = 32767 : EndIf
   need = PmI8ScratchBytes(*g\M * *g\K, *g\M, *g\Wide)
-  If PmTensorInt8Scratch = 0 Or need > PmTensorInt8ScratchBytes
+  If scratch = 0 Or need > scratchBytes
     PmTensorInt8Fault = 2 : ProcedureReturn 0
   EndIf
-  q = PmI8Base()
+  q = PmI8Align(scratch)
   s = q + PmI8Align(*g\M * *g\K * es)
   inv = s + PmI8Align(*g\M * 4)
   tile = inv + PmI8Align(*g\M * 4)
   r = 0
   While r < *g\M
+    CompilerIf #PMO_INT8_BACKEND=1
+    PmKernelIdle()
+    CompilerEndIf
     If PmI8QuantRow(*g\A + r * *g\K * 4, *g\K, 4, qmax, q + r * *g\K * es, s + r * 4, inv + r * 4) = 0
       PmTensorInt8Fault = 1 : ProcedureReturn 0
     EndIf
@@ -5747,6 +5750,9 @@ Procedure.i PmI8MatMul(*g.PmI8MatMulArgs)
   CompilerEndIf
   r = 0
   While r < *g\M
+    CompilerIf #PMO_INT8_BACKEND=1
+    PmKernelIdle()
+    CompilerEndIf
     c = col0
     While c < *g\N
       f1 = PmI8RowF(0.0, q + r * *g\K * es, es, *g\B + c, *g\N, *g\K, *g\Wide, PmI8GetF(s + r * 4))
@@ -5761,6 +5767,10 @@ Procedure.i PmI8MatMul(*g.PmI8MatMulArgs)
     r = r + 1
   Wend
   ProcedureReturn 1
+EndProcedure
+
+Procedure.i PmI8MatMul(*g.PmI8MatMulArgs)
+  ProcedureReturn PmI8MatMulScratch(*g,PmTensorInt8Scratch,PmTensorInt8ScratchBytes)
 EndProcedure
 
 ; The fixed-shape entry: narrow weights.
@@ -6675,11 +6685,11 @@ Procedure PmTensorResize1D(*src.i, *dst.i, outer.i, inWidth.i, outWidth.i, mode.
   Protected high.f
   Protected fraction.f
   Protected whole.f
-  row = 0
-  While row < outer
-    base = row * inWidth
-    ox = 0
-    While ox < outWidth
+  ox = 0
+  While ox < outWidth
+    CompilerIf #PMO_INT8_BACKEND=1
+    If (ox & 127)=0 : PmKernelIdle() : EndIf
+    CompilerEndIf
       If coordinateMode = 1
         source = ox
         source = (source + 0.5) / scale - 0.5
@@ -6693,7 +6703,11 @@ Procedure PmTensorResize1D(*src.i, *dst.i, outer.i, inWidth.i, outWidth.i, mode.
       If mode = 0
         If ix0 < 0 : ix0 = 0 : EndIf
         If ix0 >= inWidth : ix0 = inWidth - 1 : EndIf
-        PmTensorPut(*dst, row * outWidth + ox, PmTensorGet(*src, base + ix0))
+        row = 0
+        While row < outer
+          PmTensorPut(*dst, row * outWidth + ox, PmTensorGet(*src, row * inWidth + ix0))
+          row = row + 1
+        Wend
       Else
         ix1 = ix0 + 1
         whole = ix0
@@ -6702,13 +6716,16 @@ Procedure PmTensorResize1D(*src.i, *dst.i, outer.i, inWidth.i, outWidth.i, mode.
         If ix1 < 0 : ix1 = 0 : EndIf
         If ix0 >= inWidth : ix0 = inWidth - 1 : EndIf
         If ix1 >= inWidth : ix1 = inWidth - 1 : EndIf
-        low = PmTensorGet(*src, base + ix0)
-        high = PmTensorGet(*src, base + ix1)
-        PmTensorPut(*dst, row * outWidth + ox, low + (high - low) * fraction)
+        row = 0
+        While row < outer
+          base = row * inWidth
+          low = PmTensorGet(*src, base + ix0)
+          high = PmTensorGet(*src, base + ix1)
+          PmTensorPut(*dst, row * outWidth + ox, low + (high - low) * fraction)
+          row = row + 1
+        Wend
       EndIf
-      ox = ox + 1
-    Wend
-    row = row + 1
+    ox = ox + 1
   Wend
 EndProcedure
 CompilerEndIf
@@ -6998,7 +7015,7 @@ CompilerIf #PMO_INT8_BACKEND = 1
 ; positions per tile, any stride (the phase layout makes every tap's sixteen
 ; values neighbours); the last tile of a row is computed whole and stored as
 ; far as the row goes.
-Procedure PmI8Conv1DNeonRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, ocLast.i, tile.i)
+Procedure PmI8Conv1DNeonPositionRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, ocLast.i, tile.i,positionFirst.i,positionLast.i)
   Protected ta.PmI8TileArgs
   Protected ea.PmI8EpiArgs
   Protected qp.i
@@ -7048,8 +7065,9 @@ Procedure PmI8Conv1DNeonRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, ocLast.i, 
     w2 = wlast : If rows > 2 : w2 = w1 + cg * *g\Kernel : EndIf
     w3 = wlast : If rows > 3 : w3 = w2 + cg * *g\Kernel : EndIf
     qrow = q + grp * cg * qp * es
-    p0 = 0
-    While p0 < *g\OutWidth
+    p0 = positionFirst
+    While p0 < positionLast
+      If (p0 & 255)=0 : PmKernelIdle() : EndIf
       p = 0
       While p <= *g\Wide
         ta\F = tile + p * 256 : ta\Zero = 1
@@ -7101,6 +7119,10 @@ Procedure PmI8Conv1DNeonRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, ocLast.i, 
     oc = oc + rows
   Wend
 EndProcedure
+Procedure PmI8Conv1DNeonRange(*g.PmTensorConv1DArgs,bn.i,ocFirst.i,ocLast.i,tile.i)
+  PmI8Conv1DNeonPositionRange(*g,bn,ocFirst,ocLast,tile,0,*g\OutWidth)
+EndProcedure
+
 CompilerEndIf
 
 ; Output channels [ocFirst, ocLast) of batch bn, from the quantized batch.
@@ -7941,7 +7963,7 @@ CompilerIf #PMO_USE_INT8 = 1
 ; pre-activation is (bias sum) + W.x + R.h in that order. A weight left in
 ; FP32 contributes the float dot of the reference instead.
 ; Returns 0 on a fault (PmTensorInt8Fault says which).
-Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
+Procedure.i PmI8LstmRange(*g.PmTensorLstmArgs,scratch.i,scratchBytes.i,firstDir.i,lastDir.i)
   Protected width.i
   Protected ww.i
   Protected rw.i
@@ -7986,10 +8008,10 @@ Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
   width = 4 * *g\Hidden
   ww = 0 : If *g\WScales <> 0 : ww = *g\WWide : EndIf
   rw = 0 : If *g\RScales <> 0 : rw = *g\RWide : EndIf
-  If PmTensorInt8Scratch = 0 Or PmI8LstmScratchBytes(*g\InputSize, *g\Hidden, ww, rw) > PmTensorInt8ScratchBytes
+  If scratch = 0 Or PmI8LstmScratchBytes(*g\InputSize, *g\Hidden, ww, rw) > scratchBytes
     PmTensorInt8Fault = 2 : ProcedureReturn 0
   EndIf
-  xq = PmI8Base()
+  xq = scratch
   hq = xq + PmI8Align(*g\InputSize * (1 + ww))
   gw = hq + PmI8Align(*g\Hidden * (1 + rw))
   gr = gw + PmI8Align(width * 4)
@@ -7999,19 +8021,21 @@ Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
   rElements = *g\Directions * width * *g\Hidden
   qx = 127 : If ww <> 0 : qx = 32767 : EndIf
   qh = 127 : If rw <> 0 : qh = 32767 : EndIf
-  PmTensorLstmClearY(*g)
-  i = 0
-  While i < *g\Directions * *g\Batch * *g\Hidden
+  i = firstDir * *g\Batch * *g\Hidden
+  While i < lastDir * *g\Batch * *g\Hidden
     iv = 0.0 : cv = 0.0
     If *g\InitialH <> 0 : iv = PmI8GetF(*g\InitialH + i * 4) : EndIf
     If *g\InitialC <> 0 : cv = PmI8GetF(*g\InitialC + i * 4) : EndIf
     PmI8PutF(*g\YH + i * 4, iv) : PmI8PutF(*g\YC + i * 4, cv)
     i = i + 1
   Wend
-  dir = 0
-  While dir < *g\Directions
+  dir = firstDir
+  While dir < lastDir
     stepIndex = 0
     While stepIndex < *g\Sequence
+      CompilerIf #PMO_INT8_BACKEND=1
+      PmKernelIdle()
+      CompilerEndIf
       bn = 0
       While bn < *g\Batch
         valid = PmTensorLstmValid(*g, bn)
@@ -8148,6 +8172,11 @@ Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
   Wend
   ProcedureReturn 1
 EndProcedure
+Procedure.i PmI8Lstm(*g.PmTensorLstmArgs)
+  PmTensorLstmClearY(*g)
+  ProcedureReturn PmI8LstmRange(*g,PmTensorInt8Scratch,PmTensorInt8ScratchBytes,0,*g\Directions)
+EndProcedure
+
 CompilerEndIf
 
 Procedure PmTensorLstm(*g.PmTensorLstmArgs)
@@ -8219,6 +8248,9 @@ Procedure PmTensorLstm(*g.PmTensorLstmArgs)
   While dir < *g\Directions
     step = 0
     While step < *g\Sequence
+      CompilerIf #PMO_INT8_BACKEND=1
+      PmKernelIdle()
+      CompilerEndIf
       bn = 0
       While bn < *g\Batch
         valid = PmTensorLstmValid(*g, bn)
