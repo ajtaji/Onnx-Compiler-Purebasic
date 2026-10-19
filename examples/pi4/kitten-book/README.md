@@ -121,6 +121,80 @@ changes. UNO Q has not been hardware-tested for this update.
 
 All three measured excerpts generated faster than playback, with no recorded starvation.
 
-Weights-resident short-phrase inference now measures 1.313 seconds for 'Hello'. The other four phrases measure 1.657, 2.074, 2.274, 3.523 seconds. These exclude speaker connection and buffering. A 0.5-1 second request-to-speech start has not been demonstrated. The current book reader prefetches two chunks before connecting; an interactive reader still needs a persistent model/connection and an opening-phrase scheduler. Kitten returns each complete waveform, so it currently cannot play part of a phrase while that phrase is still being generated.
+The full-waveform control measured 1.313 seconds for Hello, excluding speaker setup. The book reader still prefetches two chunks before connecting. The separate warm-reply mode below starts from generated waveform windows while the rest is computed; its latency and quality checks are reported separately.
 
 The reader refuses SBC frames with an invalid sync header (playback fault 4).
+
+
+## Warm replies and route instructions
+
+Use `prepare_reply.py` for interactive replies with the model already resident
+and Bluetooth already connected. The same host-prepared input format is used.
+The generated `ReplyStart(index)`, `ReplyDrain()` and `ReplyPoll()` procedures
+can be called from an enclosing application loop. `ReplyStart` is synchronous,
+but begins playback from early windows before synthesis finishes. Poll while
+waiting for input; the primary-core idle callback services Bluetooth during
+inference. Drain the preceding queue before submitting an independent reply.
+
+```powershell
+py prepare_reply.py --anvil ANVIL_ROOT --model model/kitten.pi4 --inputs directions.ktbk --firmware BRCMBT.HCD --private-config speaker.bin --out replies
+PureMetalForge.exe --compile replies/KittenReplySession.pi4 -t pi4 --load-addr 0x3000000 --bss-addr 0x1000000 --stack-addr 0x7F00000 --entry-returns --wants-services -o replies/KittenReplySession.img
+py ANVIL_ROOT/tools/board_model_run.py replies/reply.run.json --console-ip PI_ADDRESS --lease-file BOARD_SHARE_FILE --lane kitten-replies --lease-wait 1
+py read_reply_results.py replies/runs/RUN_ID
+```
+
+The supplied Main is a bounded demonstration: it warms the model, opens A2DP
+once, reads each prepared input as a fresh request, then returns and releases
+Bluetooth. In an application, retain the initialized model and connection
+around the application's own request loop. No TruckGPS source is changed.
+The input table supports 1..128 short replies. Long requests can exceed the
+bounded temporal scratch map; split them into shorter phrases. The adapter
+requires the validated Kitten 0.8 INT8 emitted graph and refuses other graphs
+instead of assuming that their tensor identifiers have the same meaning.
+
+Additional temporary slots are `0x48000000` (latent features, 2 MiB),
+`0x48200000` (F0), `0x48400000` (spectrogram, 4 MiB), and `0x4A000000`
+(assembled output, 16 MiB). These returning-payload slots do not alter boot
+media. They must be reserved before embedding the example in another app.
+
+For route lookahead or fixed prompts, add `--prepared` and choose a new output
+folder. This generates complete instructions on the Pi before opening A2DP,
+stores up to 64 MiB of audio at `0x4C000000`, and uses the same reply API for
+later cached requests. The model remains loaded. Preparation and request
+timings are reported separately; this mode does not claim fresh synthesis
+in a few milliseconds. `ReplyCachePrepare` runs during initial warmup.
+
+Fresh replies retain a common excitation phase across all windows and blend
+joins for 20 ms. Their per-window normalization differs from the full-waveform
+model. The control using one full window preserves the reference samples;
+the streamed path is separately checked for clear, continuous playback.
+
+Measured four-core GPS tests, with upstream Rosie speed 0.8:
+
+| Path | First voice packet | Active stream position | Queue starvation |
+|---|---:|---:|---:|
+| Fresh short directions | about 0.80 s | about 0.86-0.89 s | 0 |
+| Fresh longer directions | about 1.02-1.29 s | about 1.10-1.37 s | 0 |
+| Prepared directions | 3-8 ms | about 80-85 ms before retained leading quiet | 0 |
+
+Prepared active-audio positions are 0.08-0.32 seconds including leading quiet.
+The listener confirmed the fresh directions clear and continuous. The speaker's
+additional acoustic delay was not measured. Fresh model work/audio ratios are
+still above one on these short clips; the initial queued speech permits
+continuous playback. Use the full-waveform reader for sustained books, and
+route lookahead to leave the inference cores available during directions.
+
+The USB reply recipes use the existing weights, firmware and speaker bond:
+
+```text
+load 2:/models/KITTEN8.PMW 44000000
+load 2:/models/GPSREPLY.KTB 52000000
+load 1:/BRCMBT.HCD 53000000
+load 2:/models/KITBT.CFG 53010000
+load 2:/models/KITREPLY.PMF 3000000
+deadman 15
+boot mem 3000000
+```
+
+Use `KITNAV.PMF` instead of `KITREPLY.PMF` for the prepared-instruction version.
+After either demonstration returns, use `deadman off`. Neither changes auto boot.

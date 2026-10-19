@@ -1,0 +1,9 @@
+  If *KittenWindowPublish=0
+    keep=count-#KT_TRIM
+    DCopy(Dt(id)\Data,#KT_WAVE_BASE,keep*4)
+    KtWaveUsed=keep*4 : KtResultSamples=keep
+  EndIf
+  If k<=128 : PokeI($58002010+(k-1)*32,KtResultSamples) : EndIf
+  elapsed=KtTicks()-bookBegin : BookTotalTicks=BookTotalTicks+elapsed
+  KtResultBytes=KtWaveUsed : KtResultRequests=KtResultRequests+1
+  ProcedureReturn 0

@@ -2185,7 +2185,35 @@ of Alice's Adventures in Wonderland, including narration and short dialogue.
 
 All three measured excerpts generated faster than playback, with no recorded starvation.
 
-Weights-resident short-phrase inference now measures 1.313 seconds for 'Hello'. The other four phrases measure 1.657, 2.074, 2.274, 3.523 seconds. These exclude speaker connection and buffering. A 0.5-1 second request-to-speech start has not been demonstrated. The current book reader prefetches two chunks before connecting; an interactive reader still needs a persistent model/connection and an opening-phrase scheduler. Kitten returns each complete waveform, so it currently cannot play part of a phrase while that phrase is still being generated.
+Warm interactive replies now have a separate prepare_reply.py example. It
+keeps the model bound and A2DP streaming between requests. Short GPS directions
+reach their first voice packet in about 0.80 seconds, at stream positions about
+0.86-0.89 seconds, while later waveform windows are still being generated.
+Eight directions completed without speech-queue underruns or Bluetooth faults;
+the listener confirmed clear, continuous speech. Longer fresh directions still
+take about 1.10-1.37 seconds to reach the stream's active-audio position.
+
+The model-specific adapter computes excitation and STFT once for the whole
+reply, then uses short initial vocoder windows and larger later windows.
+It caps the initial boundary duration at eight frames and blends 20 ms at
+window joins. Normalization is local to each window, so this reply mode has
+a separate listening contract from the byte-identical full-waveform runtime.
+A full-window control reproduces all five reference phrases byte for byte.
+The preparer checks the supported emitted graph signature before adapting it.
+
+For known route instructions, --prepared generates complete audio on the Pi
+during warmup. Later requests reach a voice packet in 3-8 ms and a stream
+position near 80-85 ms, leaving the inference cores idle during playback.
+Preparation cost 1.46-2.77 seconds per tested instruction and is excluded from
+those request times. Active audio falls at stream positions of 0.08-0.32 seconds
+including retained leading quiet. Neither mode measures the speaker's acoustic latency.
+Text preparation still supplies phonemes/style/speed from the host; no host
+inference engine renders the audio. The TruckGPS project itself is unchanged.
+
+The fresh reply path prioritizes onset and continuity: its complete model
+work/audio ratio is still above 1 for these short clips. It does not establish
+new sustained book-reading headroom. The existing full-waveform book results
+remain 0.96403, 0.95064 and 0.94096; do not replace them with cached timings.
 
 Earlier short prefetched runs concealed a sustained deficit. The listener
 reported clear speech, then occasional pops on a longer run, then unusual pauses.
@@ -2245,3 +2273,26 @@ benefit on the reference fixture and are not retained. A boundary-duration
 quality experiment is still private and unproven; do not count it as a result.
 TruckGPS directions are the interactive use case. Route lookahead/cache and
 fresh synthesis must be measured separately. No TruckGPS files changed.
+
+
+### Packaged warm reply release, 2026-10-19
+
+The packaged fresh reply API passed eight GPS requests on Anvil build 328,
+four cores, 1.5 GHz: first packets 0.783-0.806 s for Turn/Keep directions,
+active stream positions 0.859-0.883 s. Longer directions: 1.096-1.363 s.
+Zero speech-queue underruns, Bluetooth late events, receive errors and faults;
+max pump gap 14.847 ms. The listener confirmed the faster packaged version
+clear and continuous. Model weights bind once, and A2DP stays connected while
+idle silence keeps the speaker ready. The demonstration returns after eight
+requests; application loops can retain it using ReplyStart/ReplyDrain/ReplyPoll.
+
+The working adapter caps the initial boundary duration at eight frames,
+computes the whole reply excitation/STFT once to retain phase, and begins with
+four 32-frame vocoder windows before increasing later windows. Joins blend
+20 ms. Local window normalization changes the generated waveform; this is
+separate from the exact full-waveform runtime contract. The full-window
+adapter control reproduces all five captured short phrase waveforms exactly.
+The preparer checks emitted source SHA-256
+f12075e4c0ee0d832ff858724cc21d56bcc5cf51c22bed174b52c2e53407805c.
+
+Prepared warmup generated 18.052667 seconds of complete audio in 15.637683 seconds (work/audio 0.866226, before Bluetooth opens). This preparation is separate from cached request latency. Both packaged modes passed all eight requests without queue starvation or Bluetooth faults. The combined signed runtime proof passes 703 cases and 5,549,816 comparisons.

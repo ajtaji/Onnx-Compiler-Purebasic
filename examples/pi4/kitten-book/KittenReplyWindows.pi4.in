@@ -1,0 +1,90 @@
+; Kitten 0.8 model-specific temporal adapter; the preparer verifies the model signature.
+Global *KittenWindowPublish
+Global KittenWindowTotalSamples.i
+Global KittenWindowFirstTicks.i,KittenWindowFrontTicks.i,KittenWindowCount.i
+Procedure.i KittenWindowClock()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure PmModelStage1()
+  Protected started.i=KittenWindowClock(),width.i,channels.i,i.i,j.i,at.i=0
+  Protected first.i,last.i,take.i,coreEnd.i,fullSamples.i,outAt.i,emitEnd.i,step.i=32
+  Protected left.f,right.f
+  Protected specWidth.i,specChannels.i,specExtra.i,specTake.i
+  KittenWindowFirstTicks=0 : KittenWindowCount=0
+  KittenWindowFrontend()
+  If DError Or DCancel : ProcedureReturn : EndIf
+  KittenWindowFrontTicks=KittenWindowClock()-started
+  width=DDims(2068*8+2) : channels=DDims(2068*8+1)
+  PokeI($58C00000,width) : PokeI($58C00008,channels)
+  PokeI($58C00010,Dt(1941)\Rank) : PokeI($58C00018,Dt(1941)\Count)
+  PokeI($58C00020,DDims(1941*8+2))
+  If Dt(2068)\Rank<>3 Or DDims(2068*8)<>1 Or width<1 Or channels<1 Or channels*width*4>$200000
+    DFail("Reply vocoder window latent shape is outside the bounded scratch map.") : ProcedureReturn
+  EndIf
+  If Dt(1941)\Rank<>3 Or Dt(1941)\Count<>width Or DDims(1941*8+2)<>width
+    DFail("Reply vocoder window F0 must match the latent width.") : ProcedureReturn
+  EndIf
+  fullSamples=width*300 : KittenWindowTotalSamples=fullSamples
+  If fullSamples*4>$1000000 : DFail("Reply vocoder window output exceeds scratch.") : ProcedureReturn : EndIf
+  DCopy(Dt(2068)\Data,$48000000,channels*width*4)
+  DCopy(Dt(1941)\Data,$48200000,width*4)
+  KittenPrepareExcitation()
+  If DError Or DCancel : ProcedureReturn : EndIf
+  specWidth=DDims(2179*8+2) : specChannels=DDims(2179*8+1)
+  specExtra=specWidth-width*60
+  PokeI($58C00028,specWidth) : PokeI($58C00030,specChannels) : PokeI($58C00038,specExtra)
+  If specExtra<0 Or specExtra>1 Or Dt(2179)\Bytes>$400000
+    DFail("Continuous excitation spectrogram is outside the reply scratch map.") : ProcedureReturn
+  EndIf
+  DCopy(Dt(2179)\Data,$48400000,Dt(2179)\Bytes)
+  For i=2069 To #PMD_TENSOR_COUNT : DRelease(i) : Next
+  DRelease(2068) : DRelease(1941)
+  While at<width
+    first=at-8 : If first<0 : first=0 : EndIf
+    coreEnd=at+step : If coreEnd>width : coreEnd=width : EndIf
+    last=coreEnd+8 : If last>width : last=width : EndIf
+    take=last-first
+    If DShapeOverwrite(2068,1,3,1,channels,take,0)=0 : ProcedureReturn : EndIf
+    If DShapeOverwrite(1941,1,3,1,1,take,0)=0 : ProcedureReturn : EndIf
+    For i=0 To channels-1
+      DCopy($48000000+(i*width+first)*4,Dt(2068)\Data+i*take*4,take*4)
+    Next
+    DCopy($48200000+first*4,Dt(1941)\Data,take*4)
+    specTake=take*60+specExtra
+    If DShapeOverwrite(2179,1,3,1,specChannels,specTake,0)=0 : ProcedureReturn : EndIf
+    For i=0 To specChannels-1
+      DCopy($48400000+(i*specWidth+first*60)*4,Dt(2179)\Data+i*specTake*4,specTake*4)
+    Next
+    KittenWindowTail()
+    If DError Or DCancel : ProcedureReturn : EndIf
+    If Dt(2728)\Count<>take*300 : DFail("Reply window output sample count mismatch.") : ProcedureReturn : EndIf
+    If at>0
+      For i=0 To 479
+        left=PmTensorGet($4A000000,at*300-480+i)
+        right=PmTensorGet(Dt(2728)\Data,(at-first)*300-480+i)
+        PmTensorPut($4A000000,at*300-480+i,left*((479-i)/480.0)+right*(i/480.0))
+      Next
+    EndIf
+    DCopy(Dt(2728)\Data+(at-first)*300*4,$4A000000+at*300*4,(coreEnd-at)*300*4)
+    KittenWindowCount=KittenWindowCount+1
+    If KittenWindowFirstTicks=0 : KittenWindowFirstTicks=KittenWindowClock()-started : EndIf
+    If *KittenWindowPublish<>0
+      outAt=at*300-480 : If outAt<0 : outAt=0 : EndIf
+      emitEnd=coreEnd*300-480 : If coreEnd=width : emitEnd=fullSamples : EndIf
+      If KittenWindowPublish($4A000000+outAt*4,emitEnd-outAt,outAt)=0
+        DFail("Streaming reply output callback refused the audio window.") : ProcedureReturn
+      EndIf
+    EndIf
+    For i=2069 To #PMD_TENSOR_COUNT : DRelease(i) : Next
+    at=coreEnd
+    If KittenWindowCount>=4 And step<128 : step=step+16 : EndIf
+    If step>128 : step=128 : EndIf
+    PmKernelIdle()
+  Wend
+  DRelease(1948)
+  If DShapeOverwrite(2728,1,1,fullSamples,0,0,0)=0 : ProcedureReturn : EndIf
+  DCopy($4A000000,Dt(2728)\Data,fullSamples*4)
+EndProcedure

@@ -235,7 +235,7 @@ The Kitten nano Rosie integration returns the INT8 fixture in 23.015 seconds
 for 24.667 seconds of speech on a Pi 4 at 1.5 GHz. All 592,000 native samples
 remain byte-identical. Convolution uses small position windows across output
 channels and interleaves independent integer rows while retaining reduction
-order. The current focused Pi proof passes 255 cases and 4,575,672 values.
+order. The current focused Pi proof passes 703 cases and 5,549,816 values.
 
 For sustained reading, include complete chunk production and SBC encoding.
 The three 24-chunk chapter excerpts measured work/audio ratios of
@@ -243,7 +243,35 @@ The three 24-chunk chapter excerpts measured work/audio ratios of
 Initial prefetch is excluded, and ratios use the actual paced samples.
 See examples/pi4/kitten-book/README.md for the recipe, each result and limits.
 
-Weights-resident short-phrase inference now measures 1.313 seconds for 'Hello'. The other four phrases measure 1.657, 2.074, 2.274, 3.523 seconds. These exclude speaker connection and buffering. A 0.5-1 second request-to-speech start has not been demonstrated. The current book reader prefetches two chunks before connecting; an interactive reader still needs a persistent model/connection and an opening-phrase scheduler. Kitten returns each complete waveform, so it currently cannot play part of a phrase while that phrase is still being generated.
+Warm interactive replies now have a separate prepare_reply.py example. It
+keeps the model bound and A2DP streaming between requests. Short GPS directions
+reach their first voice packet in about 0.80 seconds, at stream positions about
+0.86-0.89 seconds, while later waveform windows are still being generated.
+Eight directions completed without speech-queue underruns or Bluetooth faults;
+the listener confirmed clear, continuous speech. Longer fresh directions still
+take about 1.10-1.37 seconds to reach the stream's active-audio position.
+
+The model-specific adapter computes excitation and STFT once for the whole
+reply, then uses short initial vocoder windows and larger later windows.
+It caps the initial boundary duration at eight frames and blends 20 ms at
+window joins. Normalization is local to each window, so this reply mode has
+a separate listening contract from the byte-identical full-waveform runtime.
+A full-window control reproduces all five reference phrases byte for byte.
+The preparer checks the supported emitted graph signature before adapting it.
+
+For known route instructions, --prepared generates complete audio on the Pi
+during warmup. Later requests reach a voice packet in 3-8 ms and a stream
+position near 80-85 ms, leaving the inference cores idle during playback.
+Preparation cost 1.46-2.77 seconds per tested instruction and is excluded from
+those request times. Active audio falls at stream positions of 0.08-0.32 seconds
+including retained leading quiet. Neither mode measures the speaker's acoustic latency.
+Text preparation still supplies phonemes/style/speed from the host; no host
+inference engine renders the audio. The TruckGPS project itself is unchanged.
+
+The fresh reply path prioritizes onset and continuity: its complete model
+work/audio ratio is still above 1 for these short clips. It does not establish
+new sustained book-reading headroom. The existing full-waveform book results
+remain 0.96403, 0.95064 and 0.94096; do not replace them with cached timings.
 
 @SECTION Pico and Pico 2
 

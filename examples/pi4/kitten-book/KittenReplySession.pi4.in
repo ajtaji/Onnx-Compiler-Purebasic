@@ -1,0 +1,49 @@
+; Call ReplyStart with a prepared input index, keep calling BtPump while idle,
+; and drain the preceding queue before submitting another independent reply.
+; Model weights and A2DP stay live throughout the enclosing application's loop.
+Procedure.i ReplyPoll()
+  BtPump()
+  If *KtSvcPet<>0 : KtSvcPet() : EndIf
+  ProcedureReturn Bool(BtRunning And BtFault=0)
+EndProcedure
+
+Procedure.i ReplyDrain()
+  Protected deadline.i=KtTicks()+KtResultHz*#KT_TIMEOUT_SECONDS
+  Repeat
+    If ReplyPoll()=0 Or KtTicks()>deadline : ProcedureReturn 0 : EndIf
+  Until BtRead48>=KtResultSamples*2 And ReplyFirstPacket<>0
+  PokeI($58004030+(ReplyIndex-1)*64,ReplyUnderrun)
+  ReplyIndex=0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ReplyStart(index.i)
+  If index<1 Or index>128 Or index>PeekI($52000008) Or BtRunning=0 Or BtFault : ProcedureReturn 0 : EndIf
+  If BtRead48<KtResultSamples*2 : ProcedureReturn 0 : EndIf
+  ReplyIndex=index : ReplyFirstPacket=0 : ReplyPacketVoice=0
+  ReplyDone=0 : ReplyUnderrun=0 : ReplyAudible=0 : ReplyPacketAudible=0
+  BtRead48=0 : KtWaveUsed=0 : KtResultSamples=0
+  ReplyStarted=KtTicks()
+  If KtChunk(index)<>0 Or BtFault : ProcedureReturn 0 : EndIf
+  ReplyDone=1
+  PokeI($58004020+(index-1)*64,KtTicks())
+  PokeI($58004028+(index-1)*64,KittenWindowFirstTicks)
+  ProcedureReturn 1
+EndProcedure
+
+; Bounded demonstration loop
+  status=KtChunk(1) : If status<>0 : ProcedureReturn KtFinish(100+status) : EndIf
+  KtWaveUsed=0 : KtResultSamples=0 : KtResultBytes=0 : KtResultRequests=0
+  If BtStart()=0 : ProcedureReturn KtFinish(700+BtError) : EndIf
+  PmSetIdleCallback(@BtPump)
+  *KittenWindowPublish=@ReplyPublish
+  started=KtTicks()+KtResultHz
+  While KtTicks()<started : BtPump() : If *KtSvcPet<>0 : KtSvcPet() : EndIf : Wend
+  sessionStarted=KtTicks()
+  For status=1 To limit
+    If ReplyStart(status)=0 : ProcedureReturn KtFinish(800+status) : EndIf
+    If ReplyDrain()=0 : ProcedureReturn KtFinish(900+status) : EndIf
+    ; A demonstration request gap. Applications poll while waiting for input.
+    started=KtTicks()+KtResultHz
+    While KtTicks()<started : BtPump() : If *KtSvcPet<>0 : KtSvcPet() : EndIf : Wend
+  Next

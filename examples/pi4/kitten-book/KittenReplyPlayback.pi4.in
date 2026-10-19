@@ -1,0 +1,132 @@
+; Warm A2DP reply queue, using the shared Anvil stack and SBC implementation.
+Global ReplyDone.i,ReplyUnderrun.i,ReplyAudible.i,ReplyPacketAudible.i
+Global ReplyIndex.i,ReplyStarted.i,ReplyFirstPacket.i,ReplyFrame.i,ReplyPacketVoice.i
+
+Procedure.i ReplyPublish(data.i,samples.i,offset.i)
+  Protected i.i,bits.l,firstActive.i=-1,skip.i=0,head.i,firstCopy.i,limit.i=KittenWindowTotalSamples-#KT_TRIM
+  If offset>=limit : ReplyDone=1 : ProcedureReturn 1 : EndIf
+  If samples>limit-offset : samples=limit-offset : EndIf
+  If offset+samples>=limit : ReplyDone=1 : EndIf
+  If samples<1 : ProcedureReturn 1 : EndIf
+  For i=0 To samples-1
+    bits=PeekL(data+i*4)
+    If (bits & $7F800000)=$7F800000 : ProcedureReturn 0 : EndIf
+    If (bits & $7FFFFFFF)>$38D1B717 And firstActive<0 : firstActive=i : EndIf
+  Next
+  If offset=0 And firstActive>2400 : skip=firstActive-2400 : EndIf
+  samples=samples-skip : data=data+skip*4
+  If samples*4>#KT_WAVE_BYTES-KtWaveUsed : ProcedureReturn 0 : EndIf
+  head=KtWaveUsed % #KT_WAVE_BYTES
+  firstCopy=samples*4 : If firstCopy>#KT_WAVE_BYTES-head : firstCopy=#KT_WAVE_BYTES-head : EndIf
+  DCopy(data,#KT_WAVE_BASE+head,firstCopy)
+  If firstCopy<samples*4 : DCopy(data+firstCopy,#KT_WAVE_BASE,samples*4-firstCopy) : EndIf
+  If ReplyIndex>0 And ReplyIndex<=8 And KittenWindowCount<=16
+    head=$58C01000+(ReplyIndex-1)*512+(KittenWindowCount-1)*32
+    PokeI(head,KtTicks()-ReplyStarted) : PokeI(head+8,samples)
+    PokeI(head+16,KtResultSamples-BtRead48/2) : PokeI(head+24,ReplyUnderrun)
+  EndIf
+  KtWaveUsed=KtWaveUsed+samples*4 : KtResultSamples=KtResultSamples+samples
+  ProcedureReturn 1
+EndProcedure
+
+Procedure BtPump()
+  Protected now.i, gap.i, due.i, packet.i, i.i, k.i, at.i, nextAt.i, begin.i
+  Protected sample.f, other.f
+  Protected pcm.i, source.i, *pcmSource.f
+  If BtRunning=0 Or BtFault : ProcedureReturn : EndIf
+  now=KtTicks()
+  If PmKernelCore()<>0 : BookIdleFaults=BookIdleFaults+1 : BtFault=1 : ProcedureReturn : EndIf
+  If BookIdleLast
+    gap=now-BookIdleLast
+    If gap>BookIdleMaxGap : BookIdleMaxGap=gap : PokeI($58000020,DNode) : EndIf
+  EndIf
+  BookIdleLast=now : BookIdleCalls=BookIdleCalls+1
+  If A2dpPoll()<>#A2DP_STREAMING : BtFault=2 : ProcedureReturn : EndIf
+  due=(now-BtStartTicks)*375/KtResultHz
+  If BtSent>0 And due>BtSent And (BtEof=0 Or BtSent<((KtResultSamples*2+383)/384)*3)
+    If BtLate=0 : BtLateEvents=BtLateEvents+1 : EndIf
+    BtLate=1
+    If due-BtSent>BtMaxLate : BtMaxLate=due-BtSent : EndIf
+  Else
+    BtLate=0
+  EndIf
+  For packet=0 To 3
+    While BtHave<3 And BtSent+BtHave<due+32
+      begin=KtTicks()
+      at=BtRead48/2
+      source=at%(#KT_WAVE_BYTES/4)
+      If (BtRead48 & 1)=0 And at+65<=KtResultSamples And source+65<=#KT_WAVE_BYTES/4
+        ; A complete frame in one ring span: share each pair's source reads.
+        source=#KT_WAVE_BASE+source*4
+        For i=0 To 63
+          *pcmSource=source : sample=*pcmSource.f
+          *pcmSource=source+4 : other=*pcmSource.f
+          sample=sample*32767.0
+          If sample>32767.0 : sample=32767.0 : EndIf
+          If sample< -32768.0 : sample=-32768.0 : EndIf
+          pcm=Int(sample) : SbcPcm(i*2)=pcm
+          *pcmSource=source : sample=(*pcmSource.f+other)*0.5
+          sample=sample*32767.0
+          If sample>32767.0 : sample=32767.0 : EndIf
+          If sample< -32768.0 : sample=-32768.0 : EndIf
+          pcm=Int(sample) : SbcPcm(i*2+1)=pcm
+          source=source+4
+        Next
+        BtRead48=BtRead48+128
+      ElseIf at<KtResultSamples
+      For i=0 To 127
+        at=BtRead48/2
+        sample=0.0
+        If at<KtResultSamples
+          sample=PmTensorGet(#KT_WAVE_BASE,(at%(#KT_WAVE_BYTES/4)))
+          If (BtRead48 & 1)<>0 And at+1<KtResultSamples
+            nextAt=(at+1)%(#KT_WAVE_BYTES/4)
+            other=PmTensorGet(#KT_WAVE_BASE,nextAt)
+            sample=(sample+other)*0.5
+          EndIf
+        EndIf
+        If sample<>sample : BtFault=3 : ProcedureReturn : EndIf
+        sample=sample*32767.0
+        If sample>32767.0 : sample=32767.0 : EndIf
+        If sample< -32768.0 : sample=-32768.0 : EndIf
+        pcm=Int(sample) : SbcPcm(i)=pcm
+        BtRead48=BtRead48+1
+      Next
+      Else
+        If ReplyIndex>0 And ReplyFirstPacket<>0 And ReplyDone=0 : ReplyUnderrun=ReplyUnderrun+1 : EndIf
+        For i=0 To 127 : SbcPcm(i)=0 : Next
+      EndIf
+      If BtRead48>0 And ReplyIndex>0 And ReplyFirstPacket=0
+        ReplyPacketVoice=1
+      EndIf
+      If ReplyIndex>0 And ReplyAudible=0
+        For i=0 To 127
+          pcm=SbcPcm(i)
+          If pcm>3 Or pcm< -3 : ReplyPacketAudible=1 : Break : EndIf
+        Next
+      EndIf
+      SbcEncode()
+      DCopy(@SbcEncoded(0),@BtFrames[0]+BtHave*68,68)
+      BtEncodeTicks=BtEncodeTicks+KtTicks()-begin
+      BtHave=BtHave+1
+    Wend
+    If BtHave<>3 : ProcedureReturn : EndIf
+    If BtFrames[0]<>$9C Or BtFrames[68]<>$9C Or BtFrames[136]<>$9C : BtFault=4 : ProcedureReturn : EndIf
+    If A2dpSend(@BtFrames[0],3)=0 : ProcedureReturn : EndIf
+    If ReplyPacketVoice And ReplyFirstPacket=0
+      ReplyFirstPacket=KtTicks() : ReplyFrame=BtSent
+      PokeI($58004000+(ReplyIndex-1)*64,ReplyStarted)
+      PokeI($58004008+(ReplyIndex-1)*64,ReplyFirstPacket)
+      PokeI($58004010+(ReplyIndex-1)*64,BtStartTicks+ReplyFrame*KtResultHz/375)
+      PokeI($58004018+(ReplyIndex-1)*64,KtResultHz)
+    EndIf
+    If ReplyPacketAudible And ReplyAudible=0
+      ReplyAudible=BtStartTicks+BtSent*KtResultHz/375
+      PokeI($58004038+(ReplyIndex-1)*64,ReplyAudible)
+    EndIf
+    ReplyPacketAudible=0
+    ReplyPacketVoice=0
+    BtSent=BtSent+3 : BtHave=0
+    A2dpPoll()
+  Next
+EndProcedure

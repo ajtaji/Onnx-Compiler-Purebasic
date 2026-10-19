@@ -1,0 +1,32 @@
+; Prepared instruction cache, generated on the Pi during warmup.
+Global Dim ReplyCachePointer.i[128]
+Global Dim ReplyCacheSamples.i[128]
+Global ReplyCacheBytes.i
+Procedure.i ReplyCachePrepare(index.i)
+  Protected status.i,started.i=KtTicks()
+  If index<1 Or index>128 Or BtRunning : ProcedureReturn 0 : EndIf
+  KtWaveUsed=0 : KtResultSamples=0
+  status=KtChunk(index)
+  If status<>0 : ProcedureReturn 0 : EndIf
+  If ReplyCacheBytes+KtWaveUsed>$04000000 : ProcedureReturn 0 : EndIf
+  ReplyCachePointer[index-1]=$4C000000+ReplyCacheBytes
+  ReplyCacheSamples[index-1]=KtResultSamples
+  DCopy(#KT_WAVE_BASE,ReplyCachePointer[index-1],KtWaveUsed)
+  ReplyCacheBytes=ReplyCacheBytes+KtWaveUsed
+  PokeI($58C01000+(index-1)*32,KtTicks()-started)
+  PokeI($58C01008+(index-1)*32,KtResultSamples)
+  ProcedureReturn 1
+EndProcedure
+Procedure.i ReplyCacheSubmit(index.i)
+  Protected samples.i,started.i=KtTicks()
+  If index<1 Or index>128 : ProcedureReturn 0 : EndIf
+  samples=ReplyCacheSamples[index-1]
+  If samples<1 Or samples*4>#KT_WAVE_BYTES Or ReplyCachePointer[index-1]=0 : ProcedureReturn 0 : EndIf
+  DCopy(ReplyCachePointer[index-1],#KT_WAVE_BASE,samples*4)
+  KtWaveUsed=samples*4 : KtResultSamples=samples
+  KtResultRequests=KtResultRequests+1
+  PokeI($58002000+(index-1)*32,index)
+  PokeI($58002008+(index-1)*32,KtTicks()-started)
+  PokeI($58002010+(index-1)*32,samples)
+  ProcedureReturn 1
+EndProcedure
