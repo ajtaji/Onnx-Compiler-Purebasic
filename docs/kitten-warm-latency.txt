@@ -98,3 +98,18 @@ seeds, nonzero offsets, request variation, odd tails and NaN bounds. All
 output bits and guards matched with four-core dispatch enabled. The normal
 transform is unchanged; slicing allows an application to yield between
 complete jobs rather than waiting for the entire noise tensor.
+
+Exact AArch64 one-dimensional resize now computes four independent output
+coordinates and interpolations per vector, with separate FP32 operations in
+the reference order. Twenty real Pi comparisons matched every output bit and
+both guards: nearest/linear, asymmetric/half-pixel, up/downsampling, odd widths,
+multiple rows, signed zero, infinities and NaN payloads. The large 120021-output
+cases improved from15.7-22.7ms to0.555-0.966ms on one core. Unsupported sizes,
+coordinates, scales or overlapping buffers retain the reference fallback.
+Existing row parallelism is retained.
+
+The subsequent moving-map30FPS experiment still counted2834 inserted silent
+SBC frames, despite reducing the maximum whole-model step from74.4 to42.8ms.
+This resize improvement does not establish sufficient whole-application audio
+headroom. Further compiler-runtime kernel work is required before another
+route listening test; the30FPS experiment is not the installed application.

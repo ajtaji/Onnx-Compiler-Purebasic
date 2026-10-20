@@ -2986,6 +2986,7 @@ EndProcedure
 CompilerIf #PMD_NATIVE_BYTES=8
 Global Dim PmResizeParts.i[32]
 Procedure.i PmResizeWorker(*p.i)
+  If PmTensorResize1DExactA64(*p) : ProcedureReturn 0 : EndIf
   PmTensorResize1D(PeekI(*p),PeekI(*p+8),PeekI(*p+16),PeekI(*p+24),PeekI(*p+32),PeekI(*p+40),PeekI(*p+48),DReadF(*p+56))
   ProcedureReturn 0
 EndProcedure
@@ -3010,6 +3011,12 @@ Procedure PmResizeRows(src.i,dst.i,rows.i,inWidth.i,outWidth.i,mode.i,coordinate
     Next
     If pmSvcParRun(@PmResizeWorker,@PmResizeParts[0],64,parts)=#PMP_SVC_OK : ProcedureReturn : EndIf
   EndIf
+  CompilerEndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  PmResizeParts[0]=src : PmResizeParts[1]=dst : PmResizeParts[2]=rows
+  PmResizeParts[3]=inWidth : PmResizeParts[4]=outWidth : PmResizeParts[5]=mode
+  PmResizeParts[6]=coordinate : DWriteF(@PmResizeParts[7],scale)
+  If PmTensorResize1DExactA64(@PmResizeParts[0]) : ProcedureReturn : EndIf
   CompilerEndIf
   PmTensorResize1D(src,dst,rows,inWidth,outWidth,mode,coordinate,scale)
 EndProcedure
