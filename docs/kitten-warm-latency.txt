@@ -27,3 +27,12 @@ resident; no prerecorded waveform was reused. The 0.5-1 second objective is
 not achieved across these phrases. Smaller opening-window trials are pending
 route/audio validation; do not substitute an isolated kernel gain for the
 measured reply latency.
+
+Further exact layout optimization: consecutive axis-group rotations are now
+collapsed to a matrix transpose, including NCHW/NHWC transformations. Six real
+Pi cases matched the preceding generic implementation word for word: odd 2D,
+both 4D rotations, a 3D rotation, a nonmatching permutation using fallback,
+and an empty tensor. Two 102,912-word cases improved from 10.8/10.7 ms to
+0.34/0.31 ms. Whole reply impact is still being measured. The 48-frame opening
+with a 0.5-second lead failed the recorded route with 128 underruns and was
+rejected. Retain the validated 64-frame opening and 0.6-second lead.

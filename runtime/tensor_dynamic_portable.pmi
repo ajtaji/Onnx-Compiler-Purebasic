@@ -1721,6 +1721,7 @@ Procedure DTranspose(Y.i,A.i,Perm.i)
   Protected sp.i
   Protected dp.i
   Protected simple.i=1
+  Protected prefix.i, pivot.i, expected.i
   Protected i.i=0
   Protected j.i=0
   Protected n.i=0
@@ -1754,12 +1755,23 @@ Procedure DTranspose(Y.i,A.i,Perm.i)
     ProcedureReturn
   EndIf
   If rank>=2 And size=4
-    If axes(rank-2)<>rank-1 Or axes(rank-1)<>rank-2 : simple=0 : EndIf
-    For j=0 To rank-3
-      If axes(j)<>j : simple=0 : EndIf
+    ; A rotation of two consecutive axis groups is a matrix transpose.
+    ; This also covers NCHW->NHWC after collapsing the spatial dimensions.
+    prefix=0
+    While prefix<rank
+      If axes(prefix)<>prefix : Break : EndIf
+      prefix+1
+    Wend
+    pivot=prefix
+    If prefix<rank : pivot=axes(prefix) : EndIf
+    If pivot<=prefix : simple=0 : EndIf
+    For j=prefix To rank-1
+      expected=pivot+j-prefix
+      If expected>=rank : expected=prefix+expected-rank : EndIf
+      If axes(j)<>expected : simple=0 : EndIf
     Next
     If simple
-      height=DDims((A)*8+(rank-2)) : width=DDims((A)*8+(rank-1))
+      height=DProduct(A,prefix,pivot-1) : width=DProduct(A,pivot,rank-1)
       If height>0 And width>0
         rows=Dt(A)\Count/(height*width)
         For batch=0 To rows-1
