@@ -5681,7 +5681,55 @@ Procedure.i PmI8RowBlock(q.i, s.i, m.i, k.i, es.i, r0.i, tile.i)
 EndProcedure
 
 ; Columns [0, N & -16) of every row. Returns the first column not written.
+
+; Immutable, caller-owned INT8 matrix layout cache (optional).
+; Pack once after binding weights, before starting requests or parallel jobs.
+; Source weights and this cache must remain live and unchanged until Reset.
+; Reset only when inference is idle; Reset(0,0) disables the cache. Packed
+; columns retain the exact reduction/scaling order and tail uses original B.
+Global PmI8PackBase.i, PmI8PackLimit.i, PmI8PackUsed.i, PmI8PackCount.i
+Global Dim PmI8PackKeys.i[64 * 5]
+Procedure PmI8PackReset(base.i, bytes.i)
+  PmI8PackBase=0 : PmI8PackLimit=0 : PmI8PackUsed=0 : PmI8PackCount=0
+  If base>0 And bytes>0 : PmI8PackBase=base : PmI8PackLimit=bytes : EndIf
+EndProcedure
+Procedure.i PmI8PackFind(source.i, k.i, n.i, wide.i)
+  Protected i.i, at.i
+  For i=0 To PmI8PackCount-1
+    at=i*5
+    If PmI8PackKeys[at]=source And PmI8PackKeys[at+1]=k And PmI8PackKeys[at+2]=n And PmI8PackKeys[at+3]=wide
+      ProcedureReturn PmI8PackKeys[at+4]
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+Procedure.i PmI8PackWeight(source.i, k.i, n.i, wide.i)
+  Protected n16.i=n & -16, bytes.i, dest.i, plane.i, col.i, row.i, a.i, b.i, at.i
+  If PmI8PackFind(source,k,n,wide)<>0 : ProcedureReturn 1 : EndIf
+  If k<1 Or n16<16 Or wide<0 Or wide>1 Or PmI8PackCount>=64 : ProcedureReturn 0 : EndIf
+  If source=0 Or PmI8PackBase=0 : ProcedureReturn 0 : EndIf
+  ; Check before multiplying so an oversized request cannot wrap the bound.
+  If k>(PmI8PackLimit-PmI8PackUsed)/n16/(1+wide) : ProcedureReturn 0 : EndIf
+  bytes=n16*k*(1+wide)
+  dest=PmI8PackBase+PmI8PackUsed
+  For plane=0 To wide
+    For col=0 To n16-1 Step 16
+      For row=0 To k-1
+        a=source+plane*k*n+row*n+col
+        b=dest+plane*k*n16+col*k+row*16
+        PokeL(b,PeekL(a)) : PokeL(b+4,PeekL(a+4))
+        PokeL(b+8,PeekL(a+8)) : PokeL(b+12,PeekL(a+12))
+      Next
+    Next
+  Next
+  at=PmI8PackCount*5
+  PmI8PackKeys[at]=source : PmI8PackKeys[at+1]=k : PmI8PackKeys[at+2]=n
+  PmI8PackKeys[at+3]=wide : PmI8PackKeys[at+4]=dest
+  PmI8PackUsed=PmI8PackUsed+bytes : PmI8PackCount=PmI8PackCount+1
+  ProcedureReturn 1
+EndProcedure
 Procedure.i PmI8MatMulNeonColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,last.i)
+  Protected packed.i=PmI8PackFind(*g\B,*g\K,*g\N,*g\Wide)
   Protected ea.PmI8EpiArgs
   Protected n16.i
   Protected r0.i
@@ -5694,7 +5742,11 @@ Procedure.i PmI8MatMulNeonColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,la
     rows = PmI8RowBlock(q, s, *g\M, *g\K, 1 + *g\Wide, r0, tile)
     c0 = first
     While c0 < n16
-      PmI8ColumnTileNeon(*g\B, *g\Elements, *g\N, c0, *g\K, *g\Wide, tile)
+      If packed<>0
+        PmI8ColumnTileNeon(packed+c0* *g\K, (*g\N & -16)* *g\K, 16, 0, *g\K, *g\Wide, tile)
+      Else
+        PmI8ColumnTileNeon(*g\B, *g\Elements, *g\N, c0, *g\K, *g\Wide, tile)
+      EndIf
       ea\F1 = tile : ea\F2 = 0 : If *g\Wide <> 0 : ea\F2 = tile + 256 : EndIf
       ea\WS = *g\Scales + c0 * 4 : ea\Bias = 0
       ea\Dst = *g\Dst + (r0 * *g\N + c0) * 4 : ea\DStride = *g\N * 4

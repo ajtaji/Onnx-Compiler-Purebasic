@@ -1,0 +1,29 @@
+Kitten warm reply latency on Anvil / Raspberry Pi 4
+2026-10-20 - ongoing performance work
+
+The AArch64 INT8 matrix runtime can optionally retain immutable weights in
+16-column blocks. Call PmI8PackReset with caller-owned memory, then
+PmI8PackWeight(source, K, N, wide) while inference is idle. The source weights
+and packed arena must remain alive and unchanged. Reset(0,0) disables the
+cache. Missing entries use the original layout; incomplete column tails also
+use the original weights. No arithmetic, activation quantization, reduction
+order or scaling order changes. This is a tensor layout cache, not an audio
+cache. The API reports insufficient capacity rather than writing beyond it.
+
+Real Pi tests compared original and packed layouts with four cores. Six large
+cases used M=32/65/128, K=768, N=2048, narrow and wide INT8 weights. Four more
+covered odd M=33/65, K=17/9 and N=35/17. All output words matched and destination
+guards remained intact. Large cases improved approximately 2.6-3.6 times.
+Splitting those original matrices by columns was slower and was not selected.
+
+A warm resident Kitten test kept a moving map and Anvil A2DP running. Six fresh
+requests ranged from a short greeting to longer road instructions. An initial
+packed-weight/opening-window experiment reduced transmitted speech onset from
+1.36-2.57 seconds to 1.09-2.17 seconds. Both runs had zero audio underruns,
+Bluetooth, graphics and parallel faults. The first request after load was
+1.96 seconds in the baseline and 1.56 seconds in the experiment. These are
+stream timestamps, excluding speaker acoustic latency. Model weights stayed
+resident; no prerecorded waveform was reused. The 0.5-1 second objective is
+not achieved across these phrases. Smaller opening-window trials are pending
+route/audio validation; do not substitute an isolated kernel gain for the
+measured reply latency.
