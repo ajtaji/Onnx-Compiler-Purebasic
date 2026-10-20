@@ -54,7 +54,9 @@ returns to its cooperative scheduler. Seven real Pi wrapper comparisons covered
 equal rank-four and rank-three batches, uneven head counts, broadcast and
 mixed-rank fallback, small columns and zero reduction. Every output word and
 shape matched, with balanced scratch accounting. Eligible examples improved
-from0.43/0.81/0.12ms to0.23/0.47/0.05ms. Full reply measurements are pending.
+from 0.43/0.81/0.12 ms to 0.23/0.47/0.05 ms. The subsequent six-reply run had
+zero underruns; warm short onsets were 0.999/1.012/0.982 seconds. This is a
+modest whole-request improvement rather than the isolated kernel speedup.
 
 With packed weights, grouped transpose, exact layer normalization and a
 56-frame opening followed by64 frames, three warm short requests reached the
@@ -65,3 +67,11 @@ completed eight cues with zero underruns and3400 map frames. Keep the0.6second
 PCM lead; reducing the lead with repeated32-frame windows had failed earlier.
 The reply target is still not met for longer instructions, and acoustic latency
 inside the speaker is additional to these transmitted stream measurements.
+
+A subsequent 52-frame opening followed by64 retained the0.6second PCM guard.
+Warm short stream onsets were0.925/0.953/0.915seconds; longer two phrases were
+1.321/1.387seconds. The first greeting after load took1.415seconds. All six
+completed without underruns or fault flags while2480mapframes were rendered.
+An actual route with this schedule completed eight cues and3439mapframes,
+also with zero underruns and faults. Road-name instructions in that route
+still took1.24-2.12seconds to start. A universal subsecond claim is not supported.
