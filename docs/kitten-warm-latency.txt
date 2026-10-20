@@ -75,3 +75,26 @@ completed without underruns or fault flags while2480mapframes were rendered.
 An actual route with this schedule completed eight cues and3439mapframes,
 also with zero underruns and faults. Road-name instructions in that route
 still took1.24-2.12seconds to start. A universal subsecond claim is not supported.
+
+An evening replay sounded clear with complete instruction beginnings, but
+counted74 inserted silent SBC frames and showed map jitter. The earlier zero
+underrun result did not repeat; robust audio headroom is not established.
+Raising map updates from12 to30persecond alone increased the underrun count
+to525. A single random-normal tensor step took81ms despite a6ms scheduling
+budget, which is checked only after whole operations return.
+
+Uniform random generation now computes four independent Threefry counters
+per vector and applies the same separate FP32 conversion, multiply and add
+steps.18 real Pi comparisons covered empty and odd tails, seeds, requests,
+counter wrap, subnormal bounds, overflow, infinities and NaN payloads. All
+output bits and guards matched.65537 draws improved7.87ms to2.67ms and262144
+draws31.46ms to10.70ms on one core; this gain applies to uniform draws.
+
+PmRandomRangeParallel also exposes bounded independent counter ranges for
+uniform and normal draws, with all parallel work complete on return. It
+rejects ranges outside the32-bit counter domain.16 real Pi cases compared
+8192-element slices with whole-range output, including both distributions,
+seeds, nonzero offsets, request variation, odd tails and NaN bounds. All
+output bits and guards matched with four-core dispatch enabled. The normal
+transform is unchanged; slicing allows an application to yield between
+complete jobs rather than waiting for the entire noise tensor.

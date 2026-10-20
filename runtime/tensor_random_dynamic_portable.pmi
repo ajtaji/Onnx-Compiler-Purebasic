@@ -35,7 +35,9 @@ Procedure.i PmRandomRangeA64(dst.i,first.i,count.i,node.i,hasSeed.i,seedBits.i,k
   EndIf
   n0=words\Lo & $FFFFFFFF : n1=words\Hi & $FFFFFFFF
   span=p2-p1
-  For i=0 To count-1
+  i=0
+  If kind=0 : i=PmRandomUniformFourA64(dst,first,count,n0,n1,request,p1Bits,p2Bits) : EndIf
+  For i=i To count-1
     If (i & 1023)=0 : PmKernelIdle() : EndIf
     PmRandomThreefryA64(n0,n1,first+i,request,@words)
     If kind=0
@@ -54,6 +56,55 @@ Procedure.i PmRandomWorker(*p.i)
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0
+EndProcedure
+CompilerEndIf
+
+CompilerIf #PMD_NATIVE_BYTES=8
+; Independent counter ranges; each synchronous job is complete on return.
+Procedure.i PmRandomRangeParallel(dst.i,first.i,count.i,node.i,hasSeed.i,seedBits.i,kind.i,low.i,high.i,request.i)
+  Protected parts.i=1,i.i,begin.i=0,last.i,at.i
+  If first<0 Or count<0 Or first>$FFFFFFFF Or count>$100000000-first : ProcedureReturn 0 : EndIf
+  If count=0 : ProcedureReturn 1 : EndIf
+  PmRandomInit()
+  If kind & 1
+    PmRandomConstants[0]=PeekL(@PmRandomTwoM24)
+    PmRandomConstants[1]=PeekL(@PmRandomLn2)
+    PmRandomConstants[2]=PeekL(@PmRandomSqrt2)
+    PmRandomConstants[3]=PeekL(@PmRandomTheta)
+    PmRandomConstants[4]=PeekL(@PmRandomC3)
+    PmRandomConstants[5]=PeekL(@PmRandomC5)
+    PmRandomConstants[6]=PeekL(@PmRandomC7)
+    PmRandomConstants[7]=PeekL(@PmRandomC9)
+    PmRandomConstants[8]=PeekL(@PmRandomH6)
+    PmRandomConstants[9]=PeekL(@PmRandomH24)
+    PmRandomConstants[10]=PeekL(@PmRandomH120)
+    PmRandomConstants[11]=PeekL(@PmRandomH720)
+    PmRandomConstants[12]=PeekL(@PmRandomH5040)
+    PmRandomConstants[13]=PeekL(@PmRandomH40320)
+    PmRandomConstants[14]=PeekL(@PmRandomH362880)
+    PmRandomConstants[15]=PeekL(@PmRandomH3628800)
+    PmRandomConstants[16]=$3F800000
+    PmRandomConstants[17]=$3F000000
+    PmRandomConstants[18]=$3E800000
+    PmRandomConstants[19]=$40800000
+    PmRandomConstants[20]=$3EC00000
+    PmRandomConstants[21]=$3F400000
+  EndIf
+  If count>=4096
+    parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
+  EndIf
+  If parts>1
+    For i=0 To parts-1
+      last=count*(i+1)/parts : at=i*10
+      PmRandomParts[at]=dst+begin*4 : PmRandomParts[at+1]=first+begin
+      PmRandomParts[at+2]=last-begin : PmRandomParts[at+3]=node
+      PmRandomParts[at+4]=hasSeed : PmRandomParts[at+5]=seedBits : PmRandomParts[at+6]=kind & 1
+      PmRandomParts[at+7]=low : PmRandomParts[at+8]=high : PmRandomParts[at+9]=request
+      begin=last
+    Next
+    If pmSvcParRun(@PmRandomWorker,@PmRandomParts[0],80,parts)=#PMP_SVC_OK : ProcedureReturn 1 : EndIf
+  EndIf
+  ProcedureReturn PmRandomRangeA64(dst,first,count,node,hasSeed,seedBits,kind & 1,low,high,request)
 EndProcedure
 CompilerEndIf
 
