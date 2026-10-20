@@ -2350,6 +2350,48 @@ Procedure.i DMatMulInt8(*g.PmI8MatMulArgs)
   ProcedureReturn DInt8End()
 EndProcedure
 
+; Equal, contiguous FLOAT batches can share one four-core job. Each worker
+; owns its packing scratch and uses the existing exact reduction kernel.
+; Broadcast shapes and INT8 weights retain their original dispatch.
+CompilerIf #PMD_NATIVE_BYTES=8
+Global Dim PmGemmBatchParts.i[36]
+Procedure.i PmGemmBatchWorker(*p.i)
+  Protected a.i=PeekI(*p),b.i=PeekI(*p+8),dst.i=PeekI(*p+16)
+  Protected m.i=PeekI(*p+24),k.i=PeekI(*p+32),n.i=PeekI(*p+40)
+  Protected first.i=PeekI(*p+48),last.i=PeekI(*p+56),pack.i=PeekI(*p+64)
+  While first<last
+    PmTensorMatMul2ExactPackedNeon(a+first*m*k*4,b+first*k*n*4,dst+first*m*n*4,m,k,n,pack)
+    first+1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+CompilerEndIf
+Procedure.i PmFastGemmBatches(a.i,b.i,dst.i,m.i,k.i,n.i,batches.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected parts.i,bytes.i,pack.i,i.i,first.i=0,last.i,at.i,status.i
+  If batches<4 Or m<1 Or k<1 Or n<16 Or m*k*n*batches<65536 : ProcedureReturn 0 : EndIf
+  parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
+  If parts<2 : ProcedureReturn 0 : EndIf
+  If k>(DLimit-DLive)/64/parts : ProcedureReturn 0 : EndIf
+  bytes=k*64*parts
+  pack=DAcquire(bytes) : If pack=0 : ProcedureReturn 0 : EndIf
+  DLive=DLive+bytes : DPeak=DMax(DPeak,DLive)
+  For i=0 To parts-1
+    last=batches*(i+1)/parts : at=i*9
+    PmGemmBatchParts[at]=a : PmGemmBatchParts[at+1]=b : PmGemmBatchParts[at+2]=dst
+    PmGemmBatchParts[at+3]=m : PmGemmBatchParts[at+4]=k : PmGemmBatchParts[at+5]=n
+    PmGemmBatchParts[at+6]=first : PmGemmBatchParts[at+7]=last
+    PmGemmBatchParts[at+8]=pack+i*k*64
+    first=last
+  Next
+  status=pmSvcParRun(@PmGemmBatchWorker,@PmGemmBatchParts[0],72,parts)
+  DFree(pack) : DLive=DLive-bytes
+  ProcedureReturn Bool(status=#PMP_SVC_OK)
+  CompilerElse
+  ProcedureReturn 0
+  CompilerEndIf
+EndProcedure
+
 Procedure DMatMul(Y.i,A.i,B.i)
   Protected Dim dims.i(8)
   Protected rank.i=DMax(Dt(A)\Rank,Dt(B)\Rank)
@@ -2369,6 +2411,7 @@ Procedure DMatMul(Y.i,A.i,B.i)
   Protected c.i=0
   Protected astride.i=0
   Protected bstride.i=0
+  Protected flatBatch.i=Bool(Dt(A)\Rank=rank And Dt(B)\Rank=rank)
   Protected mm.PmI8MatMulArgs
   DZero(@dims(0),8*#PMD_NATIVE_BYTES)
   If Dt(A)\Kind<>1 Or (Dt(B)\Kind<>1 And Dt(B)\Kind<>3 And Dt(B)\Kind<>33)
@@ -2410,6 +2453,7 @@ Procedure DMatMul(Y.i,A.i,B.i)
       DFail("MatMul batch mismatch.")
       ProcedureReturn
     EndIf
+    If ad<>bd : flatBatch=0 : EndIf
     dims(i)=DMax(ad,bd)
     batches*dims(i)
   Next
@@ -2417,6 +2461,9 @@ Procedure DMatMul(Y.i,A.i,B.i)
   dims(rank-1)=n
   If DAllocCore(Y,1,rank,@dims(0),Bool(k=0))=0
     ProcedureReturn
+  EndIf
+  If Dt(B)\Kind=1 And flatBatch
+    If PmFastGemmBatches(Dt(A)\Data,Dt(B)\Data,Dt(Y)\Data,m,k,n,batches) : ProcedureReturn : EndIf
   EndIf
   For batch=0 To batches-1
     idx=batch

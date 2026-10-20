@@ -45,3 +45,23 @@ Widths1/3/4/7/768/1025, bias present/absent, constant rows, zero epsilon, large
 values, infinities and NaN payloads were covered. The larger single-core cases
 improved from8.6-12.9ms to0.26-0.37ms. Existing row parallelism remains enabled.
 These are isolated kernel results; whole reply latency validation continues.
+
+Equal contiguous FLOAT MatMul batches now distribute independent attention
+heads across four cores, each with private packing scratch. The exact existing
+matrix kernel is reused; broadcasting, mixed ranks, small columns and INT8
+weights keep their previous dispatch. Scratch is released before inference
+returns to its cooperative scheduler. Seven real Pi wrapper comparisons covered
+equal rank-four and rank-three batches, uneven head counts, broadcast and
+mixed-rank fallback, small columns and zero reduction. Every output word and
+shape matched, with balanced scratch accounting. Eligible examples improved
+from0.43/0.81/0.12ms to0.23/0.47/0.05ms. Full reply measurements are pending.
+
+With packed weights, grouped transpose, exact layer normalization and a
+56-frame opening followed by64 frames, three warm short requests reached the
+Bluetooth stream in0.994/1.020/0.982seconds. Longer two phrases took1.393/1.466
+seconds; the first greeting after load took1.495seconds. All six completed
+without underruns while the map moved. A separate actual route recording
+completed eight cues with zero underruns and3400 map frames. Keep the0.6second
+PCM lead; reducing the lead with repeated32-frame windows had failed earlier.
+The reply target is still not met for longer instructions, and acoustic latency
+inside the speaker is additional to these transmitted stream measurements.
