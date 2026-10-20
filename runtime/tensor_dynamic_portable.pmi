@@ -2672,7 +2672,14 @@ Procedure PmNormRowsRange(src.i,scale.i,bias.i,dst.i,rows.i,width.i,epsilon.f,op
   If op=0
     PmTensorSoftmaxLast(src,dst,rows,width)
   Else
+    CompilerIf #PMD_NATIVE_BYTES=8
+    Protected norm.PmTensorLayerNormArgs
+    norm\Src=src : norm\Scale=scale : norm\Bias=bias : norm\Dst=dst
+    norm\Mean=0 : norm\InvStdDev=0 : norm\Outer=rows : norm\Width=width : norm\Epsilon=epsilon
+    PmTensorLayerNormExactNeon(@norm)
+    CompilerElse
     PmTensorLayerNormLast(src,scale,bias,dst,rows,width,epsilon)
+    CompilerEndIf
   EndIf
 EndProcedure
 CompilerIf #PMD_NATIVE_BYTES=8

@@ -36,3 +36,12 @@ and an empty tensor. Two 102,912-word cases improved from 10.8/10.7 ms to
 0.34/0.31 ms. Whole reply impact is still being measured. The 48-frame opening
 with a 0.5-second lead failed the recorded route with 128 underruns and was
 rejected. Retain the validated 64-frame opening and 0.6-second lead.
+
+Exact AArch64 layer normalization now keeps sequential mean/variance reduction
+order while normalizing four independent output values per vector, using
+separate subtraction/multiply/add operations. Twenty-two real Pi cases matched
+all output, mean and inverse-standard-deviation bits with intact guards.
+Widths1/3/4/7/768/1025, bias present/absent, constant rows, zero epsilon, large
+values, infinities and NaN payloads were covered. The larger single-core cases
+improved from8.6-12.9ms to0.26-0.37ms. Existing row parallelism remains enabled.
+These are isolated kernel results; whole reply latency validation continues.
