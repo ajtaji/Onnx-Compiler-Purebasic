@@ -589,18 +589,23 @@ Procedure.i BtStart()
   ProcedureReturn 1
 EndProcedure
 
+Global BtDisconnectTimedOut.i
 Procedure BtStop()
   Protected untilTick.i
   PmSetIdleCallback(0)
   BtRunning=0
   BtReport()
+  If HciIsOpen()=0 : ProcedureReturn : EndIf
   If HciLinkKeyGet($53010004)<>0 : PokeL($53010000,$444E4F42) : EndIf
   A2dpEnd()
-  untilTick=KtTicks()+KtResultHz/20
-  While KtTicks()<untilTick
+  ; Keep the UART until Disconnection Complete, including failed stream setup.
+  ; A fixed short delay can leave the powered controller holding the peer link.
+  untilTick=KtTicks()+KtResultHz*2
+  While HciLinkHandle()>=0 And KtTicks()<untilTick
     HciPoll()
     If *KtSvcPet<>0 : KtSvcPet() : EndIf
   Wend
+  BtDisconnectTimedOut=Bool(HciLinkHandle()>=0)
   HciClose()
 EndProcedure
 

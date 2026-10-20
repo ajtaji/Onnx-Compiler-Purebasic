@@ -167,6 +167,15 @@ byte-identical. This is still slower than real time. Nine additional
 four-core matrix cases covered row and column tails, signed zeros,
 subnormals, infinities and NaNs against the serial packed kernel.
 
+INT8 matrix row partitioning also covers tall projections with one output
+column. The work threshold remains 65,536 multiply-add pairs and at least
+32 rows; each worker has private activation quantization scratch. Sixteen
+real Pi cases covered 32, 33, 19,200 and 19,301 rows, one and three output
+columns, and narrow and wide weights. Their output bits matched serial
+execution with intact output guards. Combined kernel time was 210 ms
+serial and 53 ms on four cores. This is a kernel measurement, not a claim
+about complete speech latency; regenerate existing models to use the policy.
+
 @SECTION What the Pi 4 has actually done
 
 This is a real workload on real silicon, and the conditions matter as much
@@ -258,6 +267,9 @@ window joins. Normalization is local to each window, so this reply mode has
 a separate listening contract from the byte-identical full-waveform runtime.
 A full-window control reproduces all five reference phrases byte for byte.
 The preparer checks the supported emitted graph signature before adapting it.
+Cleanup ends A2DP and polls for controller disconnection for up to two seconds
+before closing HCI. BtDisconnectTimedOut records a timeout rather than
+assuming a short fixed delay proves that a shared speaker is released.
 
 For known route instructions, --prepared generates complete audio on the Pi
 during warmup. Later requests reach a voice packet in 3-8 ms and a stream

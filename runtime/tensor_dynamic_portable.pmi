@@ -2303,7 +2303,9 @@ Procedure.i DMatMulInt8(*g.PmI8MatMulArgs)
   Protected bytes.i
   Protected ok.i
   CompilerIf #PMD_NATIVE_BYTES=8
-  If *g\M>=32 And *g\N>=16 And *g\M* *g\K* *g\N>=65536
+  ; Tall projections with only one output column still split by independent
+  ; activation rows. Each worker retains private quantization scratch.
+  If *g\M>=32 And *g\N>=1 And *g\M* *g\K* *g\N>=65536
     parts=PmParallelCores()
     If parts>4 : parts=4 : EndIf
   EndIf

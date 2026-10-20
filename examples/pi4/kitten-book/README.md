@@ -132,7 +132,10 @@ Use `prepare_reply.py` for interactive replies with the model already resident
 and Bluetooth already connected. The same host-prepared input format is used.
 The generated `ReplyStart(index)`, `ReplyDrain()` and `ReplyPoll()` procedures
 can be called from an enclosing application loop. `ReplyStart` is synchronous,
-but begins playback from early windows before synthesis finishes. Poll while
+but begins playback from early windows before synthesis finishes. On exit,
+`BtStop()` ends A2DP and polls until the controller link is disconnected,
+with a two-second bound before closing HCI. `BtDisconnectTimedOut` records
+a timeout; a fixed delay alone does not confirm disconnection. Poll while
 waiting for input; the primary-core idle callback services Bluetooth during
 inference. Drain the preceding queue before submitting an independent reply.
 
