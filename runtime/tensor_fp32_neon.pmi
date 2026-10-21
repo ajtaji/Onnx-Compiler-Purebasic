@@ -7708,3 +7708,60 @@ Procedure PmTensorSoftmaxExactA64(src.i,dst.i,outer.i,width.i)
 EndProcedure
 
 CompilerEndIf
+
+CompilerIf #PMD_NATIVE_BYTES=8
+; Sign operations select raw bits, including signalling NaNs. LeakyRelu
+; multiplies only the selected negative result in original x*alpha order;
+; positive values, signed zero and unordered inputs keep their source bits.
+Procedure.i PmTensorSignBitsA64(src.i,dst.i,count.i,negate.i)
+ ASM
+  mov x4, #0
+  cmp x3, #1
+  b.hi pmoSignDone
+  movz w5, #0x8000, lsl #16
+  dup v16.4s, w5
+  cbnz x3, pmoSignNeg
+pmoSignAbs:
+  cmp x2, #4
+  b.lt pmoSignDone
+  ld1 {v0.4s}, [x0], #16
+  bic v0.16b, v0.16b, v16.16b
+  st1 {v0.4s}, [x1], #16
+  sub x2, x2, #4
+  add x4, x4, #4
+  b pmoSignAbs
+pmoSignNeg:
+  cmp x2, #4
+  b.lt pmoSignDone
+  ld1 {v0.4s}, [x0], #16
+  eor v0.16b, v0.16b, v16.16b
+  st1 {v0.4s}, [x1], #16
+  sub x2, x2, #4
+  add x4, x4, #4
+  b pmoSignNeg
+pmoSignDone:
+  mov x0, x4
+ EndASM
+EndProcedure
+Procedure.i PmTensorLeakyReluA64(src.i,dst.i,count.i,alphaBits.i)
+ ASM
+  mov x4, #0
+  dup v16.4s, w3
+  movi v17.4s, #0
+pmoLeakyLoop:
+  cmp x2, #4
+  b.lt pmoLeakyDone
+  ld1 {v0.4s}, [x0], #16
+  fcmgt v1.4s, v17.4s, v0.4s
+  fmul v2.4s, v0.4s, v16.4s
+  bsl v1.16b, v2.16b, v0.16b
+  st1 {v1.4s}, [x1], #16
+  sub x2, x2, #4
+  add x4, x4, #4
+  b pmoLeakyLoop
+pmoLeakyDone:
+  mov x0, x4
+ EndASM
+EndProcedure
+
+CompilerEndIf

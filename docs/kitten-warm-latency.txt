@@ -339,3 +339,31 @@ preservation checks pass on the real Pi. The extra native stack frame is
 match. First PCM ms485/479/491/477/693/867/628/480; generation ms797/740/
 833/707/1667/2505/1566/741. Silent RTF .669-.787,21-33% compute margin.
 Still no Bluetooth playback or map demonstration; speaker onset unverified.
+
+2026-10-21: general unary operator scheduling, not tied to a model identity.
+Sin/Cos use paired exact coefficient tables and four independent binary64
+lane pairs for eight inputs. Horner operations, range reduction, midpoint
+fallback and signed-zero finishing are unchanged. q8-q15 are preserved in
+128bytes.32 boundary/random/tail cases (including over2million inputs),
+explicit register-preservation and invalid/empty-op refusal checks pass.
+Abs/Neg select raw bits in SIMD; LeakyRelu preserves x*alpha operand order
+and passes through nonnegative/unordered source bits.72 cases pass with
+odd tails, in-place output, raw NaNs/subnormals and extreme alpha values.
+The existing guarded exact Exp kernel now also serves ordinary Exp nodes.
+All paths are AArch64 reusable runtime optimizations, with scalar fallbacks;
+benefit depends on operators, shapes and values, not a Kitten check.
+
+Two freshly exported opset20 FP32 synthetic graphs run with dynamic N x W
+inputs on the real Pi: Sin(x)+Cos(x), and Exp(Neg(Abs(LeakyRelu(x)))).20
+shapes/value cases each match the scalar reference and previous runtime.
+For finite771/4097-element requests, full graph execution improves1.23/1.26x
+and4.57/5.39x respectively. Small/exception-heavy cases need not improve.
+These are synthetic graph results, not whole-network promises for all models.
+
+R38 full four-core Kitten (fresh canonical runtime): first PCMms
+472.0/466.6/478.5/462.3/678.8/852.8/614.7/466.1; generationms
+776.5/720.2/810.0/685.6/1621.9/2436.0/1521.3/719.8. All eight complete
+waveform CRCs remain identical. Silent RTF.651-.765 gives24-35% compute
+margin. Aggregate generation time20.8% below R1, about2.8% below R33.
+Unary1048->786ms across8; no normalization change retained (no whole gain).
+No Bluetooth connection/playback or map demo; end-to-end onset unverified.

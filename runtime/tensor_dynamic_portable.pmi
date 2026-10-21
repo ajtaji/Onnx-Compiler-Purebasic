@@ -1455,13 +1455,27 @@ Procedure PmUnaryRange(Source.i,Destination.i,Count.i,Op.i,Alpha.f)
   Protected done.i
   Select Op
     Case 0
+      CompilerIf #PMD_NATIVE_BYTES=8 And #PMO_USE_EXPLOG=1
+      PmTensorExpExactA64(Source,Destination,Count)
+      CompilerElse
       PmTensorUnaryMath(Source,Destination,Count,Op)
+      CompilerEndIf
     Case 1
       PmTensorUnaryMath(Source,Destination,Count,Op)
     Case 3
+      CompilerIf #PMD_NATIVE_BYTES=8
+      done=PmTensorSignBitsA64(Source,Destination,Count,0)
+      PmTensorUnaryMath(Source+done*4,Destination+done*4,Count-done,Op)
+      CompilerElse
       PmTensorUnaryMath(Source,Destination,Count,Op)
+      CompilerEndIf
     Case 4
+      CompilerIf #PMD_NATIVE_BYTES=8
+      done=PmTensorSignBitsA64(Source,Destination,Count,1)
+      PmTensorUnaryMath(Source+done*4,Destination+done*4,Count-done,Op)
+      CompilerElse
       PmTensorUnaryMath(Source,Destination,Count,Op)
+      CompilerEndIf
     Case 2
       PmFastSqrt(Source,Destination,Count)
     Case 5
@@ -1484,7 +1498,12 @@ Procedure PmUnaryRange(Source.i,Destination.i,Count.i,Op.i,Alpha.f)
     Case 11
       PmTensorRoundEven(Source,Destination,Count)
     Case 12
+      CompilerIf #PMD_NATIVE_BYTES=8
+      done=PmTensorLeakyReluA64(Source,Destination,Count,PeekL(@Alpha))
+      PmTensorLeakyRelu(Source+done*4,Destination+done*4,Count-done,Alpha)
+      CompilerElse
       PmTensorLeakyRelu(Source,Destination,Count,Alpha)
+      CompilerEndIf
   EndSelect
 EndProcedure
 

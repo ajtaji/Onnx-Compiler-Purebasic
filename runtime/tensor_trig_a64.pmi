@@ -1,37 +1,18 @@
-; Independent binary64 lane pairs are interleaved. Each lane selects its
-; sine or cosine Horner coefficients before evaluation, avoiding the unused
-; polynomial. Its arithmetic order and the midpoint fallback are unchanged.
-; x4/x5 preserve reduction constants while v18/v19 hold quadrant masks.
-; AArch64 FP32 Sin/Cos tensor kernel, correctly rounded (C6c-3).
-;
-; Four arguments at a time, as two pairs of binary64 lanes: |x| 2/pi rounded to
-; the nearest integer n, r = x - n pi/2 with pi/2 in three binary64 parts
-; (fused multiply-subtract, so the first two are exact), then fdlibm's
-; minimax polynomial selected for each lane on |r| <= pi/4,
-; choosing sine or cosine coefficients by (n + op) mod 4. Each binary64 result is then tested: if the
-; bits below binary32 precision lie within 1024 binary64 units of a rounding
-; midpoint, the group is NOT rounded here. That group, and any group with an
-; argument beyond 2^20 in magnitude, an infinity or a NaN, goes to
-; PmTensorTrig - the correctly rounded integer method - so every result is the
-; correctly rounded binary32, the same bits as the scalar path and as the
-; Windows program. The original two-polynomial kernel was checked over every
-; binary32 argument against correctly rounded sin and cos. The selected-chain
-; version preserves that chain exactly; real-Pi boundary/random tests and full
-; model waveform comparisons additionally check the implementation.
-;
-; This assembler has neither FCVTL/FCVTN nor FMOV with an immediate: the four
-; conversions are written as their encodings (.word), and 0.5 and 1.0 are
-; broadcast from x11 and x12.
-;
-; EnableFloatingPoint establishes FPCR=0 before generated code runs: nearest
-; even, gradual underflow, and default-NaN disabled; FCVTN rounds to nearest
-; even. Only caller-saved SIMD registers are touched - v0..v7 and v16..v31 -
-; for the reason tensor_fp32_neon.pmi gives: an ordinary A64 procedure
-; prologue here saves x30 and nothing else, so a kernel that wrote v8..v15
-; would silently corrupt the low halves the moment Forge starts keeping
-; language float values in FP/SIMD registers across a call.
+; Correctly rounded AArch64 FP32 Sin/Cos, four/eight independent inputs.
+; Each selected fdlibm polynomial keeps its reference binary64 Horner chain,
+; three-part pi/2 reduction, final operations and 1024-ULP midpoint guard.
+; Paired coefficient tables hold sine in bytes0..7 and cosine in bytes8..15;
+; TBL selects the same coefficient bits independently for every lane.
+; Eight-input scheduling interleaves four lane pairs to hide dependencies.
+; Exceptional/large/near-midpoint groups and short suffixes use the four-input
+; helper, which retains the original correctly rounded scalar fallback.
+; Sin(-0) preserves its sign; unsupported operations still refuse, even empty.
+; The eight-input body saves/restores full q8-q15 in128bytes. Its nested
+; four-input helper uses caller-saved registers only. Worker stacks are4KiB.
+; .word contains explicit FCVTL/FCVTN and single-table TBL encodings.
+; FPCR=0 is established by EnableFloatingPoint: nearest-even, gradual underflow.
 
-Procedure PmTensorTrigA64(*src.i, *dst.i, count.i, op.i)
+Procedure PmTensorTrigTableA64(*src.i, *dst.i, count.i, op.i)
   ASM
     ; The generated receiver homes these four parameters before entering
     ; the body and preserves x0-x3.  Consume the live entry ABI values.
@@ -41,67 +22,53 @@ Procedure PmTensorTrigA64(*src.i, *dst.i, count.i, op.i)
     ; it; leaving early on an empty request would skip that refusal and let a
     ; wrongly generated program run on silently.
     cmp x3, #1
-    b.hi pmoTrigSelectedFallback
+    b.hi pmoTrigTableFallback
     cmp x2, #0
-    b.le pmoTrigSelectedDone
+    b.le pmoTrigTableDone
 
-pmoTrigSelectedSetup:
-    adrp x9, pmoTrigSelectedtwoopi
-    add x9, x9, #:lo12:pmoTrigSelectedtwoopi
+pmoTrigTableSetup:
+    adrp x9, pmoTrigTabletwoopi
+    add x9, x9, #:lo12:pmoTrigTabletwoopi
     ld1 {v16.2d}, [x9]
-    adrp x9, pmoTrigSelectedp1
-    add x9, x9, #:lo12:pmoTrigSelectedp1
+    adrp x9, pmoTrigTablep1
+    add x9, x9, #:lo12:pmoTrigTablep1
     ld1 {v17.2d}, [x9]
-    adrp x9, pmoTrigSelectedp2
-    add x9, x9, #:lo12:pmoTrigSelectedp2
-    ld1 {v18.2d}, [x9]
-    adrp x9, pmoTrigSelectedp3
-    add x9, x9, #:lo12:pmoTrigSelectedp3
-    ld1 {v19.2d}, [x9]
-    adrp x9, pmoTrigSelecteds1
-    add x9, x9, #:lo12:pmoTrigSelecteds1
-    ld1 {v20.2d}, [x9]
-    adrp x9, pmoTrigSelecteds2
-    add x9, x9, #:lo12:pmoTrigSelecteds2
-    ld1 {v21.2d}, [x9]
-    adrp x9, pmoTrigSelecteds3
-    add x9, x9, #:lo12:pmoTrigSelecteds3
-    ld1 {v22.2d}, [x9]
-    adrp x9, pmoTrigSelecteds4
-    add x9, x9, #:lo12:pmoTrigSelecteds4
-    ld1 {v23.2d}, [x9]
-    adrp x9, pmoTrigSelecteds5
-    add x9, x9, #:lo12:pmoTrigSelecteds5
-    ld1 {v24.2d}, [x9]
-    adrp x9, pmoTrigSelectedc1
-    add x9, x9, #:lo12:pmoTrigSelectedc1
-    ld1 {v25.2d}, [x9]
-    adrp x9, pmoTrigSelectedc2
-    add x9, x9, #:lo12:pmoTrigSelectedc2
-    ld1 {v26.2d}, [x9]
-    adrp x9, pmoTrigSelectedc3
-    add x9, x9, #:lo12:pmoTrigSelectedc3
+    adrp x9, pmoTrigTablep2
+    add x9, x9, #:lo12:pmoTrigTablep2
     ld1 {v27.2d}, [x9]
-    adrp x9, pmoTrigSelectedc4
-    add x9, x9, #:lo12:pmoTrigSelectedc4
+    adrp x9, pmoTrigTablep3
+    add x9, x9, #:lo12:pmoTrigTablep3
     ld1 {v28.2d}, [x9]
-    adrp x9, pmoTrigSelectedc5
-    add x9, x9, #:lo12:pmoTrigSelectedc5
-    ld1 {v29.2d}, [x9]
-    adrp x9, pmoTrigSelectedcheck
-    add x9, x9, #:lo12:pmoTrigSelectedcheck
+    adrp x9, pmoTrigTablepair1
+    add x9, x9, #:lo12:pmoTrigTablepair1
+    ld1 {v20.2d}, [x9]
+    adrp x9, pmoTrigTablepair2
+    add x9, x9, #:lo12:pmoTrigTablepair2
+    ld1 {v21.2d}, [x9]
+    adrp x9, pmoTrigTablepair3
+    add x9, x9, #:lo12:pmoTrigTablepair3
+    ld1 {v22.2d}, [x9]
+    adrp x9, pmoTrigTablepair4
+    add x9, x9, #:lo12:pmoTrigTablepair4
+    ld1 {v23.2d}, [x9]
+    adrp x9, pmoTrigTablepair5
+    add x9, x9, #:lo12:pmoTrigTablepair5
+    ld1 {v24.2d}, [x9]
+    adrp x9, pmoTrigTablecheck
+    add x9, x9, #:lo12:pmoTrigTablecheck
     ld1 {v30.2d}, [x9]
-    adrp x9, pmoTrigSelecteds6c6
-    add x9, x9, #:lo12:pmoTrigSelecteds6c6
+    adrp x9, pmoTrigTables6c6
+    add x9, x9, #:lo12:pmoTrigTables6c6
     ld1 {v31.2d}, [x9]
-    umov x4, v18.d[0]
-    umov x5, v19.d[0]
+    adrp x9, pmoTrigTableindex
+    add x9, x9, #:lo12:pmoTrigTableindex
+    ld1 {v29.2d}, [x9]
     movz x11, #16352, lsl #48
     movz x12, #16368, lsl #48
 
-pmoTrigSelectedLoop:
+pmoTrigTableLoop:
     cmp x2, #4
-    b.lt pmoTrigSelectedFallback
+    b.lt pmoTrigTableFallback
     ld1 {v7.4s}, [x0]
     ; |x| <= 2^20, finite: (bits << 1) <= $93000000 unsigned (NaN and the
     ; infinities are above it)
@@ -110,7 +77,7 @@ pmoTrigSelectedLoop:
     cmhi v6.4s, v6.4s, v5.4s
     umaxv s6, v6.4s
     fmov w9, s6
-    cbnz w9, pmoTrigSelectedGroup
+    cbnz w9, pmoTrigTableGroup
     .word 0x0E6178E0
     .word 0x4E6178E1
     fmul v2.2d, v0.2d, v16.2d
@@ -119,63 +86,48 @@ pmoTrigSelectedLoop:
     frintn v3.2d, v3.2d
     fmls v0.2d, v2.2d, v17.2d
     fmls v1.2d, v3.2d, v17.2d
-    fmls v0.2d, v2.2d, v18.2d
-    fmls v1.2d, v3.2d, v18.2d
-    fmls v0.2d, v2.2d, v19.2d
-    fmls v1.2d, v3.2d, v19.2d
+    fmls v0.2d, v2.2d, v27.2d
+    fmls v1.2d, v3.2d, v27.2d
+    fmls v0.2d, v2.2d, v28.2d
+    fmls v1.2d, v3.2d, v28.2d
     fcvtzs v2.2d, v2.2d
     fcvtzs v3.2d, v3.2d
     dup v4.2d, x3
     add v2.2d, v2.2d, v4.2d
     add v3.2d, v3.2d, v4.2d
-    umov x13, v2.d[0]
-    umov x14, v2.d[1]
-    umov x15, v3.d[0]
-    umov x16, v3.d[1]
+    mov v25.16b, v2.16b
+    mov v26.16b, v3.16b
     fmul v4.2d, v0.2d, v0.2d
     fmul v5.2d, v1.2d, v1.2d
-    fmov d18, x13
-    ins v18.d[1], x14
-    fmov d19, x15
-    ins v19.d[1], x16
-    shl v18.2d, v18.2d, #63
+    shl v18.2d, v2.2d, #63
     sshr v18.2d, v18.2d, #63
-    shl v19.2d, v19.2d, #63
+    shl v19.2d, v3.2d, #63
     sshr v19.2d, v19.2d, #63
-    dup v2.2d, v31.d[0]
-    dup v3.2d, v31.d[1]
-    mov v6.16b, v18.16b
-    mov v7.16b, v19.16b
-    bsl v6.16b, v3.16b, v2.16b
-    bsl v7.16b, v3.16b, v2.16b
-    mov v2.16b, v18.16b
-    bsl v2.16b, v29.16b, v24.16b
-    mov v3.16b, v19.16b
-    bsl v3.16b, v29.16b, v24.16b
+    movi v6.16b, #8
+    and v18.16b, v18.16b, v6.16b
+    and v19.16b, v19.16b, v6.16b
+    orr v18.16b, v18.16b, v29.16b
+    orr v19.16b, v19.16b, v29.16b
+    .word 0x4E1203E6
+    .word 0x4E1303E7
+    .word 0x4E120302
+    .word 0x4E130303
     fmla v2.2d, v6.2d, v4.2d
     fmla v3.2d, v7.2d, v5.2d
-    mov v6.16b, v18.16b
-    bsl v6.16b, v28.16b, v23.16b
-    mov v7.16b, v19.16b
-    bsl v7.16b, v28.16b, v23.16b
+    .word 0x4E1202E6
+    .word 0x4E1302E7
     fmla v6.2d, v2.2d, v4.2d
     fmla v7.2d, v3.2d, v5.2d
-    mov v2.16b, v18.16b
-    bsl v2.16b, v27.16b, v22.16b
-    mov v3.16b, v19.16b
-    bsl v3.16b, v27.16b, v22.16b
+    .word 0x4E1202C2
+    .word 0x4E1302C3
     fmla v2.2d, v6.2d, v4.2d
     fmla v3.2d, v7.2d, v5.2d
-    mov v6.16b, v18.16b
-    bsl v6.16b, v26.16b, v21.16b
-    mov v7.16b, v19.16b
-    bsl v7.16b, v26.16b, v21.16b
+    .word 0x4E1202A6
+    .word 0x4E1302A7
     fmla v6.2d, v2.2d, v4.2d
     fmla v7.2d, v3.2d, v5.2d
-    mov v2.16b, v18.16b
-    bsl v2.16b, v25.16b, v20.16b
-    mov v3.16b, v19.16b
-    bsl v3.16b, v25.16b, v20.16b
+    .word 0x4E120282
+    .word 0x4E130283
     fmla v2.2d, v6.2d, v4.2d
     fmla v3.2d, v7.2d, v5.2d
     fmul v2.2d, v2.2d, v4.2d
@@ -195,12 +147,8 @@ pmoTrigSelectedLoop:
     dup v6.2d, x12
     fadd v2.2d, v2.2d, v6.2d
     fadd v3.2d, v3.2d, v6.2d
-    dup v18.2d, x4
-    dup v19.2d, x5
-    fmov d4, x13
-    ins v4.d[1], x14
-    fmov d5, x15
-    ins v5.d[1], x16
+    mov v4.16b, v25.16b
+    mov v5.16b, v26.16b
     shl v6.2d, v4.2d, #63
     sshr v6.2d, v6.2d, #63
     bsl v6.16b, v2.16b, v0.16b
@@ -226,24 +174,24 @@ pmoTrigSelectedLoop:
     orr v0.16b, v0.16b, v1.16b
     addp v0.2d, v0.2d, v0.2d
     fmov x9, d0
-    cbnz x9, pmoTrigSelectedGroup
+    cbnz x9, pmoTrigTableGroup
     .word 0x0E6168C0
     .word 0x4E6168E0
     mov v7.16b, v0.16b
     ; Sin(-0) is -0: r = -0 - 0 pi/2 is +0 in binary64
-    cbnz x3, pmoTrigSelectedStore
+    cbnz x3, pmoTrigTableStore
     ld1 {v0.4s}, [x0]
     fcmeq v2.4s, v0.4s, #0.0
     bsl v2.16b, v0.16b, v7.16b
     mov v7.16b, v2.16b
-pmoTrigSelectedStore:
+pmoTrigTableStore:
     st1 {v7.4s}, [x1]
     add x0, x0, #16
     add x1, x1, #16
     sub x2, x2, #4
-    b pmoTrigSelectedLoop
+    b pmoTrigTableLoop
 
-pmoTrigSelectedGroup:
+pmoTrigTableGroup:
     ; these four by the integer method; the call keeps nothing in the
     ; caller-saved registers, so the constants are loaded again after it
     stp x0, x1, [sp, #-32]!
@@ -256,48 +204,338 @@ pmoTrigSelectedGroup:
     add x1, x1, #16
     sub x2, x2, #4
     cmp x2, #0
-    b.le pmoTrigSelectedDone
-    b pmoTrigSelectedSetup
+    b.le pmoTrigTableDone
+    b pmoTrigTableSetup
 
-pmoTrigSelectedFallback:
+pmoTrigTableFallback:
     ; x0/x1/x2/x3 always describe the untouched remaining suffix.  The
     ; procedure prologue saved x30, so this call is safe from inside ASM.
     bl pmtensortrig
-pmoTrigSelectedDone:
+pmoTrigTableDone:
   EndASM
 EndProcedure
 
 DataSection
-  pmoTrigSelectedTwoOPi:
+  pmoTrigTabletwoopi:
   Data.l $6DC9C883,$3FE45F30,$6DC9C883,$3FE45F30
-  pmoTrigSelectedP1:
+  pmoTrigTablep1:
   Data.l $54442D18,$3FF921FB,$54442D18,$3FF921FB
-  pmoTrigSelectedP2:
+  pmoTrigTablep2:
   Data.l $33145C07,$3C91A626,$33145C07,$3C91A626
-  pmoTrigSelectedP3:
+  pmoTrigTablep3:
   Data.l $B7ED8FBC,$B91F1976,$B7ED8FBC,$B91F1976
-  pmoTrigSelectedS1:
-  Data.l $55555549,$BFC55555,$55555549,$BFC55555
-  pmoTrigSelectedS2:
-  Data.l $1110F8A6,$3F811111,$1110F8A6,$3F811111
-  pmoTrigSelectedS3:
-  Data.l $19C161D5,$BF2A01A0,$19C161D5,$BF2A01A0
-  pmoTrigSelectedS4:
-  Data.l $57B1FE7D,$3EC71DE3,$57B1FE7D,$3EC71DE3
-  pmoTrigSelectedS5:
-  Data.l $8A2B9CEB,$BE5AE5E6,$8A2B9CEB,$BE5AE5E6
-  pmoTrigSelectedC1:
-  Data.l $5555554C,$3FA55555,$5555554C,$3FA55555
-  pmoTrigSelectedC2:
-  Data.l $16C15177,$BF56C16C,$16C15177,$BF56C16C
-  pmoTrigSelectedC3:
-  Data.l $19CB1590,$3EFA01A0,$19CB1590,$3EFA01A0
-  pmoTrigSelectedC4:
-  Data.l $809C52AD,$BE927E4F,$809C52AD,$BE927E4F
-  pmoTrigSelectedC5:
-  Data.l $BDB4B1C4,$3E21EE9E,$BDB4B1C4,$3E21EE9E
-  pmoTrigSelectedS6C6:
+  pmoTrigTables6c6:
   Data.l $5ACFD57C,$3DE5D93A,$BE8838D4,$BDA8FAE9
-  pmoTrigSelectedCheck:
+  pmoTrigTablecheck:
   Data.l $00000000,$00002000,$00000000,$00002000
+  pmoTrigTablepair1:
+  Data.l $55555549,$BFC55555,$5555554C,$3FA55555
+  pmoTrigTablepair2:
+  Data.l $1110F8A6,$3F811111,$16C15177,$BF56C16C
+  pmoTrigTablepair3:
+  Data.l $19C161D5,$BF2A01A0,$19CB1590,$3EFA01A0
+  pmoTrigTablepair4:
+  Data.l $57B1FE7D,$3EC71DE3,$809C52AD,$BE927E4F
+  pmoTrigTablepair5:
+  Data.l $8A2B9CEB,$BE5AE5E6,$BDB4B1C4,$3E21EE9E
+  pmoTrigTableindex:
+  Data.l $03020100,$07060504,$03020100,$07060504
 EndDataSection
+
+Procedure PmTensorTrigA64(*src.i,*dst.i,count.i,op.i)
+ ASM
+    stp q8, q9, [sp, #-128]!
+    stp q10, q11, [sp, #32]
+    stp q12, q13, [sp, #64]
+    stp q14, q15, [sp, #96]
+    cmp x3, #1
+    b.hi pmoTrig8Fallback
+    cmp x2, #8
+    b.lt pmoTrig8Fallback
+pmoTrig8Setup:
+    adrp x9, pmoTrigTabletwoopi
+    add x9, x9, #:lo12:pmoTrigTabletwoopi
+    ld1 {v16.2d}, [x9]
+    adrp x9, pmoTrigTablep1
+    add x9, x9, #:lo12:pmoTrigTablep1
+    ld1 {v17.2d}, [x9]
+    adrp x9, pmoTrigTablep2
+    add x9, x9, #:lo12:pmoTrigTablep2
+    ld1 {v27.2d}, [x9]
+    adrp x9, pmoTrigTablep3
+    add x9, x9, #:lo12:pmoTrigTablep3
+    ld1 {v28.2d}, [x9]
+    adrp x9, pmoTrigTablepair1
+    add x9, x9, #:lo12:pmoTrigTablepair1
+    ld1 {v20.2d}, [x9]
+    adrp x9, pmoTrigTablepair2
+    add x9, x9, #:lo12:pmoTrigTablepair2
+    ld1 {v21.2d}, [x9]
+    adrp x9, pmoTrigTablepair3
+    add x9, x9, #:lo12:pmoTrigTablepair3
+    ld1 {v22.2d}, [x9]
+    adrp x9, pmoTrigTablepair4
+    add x9, x9, #:lo12:pmoTrigTablepair4
+    ld1 {v23.2d}, [x9]
+    adrp x9, pmoTrigTablepair5
+    add x9, x9, #:lo12:pmoTrigTablepair5
+    ld1 {v24.2d}, [x9]
+    adrp x9, pmoTrigTablecheck
+    add x9, x9, #:lo12:pmoTrigTablecheck
+    ld1 {v30.2d}, [x9]
+    adrp x9, pmoTrigTables6c6
+    add x9, x9, #:lo12:pmoTrigTables6c6
+    ld1 {v31.2d}, [x9]
+    adrp x9, pmoTrigTableindex
+    add x9, x9, #:lo12:pmoTrigTableindex
+    ld1 {v29.2d}, [x9]
+    movz x11, #16352, lsl #48
+    movz x12, #16368, lsl #48
+pmoTrig8Loop:
+    cmp x2, #8
+    b.lt pmoTrig8Fallback
+    ld1 {v8.4s, v9.4s}, [x0]
+    shl v10.4s, v8.4s, #1
+    shl v11.4s, v9.4s, #1
+    movi v12.4s, #0x93, lsl #24
+    cmhi v10.4s, v10.4s, v12.4s
+    cmhi v11.4s, v11.4s, v12.4s
+    orr v10.16b, v10.16b, v11.16b
+    umaxv s10, v10.4s
+    fmov w9, s10
+    cbnz w9, pmoTrig8Group
+    .word 0x0E617900
+    .word 0x4E617901
+    .word 0x0E617922
+    .word 0x4E617923
+    fmul v8.2d, v0.2d, v16.2d
+    fmul v9.2d, v1.2d, v16.2d
+    fmul v10.2d, v2.2d, v16.2d
+    fmul v11.2d, v3.2d, v16.2d
+    frintn v8.2d, v8.2d
+    frintn v9.2d, v9.2d
+    frintn v10.2d, v10.2d
+    frintn v11.2d, v11.2d
+    fmls v0.2d, v8.2d, v17.2d
+    fmls v1.2d, v9.2d, v17.2d
+    fmls v2.2d, v10.2d, v17.2d
+    fmls v3.2d, v11.2d, v17.2d
+    fmls v0.2d, v8.2d, v27.2d
+    fmls v1.2d, v9.2d, v27.2d
+    fmls v2.2d, v10.2d, v27.2d
+    fmls v3.2d, v11.2d, v27.2d
+    fmls v0.2d, v8.2d, v28.2d
+    fmls v1.2d, v9.2d, v28.2d
+    fmls v2.2d, v10.2d, v28.2d
+    fmls v3.2d, v11.2d, v28.2d
+    fcvtzs v8.2d, v8.2d
+    fcvtzs v9.2d, v9.2d
+    fcvtzs v10.2d, v10.2d
+    fcvtzs v11.2d, v11.2d
+    dup v12.2d, x3
+    add v8.2d, v8.2d, v12.2d
+    add v9.2d, v9.2d, v12.2d
+    add v10.2d, v10.2d, v12.2d
+    add v11.2d, v11.2d, v12.2d
+    umov x4, v8.d[0]
+    umov x5, v8.d[1]
+    umov x6, v9.d[0]
+    umov x7, v9.d[1]
+    umov x13, v10.d[0]
+    umov x14, v10.d[1]
+    umov x15, v11.d[0]
+    umov x16, v11.d[1]
+    fmul v4.2d, v0.2d, v0.2d
+    fmul v5.2d, v1.2d, v1.2d
+    fmul v6.2d, v2.2d, v2.2d
+    fmul v7.2d, v3.2d, v3.2d
+    shl v18.2d, v8.2d, #63
+    sshr v18.2d, v18.2d, #63
+    shl v19.2d, v9.2d, #63
+    sshr v19.2d, v19.2d, #63
+    shl v25.2d, v10.2d, #63
+    sshr v25.2d, v25.2d, #63
+    shl v26.2d, v11.2d, #63
+    sshr v26.2d, v26.2d, #63
+    movi v12.16b, #8
+    and v18.16b, v18.16b, v12.16b
+    orr v18.16b, v18.16b, v29.16b
+    and v19.16b, v19.16b, v12.16b
+    orr v19.16b, v19.16b, v29.16b
+    and v25.16b, v25.16b, v12.16b
+    orr v25.16b, v25.16b, v29.16b
+    and v26.16b, v26.16b, v12.16b
+    orr v26.16b, v26.16b, v29.16b
+    .word 0x4E1203E8
+    .word 0x4E1303E9
+    .word 0x4E1903EA
+    .word 0x4E1A03EB
+    .word 0x4E12030C
+    .word 0x4E13030D
+    .word 0x4E19030E
+    .word 0x4E1A030F
+    fmla v12.2d, v8.2d, v4.2d
+    fmla v13.2d, v9.2d, v5.2d
+    fmla v14.2d, v10.2d, v6.2d
+    fmla v15.2d, v11.2d, v7.2d
+    .word 0x4E1202E8
+    .word 0x4E1302E9
+    .word 0x4E1902EA
+    .word 0x4E1A02EB
+    fmla v8.2d, v12.2d, v4.2d
+    fmla v9.2d, v13.2d, v5.2d
+    fmla v10.2d, v14.2d, v6.2d
+    fmla v11.2d, v15.2d, v7.2d
+    .word 0x4E1202CC
+    .word 0x4E1302CD
+    .word 0x4E1902CE
+    .word 0x4E1A02CF
+    fmla v12.2d, v8.2d, v4.2d
+    fmla v13.2d, v9.2d, v5.2d
+    fmla v14.2d, v10.2d, v6.2d
+    fmla v15.2d, v11.2d, v7.2d
+    .word 0x4E1202A8
+    .word 0x4E1302A9
+    .word 0x4E1902AA
+    .word 0x4E1A02AB
+    fmla v8.2d, v12.2d, v4.2d
+    fmla v9.2d, v13.2d, v5.2d
+    fmla v10.2d, v14.2d, v6.2d
+    fmla v11.2d, v15.2d, v7.2d
+    .word 0x4E12028C
+    .word 0x4E13028D
+    .word 0x4E19028E
+    .word 0x4E1A028F
+    fmla v12.2d, v8.2d, v4.2d
+    fmla v13.2d, v9.2d, v5.2d
+    fmla v14.2d, v10.2d, v6.2d
+    fmla v15.2d, v11.2d, v7.2d
+    fmul v8.2d, v12.2d, v4.2d
+    fmul v9.2d, v13.2d, v5.2d
+    fmul v10.2d, v14.2d, v6.2d
+    fmul v11.2d, v15.2d, v7.2d
+    fmul v12.2d, v8.2d, v0.2d
+    fmul v13.2d, v9.2d, v1.2d
+    fmul v14.2d, v10.2d, v2.2d
+    fmul v15.2d, v11.2d, v3.2d
+    fadd v0.2d, v12.2d, v0.2d
+    fadd v1.2d, v13.2d, v1.2d
+    fadd v2.2d, v14.2d, v2.2d
+    fadd v3.2d, v15.2d, v3.2d
+    fmul v8.2d, v8.2d, v4.2d
+    dup v12.2d, x11
+    fmul v12.2d, v12.2d, v4.2d
+    fmul v9.2d, v9.2d, v5.2d
+    dup v13.2d, x11
+    fmul v13.2d, v13.2d, v5.2d
+    fmul v10.2d, v10.2d, v6.2d
+    dup v14.2d, x11
+    fmul v14.2d, v14.2d, v6.2d
+    fmul v11.2d, v11.2d, v7.2d
+    dup v15.2d, x11
+    fmul v15.2d, v15.2d, v7.2d
+    fsub v8.2d, v8.2d, v12.2d
+    fsub v9.2d, v9.2d, v13.2d
+    fsub v10.2d, v10.2d, v14.2d
+    fsub v11.2d, v11.2d, v15.2d
+    dup v12.2d, x12
+    fadd v8.2d, v8.2d, v12.2d
+    fadd v9.2d, v9.2d, v12.2d
+    fadd v10.2d, v10.2d, v12.2d
+    fadd v11.2d, v11.2d, v12.2d
+    fmov d4, x4
+    ins v4.d[1], x5
+    shl v12.2d, v4.2d, #63
+    sshr v12.2d, v12.2d, #63
+    bsl v12.16b, v8.16b, v0.16b
+    shl v4.2d, v4.2d, #62
+    ushr v4.2d, v4.2d, #63
+    shl v4.2d, v4.2d, #63
+    eor v12.16b, v12.16b, v4.16b
+    fmov d5, x6
+    ins v5.d[1], x7
+    shl v13.2d, v5.2d, #63
+    sshr v13.2d, v13.2d, #63
+    bsl v13.16b, v9.16b, v1.16b
+    shl v5.2d, v5.2d, #62
+    ushr v5.2d, v5.2d, #63
+    shl v5.2d, v5.2d, #63
+    eor v13.16b, v13.16b, v5.16b
+    fmov d6, x13
+    ins v6.d[1], x14
+    shl v14.2d, v6.2d, #63
+    sshr v14.2d, v14.2d, #63
+    bsl v14.16b, v10.16b, v2.16b
+    shl v6.2d, v6.2d, #62
+    ushr v6.2d, v6.2d, #63
+    shl v6.2d, v6.2d, #63
+    eor v14.16b, v14.16b, v6.16b
+    fmov d7, x15
+    ins v7.d[1], x16
+    shl v15.2d, v7.2d, #63
+    sshr v15.2d, v15.2d, #63
+    bsl v15.16b, v11.16b, v3.16b
+    shl v7.2d, v7.2d, #62
+    ushr v7.2d, v7.2d, #63
+    shl v7.2d, v7.2d, #63
+    eor v15.16b, v15.16b, v7.16b
+    shl v0.2d, v12.2d, #35
+    fneg v0.2d, v0.2d
+    abs v0.2d, v0.2d
+    cmhi v0.2d, v30.2d, v0.2d
+    shl v1.2d, v13.2d, #35
+    fneg v1.2d, v1.2d
+    abs v1.2d, v1.2d
+    cmhi v1.2d, v30.2d, v1.2d
+    shl v2.2d, v14.2d, #35
+    fneg v2.2d, v2.2d
+    abs v2.2d, v2.2d
+    cmhi v2.2d, v30.2d, v2.2d
+    shl v3.2d, v15.2d, #35
+    fneg v3.2d, v3.2d
+    abs v3.2d, v3.2d
+    cmhi v3.2d, v30.2d, v3.2d
+    orr v0.16b, v0.16b, v1.16b
+    orr v2.16b, v2.16b, v3.16b
+    orr v0.16b, v0.16b, v2.16b
+    addp v0.2d, v0.2d, v0.2d
+    fmov x9, d0
+    cbnz x9, pmoTrig8Group
+    .word 0x0E616980
+    .word 0x4E6169A0
+    .word 0x0E6169C1
+    .word 0x4E6169E1
+    cbnz x3, pmoTrig8Store
+    ld1 {v2.4s, v3.4s}, [x0]
+    fcmeq v4.4s, v2.4s, #0.0
+    fcmeq v5.4s, v3.4s, #0.0
+    bsl v4.16b, v2.16b, v0.16b
+    bsl v5.16b, v3.16b, v1.16b
+    mov v0.16b, v4.16b
+    mov v1.16b, v5.16b
+pmoTrig8Store:
+    st1 {v0.4s, v1.4s}, [x1]
+    add x0, x0, #32
+    add x1, x1, #32
+    sub x2, x2, #8
+    b pmoTrig8Loop
+pmoTrig8Group:
+    stp x0, x1, [sp, #-32]!
+    stp x2, x3, [sp, #16]
+    mov x2, #8
+    bl pmtensortrigtablea64
+    ldp x2, x3, [sp, #16]
+    ldp x0, x1, [sp], #32
+    add x0, x0, #32
+    add x1, x1, #32
+    sub x2, x2, #8
+    cmp x2, #8
+    b.ge pmoTrig8Setup
+pmoTrig8Fallback:
+    bl pmtensortrigtablea64
+    ldp q10, q11, [sp, #32]
+    ldp q12, q13, [sp, #64]
+    ldp q14, q15, [sp, #96]
+    ldp q8, q9, [sp], #128
+ EndASM
+EndProcedure
