@@ -7869,6 +7869,58 @@ pmoConvBoundUnsafe:
   b.gt pmoConvBoundOc
  EndASM
 EndProcedure
+; The same immutable word holds four-product bits0..31 and eight-product
+; bits32..47. No cache capacity increase. Each eight-product proof checks
+; all four output rows; sum(abs(weights))<=258 bounds every INT16 prefix
+; by258*127=32766. CG64/128 and complete eight-channel groups only.
+Procedure PmConvEightMaskA64(weight.i,masks.i,cg.i,oc.i,k.i)
+ ASM
+  mul x5, x2, x4
+  mov x6, x0
+pmoConvEightBoundOc:
+  mov x7, #0
+pmoConvEightBoundTap:
+  mov x8, #0
+  mov x9, #0
+  movz x10, #1, lsl #32
+pmoConvEightBoundGroup:
+  madd x11, x8, x4, x6
+  add x11, x11, x7
+  mov x12, #4
+pmoConvEightBoundRow:
+  mov x13, x11
+  mov x14, #0
+  mov x16, #8
+pmoConvEightBoundWeight:
+  ldrsb x15, [x13]
+  cmp x15, #0
+  cneg x15, x15, mi
+  add x14, x14, x15
+  add x13, x13, x4
+  subs x16, x16, #1
+  b.ne pmoConvEightBoundWeight
+  cmp x14, #258
+  b.gt pmoConvEightBoundUnsafe
+  add x11, x11, x5
+  subs x12, x12, #1
+  b.ne pmoConvEightBoundRow
+  orr x9, x9, x10
+pmoConvEightBoundUnsafe:
+  lsl x10, x10, #1
+  add x8, x8, #8
+  cmp x8, x2
+  b.lt pmoConvEightBoundGroup
+  ldr x15, [x1]
+  orr x9, x9, x15
+  str x9, [x1], #8
+  add x7, x7, #1
+  cmp x7, x4
+  b.lt pmoConvEightBoundTap
+  add x6, x6, x5, lsl #2
+  subs x3, x3, #4
+  b.gt pmoConvEightBoundOc
+ EndASM
+EndProcedure
 Global PmConvFourCacheBase.i,PmConvFourCacheBytes.i,PmConvFourCacheUsed.i,PmConvFourCacheCount.i,PmConvFourMaskBase.i
 Global Dim PmConvFourCacheKeys.i[64*5]
 Procedure PmConvFourCacheReset(base.i,bytes.i)
@@ -7895,6 +7947,7 @@ Procedure.i PmConvFourCacheWeight(weight.i,cg.i,oc.i,k.i)
  If oc/4>(PmConvFourCacheBytes-PmConvFourCacheUsed)/8/k : ProcedureReturn 0 : EndIf
  bytes=(oc/4)*k*8 : dst=PmConvFourCacheBase+PmConvFourCacheUsed
  PmConvFourMaskA64(weight,dst,cg,oc,k)
+ PmConvEightMaskA64(weight,dst,cg,oc,k)
  at=PmConvFourCacheCount*5
  PmConvFourCacheKeys[at]=weight : PmConvFourCacheKeys[at+1]=cg : PmConvFourCacheKeys[at+2]=oc
  PmConvFourCacheKeys[at+3]=k : PmConvFourCacheKeys[at+4]=dst
@@ -7916,7 +7969,7 @@ Procedure PmI8FourTapsA64(p.i)
     stp q10, q11, [sp, #32]
     stp q12, q13, [sp, #64]
     stp q14, q15, [sp, #96]
-pmoI8FourTapsBegin:
+pmoI8EightTapsBegin:
     ldr x1, [x0, #0]
     ldr x2, [x0, #8]
     ldr x10, [x0, #16]
@@ -7927,6 +7980,7 @@ pmoI8FourTapsBegin:
     ldr x3, [x0, #56]
     ldr x15, [x0, #128]
     ldr x16, [x15]
+    lsr x15, x16, #32
     movi v16.4s, #0
     movi v17.4s, #0
     movi v18.4s, #0
@@ -7943,10 +7997,138 @@ pmoI8FourTapsBegin:
     movi v29.4s, #0
     movi v30.4s, #0
     movi v31.4s, #0
-    cbz x3, pmoI8FourTapsFlush
-pmoI8FourTapsK0:
-    cbz x3, pmoI8FourTapsFlush
-    tbz x16, #0, pmoI8FourTapsPair
+    cbz x3, pmoI8EightTapsFlush
+pmoI8EightTapsK0:
+    cbz x3, pmoI8EightTapsFlush
+    tbz x15, #0, pmoI8EightTapsUseFour
+    ld1 {v0.16b}, [x1], x2
+    ld1 {v1.16b}, [x1], x2
+    ld1 {v2.16b}, [x1], x2
+    ld1 {v3.16b}, [x1], x2
+    ld1r {v4.16b}, [x10], x14
+    smull v8.8h, v0.8b, v4.8b
+    smull2 v9.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x11], x14
+    smull v10.8h, v0.8b, v4.8b
+    smull2 v11.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x12], x14
+    smull v12.8h, v0.8b, v4.8b
+    smull2 v13.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x13], x14
+    smull v14.8h, v0.8b, v4.8b
+    smull2 v15.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x10], x14
+    smlal v8.8h, v1.8b, v4.8b
+    smlal2 v9.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x11], x14
+    smlal v10.8h, v1.8b, v4.8b
+    smlal2 v11.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x12], x14
+    smlal v12.8h, v1.8b, v4.8b
+    smlal2 v13.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x13], x14
+    smlal v14.8h, v1.8b, v4.8b
+    smlal2 v15.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x10], x14
+    smlal v8.8h, v2.8b, v4.8b
+    smlal2 v9.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x11], x14
+    smlal v10.8h, v2.8b, v4.8b
+    smlal2 v11.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x12], x14
+    smlal v12.8h, v2.8b, v4.8b
+    smlal2 v13.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x13], x14
+    smlal v14.8h, v2.8b, v4.8b
+    smlal2 v15.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x10], x14
+    smlal v8.8h, v3.8b, v4.8b
+    smlal2 v9.8h, v3.16b, v4.16b
+    ld1r {v4.16b}, [x11], x14
+    smlal v10.8h, v3.8b, v4.8b
+    smlal2 v11.8h, v3.16b, v4.16b
+    ld1r {v4.16b}, [x12], x14
+    smlal v12.8h, v3.8b, v4.8b
+    smlal2 v13.8h, v3.16b, v4.16b
+    ld1r {v4.16b}, [x13], x14
+    smlal v14.8h, v3.8b, v4.8b
+    smlal2 v15.8h, v3.16b, v4.16b
+    ld1 {v0.16b}, [x1], x2
+    ld1 {v1.16b}, [x1], x2
+    ld1 {v2.16b}, [x1], x2
+    ld1 {v3.16b}, [x1], x2
+    ld1r {v4.16b}, [x10], x14
+    smlal v8.8h, v0.8b, v4.8b
+    smlal2 v9.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x11], x14
+    smlal v10.8h, v0.8b, v4.8b
+    smlal2 v11.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x12], x14
+    smlal v12.8h, v0.8b, v4.8b
+    smlal2 v13.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x13], x14
+    smlal v14.8h, v0.8b, v4.8b
+    smlal2 v15.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x10], x14
+    smlal v8.8h, v1.8b, v4.8b
+    smlal2 v9.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x11], x14
+    smlal v10.8h, v1.8b, v4.8b
+    smlal2 v11.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x12], x14
+    smlal v12.8h, v1.8b, v4.8b
+    smlal2 v13.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x13], x14
+    smlal v14.8h, v1.8b, v4.8b
+    smlal2 v15.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x10], x14
+    smlal v8.8h, v2.8b, v4.8b
+    smlal2 v9.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x11], x14
+    smlal v10.8h, v2.8b, v4.8b
+    smlal2 v11.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x12], x14
+    smlal v12.8h, v2.8b, v4.8b
+    smlal2 v13.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x13], x14
+    smlal v14.8h, v2.8b, v4.8b
+    smlal2 v15.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x10], x14
+    smlal v8.8h, v3.8b, v4.8b
+    smlal2 v9.8h, v3.16b, v4.16b
+    ld1r {v4.16b}, [x11], x14
+    smlal v10.8h, v3.8b, v4.8b
+    smlal2 v11.8h, v3.16b, v4.16b
+    ld1r {v4.16b}, [x12], x14
+    smlal v12.8h, v3.8b, v4.8b
+    smlal2 v13.8h, v3.16b, v4.16b
+    ld1r {v4.16b}, [x13], x14
+    smlal v14.8h, v3.8b, v4.8b
+    smlal2 v15.8h, v3.16b, v4.16b
+    saddw v16.4s, v16.4s, v8.4h
+    saddw2 v17.4s, v17.4s, v8.8h
+    saddw v18.4s, v18.4s, v9.4h
+    saddw2 v19.4s, v19.4s, v9.8h
+    saddw v20.4s, v20.4s, v10.4h
+    saddw2 v21.4s, v21.4s, v10.8h
+    saddw v22.4s, v22.4s, v11.4h
+    saddw2 v23.4s, v23.4s, v11.8h
+    saddw v24.4s, v24.4s, v12.4h
+    saddw2 v25.4s, v25.4s, v12.8h
+    saddw v26.4s, v26.4s, v13.4h
+    saddw2 v27.4s, v27.4s, v13.8h
+    saddw v28.4s, v28.4s, v14.4h
+    saddw2 v29.4s, v29.4s, v14.8h
+    saddw v30.4s, v30.4s, v15.4h
+    saddw2 v31.4s, v31.4s, v15.8h
+    sub x3, x3, #8
+    lsr x16, x16, #2
+    lsr x15, x15, #1
+    b pmoI8EightTapsK0
+pmoI8EightTapsUseFour:
+    mov x9, #2
+pmoI8EightTapsFourGroup:
+    tbz x16, #0, pmoI8EightTapsPair
     ld1 {v0.16b}, [x1], x2
     ld1 {v1.16b}, [x1], x2
     ld1 {v2.16b}, [x1], x2
@@ -8016,10 +8198,10 @@ pmoI8FourTapsK0:
     saddw v30.4s, v30.4s, v15.4h
     saddw2 v31.4s, v31.4s, v15.8h
     sub x3, x3, #4
-    b pmoI8FourTapsNextGroup
-pmoI8FourTapsPair:
+    b pmoI8EightTapsNextGroup
+pmoI8EightTapsPair:
     mov x17, #2
-pmoI8FourTapsPairLoop:
+pmoI8EightTapsPairLoop:
     ld1 {v0.16b}, [x1], x2
     ld1 {v1.16b}, [x1], x2
     ld1r {v4.16b}, [x10], x14
@@ -8064,11 +8246,14 @@ pmoI8FourTapsPairLoop:
     saddw2 v31.4s, v31.4s, v5.8h
     sub x3, x3, #2
     subs x17, x17, #1
-    b.ne pmoI8FourTapsPairLoop
-pmoI8FourTapsNextGroup:
+    b.ne pmoI8EightTapsPairLoop
+pmoI8EightTapsNextGroup:
     lsr x16, x16, #1
-    b pmoI8FourTapsK0
-pmoI8FourTapsFlush:
+    subs x9, x9, #1
+    b.ne pmoI8EightTapsFourGroup
+    lsr x15, x15, #1
+    b pmoI8EightTapsK0
+pmoI8EightTapsFlush:
     ldr x5, [x0, #64]
     ldr x6, [x0, #72]
     ldr x7, [x0, #80]
@@ -8089,7 +8274,7 @@ pmoI8FourTapsFlush:
     scvtf v29.4s, v29.4s
     scvtf v30.4s, v30.4s
     scvtf v31.4s, v31.4s
-    cbnz x7, pmoI8FourTapsRowScale
+    cbnz x7, pmoI8EightTapsRowScale
     ld1 {v4.4s, v5.4s, v6.4s, v7.4s}, [x6]
     fmul v16.4s, v16.4s, v4.4s
     fmul v17.4s, v17.4s, v5.4s
@@ -8107,8 +8292,8 @@ pmoI8FourTapsFlush:
     fmul v29.4s, v29.4s, v5.4s
     fmul v30.4s, v30.4s, v6.4s
     fmul v31.4s, v31.4s, v7.4s
-    b pmoI8FourTapsAdd
-pmoI8FourTapsRowScale:
+    b pmoI8EightTapsAdd
+pmoI8EightTapsRowScale:
     ld1r {v4.4s}, [x6], #4
     fmul v16.4s, v16.4s, v4.4s
     fmul v17.4s, v17.4s, v4.4s
@@ -8129,8 +8314,8 @@ pmoI8FourTapsRowScale:
     fmul v29.4s, v29.4s, v4.4s
     fmul v30.4s, v30.4s, v4.4s
     fmul v31.4s, v31.4s, v4.4s
-pmoI8FourTapsAdd:
-    cbnz x8, pmoI8FourTapsZero
+pmoI8EightTapsAdd:
+    cbnz x8, pmoI8EightTapsZero
     ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
     fadd v16.4s, v0.4s, v16.4s
     fadd v17.4s, v1.4s, v17.4s
@@ -8155,8 +8340,8 @@ pmoI8FourTapsAdd:
     fadd v30.4s, v2.4s, v30.4s
     fadd v31.4s, v3.4s, v31.4s
     st1 {v28.4s, v29.4s, v30.4s, v31.4s}, [x5]
-    b pmoI8FourTapsDone
-pmoI8FourTapsZero:
+    b pmoI8EightTapsDone
+pmoI8EightTapsZero:
     movi v0.4s, #0
     fadd v16.4s, v0.4s, v16.4s
     fadd v17.4s, v0.4s, v17.4s
@@ -8178,11 +8363,11 @@ pmoI8FourTapsZero:
     st1 {v20.4s, v21.4s, v22.4s, v23.4s}, [x5], #64
     st1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x5], #64
     st1 {v28.4s, v29.4s, v30.4s, v31.4s}, [x5]
-pmoI8FourTapsDone:
+pmoI8EightTapsDone:
     ldr x8, [x0, #104]
     subs x8, x8, #1
     str x8, [x0, #104]
-    b.eq pmoI8FourTapsReturn
+    b.eq pmoI8EightTapsReturn
     ldr x8, [x0, #112]
     ldr x1, [x0]
     add x1, x1, x8
@@ -8207,8 +8392,8 @@ pmoI8FourTapsDone:
     ldr x8, [x0, #128]
     add x8, x8, #8
     str x8, [x0, #128]
-    b pmoI8FourTapsBegin
-pmoI8FourTapsReturn:
+    b pmoI8EightTapsBegin
+pmoI8EightTapsReturn:
     ldp q10, q11, [sp, #32]
     ldp q12, q13, [sp, #64]
     ldp q14, q15, [sp, #96]

@@ -367,3 +367,19 @@ waveform CRCs remain identical. Silent RTF.651-.765 gives24-35% compute
 margin. Aggregate generation time20.8% below R1, about2.8% below R33.
 Unary1048->786ms across8; no normalization change retained (no whole gain).
 No Bluetooth connection/playback or map demo; end-to-end onset unverified.
+
+2026-10-21: eight-product convolution bounds. Immutable proof words retain
+four-product bits0-31 and add eight-product bits32-47, without extra cache
+memory. All four output rows must satisfy sum(abs(eight weights))<=258;
+activations[-127,127] then bound every16-bit prefix by32766. Qualified groups
+widen once per eight products; others retain the existing four/pair paths.
+Tap order, integer sums, FP32 conversion/scaling and output bits unchanged.
+Native CG64/128 narrow stride1 geometry only, selected by data/shape; not by
+model identity.36 real-Pi comparisons plus independent scalar metadata proof,
+capacity/reset/guard cases and full q8-q15 preservation pass. Safe groups
+improve isolated convolution about10-12%; all-unsafe cases can lose~1%.
+
+R39 full four-core Kitten:27770/68096 groups (41%) qualify. Cached metadata
+still41728bytes. DConv+ConvThenAdd3955->3852ms across8. All8 waveform CRCs
+unchanged. First PCMms468/463/476/459/676/849/611/463; total generationms
+767/714/801/681/1605/2410/1505/714. Silent RTF.644-.758. Bluetooth/map untested.
