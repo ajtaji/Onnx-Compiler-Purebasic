@@ -253,3 +253,25 @@ about11percent faster than the starting whole-model baseline; all eight
 raw waveform CRCs are unchanged, including the repeated Turn left request.
 No worker faults or accounting errors occurred. The PCM-ready target is met
 for this sample; Bluetooth delivery and speaker latency are separate checks.
+
+
+2026-10-21: select the needed trigonometric polynomial before evaluation
+
+The AArch64 Sin/Cos kernel now evaluates the selected Horner chain once per
+lane. Reduction, coefficient values, finishing order, signed-zero correction
+and midpoint fallback remain exact. Only caller-saved registers are used;
+there is no stack growth. Thirty-two returning real-Pi cases matched all bits
+and output guards, including moderate-angle and raw-word random tests over
+262144 values, tails, midpoint neighbors, NaNs, infinities and signed zero.
+Representative 65536-value cases improve about4%, with no gain claimed for
+the exceptional-value scalar fallback. Eight full Kitten replies preserve
+every baseline waveform CRC; aggregate unary time falls1082 to1043ms.
+Whole generation improves under0.5%; this alone does not meet the goal.
+
+Canonical R15 whole-model silent first PCM was0.53-0.98s, with14-27% compute
+margin. Prior Bluetooth-active tests were materially slower: scheduled
+nonzero onset0.67-1.15s and only about3% worst-case compute margin. These
+packet/schedule times are not measured acoustic onset. Current testing stays
+silent and map demonstrations remain deferred. The installed navigation app
+has not yet received this runtime. A faster isolated binary loop did not
+produce a meaningful whole-model gain and is not included.
