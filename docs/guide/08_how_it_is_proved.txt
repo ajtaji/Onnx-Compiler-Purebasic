@@ -656,3 +656,12 @@ compare reduced precision on representative data, yourself.
 For bare metal, validate on the hardware you intend to use before making
 any correctness or performance claim. Nothing in this book substitutes for
 that, and nothing in it is meant to.
+@SECTION Checked integer powers and sums
+
+On 21 October 2026, an independent returning payload on the physical
+Raspberry Pi 4 passed 130 checks for the runtime-dimension integer Pow and
+ReduceSum paths. Cases cover scalar and broadcast powers, signed extremes,
+zero exponents, overflow and negative-exponent refusals, INT32/INT64 sums,
+multiple and negative axes, keepdims, empty reduction dimensions and an
+unchanged FLOAT reduction. This is numerical proof on that target, not a
+performance claim or a claim of complete integer operator coverage.

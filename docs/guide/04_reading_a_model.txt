@@ -680,6 +680,18 @@ its own number, and chapter 5 shows where.
 
 @SECTION What to do with your own model
 
+Runtime-dimension integer Pow accepts an INT32 or INT64 base and an integer,
+nonnegative exponent, including broadcast operands. It uses checked integer
+multiplication without passing through FLOAT. A negative exponent, an
+incompatible exponent type, or overflow of the native signed execution range
+returns an explicit runtime error.
+
+Runtime-dimension ReduceSum also accepts INT32 and INT64 tensors, including
+multiple or negative axes and keepdims. Integer accumulation stays integer;
+overflow of the native signed range returns an error. Other integer
+reductions are not implied by this support. The existing FLOAT reduction
+kernels and their arithmetic order are unchanged.
+
 Start at FP32 with inputs whose answers you already know. Check the shapes
 and element types the tool reports against what you expected. Read the
 manifest's memory accounting and compare it with the memory the target

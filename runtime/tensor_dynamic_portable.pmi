@@ -164,6 +164,24 @@ Procedure.i DIntegerOp(A.i,B.i,Op.i)
   DFail("Integer arithmetic exceeds the native signed execution range.")
   ProcedureReturn 0
 EndProcedure
+Procedure.i DIntegerPower(Base.i,Exponent.i)
+  Protected result.i=1
+  If Exponent<0
+    ProcedureReturn DFail("Integer power requires a nonnegative exponent; check the exponent tensor.")
+  EndIf
+  While Exponent>0
+    If (Exponent & 1)<>0
+      result=DIntegerOp(result,Base,2)
+      If DError<>0 : ProcedureReturn 0 : EndIf
+    EndIf
+    Exponent=Exponent>>1
+    If Exponent>0
+      Base=DIntegerOp(Base,Base,2)
+      If DError<>0 : ProcedureReturn 0 : EndIf
+    EndIf
+  Wend
+  ProcedureReturn result
+EndProcedure
 Procedure.f DFloat(Value.i)
   Protected r.f=0.0
   CompilerIf #PMD_NATIVE_BYTES=8
@@ -1293,6 +1311,12 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
             ProcedureReturn
           EndIf
           iv=DIntegerOp(ia,ib,3)
+        Case 4
+          If Dt(B)\Kind<>6 And Dt(B)\Kind<>7
+            DFail("Integer power requires an integer exponent tensor; check the exponent type.")
+            ProcedureReturn
+          EndIf
+          iv=DIntegerPower(ia,ib)
         Case 5
           iv=Bool(ia=ib)
         Case 6
@@ -2698,9 +2722,11 @@ Procedure DReduceAxes(Y.i,A.i,Axes.i,Keep.i,Mean.i)
   Protected acc.f=0.0
   Protected x.f=0.0
   Protected cf.f=0.0
+  Protected integerAcc.i=0
+  Protected integerValue.i=0
   DZero(@dims(0),8*#PMD_NATIVE_BYTES)
-  If Dt(A)\Kind<>1
-    DFail("Reduction requires FLOAT.")
+  If Dt(A)\Kind<>1 And (Mean<>0 Or (Dt(A)\Kind<>6 And Dt(A)\Kind<>7))
+    DFail("Reduction requires FLOAT, or an INT32/INT64 tensor for ReduceSum.")
     ProcedureReturn
   EndIf
   If Axes
@@ -2743,7 +2769,7 @@ Procedure DReduceAxes(Y.i,A.i,Axes.i,Keep.i,Mean.i)
       outCount=outCount*DDims((A)*8+(d))
     EndIf
   Next
-  If DAlloc(Y,1,j,@dims(0))=0
+  If DAlloc(Y,Dt(A)\Kind,j,@dims(0))=0
     ProcedureReturn
   EndIf
   cf=inner
@@ -2758,6 +2784,7 @@ Procedure DReduceAxes(Y.i,A.i,Axes.i,Keep.i,Mean.i)
       EndIf
     Next
     acc=0.0
+    integerAcc=0
     For j=0 To inner-1
       at=base
       n=j
@@ -2768,13 +2795,25 @@ Procedure DReduceAxes(Y.i,A.i,Axes.i,Keep.i,Mean.i)
           at=at+coord*stride(d)
         EndIf
       Next
-      x=PmTensorGet(Dt(A)\Data,at)
-      acc=acc+x
+      If Dt(A)\Kind=1
+        x=PmTensorGet(Dt(A)\Data,at)
+        acc=acc+x
+      Else
+        integerValue=DInt(A,at)
+        integerAcc=DIntegerOp(integerAcc,integerValue,0)
+        If DError<>0 : ProcedureReturn : EndIf
+      EndIf
     Next
     If Mean
       acc=acc/cf
     EndIf
-    PmTensorPut(Dt(Y)\Data,i,acc)
+    If Dt(A)\Kind=1
+      PmTensorPut(Dt(Y)\Data,i,acc)
+    ElseIf Dt(A)\Kind=7
+      DWriteI64(Dt(Y)\Data+i*8,integerAcc)
+    Else
+      PokeL(Dt(Y)\Data+i*4,integerAcc)
+    EndIf
   Next
 EndProcedure
 
@@ -2785,6 +2824,10 @@ Procedure DReduce(Y.i,A.i,Axes.i,Keep.i,Mean.i)
   Protected rank.i=Dt(A)\Rank
   Protected width.i=0
   DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Dt(A)\Kind<>1
+    DReduceAxes(Y,A,Axes,Keep,Mean)
+    ProcedureReturn
+  EndIf
   If Axes=0
     DReduceAxes(Y,A,Axes,Keep,Mean)
     ProcedureReturn
