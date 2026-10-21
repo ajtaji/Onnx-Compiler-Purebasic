@@ -192,6 +192,13 @@ Procedure DWriteI64(Address.i,Value.i)
   PmTensorPutI64(Address,0,Value)
 EndProcedure
 Procedure DCopy(Source.i,Destination.i,Bytes.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If ((Source | Destination) & 15)=0 And Bytes>=16
+    If Destination<=Source Or Destination-Source>=Bytes
+      PmTensorCopyAlignedNeon(Source,Destination,Bytes) : ProcedureReturn
+    EndIf
+  EndIf
+  CompilerEndIf
   Protected i.i=0
   i=0
   ; Aligned words preserve the forward byte-copy contract on every target.
@@ -1956,6 +1963,7 @@ Procedure DSlice(Y.i,A.i,Starts.i,Ends.i,Axes.i,Steps.i)
   Protected n.i=0
   Protected src.i=0
   Protected c.i=0
+  Protected block.i=1,axis.i,base.i=0,rows.i
   Protected size.i=DSize(Dt(A)\Kind)
   DZero(@dims(0),8*#PMD_NATIVE_BYTES)
   DZero(@start(0),8*#PMD_NATIVE_BYTES)
@@ -2008,6 +2016,27 @@ Procedure DSlice(Y.i,A.i,Starts.i,Ends.i,Axes.i,Steps.i)
     stepv(ax)=st
   Next
   If DAllocOverwrite(Y,Dt(A)\Kind,Dt(A)\Rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  If Dt(Y)\Count=0 : ProcedureReturn : EndIf
+  ; Coalesce the innermost contiguous suffix. The selected row may be only
+  ; part of its source row; an outer stride mismatch stops coalescing there.
+  axis=Dt(A)\Rank-1
+  For j=0 To Dt(A)\Rank-1 : base=base+start(j)*stride(j) : Next
+  While axis>=0
+    If stepv(axis)<>1 Or stride(axis)<>block : Break : EndIf
+    block=block*dims(axis) : axis=axis-1
+  Wend
+  If block>1
+    rows=Dt(Y)\Count/block
+    For i=0 To rows-1
+      n=i : src=base
+      For j=axis To 0 Step -1
+        c=n % dims(j) : n=n/dims(j)
+        src=src+c*stepv(j)*stride(j)
+      Next
+      DCopy(Dt(A)\Data+src*size,Dt(Y)\Data+i*block*size,block*size)
+    Next
     ProcedureReturn
   EndIf
   For i=0 To Dt(Y)\Count-1
@@ -2213,6 +2242,12 @@ Procedure DWhere(Y.i,Cond.i,A.i,B.i)
     astep=Bool(Dt(A)\Count<>1)*size
     bstep=Bool(Dt(B)\Count<>1)*size
     cstep=Bool(Dt(Cond)\Count<>1)
+    CompilerIf #PMD_NATIVE_BYTES=8
+    If size=4 And ((ap | bp | dp) & 15)=0 And ((cp & 3)=0 Or cstep=0)
+      PmTensorWhereWordsNeon(ap,bp,cp,dp,Dt(Y)\Count,astep,bstep,cstep)
+      ProcedureReturn
+    EndIf
+    CompilerEndIf
     For i=0 To Dt(Y)\Count-1
       src=bp
       If PeekA(cp)<>0 : src=ap : EndIf

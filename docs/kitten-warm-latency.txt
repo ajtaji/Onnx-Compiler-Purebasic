@@ -197,3 +197,26 @@ worker faults. Overall generation improved about4-5percent. This does not
 establish the universal0.5-1second audible target or sufficient application
 headroom. A sixteen-element binary unroll that looked faster in isolation
 regressed whole-model binary time and was removed. No map demo was run.
+
+
+The next pass coalesces Slice's contiguous inner dimensions into whole-row
+copies. Reversed/strided outer coordinates retain their original mapping;
+noncontiguous inner slices keep the reference element loop. Aligned raw copies
+use64-byte vector blocks only when forward copying is safe. Upward-overlapping
+and unaligned ranges retain the original forward word/byte behavior.32 copy
+cases matched complete guarded buffers, including overlap offsets1/4/16 and
+misalignment.32 slice cases matched shapes and bytes for FLOAT, INT64 and BOOL,
+partial rows, reverse/strided axes, negative axes/starts, empty and scalar data.
+
+Where now selects four independent four-byte words per vector for directly
+broadcastable Boolean inputs. Every nonzero condition byte selects A; payload
+bits never pass through arithmetic. Other broadcasts, sizes and alignments
+retain the original loop.64 cases matched all words and guards, including all
+scalar/contiguous combinations, tails, noncanonical true bytes and NaN words.
+
+Across the same eight complete warm requests, Slice fell293 to27ms and Where
+175 to136ms; transpose and reshape also benefit from the faster copies. Total
+generation is now8-9percent faster than the start of this measurement cycle.
+First PCM:553/549/562/543/840/1020/755/548ms. RTF0.748-0.882; all complete
+waveform CRCs match the baseline. No secondary-core faults occurred. Audible
+Bluetooth startup and sufficient map/audio headroom remain to be established.

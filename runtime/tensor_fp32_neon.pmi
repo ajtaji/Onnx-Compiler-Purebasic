@@ -15,6 +15,100 @@
 ; registers across calls. General-purpose state uses caller-saved x0..x17.
 ; ======================================================================
 
+; Aligned forward copy. Caller excludes upward-overlapping ranges.
+Procedure PmTensorCopyAlignedNeon(src.i,dst.i,bytes.i)
+ ASM
+  cmp x2, #0
+  b.le pmoCopyDone
+  cmp x2, #64
+  b.lt pmoCopySixteen
+pmoCopySixtyFour:
+  ld1 {v0.16b-v3.16b}, [x0], #64
+  st1 {v0.16b-v3.16b}, [x1], #64
+  sub x2, x2, #64
+  cmp x2, #64
+  b.ge pmoCopySixtyFour
+pmoCopySixteen:
+  cmp x2, #16
+  b.lt pmoCopyWords
+  ld1 {v0.16b}, [x0], #16
+  st1 {v0.16b}, [x1], #16
+  sub x2, x2, #16
+  b pmoCopySixteen
+pmoCopyWords:
+  cmp x2, #4
+  b.lt pmoCopyBytes
+  ldr w3, [x0], #4
+  str w3, [x1], #4
+  sub x2, x2, #4
+  b pmoCopyWords
+pmoCopyBytes:
+  cbz x2, pmoCopyDone
+  ldrb w3, [x0], #1
+  strb w3, [x1], #1
+  sub x2, x2, #1
+  b pmoCopyBytes
+pmoCopyDone:
+ EndASM
+EndProcedure
+
+; Four-byte values are selected as words; no floating arithmetic occurs.
+; Boolean conditions are bytes, with every nonzero byte selecting A.
+Procedure PmTensorWhereWordsNeon(a.i,b.i,c.i,dst.i,count.i,astep.i,bstep.i,cstep.i)
+ ASM
+  cmp x4, #0
+  b.le pmoWhereDone
+  movi v3.4s, #0
+  cmp x4, #4
+  b.lt pmoWhereTail
+pmoWhereFour:
+  cbz x7, pmoWhereBroadcastC
+  ldr w8, [x2], #4
+  fmov s0, w8
+  uxtl v0.8h, v0.8b
+  uxtl v0.4s, v0.4h
+  b pmoWhereLoadA
+pmoWhereBroadcastC:
+  ldrb w8, [x2]
+  dup v0.4s, w8
+pmoWhereLoadA:
+  cbz x5, pmoWhereBroadcastA
+  ld1 {v1.4s}, [x0], #16
+  b pmoWhereLoadB
+pmoWhereBroadcastA:
+  ld1r {v1.4s}, [x0]
+pmoWhereLoadB:
+  cbz x6, pmoWhereBroadcastB
+  ld1 {v2.4s}, [x1], #16
+  b pmoWhereSelect
+pmoWhereBroadcastB:
+  ld1r {v2.4s}, [x1]
+pmoWhereSelect:
+  cmhi v0.4s, v0.4s, v3.4s
+  bsl v0.16b, v1.16b, v2.16b
+  st1 {v0.4s}, [x3], #16
+  sub x4, x4, #4
+  cmp x4, #4
+  b.ge pmoWhereFour
+pmoWhereTail:
+  cbz x4, pmoWhereDone
+  ldrb w8, [x2]
+  cbz w8, pmoWhereTailB
+  ldr w9, [x0]
+  b pmoWhereTailStore
+pmoWhereTailB:
+  ldr w9, [x1]
+pmoWhereTailStore:
+  str w9, [x3], #4
+  add x0, x0, x5
+  add x1, x1, x6
+  add x2, x2, x7
+  sub x4, x4, #1
+  b pmoWhereTail
+pmoWhereDone:
+ EndASM
+EndProcedure
+
 ; Final-axis reductions keep the portable kernel's exact FP32 evaluation
 ; order while owning their hot loop state in registers.  In particular,
 ; these are deliberately scalar reductions: a horizontal vector reduction
