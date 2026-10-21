@@ -6,7 +6,8 @@ The application and all generation logic are PureBasic. The `.pmi` files are
 BASIC runtime source templates: some are shared with PureBasic, while the
 target-specific templates are emitted for a separate PureMetal application build.
 No proprietary language compiler implementation is included. The Python files
-are the node-test harness and its cases under `tests/node_suite/`, and the host
+include the optional immutable-weight cache preparer under `tools/`,
+the node-test harness and its cases under `tests/node_suite/`, and the host
 tools of the Pi 4 example under `examples/pi4/` - developer checks and board
 tools that building and using the compiler never need.
 
@@ -150,3 +151,11 @@ The rest of `tests/` is not part of this export; see [validation](VALIDATION.md)
 
 Rebuild the generator after changing any embedded runtime. Regenerate and
 separately rebuild model applications to pick up those changes.
+
+## Optional weight-layout preparation
+
+[`tools/prepare_immutable_weight_caches.py`](../tools/prepare_immutable_weight_caches.py)
+reads generated static tensor metadata and emits a caller-owned preparation
+include. [The cache contract](ImmutableWeightCaches.md) covers buffers, lifetime,
+shape selection and measured limitations. It is developer infrastructure; the
+compiler and inference never invoke it.

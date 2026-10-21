@@ -1,0 +1,113 @@
+; Independent guarded INT8 convolution shapes. RAM only, no model or audio assets.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 3215
+#PMD_NODE_COUNT = 2463
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=390016
+#PMO_WEIGHT_FILE_BYTES=119358848
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+Global *GatePet
+Global GateFaults.i,GateCases.i
+Procedure.i GateTicks()
+ ASM
+  mrs x0, cntpct_el0
+ EndASM
+EndProcedure
+Procedure GateIdle()
+ If *GatePet : GatePet() : EndIf
+EndProcedure
+Procedure GateGuard(p.i,n.i)
+ PokeI(p-16,$5A5A5A5A5A5A5A5A) : PokeI(p-8,$5A5A5A5A5A5A5A5A)
+ PokeI(p+n,$5A5A5A5A5A5A5A5A) : PokeI(p+n+8,$5A5A5A5A5A5A5A5A)
+EndProcedure
+Procedure.i GateCheck(p.i,n.i)
+ If PeekI(p-16)<>$5A5A5A5A5A5A5A5A Or PeekI(p-8)<>$5A5A5A5A5A5A5A5A Or PeekI(p+n)<>$5A5A5A5A5A5A5A5A Or PeekI(p+n+8)<>$5A5A5A5A5A5A5A5A : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure GateCase(cg.i,oc.i,width.i,k.i,dil.i,stride.i,groups.i,wide.i,batches.i,add.i)
+ Protected g.PmTensorConv1DArgs
+ Protected i.i,n.i,wn.i,on.i,begin.i,oldTicks.i,newTicks.i,bad.i,row.i
+ DZero(@g,SizeOf(PmTensorConv1DArgs))
+ g\Src=$44000010 : g\Weight=$45000010 : g\WeightScales=$46000010 : g\Dst=$47000010 : g\Bias=$46100010
+ g\InChannels=cg*groups : g\InWidth=width : g\OutChannels=oc : g\Kernel=k : g\Dilation=dil : g\Stride=stride : g\Groups=groups : g\Wide=wide : g\Batches=batches
+ g\PadLeft=dil*(k-1)/2 : g\OutWidth=(width-1)/stride+1
+ n=g\InChannels*width*batches*4 : wn=oc*cg*k*(1+wide) : on=g\OutWidth*oc*batches*4
+ For i=0 To n/4-1 : DWriteF(g\Src+i*4,((i*17+GateCases*13)%255-127)*0.0078125) : Next
+ For i=0 To wn-1 : PokeA(g\Weight+i,(i*11+GateCases*7)%256-128) : Next
+ For i=0 To oc-1 : DWriteF(g\WeightScales+i*4,(i%7+1)*0.00390625) : DWriteF(g\Bias+i*4,(i%9-4)*0.125) : Next
+ For i=0 To on/4-1
+  DWriteF($49000010+i*4,(i%31-15)*0.03125)
+  If add=2 And (i%31)=13 : PokeL($49000010+i*4,$7FC00055) : EndIf
+ Next
+ GateGuard(g\Src,n) : GateGuard(g\Weight,wn) : GateGuard(g\WeightScales,oc*4) : GateGuard(g\Bias,oc*4)
+ GateGuard(g\Dst,on) : GateGuard($48000010,on) : GateGuard($49000010,on)
+ PmConvPackedCacheReset($C2000010,$007FFFE0) : PmConvFourCacheReset($D0000010,$003FFFE0)
+ GateGuard($C2000010,$007FFFE0) : GateGuard($D0000010,$003FFFE0)
+ PmConvAddBase=0 : PmConvAddOrder=0
+ If add>0 : PmConvAddBase=$49000010 : PmConvAddOrder=add & 1 : EndIf
+ begin=GateTicks()
+ If DInt8BeginOverwrite(PmI8ConvScratchBytes(@g))=0 : bad+1 : Else : PmTensorConv1DNeon(@g) : DInt8End() : EndIf
+ oldTicks=GateTicks()-begin : DCopy(g\Dst,$48000010,on)
+ If wide=0
+  If PmConvPackedCacheWeight(g\Weight,cg,oc,k)=0 : bad+1 : EndIf
+  If PmConvFourCacheWeight(g\Weight,cg,oc,k)=0 : bad+1 : EndIf
+ EndIf
+ begin=GateTicks()
+ If DInt8BeginOverwrite(PmI8ConvScratchBytes(@g))=0 : bad+1 : Else : PmTensorConv1DNeon(@g) : DInt8End() : EndIf
+ newTicks=GateTicks()-begin
+ For i=0 To on/4-1 : If PeekL(g\Dst+i*4)<>PeekL($48000010+i*4) : bad+1 : EndIf : Next
+ If GateCheck(g\Src,n)=0 Or GateCheck(g\Weight,wn)=0 Or GateCheck(g\WeightScales,oc*4)=0 Or GateCheck(g\Bias,oc*4)=0 Or GateCheck(g\Dst,on)=0 Or GateCheck($48000010,on)=0 Or GateCheck($49000010,on)=0 : bad+1 : EndIf
+ If GateCheck($C2000010,$007FFFE0)=0 Or GateCheck($D0000010,$003FFFE0)=0 : bad+1 : EndIf
+ If DError Or DCancel : bad+1 : EndIf
+ row=$E1D00000+GateCases*128
+ PokeI(row,cg) : PokeI(row+8,oc) : PokeI(row+16,width) : PokeI(row+24,k) : PokeI(row+32,dil) : PokeI(row+40,stride)
+ PokeI(row+48,groups) : PokeI(row+56,wide) : PokeI(row+64,batches) : PokeI(row+72,add) : PokeI(row+80,oldTicks) : PokeI(row+88,newTicks) : PokeI(row+96,bad)
+ GateFaults+bad : GateCases+1 : GateIdle()
+EndProcedure
+Procedure.i Main(services.i)
+ Protected cores.i
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000)<>0 : ProcedureReturn 12 : EndIf
+ MmuEnableCached()
+ If PmSetAnvilServices(services)=0 : MmuDisableCachedFlushed() : ProcedureReturn 10 : EndIf
+ cores=PmParallelCores()
+ DZero($E1D00000,8192) : *GatePet=pmAnvilSlot(6)
+ If cores<>4 : MmuDisableCachedFlushed() : ProcedureReturn 11 : EndIf
+ If DHeapBind($80000000,$40000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 13 : EndIf
+ GateCase(256,4,15,3,1,1,1,0,1,0)
+ GateCase(256,20,31,11,1,1,1,0,1,0)
+ GateCase(256,64,65,11,3,1,1,0,1,0)
+ GateCase(256,20,193,3,1,1,1,0,1,1)
+ GateCase(512,4,15,3,1,1,1,0,1,0)
+ GateCase(512,20,31,11,1,1,1,0,1,0)
+ GateCase(512,64,65,11,3,1,1,0,1,0)
+ GateCase(512,20,193,3,1,1,1,0,1,2)
+ GateCase(256,20,65,3,1,1,1,0,2,0)
+ GateCase(512,20,65,3,1,2,1,0,1,0)
+ GateCase(256,20,65,3,1,1,2,0,1,0)
+ GateCase(512,20,65,3,1,1,1,1,1,0)
+ PokeI($E1D01FC0,GateCases) : PokeI($E1D01FC8,GateFaults) : PokeI($E1D01FD0,cores)
+ PmConvAddBase=0 : PmConvPackedCacheReset(0,0) : PmConvFourCacheReset(0,0)
+ DHeap=0 : DHeapBytes=0 : MmuDisableCachedFlushed()
+ ProcedureReturn GateFaults
+EndProcedure

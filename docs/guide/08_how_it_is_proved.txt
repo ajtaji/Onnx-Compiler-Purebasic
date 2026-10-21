@@ -665,3 +665,14 @@ zero exponents, overflow and negative-exponent refusals, INT32/INT64 sums,
 multiple and negative axes, keepdims, empty reduction dimensions and an
 unchanged FLOAT reduction. This is numerical proof on that target, not a
 performance claim or a claim of complete integer operator coverage.
+
+@SECTION Larger-channel packed convolution
+
+On 21 October, 12 independent Pi 4 cases covered 256/512-channel packed
+INT8 convolution, output tails, dilation, batches, fused residuals and
+strided/grouped/wide fallbacks. Every output bit matched the existing
+path, including a NaN payload in a residual, with intact memory guards.
+Eligible cases improved by roughly 8 to 45 percent, with a tiny case
+near parity. Two paired whole-model Kokoro runs also preserved every
+sample bit; their timing and limitations are in chapter 7. This proves
+those shapes on Pi 4, not arbitrary models or other hardware.

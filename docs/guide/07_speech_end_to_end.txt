@@ -289,3 +289,32 @@ The Pico profiles exist for small models. The full model's weights are 324
 MB and its text assets are tens of megabytes; no storage precision changes
 that by two orders of magnitude. The speech switches reject those target
 combinations outright rather than offering a demo that could never bind.
+
+@SECTION Keeping prepared weights warm
+
+Resident weights and prepared weight layouts are separate. Binding once
+avoids reloads; optional matrix and convolution caches also avoid repeated
+layout conversion. The Pi 4 developer helper reads a freshly emitted
+INT8 model and writes an include plus its exact buffer-size plan:
+
+@FRAG
+python tools/prepare_immutable_weight_caches.py generated/model.pi4 --output generated/weight-caches.pmi
+@ENDFRAG
+
+Include the result after the model. While inference is idle, bind the
+model, then call PmModelPrepareWeightCaches with matrix base/bytes,
+convolution base/bytes and proof-mask base/bytes. A return of one means
+ready. Buffers are separate, caller-owned and 16-byte aligned; keep them
+and the unchanged weights live between requests. Clear them with
+PmModelClearWeightCaches before closing, rebinding or reclaiming storage.
+Regenerate the helper when regenerating the model. The full lifetime,
+selection and range contract is in docs/ImmutableWeightCaches.md.
+
+A silent four-core mixed INT8 Kokoro test on 21 October reduced eight
+complete directions from 99.904 to 83.657 seconds by preparing immutable
+weights once. Larger-channel packed convolution reduced a second paired
+83.623-second baseline to 80.896 seconds. Every sample bit stayed equal.
+The eight directions total 27.6 seconds of speech: the final compute/audio
+ratio is still 2.93. This does not establish real-time Kokoro, subsecond
+startup, Bluetooth timing or map concurrency. The baseline's existing
+FP32 reference differences are not removed by caching.

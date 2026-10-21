@@ -7966,12 +7966,18 @@ Procedure.i PmConvFourCacheWeight(weight.i,cg.i,oc.i,k.i)
  Protected bytes.i,dst.i,at.i
  If PmConvFourCacheFind(weight,cg,oc,k)<>0 : ProcedureReturn 1 : EndIf
  If weight=0 Or PmConvFourCacheBase=0 Or PmConvFourCacheCount>=64 : ProcedureReturn 0 : EndIf
- If cg<>64 And cg<>128 : ProcedureReturn 0 : EndIf
+ If cg<>64 And cg<>128 And cg<>256 And cg<>512 : ProcedureReturn 0 : EndIf
  If oc<4 Or (oc & 3)<>0 Or k<2 : ProcedureReturn 0 : EndIf
  If oc/4>(PmConvFourCacheBytes-PmConvFourCacheUsed)/8/k : ProcedureReturn 0 : EndIf
  bytes=(oc/4)*k*8 : dst=PmConvFourCacheBase+PmConvFourCacheUsed
- PmConvFourMaskA64(weight,dst,cg,oc,k)
- PmConvEightMaskA64(weight,dst,cg,oc,k)
+ If cg<=128
+  PmConvFourMaskA64(weight,dst,cg,oc,k)
+  PmConvEightMaskA64(weight,dst,cg,oc,k)
+ Else
+  ; Large channel counts use only the safe two-product path. Their proof
+  ; groups cannot share the CG128 packed mask word without overlapping.
+  For at=0 To bytes-1 Step 8 : PokeI(dst+at,0) : Next
+ EndIf
  at=PmConvFourCacheCount*5
  PmConvFourCacheKeys[at]=weight : PmConvFourCacheKeys[at+1]=cg : PmConvFourCacheKeys[at+2]=oc
  PmConvFourCacheKeys[at+3]=k : PmConvFourCacheKeys[at+4]=dst
@@ -8002,7 +8008,7 @@ Procedure.i PmConvPackedCacheWeight(weight.i,cg.i,oc.i,k.i)
  Protected bytes.i,dst.i,at.i,row.i,tap.i,channel.i,output.i
  If PmConvPackedCacheFind(weight,cg,oc,k)<>0 : ProcedureReturn 1 : EndIf
  If weight=0 Or PmConvPackedCacheBase=0 Or PmConvPackedCacheCount>=64 : ProcedureReturn 0 : EndIf
- If cg<>64 And cg<>128 : ProcedureReturn 0 : EndIf
+ If cg<>64 And cg<>128 And cg<>256 And cg<>512 : ProcedureReturn 0 : EndIf
  If oc<4 Or (oc & 3)<>0 Or k<2 : ProcedureReturn 0 : EndIf
  If oc/4>(PmConvPackedCacheBytes-PmConvPackedCacheUsed)/cg/k/4 : ProcedureReturn 0 : EndIf
  bytes=oc*cg*k : dst=PmConvPackedCacheBase+PmConvPackedCacheUsed : at=dst
@@ -9676,7 +9682,7 @@ Procedure PmI8Conv1DNeonPackedRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, ocLa
       p = 0
       While p <= *g\Wide
         ta\F = tile + p * 256 : ta\Zero = 1
-        If *g\Stride=1 And *g\Kernel>1 And *g\Wide=0 And (cg=64 Or cg=128)
+        If *g\Stride=1 And *g\Kernel>1 And *g\Wide=0 And (cg=64 Or cg=128 Or ((cg=256 Or cg=512) And PmConvPackedWeight=*g\Weight And PmConvFourWeight=*g\Weight))
           ta\L=qrow+p0*es : ta\P0=w0+p*elements : ta\P1=w1+p*elements
           ta\P2=w2+p*elements : ta\P3=w3+p*elements
           ta\Count=cg : ta\S=s+p0*4
