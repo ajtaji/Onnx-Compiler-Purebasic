@@ -325,3 +325,17 @@ four-core model preserved all eight waveform CRCs. First PCM milliseconds:
 compute margin), approximately 17% less aggregate generation time than R1.
 Weights resident; text preparation included. No Bluetooth playback/map test;
 speaker onset and Bluetooth-active margin still require verification.
+
+2026-10-21: interleaved four-product integer kernels and matrix proof cache.
+Register PmMatrixFourCacheReset/Weight after the immutable packed weights,
+while idle. Both packed weights and this caller-owned metadata remain live
+and immutable; reset both caches before replacing weights. Narrow packed
+matrices with K divisible by4 may use safe groups, otherwise paired path.
+Eight real-model keys occupy89088bytes;81981 groups (92%) meet the bound.
+40 direct matrix tiles, 40 full matrices with odd tails/wide fallback and
+capacity/duplicate/reset guards,24 convolution cases and explicit q8-q15
+preservation checks pass on the real Pi. The extra native stack frame is
+128bytes, below the4KiB worker stack spacing. All eight R33 whole-model CRCs
+match. First PCM ms485/479/491/477/693/867/628/480; generation ms797/740/
+833/707/1667/2505/1566/741. Silent RTF .669-.787,21-33% compute margin.
+Still no Bluetooth playback or map demonstration; speaker onset unverified.

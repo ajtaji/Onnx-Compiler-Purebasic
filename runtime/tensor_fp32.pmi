@@ -5800,8 +5800,394 @@ EndProcedure
 ; Reuse each immutable packed weight tile across multiple row blocks.
 ; Each output keeps its own complete reduction; small/no-cache cases retain
 ; the original row-first traversal.
+; Optional immutable packed-matrix proof cache. Initialize/register only while
+; inference is idle, after PmI8PackWeight; reset both caches before replacing
+; any source/packed weight. Caller-owned memory stays live and immutable.
+; Each byte proves sum(abs(four weights))<=258 in all16 output columns.
+; Activations are in[-127,127], so all four-product INT16 partial sums fit.
+; Unsafe groups retain paired products, with unchanged INT32/FP32 order.
+; Narrow packed matrices only, K divisible by4. Reset(0,0) disables this path.
+; Native kernels preserve q8-q15 in a128-byte frame (secondary stacks4KiB).
+Procedure PmMatrixFourA64(*a.PmI8TileArgs,mask.i)
+  ASM
+    stp q8, q9, [sp, #-128]!
+    stp q10, q11, [sp, #32]
+    stp q12, q13, [sp, #64]
+    stp q14, q15, [sp, #96]
+    mov x15, x1
+    ldr x1, [x0, #0]
+    ldr x2, [x0, #8]
+    ldr x10, [x0, #16]
+    ldr x11, [x0, #24]
+    ldr x12, [x0, #32]
+    ldr x13, [x0, #40]
+    ldr x14, [x0, #48]
+    ldr x3, [x0, #56]
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    movi v20.4s, #0
+    movi v21.4s, #0
+    movi v22.4s, #0
+    movi v23.4s, #0
+    movi v24.4s, #0
+    movi v25.4s, #0
+    movi v26.4s, #0
+    movi v27.4s, #0
+    movi v28.4s, #0
+    movi v29.4s, #0
+    movi v30.4s, #0
+    movi v31.4s, #0
+
+pmoMatrixFourLoop:
+    ld1 {v0.16b, v1.16b, v2.16b, v3.16b}, [x1], #64
+    ldrb w4, [x15], #1
+    cbz w4, pmoMatrixFourPair
+    ld1r {v4.16b}, [x10], #1
+    smull v8.8h, v0.8b, v4.8b
+    smull2 v9.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x11], #1
+    smull v10.8h, v0.8b, v4.8b
+    smull2 v11.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x12], #1
+    smull v12.8h, v0.8b, v4.8b
+    smull2 v13.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x13], #1
+    smull v14.8h, v0.8b, v4.8b
+    smull2 v15.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x10], #1
+    smlal v8.8h, v1.8b, v4.8b
+    smlal2 v9.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x11], #1
+    smlal v10.8h, v1.8b, v4.8b
+    smlal2 v11.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x12], #1
+    smlal v12.8h, v1.8b, v4.8b
+    smlal2 v13.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x13], #1
+    smlal v14.8h, v1.8b, v4.8b
+    smlal2 v15.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x10], #1
+    smlal v8.8h, v2.8b, v4.8b
+    smlal2 v9.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x11], #1
+    smlal v10.8h, v2.8b, v4.8b
+    smlal2 v11.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x12], #1
+    smlal v12.8h, v2.8b, v4.8b
+    smlal2 v13.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x13], #1
+    smlal v14.8h, v2.8b, v4.8b
+    smlal2 v15.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x10], #1
+    smlal v8.8h, v3.8b, v4.8b
+    smlal2 v9.8h, v3.16b, v4.16b
+    ld1r {v4.16b}, [x11], #1
+    smlal v10.8h, v3.8b, v4.8b
+    smlal2 v11.8h, v3.16b, v4.16b
+    ld1r {v4.16b}, [x12], #1
+    smlal v12.8h, v3.8b, v4.8b
+    smlal2 v13.8h, v3.16b, v4.16b
+    ld1r {v4.16b}, [x13], #1
+    smlal v14.8h, v3.8b, v4.8b
+    smlal2 v15.8h, v3.16b, v4.16b
+    saddw v16.4s, v16.4s, v8.4h
+    saddw2 v17.4s, v17.4s, v8.8h
+    saddw v18.4s, v18.4s, v9.4h
+    saddw2 v19.4s, v19.4s, v9.8h
+    saddw v20.4s, v20.4s, v10.4h
+    saddw2 v21.4s, v21.4s, v10.8h
+    saddw v22.4s, v22.4s, v11.4h
+    saddw2 v23.4s, v23.4s, v11.8h
+    saddw v24.4s, v24.4s, v12.4h
+    saddw2 v25.4s, v25.4s, v12.8h
+    saddw v26.4s, v26.4s, v13.4h
+    saddw2 v27.4s, v27.4s, v13.8h
+    saddw v28.4s, v28.4s, v14.4h
+    saddw2 v29.4s, v29.4s, v14.8h
+    saddw v30.4s, v30.4s, v15.4h
+    saddw2 v31.4s, v31.4s, v15.8h
+    b pmoMatrixFourNext
+pmoMatrixFourPair:
+    ld1r {v4.16b}, [x10], #1
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x10], #1
+    smlal v6.8h, v1.8b, v4.8b
+    smlal2 v7.8h, v1.16b, v4.16b
+    saddw v16.4s, v16.4s, v6.4h
+    saddw2 v17.4s, v17.4s, v6.8h
+    saddw v18.4s, v18.4s, v7.4h
+    saddw2 v19.4s, v19.4s, v7.8h
+    ld1r {v4.16b}, [x10], #1
+    smull v6.8h, v2.8b, v4.8b
+    smull2 v7.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x10], #1
+    smlal v6.8h, v3.8b, v4.8b
+    smlal2 v7.8h, v3.16b, v4.16b
+    saddw v16.4s, v16.4s, v6.4h
+    saddw2 v17.4s, v17.4s, v6.8h
+    saddw v18.4s, v18.4s, v7.4h
+    saddw2 v19.4s, v19.4s, v7.8h
+    ld1r {v4.16b}, [x11], #1
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x11], #1
+    smlal v6.8h, v1.8b, v4.8b
+    smlal2 v7.8h, v1.16b, v4.16b
+    saddw v20.4s, v20.4s, v6.4h
+    saddw2 v21.4s, v21.4s, v6.8h
+    saddw v22.4s, v22.4s, v7.4h
+    saddw2 v23.4s, v23.4s, v7.8h
+    ld1r {v4.16b}, [x11], #1
+    smull v6.8h, v2.8b, v4.8b
+    smull2 v7.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x11], #1
+    smlal v6.8h, v3.8b, v4.8b
+    smlal2 v7.8h, v3.16b, v4.16b
+    saddw v20.4s, v20.4s, v6.4h
+    saddw2 v21.4s, v21.4s, v6.8h
+    saddw v22.4s, v22.4s, v7.4h
+    saddw2 v23.4s, v23.4s, v7.8h
+    ld1r {v4.16b}, [x12], #1
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x12], #1
+    smlal v6.8h, v1.8b, v4.8b
+    smlal2 v7.8h, v1.16b, v4.16b
+    saddw v24.4s, v24.4s, v6.4h
+    saddw2 v25.4s, v25.4s, v6.8h
+    saddw v26.4s, v26.4s, v7.4h
+    saddw2 v27.4s, v27.4s, v7.8h
+    ld1r {v4.16b}, [x12], #1
+    smull v6.8h, v2.8b, v4.8b
+    smull2 v7.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x12], #1
+    smlal v6.8h, v3.8b, v4.8b
+    smlal2 v7.8h, v3.16b, v4.16b
+    saddw v24.4s, v24.4s, v6.4h
+    saddw2 v25.4s, v25.4s, v6.8h
+    saddw v26.4s, v26.4s, v7.4h
+    saddw2 v27.4s, v27.4s, v7.8h
+    ld1r {v4.16b}, [x13], #1
+    smull v6.8h, v0.8b, v4.8b
+    smull2 v7.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x13], #1
+    smlal v6.8h, v1.8b, v4.8b
+    smlal2 v7.8h, v1.16b, v4.16b
+    saddw v28.4s, v28.4s, v6.4h
+    saddw2 v29.4s, v29.4s, v6.8h
+    saddw v30.4s, v30.4s, v7.4h
+    saddw2 v31.4s, v31.4s, v7.8h
+    ld1r {v4.16b}, [x13], #1
+    smull v6.8h, v2.8b, v4.8b
+    smull2 v7.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x13], #1
+    smlal v6.8h, v3.8b, v4.8b
+    smlal2 v7.8h, v3.16b, v4.16b
+    saddw v28.4s, v28.4s, v6.4h
+    saddw2 v29.4s, v29.4s, v6.8h
+    saddw v30.4s, v30.4s, v7.4h
+    saddw2 v31.4s, v31.4s, v7.8h
+pmoMatrixFourNext:
+    subs x3, x3, #4
+    b.ne pmoMatrixFourLoop
+pmoMatrixFourFlush:
+    ldp q10, q11, [sp, #32]
+    ldp q12, q13, [sp, #64]
+    ldp q14, q15, [sp, #96]
+    ldp q8, q9, [sp], #128
+    ldr x5, [x0, #64]
+    ldr x6, [x0, #72]
+    ldr x7, [x0, #80]
+    ldr x8, [x0, #96]
+    scvtf v16.4s, v16.4s
+    scvtf v17.4s, v17.4s
+    scvtf v18.4s, v18.4s
+    scvtf v19.4s, v19.4s
+    scvtf v20.4s, v20.4s
+    scvtf v21.4s, v21.4s
+    scvtf v22.4s, v22.4s
+    scvtf v23.4s, v23.4s
+    scvtf v24.4s, v24.4s
+    scvtf v25.4s, v25.4s
+    scvtf v26.4s, v26.4s
+    scvtf v27.4s, v27.4s
+    scvtf v28.4s, v28.4s
+    scvtf v29.4s, v29.4s
+    scvtf v30.4s, v30.4s
+    scvtf v31.4s, v31.4s
+    cbnz x7, pmoMatrixFourRowScale
+    ld1 {v4.4s, v5.4s, v6.4s, v7.4s}, [x6]
+    fmul v16.4s, v16.4s, v4.4s
+    fmul v17.4s, v17.4s, v5.4s
+    fmul v18.4s, v18.4s, v6.4s
+    fmul v19.4s, v19.4s, v7.4s
+    fmul v20.4s, v20.4s, v4.4s
+    fmul v21.4s, v21.4s, v5.4s
+    fmul v22.4s, v22.4s, v6.4s
+    fmul v23.4s, v23.4s, v7.4s
+    fmul v24.4s, v24.4s, v4.4s
+    fmul v25.4s, v25.4s, v5.4s
+    fmul v26.4s, v26.4s, v6.4s
+    fmul v27.4s, v27.4s, v7.4s
+    fmul v28.4s, v28.4s, v4.4s
+    fmul v29.4s, v29.4s, v5.4s
+    fmul v30.4s, v30.4s, v6.4s
+    fmul v31.4s, v31.4s, v7.4s
+    b pmoMatrixFourAdd
+pmoMatrixFourRowScale:
+    ld1r {v4.4s}, [x6], #4
+    fmul v16.4s, v16.4s, v4.4s
+    fmul v17.4s, v17.4s, v4.4s
+    fmul v18.4s, v18.4s, v4.4s
+    fmul v19.4s, v19.4s, v4.4s
+    ld1r {v4.4s}, [x6], #4
+    fmul v20.4s, v20.4s, v4.4s
+    fmul v21.4s, v21.4s, v4.4s
+    fmul v22.4s, v22.4s, v4.4s
+    fmul v23.4s, v23.4s, v4.4s
+    ld1r {v4.4s}, [x6], #4
+    fmul v24.4s, v24.4s, v4.4s
+    fmul v25.4s, v25.4s, v4.4s
+    fmul v26.4s, v26.4s, v4.4s
+    fmul v27.4s, v27.4s, v4.4s
+    ld1r {v4.4s}, [x6], #4
+    fmul v28.4s, v28.4s, v4.4s
+    fmul v29.4s, v29.4s, v4.4s
+    fmul v30.4s, v30.4s, v4.4s
+    fmul v31.4s, v31.4s, v4.4s
+pmoMatrixFourAdd:
+    cbnz x8, pmoMatrixFourZero
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v16.4s, v0.4s, v16.4s
+    fadd v17.4s, v1.4s, v17.4s
+    fadd v18.4s, v2.4s, v18.4s
+    fadd v19.4s, v3.4s, v19.4s
+    st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5], #64
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v20.4s, v0.4s, v20.4s
+    fadd v21.4s, v1.4s, v21.4s
+    fadd v22.4s, v2.4s, v22.4s
+    fadd v23.4s, v3.4s, v23.4s
+    st1 {v20.4s, v21.4s, v22.4s, v23.4s}, [x5], #64
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v24.4s, v0.4s, v24.4s
+    fadd v25.4s, v1.4s, v25.4s
+    fadd v26.4s, v2.4s, v26.4s
+    fadd v27.4s, v3.4s, v27.4s
+    st1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x5], #64
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v28.4s, v0.4s, v28.4s
+    fadd v29.4s, v1.4s, v29.4s
+    fadd v30.4s, v2.4s, v30.4s
+    fadd v31.4s, v3.4s, v31.4s
+    st1 {v28.4s, v29.4s, v30.4s, v31.4s}, [x5]
+    b pmoMatrixFourDone
+pmoMatrixFourZero:
+    movi v0.4s, #0
+    fadd v16.4s, v0.4s, v16.4s
+    fadd v17.4s, v0.4s, v17.4s
+    fadd v18.4s, v0.4s, v18.4s
+    fadd v19.4s, v0.4s, v19.4s
+    fadd v20.4s, v0.4s, v20.4s
+    fadd v21.4s, v0.4s, v21.4s
+    fadd v22.4s, v0.4s, v22.4s
+    fadd v23.4s, v0.4s, v23.4s
+    fadd v24.4s, v0.4s, v24.4s
+    fadd v25.4s, v0.4s, v25.4s
+    fadd v26.4s, v0.4s, v26.4s
+    fadd v27.4s, v0.4s, v27.4s
+    fadd v28.4s, v0.4s, v28.4s
+    fadd v29.4s, v0.4s, v29.4s
+    fadd v30.4s, v0.4s, v30.4s
+    fadd v31.4s, v0.4s, v31.4s
+    st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5], #64
+    st1 {v20.4s, v21.4s, v22.4s, v23.4s}, [x5], #64
+    st1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x5], #64
+    st1 {v28.4s, v29.4s, v30.4s, v31.4s}, [x5]
+pmoMatrixFourDone:
+  EndASM
+EndProcedure
+Procedure.i PmMatrixFourMaskA64(src.i,dst.i,groups.i)
+ ASM
+  mov x5, #0
+  mov w4, #258
+  dup v5.8h, w4
+pmoMatrixMaskLoop:
+  cmp x2, #0
+  b.le pmoMatrixMaskDone
+  ld1 {v0.16b, v1.16b, v2.16b, v3.16b}, [x0], #64
+  abs v0.16b, v0.16b
+  abs v1.16b, v1.16b
+  abs v2.16b, v2.16b
+  abs v3.16b, v3.16b
+  uaddl v4.8h, v0.8b, v1.8b
+  uaddl2 v6.8h, v0.16b, v1.16b
+  uaddw v4.8h, v4.8h, v2.8b
+  uaddw2 v6.8h, v6.8h, v2.16b
+  uaddw v4.8h, v4.8h, v3.8b
+  uaddw2 v6.8h, v6.8h, v3.16b
+  umax v4.8h, v4.8h, v6.8h
+  umaxv h4, v4.8h
+  umov w3, v4.h[0]
+  cmp w3, #258
+  cset w3, le
+  strb w3, [x1], #1
+  add x5, x5, x3
+  sub x2, x2, #1
+  b pmoMatrixMaskLoop
+pmoMatrixMaskDone:
+  mov x0, x5
+ EndASM
+EndProcedure
+
+Global PmMatrixFourCacheBase.i,PmMatrixFourCacheBytes.i,PmMatrixFourCacheUsed.i,PmMatrixFourCacheCount.i
+Global Dim PmMatrixFourCacheKeys.i[64*4]
+Procedure PmMatrixFourCacheReset(base.i,bytes.i)
+ PmMatrixFourCacheBase=0 : PmMatrixFourCacheBytes=0 : PmMatrixFourCacheUsed=0 : PmMatrixFourCacheCount=0
+ If base>0 And bytes>0 : PmMatrixFourCacheBase=base : PmMatrixFourCacheBytes=bytes : EndIf
+EndProcedure
+Procedure.i PmMatrixFourCacheFind(weight.i,k.i,n.i)
+ Protected i.i,at.i
+ For i=0 To PmMatrixFourCacheCount-1
+  at=i*4
+  If PmMatrixFourCacheKeys[at]=weight And PmMatrixFourCacheKeys[at+1]=k And PmMatrixFourCacheKeys[at+2]=n
+   ProcedureReturn PmMatrixFourCacheKeys[at+3]
+  EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i PmMatrixFourCacheWeight(weight.i,k.i,n.i)
+ Protected packed.i,groups.i,columns.i,bytes.i,dest.i,c.i,at.i
+ If PmMatrixFourCacheFind(weight,k,n)<>0 : ProcedureReturn 1 : EndIf
+ If weight=0 Or k<4 Or (k & 3)<>0 Or n<16 Or PmMatrixFourCacheBase=0 Or PmMatrixFourCacheCount>=64 : ProcedureReturn 0 : EndIf
+ packed=PmI8PackFind(weight,k,n,0)
+ If packed=0 : ProcedureReturn 0 : EndIf
+ groups=k/4 : columns=n/16
+ If groups>(PmMatrixFourCacheBytes-PmMatrixFourCacheUsed)/columns : ProcedureReturn 0 : EndIf
+ bytes=columns*groups : dest=PmMatrixFourCacheBase+PmMatrixFourCacheUsed
+ For c=0 To columns-1
+  PmMatrixFourMaskA64(packed+c*k*16,dest+c*groups,groups)
+ Next
+ at=PmMatrixFourCacheCount*4
+ PmMatrixFourCacheKeys[at]=weight : PmMatrixFourCacheKeys[at+1]=k : PmMatrixFourCacheKeys[at+2]=n : PmMatrixFourCacheKeys[at+3]=dest
+ PmMatrixFourCacheUsed=PmMatrixFourCacheUsed+bytes : PmMatrixFourCacheCount+1
+ ProcedureReturn 1
+EndProcedure
+Procedure PmMatrixFourColumn(packed.i,k.i,tile.i,mask.i)
+ Protected ta.PmI8TileArgs
+ ta\L=packed : ta\LStep=16 : ta\PStep=1 : ta\Count=k
+ ta\P0=PeekI(tile+784) : ta\P1=PeekI(tile+792) : ta\P2=PeekI(tile+800) : ta\P3=PeekI(tile+808)
+ ta\F=tile : ta\S=tile+768 : ta\RowScale=1 : ta\Kind=0 : ta\Zero=1
+ PmMatrixFourA64(@ta,mask)
+EndProcedure
+
 Procedure.i PmI8MatMulNeonColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,last.i)
   Protected packed.i=PmI8PackFind(*g\B,*g\K,*g\N,*g\Wide)
+  Protected mask.i
+  If *g\Wide=0 : mask=PmMatrixFourCacheFind(*g\B,*g\K,*g\N) : EndIf
   Protected ea.PmI8EpiArgs
   Protected n16.i
   Protected r0.i
@@ -5815,7 +6201,11 @@ Procedure.i PmI8MatMulNeonColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,la
       r0=0
       While r0<*g\M
         rows=PmI8RowBlock(q,s,*g\M,*g\K,1+ *g\Wide,r0,tile)
-        PmI8ColumnTileNeon(packed+c0* *g\K,(*g\N & -16)* *g\K,16,0,*g\K,*g\Wide,tile)
+        If mask<>0
+          PmMatrixFourColumn(packed+c0* *g\K,*g\K,tile,mask+(c0/16)*(*g\K/4))
+        Else
+          PmI8ColumnTileNeon(packed+c0* *g\K,(*g\N & -16)* *g\K,16,0,*g\K,*g\Wide,tile)
+        EndIf
         ea\F1=tile : ea\F2=0 : If *g\Wide<>0 : ea\F2=tile+256 : EndIf
         ea\WS=*g\Scales+c0*4 : ea\Bias=0
         ea\Dst=*g\Dst+(r0* *g\N+c0)*4 : ea\DStride=*g\N*4
@@ -5833,7 +6223,11 @@ Procedure.i PmI8MatMulNeonColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,la
     c0 = first
     While c0 < n16
       If packed<>0
-        PmI8ColumnTileNeon(packed+c0* *g\K, (*g\N & -16)* *g\K, 16, 0, *g\K, *g\Wide, tile)
+        If mask<>0
+          PmMatrixFourColumn(packed+c0* *g\K,*g\K,tile,mask+(c0/16)*(*g\K/4))
+        Else
+          PmI8ColumnTileNeon(packed+c0* *g\K, (*g\N & -16)* *g\K, 16, 0, *g\K, *g\Wide, tile)
+        EndIf
       Else
         PmI8ColumnTileNeon(*g\B, *g\Elements, *g\N, c0, *g\K, *g\Wide, tile)
       EndIf
@@ -5848,6 +6242,7 @@ Procedure.i PmI8MatMulNeonColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,la
   Wend
   ProcedureReturn n16
 EndProcedure
+
 Procedure.i PmI8MatMulNeon(*g.PmI8MatMulArgs,q.i,s.i,tile.i)
   ProcedureReturn PmI8MatMulNeonColumns(*g,q,s,tile,0,*g\N)
 EndProcedure
@@ -7512,8 +7907,15 @@ Procedure PmConvFourPrepare(*g.PmTensorConv1DArgs)
  PmConvFourMaskBase=PmConvFourCacheFind(*g\Weight,*g\InChannels,*g\OutChannels,*g\Kernel)
  If PmConvFourMaskBase<>0 : PmConvFourWeight=*g\Weight : EndIf
 EndProcedure
+; Interleave four independent row accumulators; preserve the full q8-q15
+; contents in128bytes until all taps finish. Integer and tap scaling order
+; are unchanged, including the unsafe-group paired fallback.
 Procedure PmI8FourTapsA64(p.i)
   ASM
+    stp q8, q9, [sp, #-128]!
+    stp q10, q11, [sp, #32]
+    stp q12, q13, [sp, #64]
+    stp q14, q15, [sp, #96]
 pmoI8FourTapsBegin:
     ldr x1, [x0, #0]
     ldr x2, [x0, #8]
@@ -7550,69 +7952,69 @@ pmoI8FourTapsK0:
     ld1 {v2.16b}, [x1], x2
     ld1 {v3.16b}, [x1], x2
     ld1r {v4.16b}, [x10], x14
-    ld1r {v5.16b}, [x10], x14
-    smull v6.8h, v0.8b, v4.8b
-    smull2 v7.8h, v0.16b, v4.16b
-    smlal v6.8h, v1.8b, v5.8b
-    smlal2 v7.8h, v1.16b, v5.16b
+    smull v8.8h, v0.8b, v4.8b
+    smull2 v9.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x11], x14
+    smull v10.8h, v0.8b, v4.8b
+    smull2 v11.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x12], x14
+    smull v12.8h, v0.8b, v4.8b
+    smull2 v13.8h, v0.16b, v4.16b
+    ld1r {v4.16b}, [x13], x14
+    smull v14.8h, v0.8b, v4.8b
+    smull2 v15.8h, v0.16b, v4.16b
     ld1r {v4.16b}, [x10], x14
-    ld1r {v5.16b}, [x10], x14
-    smlal v6.8h, v2.8b, v4.8b
-    smlal2 v7.8h, v2.16b, v4.16b
-    smlal v6.8h, v3.8b, v5.8b
-    smlal2 v7.8h, v3.16b, v5.16b
-    saddw v16.4s, v16.4s, v6.4h
-    saddw2 v17.4s, v17.4s, v6.8h
-    saddw v18.4s, v18.4s, v7.4h
-    saddw2 v19.4s, v19.4s, v7.8h
+    smlal v8.8h, v1.8b, v4.8b
+    smlal2 v9.8h, v1.16b, v4.16b
     ld1r {v4.16b}, [x11], x14
-    ld1r {v5.16b}, [x11], x14
-    smull v6.8h, v0.8b, v4.8b
-    smull2 v7.8h, v0.16b, v4.16b
-    smlal v6.8h, v1.8b, v5.8b
-    smlal2 v7.8h, v1.16b, v5.16b
+    smlal v10.8h, v1.8b, v4.8b
+    smlal2 v11.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x12], x14
+    smlal v12.8h, v1.8b, v4.8b
+    smlal2 v13.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x13], x14
+    smlal v14.8h, v1.8b, v4.8b
+    smlal2 v15.8h, v1.16b, v4.16b
+    ld1r {v4.16b}, [x10], x14
+    smlal v8.8h, v2.8b, v4.8b
+    smlal2 v9.8h, v2.16b, v4.16b
     ld1r {v4.16b}, [x11], x14
-    ld1r {v5.16b}, [x11], x14
-    smlal v6.8h, v2.8b, v4.8b
-    smlal2 v7.8h, v2.16b, v4.16b
-    smlal v6.8h, v3.8b, v5.8b
-    smlal2 v7.8h, v3.16b, v5.16b
-    saddw v20.4s, v20.4s, v6.4h
-    saddw2 v21.4s, v21.4s, v6.8h
-    saddw v22.4s, v22.4s, v7.4h
-    saddw2 v23.4s, v23.4s, v7.8h
+    smlal v10.8h, v2.8b, v4.8b
+    smlal2 v11.8h, v2.16b, v4.16b
     ld1r {v4.16b}, [x12], x14
-    ld1r {v5.16b}, [x12], x14
-    smull v6.8h, v0.8b, v4.8b
-    smull2 v7.8h, v0.16b, v4.16b
-    smlal v6.8h, v1.8b, v5.8b
-    smlal2 v7.8h, v1.16b, v5.16b
+    smlal v12.8h, v2.8b, v4.8b
+    smlal2 v13.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x13], x14
+    smlal v14.8h, v2.8b, v4.8b
+    smlal2 v15.8h, v2.16b, v4.16b
+    ld1r {v4.16b}, [x10], x14
+    smlal v8.8h, v3.8b, v4.8b
+    smlal2 v9.8h, v3.16b, v4.16b
+    ld1r {v4.16b}, [x11], x14
+    smlal v10.8h, v3.8b, v4.8b
+    smlal2 v11.8h, v3.16b, v4.16b
     ld1r {v4.16b}, [x12], x14
-    ld1r {v5.16b}, [x12], x14
-    smlal v6.8h, v2.8b, v4.8b
-    smlal2 v7.8h, v2.16b, v4.16b
-    smlal v6.8h, v3.8b, v5.8b
-    smlal2 v7.8h, v3.16b, v5.16b
-    saddw v24.4s, v24.4s, v6.4h
-    saddw2 v25.4s, v25.4s, v6.8h
-    saddw v26.4s, v26.4s, v7.4h
-    saddw2 v27.4s, v27.4s, v7.8h
+    smlal v12.8h, v3.8b, v4.8b
+    smlal2 v13.8h, v3.16b, v4.16b
     ld1r {v4.16b}, [x13], x14
-    ld1r {v5.16b}, [x13], x14
-    smull v6.8h, v0.8b, v4.8b
-    smull2 v7.8h, v0.16b, v4.16b
-    smlal v6.8h, v1.8b, v5.8b
-    smlal2 v7.8h, v1.16b, v5.16b
-    ld1r {v4.16b}, [x13], x14
-    ld1r {v5.16b}, [x13], x14
-    smlal v6.8h, v2.8b, v4.8b
-    smlal2 v7.8h, v2.16b, v4.16b
-    smlal v6.8h, v3.8b, v5.8b
-    smlal2 v7.8h, v3.16b, v5.16b
-    saddw v28.4s, v28.4s, v6.4h
-    saddw2 v29.4s, v29.4s, v6.8h
-    saddw v30.4s, v30.4s, v7.4h
-    saddw2 v31.4s, v31.4s, v7.8h
+    smlal v14.8h, v3.8b, v4.8b
+    smlal2 v15.8h, v3.16b, v4.16b
+    saddw v16.4s, v16.4s, v8.4h
+    saddw2 v17.4s, v17.4s, v8.8h
+    saddw v18.4s, v18.4s, v9.4h
+    saddw2 v19.4s, v19.4s, v9.8h
+    saddw v20.4s, v20.4s, v10.4h
+    saddw2 v21.4s, v21.4s, v10.8h
+    saddw v22.4s, v22.4s, v11.4h
+    saddw2 v23.4s, v23.4s, v11.8h
+    saddw v24.4s, v24.4s, v12.4h
+    saddw2 v25.4s, v25.4s, v12.8h
+    saddw v26.4s, v26.4s, v13.4h
+    saddw2 v27.4s, v27.4s, v13.8h
+    saddw v28.4s, v28.4s, v14.4h
+    saddw2 v29.4s, v29.4s, v14.8h
+    saddw v30.4s, v30.4s, v15.4h
+    saddw2 v31.4s, v31.4s, v15.8h
     sub x3, x3, #4
     b pmoI8FourTapsNextGroup
 pmoI8FourTapsPair:
@@ -7807,6 +8209,10 @@ pmoI8FourTapsDone:
     str x8, [x0, #128]
     b pmoI8FourTapsBegin
 pmoI8FourTapsReturn:
+    ldp q10, q11, [sp, #32]
+    ldp q12, q13, [sp, #64]
+    ldp q14, q15, [sp, #96]
+    ldp q8, q9, [sp], #128
   EndASM
 EndProcedure
 ; Synchronous Conv/Add fusion context. Written only by DConvThenAdd before
