@@ -1,0 +1,105 @@
+; Reusable model: emitted tensor calls with runtime dimensions.
+; BUILD THIS AS AN ANVIL PAYLOAD WITH --wants-services, and call
+; PmOnnxAnvilEnter(x0) as the first statement of Main. Without both, every
+; convolution runs on one core - the same bytes, several times slower.
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 2905
+#PMD_NODE_COUNT = 2024
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=352816
+#PMO_WEIGHT_FILE_BYTES=16956288
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "C:/Users/ajtaj/Desktop/copilotdata/voice/generated/pi4/kitten.runtime/math.pmi"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/copilotdata/voice/generated/pi4/kitten.runtime/tensor_trig_a64.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/copilotdata/voice/generated/pi4/kitten.runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/copilotdata/voice/generated/pi4/kitten.runtime/tensor_norm_small.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/copilotdata/voice/generated/pi4/kitten.runtime/tensor_dynamic_norm_small_portable.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/copilotdata/voice/generated/pi4/kitten.runtime/tensor_random.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/copilotdata/voice/generated/pi4/kitten.runtime/tensor_random_dynamic_portable.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/copilotdata/voice/generated/pi4/kitten.runtime/tensor_control_portable.pmi"
+
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+
+
+
+Global *matrixPet
+Procedure.i GateRun(services.i)
+ Protected g.PmI8MatMulArgs,c.i,i.i,bad.i,bytes.i,proofs.i,ok.i,wp.i
+ If PmSetAnvilServices(services)=0 : ProcedureReturn 1 : EndIf
+ *matrixPet=pmAnvilSlot(6)
+ If PmParallelCores()<>4 : ProcedureReturn 2 : EndIf
+ For c=0 To 23
+  matrixPet()
+  g\M=1+(c % 8) : g\K=4+4*(c % 7) : g\N=16+(c % 3)*17 : g\Wide=0
+  If c>=16 : g\M=17 : g\K=64 : g\N=65 : EndIf
+  If c=17 : g\K=63 : EndIf
+  If c=18 : g\M=60 : g\K=768 : g\N=768 : EndIf
+  If c=19 : g\M=60 : g\K=2048 : g\N=768 : EndIf
+  If c=20 : g\M=60 : g\K=768 : g\N=2048 : EndIf
+  If c=21 : g\M=65 : g\K=128 : g\N=129 : EndIf
+  If c=22 : g\M=9 : g\K=64 : g\N=17 : g\Wide=1 : EndIf
+  If c=23 : g\M=8 : g\K=4 : g\N=16 : EndIf
+  g\A=$43000000 : g\B=$43200000 : g\Scales=$43400000
+  g\Elements=g\K*g\N*(1+g\Wide)
+  For i=0 To g\M*g\K-1
+   PmTensorPut(g\A,i,((i*17) % 997-498)/123.0)
+   If i % 41=0 : PokeL(g\A+i*4,$80000000) : EndIf
+   If i % 29=0 : PokeL(g\A+i*4,1) : EndIf
+   If c=23 : PokeL(g\A+i*4,0) : EndIf
+  Next
+  For i=0 To g\Elements-1
+   wp=255 : If (c % 3)=0 : wp=65 : EndIf
+   PokeA(g\B+i,(i*19) % wp-wp/2)
+  Next
+  For i=0 To g\N-1 : PmTensorPut(g\Scales,i,0.0003+i/1000000.0) : Next
+  PmI8PackReset($43C00000,$200000)
+  PmMatrixFourCacheReset($43B00000,$40000)
+  If PmI8PackWeight(g\B,g\K,g\N,g\Wide)=0 : ProcedureReturn 3 : EndIf
+  If g\Wide=0 And (g\K & 3)=0
+   If PmMatrixFourCacheWeight(g\B,g\K,g\N)=0 : ProcedureReturn 4 : EndIf
+  EndIf
+  proofs=PmMatrixFourCacheCount : PmMatrixFourCacheCount=0
+  bytes=PmI8ScratchBytes(g\M*g\K,g\M,g\Wide)
+  PokeI($43800000+bytes,$12345678)
+  PokeI($43500000+g\M*g\N*4,$12345678)
+  PokeI($43600000+g\M*g\N*4,$12345678)
+  PmTensorInt8Fault=0 : g\Dst=$43500000
+  ok=PmI8MatMulScratch(@g,$43800000,bytes)
+  If ok=0 Or PmTensorInt8Fault : ProcedureReturn 5 : EndIf
+  PmMatrixFourCacheCount=proofs : g\Dst=$43600000
+  ok=PmI8MatMulScratch(@g,$43800000,bytes)
+  If ok=0 Or PmTensorInt8Fault : ProcedureReturn 6 : EndIf
+  bad=0
+  For i=0 To g\M*g\N-1
+   If PeekL($43500000+i*4)<>PeekL($43600000+i*4) : bad+1 : EndIf
+  Next
+  If PeekI($43800000+bytes)<>$12345678 Or PeekI($43500000+g\M*g\N*4)<>$12345678 Or PeekI($43600000+g\M*g\N*4)<>$12345678 : ProcedureReturn 7 : EndIf
+  PokeI($41374000+c*32,c) : PokeI($41374008+c*32,bad)
+  PokeI($41374010+c*32,proofs) : PokeI($41374018+c*32,g\M*g\N)
+  If bad : ProcedureReturn 8 : EndIf
+ Next
+ PmMatrixFourCacheReset(0,0) : PmI8PackReset(0,0)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected result.i
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000)<>0 : ProcedureReturn 9 : EndIf
+ MmuEnableCached() : result=GateRun(services) : MmuDisableCachedFlushed()
+ ProcedureReturn result
+EndProcedure

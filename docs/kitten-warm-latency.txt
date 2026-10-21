@@ -589,3 +589,38 @@ Excluded: minimal stride padding (mixed regressions), broad odd-cache-line
 row padding (0.177% total but several reply starts slower), and unused native
 argument trimming (0.074% total, within noise). No Bluetooth connection,
 audio/map demo, reset/flash/storage writes. Installed TruckGPS unchanged.
+
+2026-10-21: fewer activation loads in proved packed INT8 matrix groups.
+Four activation bytes per row are loaded once and broadcast from registers,
+replacing16 byte-broadcast loads with4 word loads and16 lane broadcasts.
+Two32-byte packed weight loads leave room for the row words. This applies
+to the existing native narrow/proved four-product matrix path, with no
+model identity check. Unproved groups retain paired products. K is already
+divisible by4, so word reads remain inside each live quantized row. The
+INT16 proof, INT32 sum, FP32 conversion/scaling order, q8-q15 preservation,
+128-byte stack frame and all scratch/cache capacity contracts are unchanged.
+
+Paired whole four-core Pi4/Anvil test: matrix-node time894.662->768.992ms,
+14.05% less; total8215.915->8088.126ms,1.5554% less across8 fresh replies.
+All8 first/total results improve, complete waveforms bit-identical. Longest
+frontend426.937->394.173ms,32.764ms less. This is a modest total gain,
+concentrated in warm reply latency. Text preparation remains about0.5ms.
+The old longest425ms frontend contained223ms matrix,70ms LSTM,57ms conv.
+Final canonical profile: firstPCM408.2..772.3ms; longestfrontend392.2ms;
+total8085.461ms; silentRTF.571..653 (about35..43% compute margin). It still
+does not measure Bluetooth speaker onset or map-active headroom.
+
+Public tests/pi4_matrix_block_gate.pi4 passes24 independent full-matrix
+cases on real Pi: M1..8/9/17/60/65, K4..28/63/64/128/768/2048,
+N16/17/33/50/65/129/768/2048, proved and unproved groups, odd tails,
+wide fallback, signed zero/subnormal and zero activation inputs. Every
+output word matches the original non-proof tile path; scratch/output end
+guards survive. Both standard compiler applications rebuilt/self-testPASS.
+
+Excluded after exact four-core whole-model comparisons: branch-hoisted
+elementwise unroll (0.185% total gain, too small); bulk elementwise loads
+(0.841% slower); eight-position register-held convolution tap sums (0.121%
+slower); adjacent Add/Multiply fusion (0.035% slower, common expanding
+intermediates fall back); direct matrix output scaling (0.017% slower).
+No new convolution or elementwise variant is shipped from these trials.
+No Bluetooth connection/playback, map demo, reset/flash/storage write.

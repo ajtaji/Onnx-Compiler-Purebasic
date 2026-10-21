@@ -5808,6 +5808,11 @@ EndProcedure
 ; Unsafe groups retain paired products, with unchanged INT32/FP32 order.
 ; Narrow packed matrices only, K divisible by4. Reset(0,0) disables this path.
 ; Native kernels preserve q8-q15 in a128-byte frame (secondary stacks4KiB).
+; The proved four-product path loads four activation bytes per row once,
+; then broadcasts their lanes from registers. Two packed weight loads leave
+; room for those row words without extra stack or persistent scratch. Every
+; source read stays inside the K-divisible-by-four block. Unproved groups
+; retain paired products; INT32 sums and FP32 scaling order are unchanged.
 Procedure PmMatrixFourA64(*a.PmI8TileArgs,mask.i)
   ASM
     stp q8, q9, [sp, #-128]!
@@ -5841,57 +5846,62 @@ Procedure PmMatrixFourA64(*a.PmI8TileArgs,mask.i)
     movi v31.4s, #0
 
 pmoMatrixFourLoop:
-    ld1 {v0.16b, v1.16b, v2.16b, v3.16b}, [x1], #64
     ldrb w4, [x15], #1
     cbz w4, pmoMatrixFourPair
-    ld1r {v4.16b}, [x10], #1
-    smull v8.8h, v0.8b, v4.8b
-    smull2 v9.8h, v0.16b, v4.16b
-    ld1r {v4.16b}, [x11], #1
-    smull v10.8h, v0.8b, v4.8b
-    smull2 v11.8h, v0.16b, v4.16b
-    ld1r {v4.16b}, [x12], #1
-    smull v12.8h, v0.8b, v4.8b
-    smull2 v13.8h, v0.16b, v4.16b
-    ld1r {v4.16b}, [x13], #1
-    smull v14.8h, v0.8b, v4.8b
-    smull2 v15.8h, v0.16b, v4.16b
-    ld1r {v4.16b}, [x10], #1
-    smlal v8.8h, v1.8b, v4.8b
-    smlal2 v9.8h, v1.16b, v4.16b
-    ld1r {v4.16b}, [x11], #1
-    smlal v10.8h, v1.8b, v4.8b
-    smlal2 v11.8h, v1.16b, v4.16b
-    ld1r {v4.16b}, [x12], #1
-    smlal v12.8h, v1.8b, v4.8b
-    smlal2 v13.8h, v1.16b, v4.16b
-    ld1r {v4.16b}, [x13], #1
-    smlal v14.8h, v1.8b, v4.8b
-    smlal2 v15.8h, v1.16b, v4.16b
-    ld1r {v4.16b}, [x10], #1
-    smlal v8.8h, v2.8b, v4.8b
-    smlal2 v9.8h, v2.16b, v4.16b
-    ld1r {v4.16b}, [x11], #1
-    smlal v10.8h, v2.8b, v4.8b
-    smlal2 v11.8h, v2.16b, v4.16b
-    ld1r {v4.16b}, [x12], #1
-    smlal v12.8h, v2.8b, v4.8b
-    smlal2 v13.8h, v2.16b, v4.16b
-    ld1r {v4.16b}, [x13], #1
-    smlal v14.8h, v2.8b, v4.8b
-    smlal2 v15.8h, v2.16b, v4.16b
-    ld1r {v4.16b}, [x10], #1
-    smlal v8.8h, v3.8b, v4.8b
-    smlal2 v9.8h, v3.16b, v4.16b
-    ld1r {v4.16b}, [x11], #1
-    smlal v10.8h, v3.8b, v4.8b
-    smlal2 v11.8h, v3.16b, v4.16b
-    ld1r {v4.16b}, [x12], #1
-    smlal v12.8h, v3.8b, v4.8b
-    smlal2 v13.8h, v3.16b, v4.16b
-    ld1r {v4.16b}, [x13], #1
-    smlal v14.8h, v3.8b, v4.8b
-    smlal2 v15.8h, v3.16b, v4.16b
+    ld1 {v0.16b, v1.16b}, [x1], #32
+    ldr s4, [x10], #4
+    ldr s5, [x11], #4
+    ldr s6, [x12], #4
+    ldr s7, [x13], #4
+    dup v2.16b, v4.b[0]
+    smull v8.8h, v0.8b, v2.8b
+    smull2 v9.8h, v0.16b, v2.16b
+    dup v2.16b, v5.b[0]
+    smull v10.8h, v0.8b, v2.8b
+    smull2 v11.8h, v0.16b, v2.16b
+    dup v2.16b, v6.b[0]
+    smull v12.8h, v0.8b, v2.8b
+    smull2 v13.8h, v0.16b, v2.16b
+    dup v2.16b, v7.b[0]
+    smull v14.8h, v0.8b, v2.8b
+    smull2 v15.8h, v0.16b, v2.16b
+    dup v2.16b, v4.b[1]
+    smlal v8.8h, v1.8b, v2.8b
+    smlal2 v9.8h, v1.16b, v2.16b
+    dup v2.16b, v5.b[1]
+    smlal v10.8h, v1.8b, v2.8b
+    smlal2 v11.8h, v1.16b, v2.16b
+    dup v2.16b, v6.b[1]
+    smlal v12.8h, v1.8b, v2.8b
+    smlal2 v13.8h, v1.16b, v2.16b
+    dup v2.16b, v7.b[1]
+    smlal v14.8h, v1.8b, v2.8b
+    smlal2 v15.8h, v1.16b, v2.16b
+    ld1 {v0.16b, v1.16b}, [x1], #32
+    dup v2.16b, v4.b[2]
+    smlal v8.8h, v0.8b, v2.8b
+    smlal2 v9.8h, v0.16b, v2.16b
+    dup v2.16b, v5.b[2]
+    smlal v10.8h, v0.8b, v2.8b
+    smlal2 v11.8h, v0.16b, v2.16b
+    dup v2.16b, v6.b[2]
+    smlal v12.8h, v0.8b, v2.8b
+    smlal2 v13.8h, v0.16b, v2.16b
+    dup v2.16b, v7.b[2]
+    smlal v14.8h, v0.8b, v2.8b
+    smlal2 v15.8h, v0.16b, v2.16b
+    dup v2.16b, v4.b[3]
+    smlal v8.8h, v1.8b, v2.8b
+    smlal2 v9.8h, v1.16b, v2.16b
+    dup v2.16b, v5.b[3]
+    smlal v10.8h, v1.8b, v2.8b
+    smlal2 v11.8h, v1.16b, v2.16b
+    dup v2.16b, v6.b[3]
+    smlal v12.8h, v1.8b, v2.8b
+    smlal2 v13.8h, v1.16b, v2.16b
+    dup v2.16b, v7.b[3]
+    smlal v14.8h, v1.8b, v2.8b
+    smlal2 v15.8h, v1.16b, v2.16b
     saddw v16.4s, v16.4s, v8.4h
     saddw2 v17.4s, v17.4s, v8.8h
     saddw v18.4s, v18.4s, v9.4h
@@ -5910,6 +5920,7 @@ pmoMatrixFourLoop:
     saddw2 v31.4s, v31.4s, v15.8h
     b pmoMatrixFourNext
 pmoMatrixFourPair:
+    ld1 {v0.16b, v1.16b, v2.16b, v3.16b}, [x1], #64
     ld1r {v4.16b}, [x10], #1
     smull v6.8h, v0.8b, v4.8b
     smull2 v7.8h, v0.16b, v4.16b
