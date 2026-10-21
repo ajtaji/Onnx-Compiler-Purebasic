@@ -275,3 +275,31 @@ packet/schedule times are not measured acoustic onset. Current testing stays
 silent and map demonstrations remain deferred. The installed navigation app
 has not yet received this runtime. A faster isolated binary loop did not
 produce a meaningful whole-model gain and is not included.
+
+
+2026-10-21: immutable convolution bounds and exact four-product groups
+
+New optional PmConvFourCacheReset(base,bytes)/CacheWeight(weight,cg,oc,k)
+prepare immutable weight bounds while inference is idle. Reset(0,0) disables
+the cache. Cache memory must be eight-byte aligned and remain unchanged, as
+must the registered source weights. Up to64 keys; capacity is checked before
+products. Missing, ineligible or unsafe groups use the original kernel.
+
+For narrow stride-one convolutions with64/128 input channels and groups1,
+each group of four weights is used only when their absolute sum is at most
+258 for every output row. Activations stay in[-127,127], so all intermediate
+16-bit sums fit within[-32766,32766]. Integer sums remain exact; each tap's
+floating-point conversion/scaling/addition order is unchanged. Other cases,
+including wide weights, keep their original path. Worker arguments grow by
+one word; no per-worker packing buffers are introduced.
+
+Real Pi:24 full convolution comparisons matched every output word, including
+safe258/unsafe259 weight bounds, signed-128 weights, odd widths, dilation and
+stride fallbacks and rejected nonfinite activations. Cache tests verify
+capacity refusal, exact-fit guards, duplicate keys, overflow bounds and reset.
+The full four-core Kitten run registers50 immutable keys using41728 bytes.
+All eight raw waveform CRCs match. Aggregate convolution time falls4152 to
+3977ms; total generation is856/793/891/758/1822/2681/1701/793ms.
+First PCM is531/524/538/519/807/971/724/524ms. Silent real-time factors are
+.784/.842/.763/.827/.778/.716/.759/.842. Bluetooth was not played during
+this run; no new Bluetooth onset or listening claim is made.

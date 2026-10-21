@@ -2448,6 +2448,7 @@ Procedure.i PmParallelConv1DInt8(*g.PmTensorConv1DArgs)
   If *g=0
     ProcedureReturn 0
   EndIf
+  PmConvFourPrepare(*g)
   If PmConvWorkParallel(*g) : ProcedureReturn 1 : EndIf
   tile=PmParallelConvInt8Tile()
   count=pmParallelConvParts(*g,tile)
