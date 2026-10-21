@@ -456,3 +456,39 @@ gain only), wider output preloads (~1%slower),64-position cache blocking(no
 gain), and per-row eight-product proof (R41 whole model0.39%slower despite
 some direct gains). None retained. No Bluetooth connection/playback, map
 demo, reset/flash/storage write. Installed TruckGPS remains unchanged.
+
+2026-10-21: eight-position exact transposed convolution. The existing native
+FLOAT stride6/kernel12/dilation1 interior kernel now handles8 complete input
+positions together, reusing9 source values and one weight row per channel.
+Four-position/short/edge paths remain unchanged. Ascending input-channel and
+input-position reductions still use separate FMUL/FADD, with input on the
+same multiplication operand. NaN payload behavior is preserved. Fullq8-q15
+save/restore uses128 stackbytes; existing6144-byte per-worker external pack
+and scratch eligibility are unchanged. No new memory cache or model check.
+
+24 real-Pi comparisons cover batches, groups2/4, inputchannels32..128 pergroup,
+odd widths, cropping, missing bias, -0, q/sNaNs and Inf. Every output word and
+guard matches the prior kernel. Explicit128-byte q8-q15 ABI check passes.
+tests/pi4_convt_eight_gate.pi4 reproduces24 cases using canonical includes.
+A fresh dynamic FP32 ONNX upsampling graph(64->32,K12/S6) passes12 further
+shape/value cases, including short fallback and balanced arena after close.
+Both standard compiler applications rebuilt; self-test PASS.
+
+Direct stride-six cases improve about1.05-1.15x. R47 whole four-core Kitten
+has all8 identical waveform CRCs and no error/cancel/profile faults. FirstPCM
+0.445-0.835s; silentRTF about.625-.728. Transposed-convolution family483.2->
+453.4ms across8; plain convolution remains~3733ms, the largest cost.
+
+Paired same-build old/new warm requests confirm a modest total improvement:
+all8 new requests faster, aggregate8920.371->8894.364ms(0.2916%less), complete
+waveformCRCs exact. The two large transposed-convolution nodes451.191->
+421.320ms(6.6206%less). This is not a large overall-headroom increase. The
+benchmark switch exists only in scratch test runtime, never shipped source.
+
+Excluded this cycle: direct INT8 epilogue fusion(R43 no whole-model gain),
+native padding clears(R44 totalwithinnoise), broader256/128 spatial spans
+(R45 ~0.82%slower),32-position spans(R46 withinnoise), initializing integer
+accumulators from the first product group(no useful direct gain), and reuse
+alone in the four-position transposed kernel(mixed small direct results).
+No Bluetooth/audio/map tests, reset/flash/storage write. Installed app unchanged.
+Speaker onset and Bluetooth-active/map headroom remain unverified.

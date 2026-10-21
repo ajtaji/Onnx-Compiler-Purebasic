@@ -2066,6 +2066,156 @@ pmoConvSixEdgeNext:
 EndProcedure
 
 
+; Eight complete stride-six positions reuse nine source values and one
+; weight row per input channel. Preserve both FP32 rounding instructions
+; and the ascending channel/position reduction order. The private kernel
+; needs128 bytes for full q8-q15 preservation, not a local weight pack.
+Procedure PmConvSixEightA64(p.i)
+ ASM
+  stp q8, q9, [sp, #-128]!
+  stp q10, q11, [sp, #32]
+  stp q12, q13, [sp, #64]
+  stp q14, q15, [sp, #96]
+  ldr x1, [x0]
+  ldr x2, [x0, #8]
+  ldr x3, [x0, #16]
+  ldr x4, [x0, #24]
+  ldr x5, [x0, #32]
+  ldr x6, [x0, #40]
+  ldr w9, [x0, #64]
+  dup v0.4s, w9
+  mov v16.16b, v0.16b
+  mov v17.16b, v0.16b
+  mov v18.16b, v0.16b
+  mov v19.16b, v0.16b
+  mov v20.16b, v0.16b
+  mov v21.16b, v0.16b
+  mov v22.16b, v0.16b
+  mov v23.16b, v0.16b
+  mov v24.16b, v0.16b
+  mov v25.16b, v0.16b
+  mov v26.16b, v0.16b
+  mov v27.16b, v0.16b
+  mov v28.16b, v0.16b
+  mov v29.16b, v0.16b
+  mov v30.16b, v0.16b
+  mov v31.16b, v0.16b
+pmoConvSixEightChannel:
+  ld1 {v1.4s}, [x2]
+  add x9, x2, #16
+  ld1 {v2.2s}, [x9]
+  add x9, x2, #24
+  ld1 {v3.4s}, [x9]
+  add x9, x2, #40
+  ld1 {v4.2s}, [x9]
+  ld1 {v5.4s, v6.4s}, [x1]
+  ldr s7, [x1, #32]
+  dup v0.4s, v5.s[0]
+  fmul v8.4s, v0.4s, v3.4s
+  fmul v9.2s, v0.2s, v4.2s
+  dup v0.4s, v5.s[1]
+  fmul v10.4s, v0.4s, v3.4s
+  fmul v11.2s, v0.2s, v4.2s
+  dup v0.4s, v5.s[2]
+  fmul v12.4s, v0.4s, v3.4s
+  fmul v13.2s, v0.2s, v4.2s
+  dup v0.4s, v5.s[3]
+  fmul v14.4s, v0.4s, v3.4s
+  fmul v15.2s, v0.2s, v4.2s
+  fadd v16.4s, v16.4s, v8.4s
+  fadd v17.2s, v17.2s, v9.2s
+  fadd v18.4s, v18.4s, v10.4s
+  fadd v19.2s, v19.2s, v11.2s
+  fadd v20.4s, v20.4s, v12.4s
+  fadd v21.2s, v21.2s, v13.2s
+  fadd v22.4s, v22.4s, v14.4s
+  fadd v23.2s, v23.2s, v15.2s
+  dup v0.4s, v5.s[1]
+  fmul v8.4s, v0.4s, v1.4s
+  fmul v9.2s, v0.2s, v2.2s
+  dup v0.4s, v5.s[2]
+  fmul v10.4s, v0.4s, v1.4s
+  fmul v11.2s, v0.2s, v2.2s
+  dup v0.4s, v5.s[3]
+  fmul v12.4s, v0.4s, v1.4s
+  fmul v13.2s, v0.2s, v2.2s
+  dup v0.4s, v6.s[0]
+  fmul v14.4s, v0.4s, v1.4s
+  fmul v15.2s, v0.2s, v2.2s
+  fadd v16.4s, v16.4s, v8.4s
+  fadd v17.2s, v17.2s, v9.2s
+  fadd v18.4s, v18.4s, v10.4s
+  fadd v19.2s, v19.2s, v11.2s
+  fadd v20.4s, v20.4s, v12.4s
+  fadd v21.2s, v21.2s, v13.2s
+  fadd v22.4s, v22.4s, v14.4s
+  fadd v23.2s, v23.2s, v15.2s
+  dup v0.4s, v6.s[0]
+  fmul v8.4s, v0.4s, v3.4s
+  fmul v9.2s, v0.2s, v4.2s
+  dup v0.4s, v6.s[1]
+  fmul v10.4s, v0.4s, v3.4s
+  fmul v11.2s, v0.2s, v4.2s
+  dup v0.4s, v6.s[2]
+  fmul v12.4s, v0.4s, v3.4s
+  fmul v13.2s, v0.2s, v4.2s
+  dup v0.4s, v6.s[3]
+  fmul v14.4s, v0.4s, v3.4s
+  fmul v15.2s, v0.2s, v4.2s
+  fadd v24.4s, v24.4s, v8.4s
+  fadd v25.2s, v25.2s, v9.2s
+  fadd v26.4s, v26.4s, v10.4s
+  fadd v27.2s, v27.2s, v11.2s
+  fadd v28.4s, v28.4s, v12.4s
+  fadd v29.2s, v29.2s, v13.2s
+  fadd v30.4s, v30.4s, v14.4s
+  fadd v31.2s, v31.2s, v15.2s
+  dup v0.4s, v6.s[1]
+  fmul v8.4s, v0.4s, v1.4s
+  fmul v9.2s, v0.2s, v2.2s
+  dup v0.4s, v6.s[2]
+  fmul v10.4s, v0.4s, v1.4s
+  fmul v11.2s, v0.2s, v2.2s
+  dup v0.4s, v6.s[3]
+  fmul v12.4s, v0.4s, v1.4s
+  fmul v13.2s, v0.2s, v2.2s
+  dup v0.4s, v7.s[0]
+  fmul v14.4s, v0.4s, v1.4s
+  fmul v15.2s, v0.2s, v2.2s
+  fadd v24.4s, v24.4s, v8.4s
+  fadd v25.2s, v25.2s, v9.2s
+  fadd v26.4s, v26.4s, v10.4s
+  fadd v27.2s, v27.2s, v11.2s
+  fadd v28.4s, v28.4s, v12.4s
+  fadd v29.2s, v29.2s, v13.2s
+  fadd v30.4s, v30.4s, v14.4s
+  fadd v31.2s, v31.2s, v15.2s
+  add x1, x1, x5
+  add x2, x2, x6
+  subs x4, x4, #1
+  b.ne pmoConvSixEightChannel
+  st1 {v16.4s}, [x3], #16
+  st1 {v17.2s}, [x3], #8
+  st1 {v18.4s}, [x3], #16
+  st1 {v19.2s}, [x3], #8
+  st1 {v20.4s}, [x3], #16
+  st1 {v21.2s}, [x3], #8
+  st1 {v22.4s}, [x3], #16
+  st1 {v23.2s}, [x3], #8
+  st1 {v24.4s}, [x3], #16
+  st1 {v25.2s}, [x3], #8
+  st1 {v26.4s}, [x3], #16
+  st1 {v27.2s}, [x3], #8
+  st1 {v28.4s}, [x3], #16
+  st1 {v29.2s}, [x3], #8
+  st1 {v30.4s}, [x3], #16
+  st1 {v31.2s}, [x3], #8
+  ldp q10, q11, [sp, #32]
+  ldp q12, q13, [sp, #64]
+  ldp q14, q15, [sp, #96]
+  ldp q8, q9, [sp], #128
+ EndASM
+EndProcedure
 Procedure.i PmConvTransposeSixRange(*g.PmTensorConvTranspose1DArgs,ocFirst.i,ocLast.i,packed.i)
   Protected bn.i,oc.i,ic.i,group.i,ocg.i,ipg.i,opg.i,n.i,nFirst.i,nLast.i,take.i
   Protected ox.i,phase.i,ix.i,src.i,weight.i,dst.i,endFirst.i,startLast.i,bias.i,weightStep.i
@@ -2096,10 +2246,10 @@ Procedure.i PmConvTransposeSixRange(*g.PmTensorConvTranspose1DArgs,ocFirst.i,ocL
       bias=0 : If *g\Bias<>0 : bias=PeekL(*g\Bias+oc*4) : EndIf
       n=nFirst
       While n<nLast
-        take=nLast-n : If take>4 : take=4 : EndIf
+        take=nLast-n : If take>=8 : take=8 : ElseIf take>4 : take=4 : EndIf
         p[0]=src+(n-1)*4 : p[1]=weight : p[2]=dst+(n*6-*g\PadLeft)*4
         p[3]=ipg : p[4]=*g\InWidth*4 : p[5]=weightStep : p[6]=take : p[8]=bias
-        PmConvTransposeSixTileA64(@p[0])
+        If take=8 : PmConvSixEightA64(@p[0]) : Else : PmConvTransposeSixTileA64(@p[0]) : EndIf
         n+take
       Wend
       ox=0

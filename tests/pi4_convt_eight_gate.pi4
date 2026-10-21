@@ -1,0 +1,138 @@
+; Returning real-Pi4 regression gate, no audio or storage writes.
+; Compile with Forge --compile, -t pi4, --load-addr 0x1000000,
+; --stack-addr 0x4F00000, --entry-returns and --wants-services.
+; Requires a returning Anvil RAM loader and four healthy real cores.
+; x0=0 means all exact comparisons/cache guards passed.
+EnableFloatingPoint
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMO_USE_BATCHNORM=1
+#PMO_USE_STFT=1
+#PMO_USE_RESIZE=1
+#PMO_USE_CONVTRANSPOSE=1
+#PMO_USE_CONV=1
+#PMO_USE_LSTM=1
+#PMO_USE_INT8=1
+#PMO_USE_EXPLOG=1
+#PMO_USE_TRIG=1
+#PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+Procedure.i PmConvSixReferenceRange(*g.PmTensorConvTranspose1DArgs,ocFirst.i,ocLast.i,packed.i)
+  Protected bn.i,oc.i,ic.i,group.i,ocg.i,ipg.i,opg.i,n.i,nFirst.i,nLast.i,take.i
+  Protected ox.i,phase.i,ix.i,src.i,weight.i,dst.i,endFirst.i,startLast.i,bias.i,weightStep.i
+  Protected Dim p.i[10]
+  If *g=0 : ProcedureReturn 0 : EndIf
+  If *g\Stride<>6 Or *g\Kernel<>12 Or *g\Dilation<>1 Or *g\Groups<=0 Or *g\InWidth<=0 Or *g\OutWidth<=0 Or *g\Batches<=0 : ProcedureReturn 0 : EndIf
+  ipg=*g\InChannels/ *g\Groups : opg=*g\OutChannels/ *g\Groups
+  If ipg<=0 Or opg<=0 Or ipg* *g\Groups<>*g\InChannels Or opg* *g\Groups<>*g\OutChannels : ProcedureReturn 0 : EndIf
+  If *g\PadLeft<0 : ProcedureReturn 0 : EndIf
+  nFirst=(*g\PadLeft+5)/6 : If nFirst<1 : nFirst=1 : EndIf
+  nLast=(*g\OutWidth+*g\PadLeft)/6
+  If nLast>*g\InWidth : nLast=*g\InWidth : EndIf
+  If nLast<nFirst : nLast=nFirst : EndIf
+  endFirst=nFirst*6-*g\PadLeft : If endFirst>*g\OutWidth : endFirst=*g\OutWidth : EndIf
+  startLast=nLast*6-*g\PadLeft : If startLast<endFirst : startLast=endFirst : EndIf
+  For bn=0 To *g\Batches-1
+    For oc=ocFirst To ocLast-1
+      PmKernelIdle()
+      group=oc/opg : ocg=oc-group*opg
+      src=*g\Src+(bn* *g\InChannels+group*ipg)* *g\InWidth*4
+      weight=*g\Weight+((group*ipg)*opg+ocg)*48
+      weightStep=opg*48
+      If packed<>0 And ipg>=32 And ipg<=128 And *g\InWidth>=16
+        PmConvTransposeSixPackA64(weight,packed,ipg,weightStep)
+        weight=packed : weightStep=48
+      EndIf
+      dst=*g\Dst+(bn* *g\OutChannels+oc)* *g\OutWidth*4
+      bias=0 : If *g\Bias<>0 : bias=PeekL(*g\Bias+oc*4) : EndIf
+      n=nFirst
+      While n<nLast
+        take=nLast-n : If take>4 : take=4 : EndIf
+        p[0]=src+(n-1)*4 : p[1]=weight : p[2]=dst+(n*6-*g\PadLeft)*4
+        p[3]=ipg : p[4]=*g\InWidth*4 : p[5]=weightStep : p[6]=take : p[8]=bias
+        PmConvTransposeSixTileA64(@p[0])
+        n+take
+      Wend
+      ox=0
+      While ox<*g\OutWidth
+        If ox=endFirst : ox=startLast : EndIf
+        If ox>=*g\OutWidth : Break : EndIf
+        ix=(ox+*g\PadLeft)/6 : phase=(ox+*g\PadLeft) % 6
+        p[0]=src : p[1]=weight : p[2]=dst+ox*4 : p[3]=ipg
+        p[4]=*g\InWidth*4 : p[5]=weightStep : p[6]=ix : p[7]=phase : p[8]=bias : p[9]=*g\InWidth
+        PmConvTransposeSixEdgeA64(@p[0])
+        ox+1
+      Wend
+    Next
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Global *gatePet
+Procedure.i GateClock()
+ ASM
+  mrs x0, cntpct_el0
+ EndASM
+EndProcedure
+Procedure.i GateRun(services.i)
+ Protected g.PmTensorConvTranspose1DArgs,c.i,i.i,outputBytes.i,bad.i,totalbad.i,start.i,old.i,fast.i,ok1.i,ok2.i
+ If PmSetAnvilServices(services)=0 Or PmParallelCores()<>4 : ProcedureReturn 1 : EndIf
+ *gatePet=pmAnvilSlot(6)
+ For c=0 To 23
+  gatePet()
+  g\Src=$43000000 : g\Weight=$43100000 : g\Bias=$431F1000
+  g\Batches=1 : g\InChannels=64 : g\OutChannels=64 : g\InWidth=52+(c % 4)*4
+  g\Kernel=12 : g\Stride=6 : g\Dilation=1 : g\Groups=1 : g\PadLeft=c % 13
+  If c % 6=0 : g\InChannels=128 : g\Batches=2 : EndIf
+  If c % 6=1 : g\InWidth=17 : EndIf
+  If c % 6=2 : g\InWidth=65 : EndIf
+  If c % 6=3 : g\InWidth=129 : EndIf
+  If c % 6=4 : g\InChannels=128 : g\Groups=2 : EndIf
+  If c % 6=5 : g\InChannels=128 : g\Groups=4 : EndIf
+  g\OutWidth=(g\InWidth-1)*6-g\PadLeft*2+12
+  outputBytes=g\Batches*g\OutChannels*g\OutWidth*4
+  For i=0 To g\Batches*g\InChannels*g\InWidth-1
+   PmTensorPut(g\Src,i,((i*73+c*17) % 997-498)/71.0)
+   If i % 11=0 : PokeL(g\Src+i*4,$80000000) : EndIf
+   If c>=12 And i % 31=0 : PokeL(g\Src+i*4,$7FC12345) : EndIf
+   If c>=12 And i % 37=0 : PokeL(g\Src+i*4,$7F812345) : EndIf
+   If c>=12 And i % 41=0 : PokeL(g\Src+i*4,$7F800000) : EndIf
+  Next
+  For i=0 To g\InChannels*(g\OutChannels/g\Groups)*12-1
+   PmTensorPut(g\Weight,i,((i*17+c*13) % 271-135)/123.0)
+   If c>=12 And i % 67=0 : PokeL(g\Weight+i*4,$7FC54321) : EndIf
+   If c>=12 And i % 73=0 : PokeL(g\Weight+i*4,$7F854321) : EndIf
+  Next
+  For i=0 To g\OutChannels-1 : PmTensorPut(g\Bias,i,(i-31)/97.0) : Next
+  If c % 3=1 : g\Bias=0 : EndIf
+  PokeI($433FFFF8,$12345678) : PokeI($43400000+outputBytes,$12345678)
+  PokeI($43D01FF8,$12345678) : PokeI($43D03800,$12345678)
+  g\Dst=$43200000 : start=GateClock() : ok1=PmConvSixReferenceRange(@g,0,g\OutChannels,$43D00000) : old=GateClock()-start
+  g\Dst=$43400000 : start=GateClock() : ok2=PmConvTransposeSixRange(@g,0,g\OutChannels,$43D02000) : fast=GateClock()-start
+  If ok1<>1 Or ok2<>1 : ProcedureReturn 2 : EndIf
+  bad=0
+  For i=0 To outputBytes-1 Step 4 : If PeekL($43200000+i)<>PeekL($43400000+i) : bad=bad+1 : EndIf : Next
+  If PeekI($433FFFF8)<>$12345678 Or PeekI($43400000+outputBytes)<>$12345678 : ProcedureReturn 3 : EndIf
+  If PeekI($43D01FF8)<>$12345678 Or PeekI($43D03800)<>$12345678 : ProcedureReturn 4 : EndIf
+  PokeI($41374000+c*32,outputBytes/4) : PokeI($41374008+c*32,bad)
+  PokeI($41374010+c*32,old) : PokeI($41374018+c*32,fast)
+  totalbad=totalbad+bad
+ Next
+ ProcedureReturn totalbad
+EndProcedure
+Procedure.i Main(services.i)
+  Protected rc.i
+  MmuClearNc()
+  MmuAddNc($08A00000,$09200000)
+  MmuAddNc($08100000,$08180000)
+  If MmuBuildTables($00800000)<>0 : ProcedureReturn 8 : EndIf
+  MmuEnableCached()
+  rc=GateRun(services)
+  MmuDisableCachedFlushed()
+  ProcedureReturn rc
+EndProcedure
