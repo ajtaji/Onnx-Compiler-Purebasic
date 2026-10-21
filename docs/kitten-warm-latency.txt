@@ -518,3 +518,33 @@ Both standard compiler applications rebuilt; self-test PASS.
 tests/pi4_conv_lane_gate.pi4 contains the prior-kernel reference comparison.
 No prerecorded speech, Bluetooth connection, reset, flash or storage writes.
 Installed TruckGPS unchanged; Bluetooth-active/map headroom remains untested.
+
+2026-10-21: bounded native convolution output spans and input-load pipeline.
+The packed four-row INT8 kernel now alternates two input registers, loading
+the next channel before multiplying the current channel. A complete span
+of two to four adjacent sixteen-position tiles uses one native entry with
+the exact final scale/bias/residual epilogue. Private saved initial pointers
+restore every tap sequence for the next output tile. Spans are at most64
+positions; the scheduler and application idle-service opportunities remain.
+Tail/short/partial-row fallbacks retain the existing path. Packed layout,
+proofs, quantization and per-output arithmetic/rounding order are unchanged.
+No model identity check, extra cache/heap or prerecorded speech. Fullq8-q15
+save remains128bytes; private argument block grows by72bytes, well within
+the4KiB secondary stack. Optional packed-path eligibility remains unchanged.
+
+Paired same-image complete four-core Kitten old/new requests against4b2a902:
+total8455.540->8286.142ms,2.0034% less; ordinary convolution3314.132->
+3143.498ms,5.1487% less. All8 new requests faster, all full waveform CRCs
+identical, fault fields0. FirstPCM418.4..808.2ms, silentRTF.583..684;
+about32..42% compute margin. These are silent sample timings, not speaker
+onset. Span alone measured1.588% less total; pipeline alone0.358% less.
+
+48 canonical old/new cases compare complete output words, quantized scratch
+and guards: two/three/four-tile spans, odd tails, dilation1..3, proof limits,
+INT16/stride fallbacks, missing bias, residual operand order and NaNs.
+Explicit full128byte q8-q15 preservation passes all12 proof-mode/span cases.
+Fresh standard-compiler exports of independent dynamic Conv/Add graphs
+IC64/K3/D1 and IC128/K7/D3 pass12 batch/width cases each, arena balanced.
+Both compiler applications rebuilt; self-test PASS. Public reproduction is
+tests/pi4_conv_span_gate.pi4. No Bluetooth connection/playback or map demo;
+installed TruckGPS unchanged. Bluetooth-active/map headroom remains untested.
