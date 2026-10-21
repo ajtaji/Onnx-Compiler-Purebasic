@@ -220,3 +220,19 @@ generation is now8-9percent faster than the start of this measurement cycle.
 First PCM:553/549/562/543/840/1020/755/548ms. RTF0.748-0.882; all complete
 waveform CRCs match the baseline. No secondary-core faults occurred. Audible
 Bluetooth startup and sufficient map/audio headroom remain to be established.
+
+
+Additional exact4x4 and1x4 FLOAT matrix tiles handle four to fifteen columns
+remaining after the16-column body.40 real-Pi comparisons passed all bits and
+guards, including K=0, small/odd shapes and random raw FLOAT words. Isolated
+60x64 by64x15 improved0.166 to0.070ms; the whole-model matrix gain was modest,
+1124 to1108ms across eight requests. No large whole-model gain is inferred.
+
+Boolean Where broadcasts now compute each operand's index once per output
+row. A contiguous chosen row is copied in bulk; other rows use the word
+selector or the same scalar pointer loop.32 broadcast shapes matched every
+output byte and balanced arena accounting. Whole-model Where dropped from
+175ms originally to roughly2ms. The combined run produced first PCM at
+542/536/550/531/819/981/735/536ms, RTF0.739-0.868. Complete waveform CRCs remain
+identical. This meets0.5-1second PCM readiness for this eight-text sample,
+with14-26percent generation-time margin; Bluetooth onset is not included.

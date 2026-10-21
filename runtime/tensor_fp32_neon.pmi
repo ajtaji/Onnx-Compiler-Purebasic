@@ -2837,9 +2837,86 @@ EndProcedure
 ; each body walks the same inner indices in the same order, so a result never
 ; depends on which body its output landed in.  Rows are taken four at a time
 ; while four remain and one at a time after that; columns sixteen at a time
-; while sixteen remain and one at a time after that.  Nothing here needs the
+; while sixteen remain, four while four remain, and single columns after that.  Nothing here needs the
 ; shape to be a multiple of anything, and an empty matrix writes nothing,
 ; exactly as the reference does.
+; Smaller exact tiles keep four to fifteen leftover columns vectorized.
+Procedure PmTensorMatMul2ExactFourByFour(*t.PmTensorMatMul2ExactArgs)
+ ASM
+  ldr x1, [x0, #0]
+  ldr x2, [x0, #8]
+  ldr x4, [x0, #24]
+  ldr x5, [x0, #32]
+  ldr x6, [x0, #40]
+  add x9, x1, x5
+  add x10, x9, x5
+  add x11, x10, x5
+  movi v16.4s, #0
+  movi v17.4s, #0
+  movi v18.4s, #0
+  movi v19.4s, #0
+  cmp x4, #1
+  b.lt pmoMatMulFourFourColsStore
+pmoMatMulFourFourColsLoop:
+  ld1 {v0.4s}, [x2]
+  ld1r {v4.4s}, [x1]
+  fmul v1.4s, v4.4s, v0.4s
+  fadd v16.4s, v16.4s, v1.4s
+  ld1r {v5.4s}, [x9]
+  fmul v1.4s, v5.4s, v0.4s
+  fadd v17.4s, v17.4s, v1.4s
+  ld1r {v6.4s}, [x10]
+  fmul v1.4s, v6.4s, v0.4s
+  fadd v18.4s, v18.4s, v1.4s
+  ld1r {v7.4s}, [x11]
+  fmul v1.4s, v7.4s, v0.4s
+  fadd v19.4s, v19.4s, v1.4s
+  add x1, x1, #4
+  add x9, x9, #4
+  add x10, x10, #4
+  add x11, x11, #4
+  add x2, x2, x6
+  subs x4, x4, #1
+  b.ne pmoMatMulFourFourColsLoop
+pmoMatMulFourFourColsStore:
+  ldr x3, [x0, #16]
+  ldr x7, [x0, #48]
+  st1 {v16.4s}, [x3]
+  add x3, x3, x7
+  st1 {v17.4s}, [x3]
+  add x3, x3, x7
+  st1 {v18.4s}, [x3]
+  add x3, x3, x7
+  st1 {v19.4s}, [x3]
+ EndASM
+EndProcedure
+
+Procedure PmTensorMatMul2ExactOneByFour(*t.PmTensorMatMul2ExactArgs)
+ ASM
+  ldr x1, [x0, #0]
+  ldr x2, [x0, #8]
+  ldr x4, [x0, #24]
+  ldr x5, [x0, #32]
+  ldr x6, [x0, #40]
+  movi v16.4s, #0
+  cmp x4, #1
+  b.lt pmoMatMulOneFourColsStore
+pmoMatMulOneFourColsLoop:
+  ld1 {v0.4s}, [x2]
+  ld1r {v4.4s}, [x1]
+  fmul v1.4s, v4.4s, v0.4s
+  fadd v16.4s, v16.4s, v1.4s
+  add x1, x1, #4
+  add x2, x2, x6
+  subs x4, x4, #1
+  b.ne pmoMatMulOneFourColsLoop
+pmoMatMulOneFourColsStore:
+  ldr x3, [x0, #16]
+  ldr x7, [x0, #48]
+  st1 {v16.4s}, [x3]
+ EndASM
+EndProcedure
+
 Procedure PmTensorMatMul2ExactNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i)
   Protected row.i
   Protected col.i
@@ -2869,6 +2946,11 @@ Procedure PmTensorMatMul2ExactNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i)
         PmTensorMatMul2ExactFourBySixteen(@t)
         col+16
       Wend
+      While colBlock>=4 And n-col>=4
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactFourByFour(@t)
+        col=col+4
+      Wend
       While col<n
         lane=0
         While lane<4
@@ -2886,6 +2968,11 @@ Procedure PmTensorMatMul2ExactNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i)
         PmTensorMatMul2ExactOneBySixteen(@t)
         col+16
       Wend
+      While colBlock>=4 And n-col>=4
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactOneByFour(@t)
+        col=col+4
+      Wend
       While col<n
         t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
         PmTensorMatMul2ExactOneByOne(@t)
@@ -2895,6 +2982,7 @@ Procedure PmTensorMatMul2ExactNeon(*a.i, *b.i, *dst.i, m.i, k.i, n.i)
     EndIf
   Wend
 EndProcedure
+
 
 ; ======================================================================
 ; Zero fill - the arena's own primitive.
