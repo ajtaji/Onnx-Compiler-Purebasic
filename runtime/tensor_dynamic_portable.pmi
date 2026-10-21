@@ -3403,3 +3403,65 @@ EndProcedure
 
 ; Shape start/end, Conv and ConvTranspose auto_pad SAME, ScatterND reductions.
 XIncludeFile "tensor_dynamic_forms_portable.pmi"
+
+; Adjacent single-use Sin/Cos and square retain both FP32 rounding steps.
+CompilerIf #PMD_NATIVE_BYTES=8
+Procedure.i PmTrigSquareRange(src.i,dst.i,count.i,op.i)
+ Protected Dim scratch.i[128]
+ Protected first.i=0,take.i
+ While first<count
+  If DCancel<>0 Or DError<>0 : ProcedureReturn 0 : EndIf
+  PmKernelIdle()
+  take=count-first : If take>256 : take=256 : EndIf
+  PmFastTrig(src+first*4,@scratch[0],take,op)
+  If PmTensorTrigOk=0 : ProcedureReturn 0 : EndIf
+  PmTensorSquareExactNeon(@scratch[0],dst+first*4,take,1)
+  first=first+take
+ Wend
+ ProcedureReturn 1
+EndProcedure
+Global Dim PmTrigSquareParts.i[16]
+Procedure.i PmTrigSquareWorker(*p.i)
+ If PmTrigSquareRange(PeekI(*p),PeekI(*p+8),PeekI(*p+16),PeekI(*p+24))=0 : ProcedureReturn 1 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i PmTrigSquareDispatch(src.i,dst.i,count.i,op.i)
+ Protected parts.i=1,i.i,first.i=0,last.i,at.i
+ If count>=16384 : parts=PmParallelCores() : If parts>4 : parts=4 : EndIf : EndIf
+ If parts>1
+  For i=0 To parts-1
+   last=count : If i<parts-1 : last=(count*(i+1)/parts)/16*16 : EndIf
+   at=i*4
+   PmTrigSquareParts[at]=src+first*4 : PmTrigSquareParts[at+1]=dst+first*4
+   PmTrigSquareParts[at+2]=last-first : PmTrigSquareParts[at+3]=op
+   first=last
+  Next
+  If pmSvcParRun(@PmTrigSquareWorker,@PmTrigSquareParts[0],32,parts)<>#PMP_SVC_OK : ProcedureReturn 0 : EndIf
+  ProcedureReturn Bool(DError=0 And DCancel=0 And PmTensorTrigOk<>0)
+ EndIf
+ ProcedureReturn PmTrigSquareRange(src,dst,count,op)
+EndProcedure
+CompilerEndIf
+Procedure DTrigThenSquare(Y.i,T.i,A.i,B.i,op.i,UnaryNode.i,releaseA.i)
+ Protected powNode.i=DNode
+ DNode=UnaryNode
+ CompilerIf #PMD_NATIVE_BYTES=8
+ If Y<>T And Y<>A And Y<>B And T<>A And T<>B And Dt(T)\Data=0 And Dt(A)\Kind=1 And Dt(B)\Kind=1 And Dt(B)\Count=1 And Dt(B)\Data<>0 And (op=5 Or op=6)
+  If PeekL(Dt(B)\Data)=$40000000
+   If DLikeOverwrite(Y,A,0)=0 : ProcedureReturn : EndIf
+   If PmTrigSquareDispatch(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count,op-5)=0
+    If DError=0 And DCancel=0 : DFail("Parallel trigonometric square did not complete.") : EndIf
+    ProcedureReturn
+   EndIf
+   If releaseA : DRelease(A) : EndIf
+   DNode=powNode
+   ProcedureReturn
+  EndIf
+ EndIf
+ CompilerEndIf
+ DUnary(T,A,op,0.0)
+ If DError<>0 Or DCancel<>0 : ProcedureReturn : EndIf
+ If releaseA : DRelease(A) : EndIf
+ DNode=powNode
+ DBinary(Y,T,B,4)
+EndProcedure

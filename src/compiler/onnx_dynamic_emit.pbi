@@ -557,6 +557,34 @@ Procedure PmdCombineConvAdd(List Calls.s(),List ScheduleStatic.i(),Map Last.i(),
   Next
 EndProcedure
 
+; Eliminate a full intermediate tensor for adjacent single-use Sin/Cos
+; followed by Pow. The runtime checks the exponent and otherwise executes
+; the original calls, including their original input release boundary.
+Procedure PmdCombineTrigSquare(List Calls.s(),List ScheduleStatic.i(),Map Last.i(),Map Persistent.i())
+  Protected i.i,n.i=ListSize(Calls()),unary.s,power.s,t.i,a.i,y.i,b.i,op.i,releaseA.i
+  For i=0 To n-2
+    SelectElement(ScheduleStatic(),i) : If ScheduleStatic()<>0 : Continue : EndIf
+    SelectElement(ScheduleStatic(),i+1) : If ScheduleStatic()<>0 : Continue : EndIf
+    SelectElement(Calls(),i) : unary=Calls()
+    SelectElement(Calls(),i+1) : power=Calls()
+    If Left(unary,7)<>"DUnary(" Or Left(power,8)<>"DBinary(" Or Right(power,3)<>",4)" : Continue : EndIf
+    t=Val(StringField(Mid(unary,8),1,",")) : a=Val(StringField(Mid(unary,8),2,","))
+    op=Val(StringField(Mid(unary,8),3,","))
+    y=Val(StringField(Mid(power,9),1,",")) : b=Val(StringField(Mid(power,9),3,","))
+    If op<>5 And op<>6 : Continue : EndIf
+    If t<=0 Or a<=0 Or y<=0 Or b<=0 Or Val(StringField(Mid(power,9),2,","))<>t : Continue : EndIf
+    If y=t Or y=a Or y=b Or t=a Or t=b Or a=b : Continue : EndIf
+    If Last(Str(t))<>i+1 Or Persistent(Str(t)) : Continue : EndIf
+    releaseA=0
+    If Last(Str(a))=i And Persistent(Str(a))=0
+      releaseA=1 : Last(Str(a))=i+1
+    EndIf
+    SelectElement(Calls(),i) : Calls()="; Trigonometric result evaluated with the following Pow."
+    SelectElement(Calls(),i+1)
+    Calls()="DTrigThenSquare("+Str(y)+","+Str(t)+","+Str(a)+","+Str(b)+","+Str(op)+","+Str(i)+","+Str(releaseA)+")"
+  Next
+EndProcedure
+
 Procedure.i PmoDynamicCommand(ModelPath.s)
   ClearList(PmoOpsTableLines()) : PmoOpsTableCount = 0
   Protected model.PmoOnnxModel,ir.PmoIrModel,root.s=PmoCompileProjectRoot()
@@ -707,6 +735,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   If PmdPortable And PmoTargets(targetIndex)\NativeIntegerBytes=8
     PmdCombineMultiplyAdd(calls(),isstatic(),last(),persistent())
     PmdCombineConvAdd(calls(),isstatic(),last(),persistent())
+    PmdCombineTrigSquare(calls(),isstatic(),last(),persistent())
   EndIf
   If PmoStorageReduce(@ir,precision)=0 : PmoDynamicError=PmoQuantError : Goto Failed : EndIf
   If ir\DecodedWeightBytes>1024*1024*1024 : PmoDynamicError="Decoded resident weights exceed the working-memory limit. Reduced storage is not reduced execution RAM." : Goto Failed : EndIf

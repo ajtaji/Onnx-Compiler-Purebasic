@@ -383,3 +383,32 @@ R39 full four-core Kitten:27770/68096 groups (41%) qualify. Cached metadata
 still41728bytes. DConv+ConvThenAdd3955->3852ms across8. All8 waveform CRCs
 unchanged. First PCMms468/463/476/459/676/849/611/463; total generationms
 767/714/801/681/1605/2410/1505/714. Silent RTF.644-.758. Bluetooth/map untested.
+
+2026-10-21: adjacent trigonometric square pipeline. The reusable A64 emitter
+combines adjacent single-use Sin/Cos then Pow, with a runtime exact FLOAT
+scalar +2 check. Each worker uses a 1KiB buffer for at most256 intermediate
+FP32 values; sine/cosine and multiplication still round separately. Large
+counts split across four cores. Other exponents/broadcasts/types use the
+original two calls. Shared/persistent intermediates and static schedules are
+not combined. Input release moves to the combined node, retaining the
+original release boundary in fallback. No model identity or audio cache.
+
+32 direct real-Pi shape/value/broadcast comparisons passed bit for bit.
+16 emitter lifetime/alias/static/multiple-consumer cases passed. Fresh Sin-Pow
+and Cos-Pow FP32 dynamic ONNX exports each passed24 real-Pi comparisons,
+including NaNs/Inf/signed zero and exponent3 fallback; both fast/fallback
+release-input paths and unary-error node attribution passed. A shared-output
+graph correctly remains unfused. Both compiler applications build/self-test.
+The direct finite large-array pipeline improves about1.7-2.3x; this is not a
+whole-model speedup claim.
+
+R40 full four-core Kitten combines this change with eight-product bounds.
+First PCMms459.7/454.4/465.9/450.1/665.8/839.5/602.0/454.0; generationms
+749.9/699.6/783.9/666.6/1579.8/2376.0/1480.0/698.6. All8 complete waveform
+CRCs identical. Silent RTF.635-.743 gives26-36% compute margin. Aggregate
+generation23.0% below R1,2.7% below R38 and1.7% below R39 (rounded).
+Convolution remains the largest aggregate family (~3852ms across8), followed
+by binary operations1135ms, MatMul890ms and fused trig/square750ms.
+No Bluetooth or map demo. First PCM is not measured speaker onset; audible
+under1s and simultaneous map headroom remain unverified. Installed TruckGPS
+is unchanged. Tests are fresh inference with resident weights.
