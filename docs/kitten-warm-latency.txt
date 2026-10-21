@@ -135,7 +135,27 @@ operator measurements, not a whole-Kitten headroom or reply-latency claim.
 Rejected experiments: widening the narrow integer tile was slower; simply
 rescheduling independent FP32 transposed-convolution operations did not help.
 A register-tiled stride-six prototype matched20 cases and improved one large
-case about30percent but remains experimental. Keeping all taps inside one
+case about30percent in its initial single-core test. Keeping all taps inside one
 native integer tile improved tested stride-one cases only2-6percent on one
 core; it is not shipped. Further work should target the dominant stride-one
 convolutions rather than extrapolating the strided quantization gain.
+
+The stride-six/kernel-twelve FLOAT transposed convolution is now integrated
+with caller-owned packing scratch. An initial four-core prototype put more
+than6KiB on each worker stack and timed out. A returning stack-pointer probe
+showed secondary stack pointers spaced4096bytes apart. That unsafe prototype
+was rejected. The integrated operator allocates24KiB from its bounded arena,
+gives each worker a separate6144-byte region and releases it after the join.
+It retains the original path for other geometries, small inputs and a budget
+below24KiB. A failed parallel dispatch reports an error and retains scratch;
+it is never hidden by rerunning on the primary.
+
+Twenty integrated real-Pi comparisons matched every output bit with intact
+output and arena guards, zero core faults and balanced scratch accounting.
+Coverage includes signed zero, infinities, NaN payloads, batches, groups,
+odd widths, edge cropping and insufficient-scratch fallback/refusal. A
+two-batch128-to64-channel example improved2.87ms to1.87ms on four cores;
+grouped examples improved0.735ms to0.464ms and0.413ms to0.274ms. Representative
+ungrouped external-scratch tests improved1.5-1.6ms to1.0-1.2ms. These remain
+isolated operator measurements; full Kitten headroom and subsecond reply
+startup have not yet been established with these changes.

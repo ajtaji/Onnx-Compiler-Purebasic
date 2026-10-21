@@ -1756,6 +1756,308 @@ pmoConvTWideDone:
   EndASM
 EndProcedure
 
+; Exact stride-six register tiling. Each output retains ascending input
+; channel and input-position reductions, separate multiply then add.
+Procedure PmConvTransposeSixTileA64(p.i)
+  ASM
+    mov x17, x0
+    ldr x1, [x17]
+    ldr x2, [x17, #8]
+    ldr x3, [x17, #16]
+    ldr x4, [x17, #24]
+    ldr x5, [x17, #32]
+    ldr x6, [x17, #40]
+    ldr x7, [x17, #48]
+    ldr x8, [x17, #56]
+    ldr w9, [x17, #64]
+    dup v7.4s, w9
+    mov v16.16b, v7.16b
+    mov v17.16b, v7.16b
+    mov v18.16b, v7.16b
+    mov v19.16b, v7.16b
+    mov v20.16b, v7.16b
+    mov v21.16b, v7.16b
+    mov v22.16b, v7.16b
+    mov v23.16b, v7.16b
+pmoConvSixChannel:
+    ld1 {v1.4s}, [x2]
+    add x9, x2, #16
+    ld1 {v2.2s}, [x9]
+    add x9, x2, #24
+    ld1 {v3.4s}, [x9]
+    add x9, x2, #40
+    ld1 {v4.2s}, [x9]
+    cmp x7, #4
+    b.ne pmoConvSixPartial
+    ldr s0, [x1, #0]
+    dup v0.4s, v0.s[0]
+    fmul v24.4s, v0.4s, v3.4s
+    fmul v25.2s, v0.2s, v4.2s
+    ldr s0, [x1, #4]
+    dup v0.4s, v0.s[0]
+    fmul v26.4s, v0.4s, v3.4s
+    fmul v27.2s, v0.2s, v4.2s
+    ldr s0, [x1, #8]
+    dup v0.4s, v0.s[0]
+    fmul v28.4s, v0.4s, v3.4s
+    fmul v29.2s, v0.2s, v4.2s
+    ldr s0, [x1, #12]
+    dup v0.4s, v0.s[0]
+    fmul v30.4s, v0.4s, v3.4s
+    fmul v31.2s, v0.2s, v4.2s
+    fadd v16.4s, v16.4s, v24.4s
+    fadd v17.2s, v17.2s, v25.2s
+    fadd v18.4s, v18.4s, v26.4s
+    fadd v19.2s, v19.2s, v27.2s
+    fadd v20.4s, v20.4s, v28.4s
+    fadd v21.2s, v21.2s, v29.2s
+    fadd v22.4s, v22.4s, v30.4s
+    fadd v23.2s, v23.2s, v31.2s
+    ldr s0, [x1, #4]
+    dup v0.4s, v0.s[0]
+    fmul v24.4s, v0.4s, v1.4s
+    fmul v25.2s, v0.2s, v2.2s
+    ldr s0, [x1, #8]
+    dup v0.4s, v0.s[0]
+    fmul v26.4s, v0.4s, v1.4s
+    fmul v27.2s, v0.2s, v2.2s
+    ldr s0, [x1, #12]
+    dup v0.4s, v0.s[0]
+    fmul v28.4s, v0.4s, v1.4s
+    fmul v29.2s, v0.2s, v2.2s
+    ldr s0, [x1, #16]
+    dup v0.4s, v0.s[0]
+    fmul v30.4s, v0.4s, v1.4s
+    fmul v31.2s, v0.2s, v2.2s
+    fadd v16.4s, v16.4s, v24.4s
+    fadd v17.2s, v17.2s, v25.2s
+    fadd v18.4s, v18.4s, v26.4s
+    fadd v19.2s, v19.2s, v27.2s
+    fadd v20.4s, v20.4s, v28.4s
+    fadd v21.2s, v21.2s, v29.2s
+    fadd v22.4s, v22.4s, v30.4s
+    fadd v23.2s, v23.2s, v31.2s
+    b pmoConvSixNextChannel
+pmoConvSixPartial:
+    ldr s0, [x1, #0]
+    dup v0.4s, v0.s[0]
+    fmul v5.4s, v0.4s, v3.4s
+    fadd v16.4s, v16.4s, v5.4s
+    fmul v5.2s, v0.2s, v4.2s
+    fadd v17.2s, v17.2s, v5.2s
+    ldr s0, [x1, #4]
+    dup v0.4s, v0.s[0]
+    fmul v5.4s, v0.4s, v1.4s
+    fadd v16.4s, v16.4s, v5.4s
+    fmul v5.2s, v0.2s, v2.2s
+    fadd v17.2s, v17.2s, v5.2s
+    cmp x7, #2
+    b.lt pmoConvSixNextChannel
+    ldr s0, [x1, #4]
+    dup v0.4s, v0.s[0]
+    fmul v5.4s, v0.4s, v3.4s
+    fadd v18.4s, v18.4s, v5.4s
+    fmul v5.2s, v0.2s, v4.2s
+    fadd v19.2s, v19.2s, v5.2s
+    ldr s0, [x1, #8]
+    dup v0.4s, v0.s[0]
+    fmul v5.4s, v0.4s, v1.4s
+    fadd v18.4s, v18.4s, v5.4s
+    fmul v5.2s, v0.2s, v2.2s
+    fadd v19.2s, v19.2s, v5.2s
+    cmp x7, #3
+    b.lt pmoConvSixNextChannel
+    ldr s0, [x1, #8]
+    dup v0.4s, v0.s[0]
+    fmul v5.4s, v0.4s, v3.4s
+    fadd v20.4s, v20.4s, v5.4s
+    fmul v5.2s, v0.2s, v4.2s
+    fadd v21.2s, v21.2s, v5.2s
+    ldr s0, [x1, #12]
+    dup v0.4s, v0.s[0]
+    fmul v5.4s, v0.4s, v1.4s
+    fadd v20.4s, v20.4s, v5.4s
+    fmul v5.2s, v0.2s, v2.2s
+    fadd v21.2s, v21.2s, v5.2s
+    cmp x7, #4
+    b.lt pmoConvSixNextChannel
+    ldr s0, [x1, #12]
+    dup v0.4s, v0.s[0]
+    fmul v5.4s, v0.4s, v3.4s
+    fadd v22.4s, v22.4s, v5.4s
+    fmul v5.2s, v0.2s, v4.2s
+    fadd v23.2s, v23.2s, v5.2s
+    ldr s0, [x1, #16]
+    dup v0.4s, v0.s[0]
+    fmul v5.4s, v0.4s, v1.4s
+    fadd v22.4s, v22.4s, v5.4s
+    fmul v5.2s, v0.2s, v2.2s
+    fadd v23.2s, v23.2s, v5.2s
+pmoConvSixNextChannel:
+    add x1, x1, x5
+    add x2, x2, x6
+    subs x4, x4, #1
+    b.ne pmoConvSixChannel
+    st1 {v16.4s}, [x3], #16
+    st1 {v17.2s}, [x3], #8
+    cmp x7, #2
+    b.lt pmoConvSixDone
+    st1 {v18.4s}, [x3], #16
+    st1 {v19.2s}, [x3], #8
+    cmp x7, #3
+    b.lt pmoConvSixDone
+    st1 {v20.4s}, [x3], #16
+    st1 {v21.2s}, [x3], #8
+    cmp x7, #4
+    b.lt pmoConvSixDone
+    st1 {v22.4s}, [x3], #16
+    st1 {v23.2s}, [x3], #8
+pmoConvSixDone:
+  EndASM
+EndProcedure
+
+Procedure PmConvTransposeSixPackA64(src.i,dst.i,channels.i,stride.i)
+  ASM
+pmoConvSixPackLoop:
+    ld1 {v0.4s-v2.4s}, [x0]
+    st1 {v0.4s-v2.4s}, [x1], #48
+    add x0, x0, x3
+    subs x2, x2, #1
+    b.ne pmoConvSixPackLoop
+  EndASM
+EndProcedure
+
+Procedure PmConvTransposeSixEdgeA64(p.i)
+  ASM
+    ldr x1, [x0]
+    ldr x2, [x0, #8]
+    ldr x3, [x0, #16]
+    ldr x4, [x0, #24]
+    ldr x5, [x0, #32]
+    ldr x6, [x0, #40]
+    ldr x7, [x0, #48]
+    ldr x8, [x0, #56]
+    ldr w9, [x0, #64]
+    ldr x10, [x0, #72]
+    fmov s16, w9
+    add x1, x1, x7, lsl #2
+    add x2, x2, x8, lsl #2
+pmoConvSixEdgeChannel:
+    cmp x7, #1
+    b.lt pmoConvSixEdgeCurrent
+    cmp x7, x10
+    b.gt pmoConvSixEdgeCurrent
+    sub x11, x1, #4
+    ldr s0, [x11]
+    ldr s1, [x2, #24]
+    fmul s2, s0, s1
+    fadd s16, s16, s2
+pmoConvSixEdgeCurrent:
+    cmp x7, #0
+    b.lt pmoConvSixEdgeNext
+    cmp x7, x10
+    b.ge pmoConvSixEdgeNext
+    ldr s0, [x1]
+    ldr s1, [x2]
+    fmul s2, s0, s1
+    fadd s16, s16, s2
+pmoConvSixEdgeNext:
+    add x1, x1, x5
+    add x2, x2, x6
+    subs x4, x4, #1
+    b.ne pmoConvSixEdgeChannel
+    str s16, [x3]
+  EndASM
+EndProcedure
+
+
+Procedure.i PmConvTransposeSixRange(*g.PmTensorConvTranspose1DArgs,ocFirst.i,ocLast.i,packed.i)
+  Protected bn.i,oc.i,ic.i,group.i,ocg.i,ipg.i,opg.i,n.i,nFirst.i,nLast.i,take.i
+  Protected ox.i,phase.i,ix.i,src.i,weight.i,dst.i,endFirst.i,startLast.i,bias.i,weightStep.i
+  Protected Dim p.i[10]
+  If *g=0 : ProcedureReturn 0 : EndIf
+  If *g\Stride<>6 Or *g\Kernel<>12 Or *g\Dilation<>1 Or *g\Groups<=0 Or *g\InWidth<=0 Or *g\OutWidth<=0 Or *g\Batches<=0 : ProcedureReturn 0 : EndIf
+  ipg=*g\InChannels/ *g\Groups : opg=*g\OutChannels/ *g\Groups
+  If ipg<=0 Or opg<=0 Or ipg* *g\Groups<>*g\InChannels Or opg* *g\Groups<>*g\OutChannels : ProcedureReturn 0 : EndIf
+  If *g\PadLeft<0 : ProcedureReturn 0 : EndIf
+  nFirst=(*g\PadLeft+5)/6 : If nFirst<1 : nFirst=1 : EndIf
+  nLast=(*g\OutWidth+*g\PadLeft)/6
+  If nLast>*g\InWidth : nLast=*g\InWidth : EndIf
+  If nLast<nFirst : nLast=nFirst : EndIf
+  endFirst=nFirst*6-*g\PadLeft : If endFirst>*g\OutWidth : endFirst=*g\OutWidth : EndIf
+  startLast=nLast*6-*g\PadLeft : If startLast<endFirst : startLast=endFirst : EndIf
+  For bn=0 To *g\Batches-1
+    For oc=ocFirst To ocLast-1
+      PmKernelIdle()
+      group=oc/opg : ocg=oc-group*opg
+      src=*g\Src+(bn* *g\InChannels+group*ipg)* *g\InWidth*4
+      weight=*g\Weight+((group*ipg)*opg+ocg)*48
+      weightStep=opg*48
+      If packed<>0 And ipg>=32 And ipg<=128 And *g\InWidth>=16
+        PmConvTransposeSixPackA64(weight,packed,ipg,weightStep)
+        weight=packed : weightStep=48
+      EndIf
+      dst=*g\Dst+(bn* *g\OutChannels+oc)* *g\OutWidth*4
+      bias=0 : If *g\Bias<>0 : bias=PeekL(*g\Bias+oc*4) : EndIf
+      n=nFirst
+      While n<nLast
+        take=nLast-n : If take>4 : take=4 : EndIf
+        p[0]=src+(n-1)*4 : p[1]=weight : p[2]=dst+(n*6-*g\PadLeft)*4
+        p[3]=ipg : p[4]=*g\InWidth*4 : p[5]=weightStep : p[6]=take : p[8]=bias
+        PmConvTransposeSixTileA64(@p[0])
+        n+take
+      Wend
+      ox=0
+      While ox<*g\OutWidth
+        If ox=endFirst : ox=startLast : EndIf
+        If ox>=*g\OutWidth : Break : EndIf
+        ix=(ox+*g\PadLeft)/6 : phase=(ox+*g\PadLeft) % 6
+        p[0]=src : p[1]=weight : p[2]=dst+ox*4 : p[3]=ipg
+        p[4]=*g\InWidth*4 : p[5]=weightStep : p[6]=ix : p[7]=phase : p[8]=bias : p[9]=*g\InWidth
+        PmConvTransposeSixEdgeA64(@p[0])
+        ox+1
+      Wend
+    Next
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+
+; The worker stacks are small. Each worker receives a separate6144-byte
+; packing region owned by the calling operator, never a local packed array.
+Procedure.i PmConvTransposeSixEligible(*g.PmTensorConvTranspose1DArgs)
+  Protected ipg.i,opg.i
+  If *g=0 : ProcedureReturn 0 : EndIf
+  If *g\Stride<>6 Or *g\Kernel<>12 Or *g\Dilation<>1 Or *g\Groups<=0 Or *g\Batches<=0 Or *g\InWidth<16 Or *g\OutWidth<32 Or *g\PadLeft<0 Or *g\PadLeft>12 : ProcedureReturn 0 : EndIf
+  ipg=*g\InChannels/ *g\Groups : opg=*g\OutChannels/ *g\Groups
+  If ipg<32 Or ipg>128 Or opg<1 Or ipg* *g\Groups<>*g\InChannels Or opg* *g\Groups<>*g\OutChannels : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+Global Dim PmConvSixParts.i[16]
+Procedure.i PmConvSixWorker(p.i)
+  If PmConvTransposeSixRange(PeekI(p),PeekI(p+8),PeekI(p+16),PeekI(p+24))=0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i PmConvTransposeSixParallel(*g.PmTensorConvTranspose1DArgs,scratch.i,bytes.i)
+  Protected parts.i=1,i.i,first.i,last.i
+  If PmConvTransposeSixEligible(*g)=0 Or scratch=0 : ProcedureReturn 0 : EndIf
+  If *g\OutChannels>=4 And *g\OutChannels* *g\OutWidth>=16384
+    parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
+  EndIf
+  If bytes<parts*6144 : ProcedureReturn 0 : EndIf
+  If parts>1
+    For i=0 To parts-1
+      last=*g\OutChannels*(i+1)/parts
+      PmConvSixParts[i*4]=*g : PmConvSixParts[i*4+1]=first : PmConvSixParts[i*4+2]=last
+      PmConvSixParts[i*4+3]=scratch+i*6144 : first=last
+    Next
+    ; A failed dispatch must not be hidden by a successful primary rerun.
+    If pmSvcParRun(@PmConvSixWorker,@PmConvSixParts[0],32,parts)<>#PMP_SVC_OK : ProcedureReturn -1 : EndIf
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn PmConvTransposeSixRange(*g,0,*g\OutChannels,scratch)
+EndProcedure
+
 Procedure PmTensorConvTranspose1DFp32NeonRange(*g.PmTensorConvTranspose1DArgs,ocFirst.i,ocLast.i)
   Protected bn.i
   Protected ic.i

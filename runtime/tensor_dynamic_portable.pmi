@@ -909,6 +909,21 @@ Procedure.i PmFastConv(*g.PmTensorConv1DArgs,Available.i)
 EndProcedure
 Procedure.i PmFastConvTranspose(*g.PmTensorConvTranspose1DArgs,Available.i)
   CompilerIf #PMD_NATIVE_BYTES=8
+  Protected scratch.i,bytes.i=24576,status.i
+  If PmConvTransposeSixEligible(*g) And Available>=bytes
+    scratch=DAcquireOverwrite(bytes)
+    If scratch=0 : ProcedureReturn 0 : EndIf
+    DLive=DLive+bytes : DPeak=DMax(DPeak,DLive)
+    status=PmConvTransposeSixParallel(*g,scratch,bytes)
+    If status<0
+      ; Retain scratch after an incomplete dispatch. It must not be reused
+      ; while an unjoined worker could still own it.
+      DFail("Transposed convolution parallel worker failed.")
+      ProcedureReturn 0
+    EndIf
+    DFree(scratch) : DLive=DLive-bytes
+    If status>0 : ProcedureReturn 1 : EndIf
+  EndIf
   PmTensorConvTranspose1DFp32Neon(*g)
   CompilerElse
   PmTensorConvTranspose1D(*g)
