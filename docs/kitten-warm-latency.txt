@@ -159,3 +159,41 @@ grouped examples improved0.735ms to0.464ms and0.413ms to0.274ms. Representative
 ungrouped external-scratch tests improved1.5-1.6ms to1.0-1.2ms. These remain
 isolated operator measurements; full Kitten headroom and subsecond reply
 startup have not yet been established with these changes.
+
+
+2026-10-20: whole-model measurements on the four-core Pi 4 under Anvil.
+Eight fresh text-to-PCM requests use resident weights, fixed per-request seed
+and the production temporal-window schedule. Model reset and text preparation
+are included; initial USB load, binding and immutable weight packing are not.
+These are PCM availability timings, not Bluetooth or acoustic onset timings.
+
+Baseline first PCM: 594-616ms for short replies, 823/913/1119ms for longer
+requests. Whole-request real-time factors: 0.817-0.968. An RTF below one means
+generation finishes faster than the spoken duration; this still leaves little
+room for graphics and Bluetooth. Allocation is below one percent. Empty
+four-core dispatch costs 4.09us; actual parallel arithmetic dominates.
+
+Interleaving independent binary64 lane pairs in Sin/Cos preserves every
+per-lane operation, rounding guard and fallback. Twenty-four real-Pi exact
+comparisons passed, including tails, moderate angles, boundary angles, random
+raw floats, signed zero, subnormals, infinities and NaNs. Representative 65k
+element kernels improved about 1.2x. Whole-model unary time fell 1250 to1083ms
+aggregated across the eight requests, with identical complete waveform CRCs.
+
+Convolution position tiles now cover64 rather than256 positions. This keeps
+smaller input windows hot across output channels, with the same reductions
+and disjoint writes. Complete-model convolution time fell4579 to4259ms.
+A16-position experiment gained little further and is not shipped.
+
+The common integer exponent2 uses the same squared result with the original
+NaN word selected back, including signalling NaNs. Twenty-four exact cases
+passed with guards, counts0-15 and65537, broadcast/contiguous bases, random
+float words, subnormals, infinities and NaNs. Isolated speed improved3-4x;
+the whole-model benefit was small and is not extrapolated from that result.
+
+Combined whole-model first PCM is570-592ms for short replies and801/892/1089ms
+for longer requests. RTF0.783-0.921, all eight waveform CRCs unchanged and no
+worker faults. Overall generation improved about4-5percent. This does not
+establish the universal0.5-1second audible target or sufficient application
+headroom. A sixteen-element binary unroll that looked faster in isolation
+regressed whole-model binary time and was removed. No map demo was run.

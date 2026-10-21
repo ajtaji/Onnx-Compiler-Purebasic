@@ -1,3 +1,5 @@
+; Independent binary64 lane pairs are interleaved to hide polynomial
+; dependency latency. Every per-lane operation and fallback is unchanged.
 ; AArch64 FP32 Sin/Cos tensor kernel, correctly rounded (C6c-3).
 ;
 ; Four arguments at a time, as two pairs of binary64 lanes: |x| 2/pi rounded to
@@ -40,53 +42,53 @@ Procedure PmTensorTrigA64(*src.i, *dst.i, count.i, op.i)
     b.le pmoTrigA64Done
 
 pmoTrigA64Setup:
-    adrp x9, pmotriga64twoopi
-    add x9, x9, #:lo12:pmotriga64twoopi
+    adrp x9, pmoTrigA64twoopi
+    add x9, x9, #:lo12:pmoTrigA64twoopi
     ld1 {v16.2d}, [x9]
-    adrp x9, pmotriga64p1
-    add x9, x9, #:lo12:pmotriga64p1
+    adrp x9, pmoTrigA64p1
+    add x9, x9, #:lo12:pmoTrigA64p1
     ld1 {v17.2d}, [x9]
-    adrp x9, pmotriga64p2
-    add x9, x9, #:lo12:pmotriga64p2
+    adrp x9, pmoTrigA64p2
+    add x9, x9, #:lo12:pmoTrigA64p2
     ld1 {v18.2d}, [x9]
-    adrp x9, pmotriga64p3
-    add x9, x9, #:lo12:pmotriga64p3
+    adrp x9, pmoTrigA64p3
+    add x9, x9, #:lo12:pmoTrigA64p3
     ld1 {v19.2d}, [x9]
-    adrp x9, pmotriga64s1
-    add x9, x9, #:lo12:pmotriga64s1
+    adrp x9, pmoTrigA64s1
+    add x9, x9, #:lo12:pmoTrigA64s1
     ld1 {v20.2d}, [x9]
-    adrp x9, pmotriga64s2
-    add x9, x9, #:lo12:pmotriga64s2
+    adrp x9, pmoTrigA64s2
+    add x9, x9, #:lo12:pmoTrigA64s2
     ld1 {v21.2d}, [x9]
-    adrp x9, pmotriga64s3
-    add x9, x9, #:lo12:pmotriga64s3
+    adrp x9, pmoTrigA64s3
+    add x9, x9, #:lo12:pmoTrigA64s3
     ld1 {v22.2d}, [x9]
-    adrp x9, pmotriga64s4
-    add x9, x9, #:lo12:pmotriga64s4
+    adrp x9, pmoTrigA64s4
+    add x9, x9, #:lo12:pmoTrigA64s4
     ld1 {v23.2d}, [x9]
-    adrp x9, pmotriga64s5
-    add x9, x9, #:lo12:pmotriga64s5
+    adrp x9, pmoTrigA64s5
+    add x9, x9, #:lo12:pmoTrigA64s5
     ld1 {v24.2d}, [x9]
-    adrp x9, pmotriga64c1
-    add x9, x9, #:lo12:pmotriga64c1
+    adrp x9, pmoTrigA64c1
+    add x9, x9, #:lo12:pmoTrigA64c1
     ld1 {v25.2d}, [x9]
-    adrp x9, pmotriga64c2
-    add x9, x9, #:lo12:pmotriga64c2
+    adrp x9, pmoTrigA64c2
+    add x9, x9, #:lo12:pmoTrigA64c2
     ld1 {v26.2d}, [x9]
-    adrp x9, pmotriga64c3
-    add x9, x9, #:lo12:pmotriga64c3
+    adrp x9, pmoTrigA64c3
+    add x9, x9, #:lo12:pmoTrigA64c3
     ld1 {v27.2d}, [x9]
-    adrp x9, pmotriga64c4
-    add x9, x9, #:lo12:pmotriga64c4
+    adrp x9, pmoTrigA64c4
+    add x9, x9, #:lo12:pmoTrigA64c4
     ld1 {v28.2d}, [x9]
-    adrp x9, pmotriga64c5
-    add x9, x9, #:lo12:pmotriga64c5
+    adrp x9, pmoTrigA64c5
+    add x9, x9, #:lo12:pmoTrigA64c5
     ld1 {v29.2d}, [x9]
-    adrp x9, pmotriga64check
-    add x9, x9, #:lo12:pmotriga64check
+    adrp x9, pmoTrigA64check
+    add x9, x9, #:lo12:pmoTrigA64check
     ld1 {v30.2d}, [x9]
-    adrp x9, pmotriga64s6c6
-    add x9, x9, #:lo12:pmotriga64s6c6
+    adrp x9, pmoTrigA64s6c6
+    add x9, x9, #:lo12:pmoTrigA64s6c6
     ld1 {v31.2d}, [x9]
     movz x11, #16352, lsl #48
     movz x12, #16368, lsl #48
@@ -103,123 +105,125 @@ pmoTrigA64Loop:
     umaxv s6, v6.4s
     fmov w9, s6
     cbnz w9, pmoTrigA64Group
-    ; fcvtl v0.2d, v7.2s ; fcvtl2 v1.2d, v7.4s
     .word 0x0E6178E0
     .word 0x4E6178E1
     fmul v2.2d, v0.2d, v16.2d
+    fmul v3.2d, v1.2d, v16.2d
     frintn v2.2d, v2.2d
+    frintn v3.2d, v3.2d
     fmls v0.2d, v2.2d, v17.2d
+    fmls v1.2d, v3.2d, v17.2d
     fmls v0.2d, v2.2d, v18.2d
+    fmls v1.2d, v3.2d, v18.2d
     fmls v0.2d, v2.2d, v19.2d
+    fmls v1.2d, v3.2d, v19.2d
     fcvtzs v2.2d, v2.2d
-    dup v3.2d, x3
-    add v2.2d, v2.2d, v3.2d
-    fmul v3.2d, v0.2d, v0.2d
-    dup v4.2d, v31.d[0]
-    mov v5.16b, v24.16b
-    fmla v5.2d, v4.2d, v3.2d
-    mov v4.16b, v23.16b
-    fmla v4.2d, v5.2d, v3.2d
-    mov v5.16b, v22.16b
-    fmla v5.2d, v4.2d, v3.2d
-    mov v4.16b, v21.16b
-    fmla v4.2d, v5.2d, v3.2d
-    mov v5.16b, v20.16b
-    fmla v5.2d, v4.2d, v3.2d
-    fmul v5.2d, v5.2d, v3.2d
-    fmul v5.2d, v5.2d, v0.2d
-    fadd v5.2d, v5.2d, v0.2d
-    dup v4.2d, v31.d[1]
-    mov v6.16b, v29.16b
-    fmla v6.2d, v4.2d, v3.2d
-    mov v4.16b, v28.16b
-    fmla v4.2d, v6.2d, v3.2d
-    mov v6.16b, v27.16b
-    fmla v6.2d, v4.2d, v3.2d
-    mov v4.16b, v26.16b
-    fmla v4.2d, v6.2d, v3.2d
-    mov v6.16b, v25.16b
-    fmla v6.2d, v4.2d, v3.2d
-    fmul v6.2d, v6.2d, v3.2d
-    fmul v6.2d, v6.2d, v3.2d
-    dup v4.2d, x11
-    fmul v4.2d, v4.2d, v3.2d
-    fsub v6.2d, v6.2d, v4.2d
-    dup v4.2d, x12
-    fadd v6.2d, v6.2d, v4.2d
-    shl v4.2d, v2.2d, #63
-    sshr v4.2d, v4.2d, #63
-    bsl v4.16b, v6.16b, v5.16b
-    shl v5.2d, v2.2d, #62
+    fcvtzs v3.2d, v3.2d
+    dup v4.2d, x3
+    add v2.2d, v2.2d, v4.2d
+    add v3.2d, v3.2d, v4.2d
+    umov x13, v2.d[0]
+    umov x14, v2.d[1]
+    umov x15, v3.d[0]
+    umov x16, v3.d[1]
+    fmul v4.2d, v0.2d, v0.2d
+    fmul v5.2d, v1.2d, v1.2d
+    dup v6.2d, v31.d[0]
+    dup v7.2d, v31.d[0]
+    mov v2.16b, v24.16b
+    mov v3.16b, v24.16b
+    fmla v2.2d, v6.2d, v4.2d
+    fmla v3.2d, v7.2d, v5.2d
+    mov v6.16b, v23.16b
+    mov v7.16b, v23.16b
+    fmla v6.2d, v2.2d, v4.2d
+    fmla v7.2d, v3.2d, v5.2d
+    mov v2.16b, v22.16b
+    mov v3.16b, v22.16b
+    fmla v2.2d, v6.2d, v4.2d
+    fmla v3.2d, v7.2d, v5.2d
+    mov v6.16b, v21.16b
+    mov v7.16b, v21.16b
+    fmla v6.2d, v2.2d, v4.2d
+    fmla v7.2d, v3.2d, v5.2d
+    mov v2.16b, v20.16b
+    mov v3.16b, v20.16b
+    fmla v2.2d, v6.2d, v4.2d
+    fmla v3.2d, v7.2d, v5.2d
+    fmul v2.2d, v2.2d, v4.2d
+    fmul v3.2d, v3.2d, v5.2d
+    fmul v2.2d, v2.2d, v0.2d
+    fmul v3.2d, v3.2d, v1.2d
+    fadd v0.2d, v2.2d, v0.2d
+    fadd v1.2d, v3.2d, v1.2d
+    dup v6.2d, v31.d[1]
+    dup v7.2d, v31.d[1]
+    mov v2.16b, v29.16b
+    mov v3.16b, v29.16b
+    fmla v2.2d, v6.2d, v4.2d
+    fmla v3.2d, v7.2d, v5.2d
+    mov v6.16b, v28.16b
+    mov v7.16b, v28.16b
+    fmla v6.2d, v2.2d, v4.2d
+    fmla v7.2d, v3.2d, v5.2d
+    mov v2.16b, v27.16b
+    mov v3.16b, v27.16b
+    fmla v2.2d, v6.2d, v4.2d
+    fmla v3.2d, v7.2d, v5.2d
+    mov v6.16b, v26.16b
+    mov v7.16b, v26.16b
+    fmla v6.2d, v2.2d, v4.2d
+    fmla v7.2d, v3.2d, v5.2d
+    mov v2.16b, v25.16b
+    mov v3.16b, v25.16b
+    fmla v2.2d, v6.2d, v4.2d
+    fmla v3.2d, v7.2d, v5.2d
+    fmul v2.2d, v2.2d, v4.2d
+    fmul v3.2d, v3.2d, v5.2d
+    fmul v2.2d, v2.2d, v4.2d
+    fmul v3.2d, v3.2d, v5.2d
+    dup v6.2d, x11
+    dup v7.2d, x11
+    fmul v6.2d, v6.2d, v4.2d
+    fmul v7.2d, v7.2d, v5.2d
+    fsub v2.2d, v2.2d, v6.2d
+    fsub v3.2d, v3.2d, v7.2d
+    dup v6.2d, x12
+    fadd v2.2d, v2.2d, v6.2d
+    fadd v3.2d, v3.2d, v6.2d
+    fmov d4, x13
+    ins v4.d[1], x14
+    fmov d5, x15
+    ins v5.d[1], x16
+    shl v6.2d, v4.2d, #63
+    sshr v6.2d, v6.2d, #63
+    bsl v6.16b, v2.16b, v0.16b
+    shl v7.2d, v5.2d, #63
+    sshr v7.2d, v7.2d, #63
+    bsl v7.16b, v3.16b, v1.16b
+    shl v4.2d, v4.2d, #62
+    ushr v4.2d, v4.2d, #63
+    shl v4.2d, v4.2d, #63
+    eor v6.16b, v6.16b, v4.16b
+    shl v5.2d, v5.2d, #62
     ushr v5.2d, v5.2d, #63
     shl v5.2d, v5.2d, #63
-    eor v4.16b, v4.16b, v5.16b
-    shl v5.2d, v4.2d, #35
-    fneg v5.2d, v5.2d
-    abs v5.2d, v5.2d
-    cmhi v5.2d, v30.2d, v5.2d
-    addp v5.2d, v5.2d, v5.2d
-    fmov x9, d5
+    eor v7.16b, v7.16b, v5.16b
+    shl v0.2d, v6.2d, #35
+    shl v1.2d, v7.2d, #35
+    fneg v0.2d, v0.2d
+    fneg v1.2d, v1.2d
+    abs v0.2d, v0.2d
+    abs v1.2d, v1.2d
+    cmhi v0.2d, v30.2d, v0.2d
+    cmhi v1.2d, v30.2d, v1.2d
+    orr v0.16b, v0.16b, v1.16b
+    addp v0.2d, v0.2d, v0.2d
+    fmov x9, d0
     cbnz x9, pmoTrigA64Group
-    ; fcvtn v7.2s, v4.2d
-    .word 0x0E616887
-    fmul v2.2d, v1.2d, v16.2d
-    frintn v2.2d, v2.2d
-    fmls v1.2d, v2.2d, v17.2d
-    fmls v1.2d, v2.2d, v18.2d
-    fmls v1.2d, v2.2d, v19.2d
-    fcvtzs v2.2d, v2.2d
-    dup v3.2d, x3
-    add v2.2d, v2.2d, v3.2d
-    fmul v3.2d, v1.2d, v1.2d
-    dup v4.2d, v31.d[0]
-    mov v5.16b, v24.16b
-    fmla v5.2d, v4.2d, v3.2d
-    mov v4.16b, v23.16b
-    fmla v4.2d, v5.2d, v3.2d
-    mov v5.16b, v22.16b
-    fmla v5.2d, v4.2d, v3.2d
-    mov v4.16b, v21.16b
-    fmla v4.2d, v5.2d, v3.2d
-    mov v5.16b, v20.16b
-    fmla v5.2d, v4.2d, v3.2d
-    fmul v5.2d, v5.2d, v3.2d
-    fmul v5.2d, v5.2d, v1.2d
-    fadd v5.2d, v5.2d, v1.2d
-    dup v4.2d, v31.d[1]
-    mov v6.16b, v29.16b
-    fmla v6.2d, v4.2d, v3.2d
-    mov v4.16b, v28.16b
-    fmla v4.2d, v6.2d, v3.2d
-    mov v6.16b, v27.16b
-    fmla v6.2d, v4.2d, v3.2d
-    mov v4.16b, v26.16b
-    fmla v4.2d, v6.2d, v3.2d
-    mov v6.16b, v25.16b
-    fmla v6.2d, v4.2d, v3.2d
-    fmul v6.2d, v6.2d, v3.2d
-    fmul v6.2d, v6.2d, v3.2d
-    dup v4.2d, x11
-    fmul v4.2d, v4.2d, v3.2d
-    fsub v6.2d, v6.2d, v4.2d
-    dup v4.2d, x12
-    fadd v6.2d, v6.2d, v4.2d
-    shl v4.2d, v2.2d, #63
-    sshr v4.2d, v4.2d, #63
-    bsl v4.16b, v6.16b, v5.16b
-    shl v5.2d, v2.2d, #62
-    ushr v5.2d, v5.2d, #63
-    shl v5.2d, v5.2d, #63
-    eor v4.16b, v4.16b, v5.16b
-    shl v5.2d, v4.2d, #35
-    fneg v5.2d, v5.2d
-    abs v5.2d, v5.2d
-    cmhi v5.2d, v30.2d, v5.2d
-    addp v5.2d, v5.2d, v5.2d
-    fmov x9, d5
-    cbnz x9, pmoTrigA64Group
-    ; fcvtn2 v7.4s, v4.2d
-    .word 0x4E616887
+    .word 0x0E6168C0
+    .word 0x4E6168E0
+    mov v7.16b, v0.16b
     ; Sin(-0) is -0: r = -0 - 0 pi/2 is +0 in binary64
     cbnz x3, pmoTrigA64Store
     ld1 {v0.4s}, [x0]

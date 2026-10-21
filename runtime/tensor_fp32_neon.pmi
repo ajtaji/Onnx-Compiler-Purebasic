@@ -181,6 +181,7 @@ pmoNeonBinaryDone:
 EndProcedure
 
 
+
 ; ======================================================================
 ;  ANVIL'S SERVICE TABLE - ABOVE THE PER-OPERATOR GUARDS ON PURPOSE.
 ;
@@ -2307,13 +2308,14 @@ Procedure.i PmConvWorkWorker(*p.i)
   Protected og.i=*g\OutChannels/ *g\Groups,blocks.i=(og+3)/4
   Protected group.i,oc.i,ocLast.i,finish.i,pFirst.i,pLast.i
   While first<last
-    ; Keep a small input-position window hot across all output channels.
+    ; Sixty-four positions keep the input window hot across output channels.
+    ; Complete reductions and disjoint writes are unchanged by the tile size.
     group=(first/blocks)% *g\Groups
     oc=group*og+(first%blocks)*4
     finish=(first/blocks+1)*blocks : If finish>last : finish=last : EndIf
     ocLast=oc+(finish-first)*4 : If ocLast>(group+1)*og : ocLast=(group+1)*og : EndIf
-    pFirst=(first/(blocks* *g\Groups))*256
-    pLast=pFirst+256 : If pLast>*g\OutWidth : pLast=*g\OutWidth : EndIf
+    pFirst=(first/(blocks* *g\Groups))*64
+    pLast=pFirst+64 : If pLast>*g\OutWidth : pLast=*g\OutWidth : EndIf
     PmI8Conv1DNeonPositionRange(*g,bn,oc,ocLast,tile,pFirst,pLast)
     first=finish
   Wend
@@ -2321,10 +2323,10 @@ Procedure.i PmConvWorkWorker(*p.i)
 EndProcedure
 Procedure.i PmConvWorkParallel(*g.PmTensorConv1DArgs)
   Protected total.i,parts.i,i.i,first.i=0,last.i,at.i,og.i
-  If *g\Groups<=0 Or *g\OutWidth<256 Or *g\OutChannels<1 : ProcedureReturn 0 : EndIf
+  If *g\Groups<=0 Or *g\OutWidth<64 Or *g\OutChannels<1 : ProcedureReturn 0 : EndIf
   og=*g\OutChannels/ *g\Groups
   If og<1 : ProcedureReturn 0 : EndIf
-  total=*g\Groups*((og+3)/4)*((*g\OutWidth+255)/256)
+  total=*g\Groups*((og+3)/4)*((*g\OutWidth+63)/64)
   parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
   If parts<2 Or total<parts : ProcedureReturn 0 : EndIf
   For i=0 To parts-1
@@ -3529,6 +3531,44 @@ EndProcedure
 ; otherwise.  Both are constants in the host language rather than a
 ; movi/fmov immediate, so the bit patterns are readable here and the body
 ; has no encoded constants at all.
+; Pow(x,2) preserves the input NaN word, including signalling NaNs.
+; Every finite lane is the original repeated-squaring result: x*x.
+Procedure PmTensorSquareExactNeon(a.i,dst.i,count.i,astep.i)
+ ASM
+  cmp x2, #0
+  b.le pmoSquareDone
+  cmp x2, #4
+  b.lt pmoSquareTail
+pmoSquareFour:
+  cbz x3, pmoSquareBroadcast
+  ld1 {v0.4s}, [x0], #16
+  b pmoSquareApply
+pmoSquareBroadcast:
+  ld1r {v0.4s}, [x0]
+pmoSquareApply:
+  fmul v1.4s, v0.4s, v0.4s
+  fcmeq v2.4s, v0.4s, v0.4s
+  bsl v2.16b, v1.16b, v0.16b
+  st1 {v2.4s}, [x1], #16
+  sub x2, x2, #4
+  cmp x2, #4
+  b.ge pmoSquareFour
+pmoSquareTail:
+  cbz x2, pmoSquareDone
+  ldr s0, [x0]
+  fmul v1.4s, v0.4s, v0.4s
+  fcmeq v2.4s, v0.4s, v0.4s
+  bsl v2.16b, v1.16b, v0.16b
+  str s2, [x1], #4
+  cbz x3, pmoSquareTailNext
+  add x0, x0, #4
+pmoSquareTailNext:
+  sub x2, x2, #1
+  b pmoSquareTail
+pmoSquareDone:
+ EndASM
+EndProcedure
+
 Procedure PmTensorPowIntFp32Neon(*a.i, *b.i, *destination.i, count.i, aStride.i)
   Protected k.i=0
   Protected zeroBits.i=0
@@ -3539,7 +3579,11 @@ Procedure PmTensorPowIntFp32Neon(*a.i, *b.i, *destination.i, count.i, aStride.i)
   If k<0
     zeroBits=2139095040
   EndIf
-  PmTensorPowIntFp32NeonBody(*a,*destination,count,aStride,k,1065353216,zeroBits)
+  If k=2
+    PmTensorSquareExactNeon(*a,*destination,count,aStride)
+  Else
+    PmTensorPowIntFp32NeonBody(*a,*destination,count,aStride,k,1065353216,zeroBits)
+  EndIf
 EndProcedure
 
 
@@ -6287,6 +6331,7 @@ pmoBinaryRowsDivNext:
 pmoBinaryRowsDone:
   EndASM
 EndProcedure
+
 
 ; A multiply followed by an add, with two independently rounded FP32
 ; instructions. The final add's operand order is retained for NaN payloads.
