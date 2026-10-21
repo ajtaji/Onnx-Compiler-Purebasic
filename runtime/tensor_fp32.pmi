@@ -8524,6 +8524,10 @@ pmoI8EpiAddAdvance:
 pmoI8EpiAddDone:
   EndASM
 EndProcedure
+; Load each proved four/eight-channel weight block once. Lane DUPs supply
+; the four row broadcasts without repeated LD4R structures. The immutable
+; packed layout, proof bits, exact integer sums, tap scaling and FP32 order
+; are unchanged; the unrestricted two-product path remains the fallback.
 Procedure PmI8PackedTapsA64(p.i)
   ASM
     stp q8, q9, [sp, #-128]!
@@ -8562,86 +8566,111 @@ pmoI8PackedTapsBegin:
 pmoI8PackedTapsK0:
     cbz x3, pmoI8PackedTapsFlush
     tbz x15, #0, pmoI8PackedTapsUseFour
+    ld1 {v4.16b, v5.16b}, [x10], #32
     ld1 {v0.16b}, [x1], x2
-    ld1 {v1.16b}, [x1], x2
-    ld1 {v2.16b}, [x1], x2
-    ld1 {v3.16b}, [x1], x2
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smull v8.8h, v0.8b, v4.8b
-    smull2 v9.8h, v0.16b, v4.16b
-    smull v10.8h, v0.8b, v5.8b
-    smull2 v11.8h, v0.16b, v5.16b
-    smull v12.8h, v0.8b, v6.8b
-    smull2 v13.8h, v0.16b, v6.16b
-    smull v14.8h, v0.8b, v7.8b
-    smull2 v15.8h, v0.16b, v7.16b
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smlal v8.8h, v1.8b, v4.8b
-    smlal2 v9.8h, v1.16b, v4.16b
-    smlal v10.8h, v1.8b, v5.8b
-    smlal2 v11.8h, v1.16b, v5.16b
-    smlal v12.8h, v1.8b, v6.8b
-    smlal2 v13.8h, v1.16b, v6.16b
-    smlal v14.8h, v1.8b, v7.8b
-    smlal2 v15.8h, v1.16b, v7.16b
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smlal v8.8h, v2.8b, v4.8b
-    smlal2 v9.8h, v2.16b, v4.16b
-    smlal v10.8h, v2.8b, v5.8b
-    smlal2 v11.8h, v2.16b, v5.16b
-    smlal v12.8h, v2.8b, v6.8b
-    smlal2 v13.8h, v2.16b, v6.16b
-    smlal v14.8h, v2.8b, v7.8b
-    smlal2 v15.8h, v2.16b, v7.16b
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smlal v8.8h, v3.8b, v4.8b
-    smlal2 v9.8h, v3.16b, v4.16b
-    smlal v10.8h, v3.8b, v5.8b
-    smlal2 v11.8h, v3.16b, v5.16b
-    smlal v12.8h, v3.8b, v6.8b
-    smlal2 v13.8h, v3.16b, v6.16b
-    smlal v14.8h, v3.8b, v7.8b
-    smlal2 v15.8h, v3.16b, v7.16b
+    dup v1.16b, v4.b[0]
+    smull v8.8h, v0.8b, v1.8b
+    smull2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[1]
+    smull v10.8h, v0.8b, v1.8b
+    smull2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[2]
+    smull v12.8h, v0.8b, v1.8b
+    smull2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[3]
+    smull v14.8h, v0.8b, v1.8b
+    smull2 v15.8h, v0.16b, v1.16b
     ld1 {v0.16b}, [x1], x2
-    ld1 {v1.16b}, [x1], x2
-    ld1 {v2.16b}, [x1], x2
-    ld1 {v3.16b}, [x1], x2
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smlal v8.8h, v0.8b, v4.8b
-    smlal2 v9.8h, v0.16b, v4.16b
-    smlal v10.8h, v0.8b, v5.8b
-    smlal2 v11.8h, v0.16b, v5.16b
-    smlal v12.8h, v0.8b, v6.8b
-    smlal2 v13.8h, v0.16b, v6.16b
-    smlal v14.8h, v0.8b, v7.8b
-    smlal2 v15.8h, v0.16b, v7.16b
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smlal v8.8h, v1.8b, v4.8b
-    smlal2 v9.8h, v1.16b, v4.16b
-    smlal v10.8h, v1.8b, v5.8b
-    smlal2 v11.8h, v1.16b, v5.16b
-    smlal v12.8h, v1.8b, v6.8b
-    smlal2 v13.8h, v1.16b, v6.16b
-    smlal v14.8h, v1.8b, v7.8b
-    smlal2 v15.8h, v1.16b, v7.16b
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smlal v8.8h, v2.8b, v4.8b
-    smlal2 v9.8h, v2.16b, v4.16b
-    smlal v10.8h, v2.8b, v5.8b
-    smlal2 v11.8h, v2.16b, v5.16b
-    smlal v12.8h, v2.8b, v6.8b
-    smlal2 v13.8h, v2.16b, v6.16b
-    smlal v14.8h, v2.8b, v7.8b
-    smlal2 v15.8h, v2.16b, v7.16b
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smlal v8.8h, v3.8b, v4.8b
-    smlal2 v9.8h, v3.16b, v4.16b
-    smlal v10.8h, v3.8b, v5.8b
-    smlal2 v11.8h, v3.16b, v5.16b
-    smlal v12.8h, v3.8b, v6.8b
-    smlal2 v13.8h, v3.16b, v6.16b
-    smlal v14.8h, v3.8b, v7.8b
-    smlal2 v15.8h, v3.16b, v7.16b
+    dup v1.16b, v4.b[4]
+    smlal v8.8h, v0.8b, v1.8b
+    smlal2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[5]
+    smlal v10.8h, v0.8b, v1.8b
+    smlal2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[6]
+    smlal v12.8h, v0.8b, v1.8b
+    smlal2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[7]
+    smlal v14.8h, v0.8b, v1.8b
+    smlal2 v15.8h, v0.16b, v1.16b
+    ld1 {v0.16b}, [x1], x2
+    dup v1.16b, v4.b[8]
+    smlal v8.8h, v0.8b, v1.8b
+    smlal2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[9]
+    smlal v10.8h, v0.8b, v1.8b
+    smlal2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[10]
+    smlal v12.8h, v0.8b, v1.8b
+    smlal2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[11]
+    smlal v14.8h, v0.8b, v1.8b
+    smlal2 v15.8h, v0.16b, v1.16b
+    ld1 {v0.16b}, [x1], x2
+    dup v1.16b, v4.b[12]
+    smlal v8.8h, v0.8b, v1.8b
+    smlal2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[13]
+    smlal v10.8h, v0.8b, v1.8b
+    smlal2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[14]
+    smlal v12.8h, v0.8b, v1.8b
+    smlal2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[15]
+    smlal v14.8h, v0.8b, v1.8b
+    smlal2 v15.8h, v0.16b, v1.16b
+    ld1 {v0.16b}, [x1], x2
+    dup v1.16b, v5.b[0]
+    smlal v8.8h, v0.8b, v1.8b
+    smlal2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[1]
+    smlal v10.8h, v0.8b, v1.8b
+    smlal2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[2]
+    smlal v12.8h, v0.8b, v1.8b
+    smlal2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[3]
+    smlal v14.8h, v0.8b, v1.8b
+    smlal2 v15.8h, v0.16b, v1.16b
+    ld1 {v0.16b}, [x1], x2
+    dup v1.16b, v5.b[4]
+    smlal v8.8h, v0.8b, v1.8b
+    smlal2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[5]
+    smlal v10.8h, v0.8b, v1.8b
+    smlal2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[6]
+    smlal v12.8h, v0.8b, v1.8b
+    smlal2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[7]
+    smlal v14.8h, v0.8b, v1.8b
+    smlal2 v15.8h, v0.16b, v1.16b
+    ld1 {v0.16b}, [x1], x2
+    dup v1.16b, v5.b[8]
+    smlal v8.8h, v0.8b, v1.8b
+    smlal2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[9]
+    smlal v10.8h, v0.8b, v1.8b
+    smlal2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[10]
+    smlal v12.8h, v0.8b, v1.8b
+    smlal2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[11]
+    smlal v14.8h, v0.8b, v1.8b
+    smlal2 v15.8h, v0.16b, v1.16b
+    ld1 {v0.16b}, [x1], x2
+    dup v1.16b, v5.b[12]
+    smlal v8.8h, v0.8b, v1.8b
+    smlal2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[13]
+    smlal v10.8h, v0.8b, v1.8b
+    smlal2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[14]
+    smlal v12.8h, v0.8b, v1.8b
+    smlal2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v5.b[15]
+    smlal v14.8h, v0.8b, v1.8b
+    smlal2 v15.8h, v0.16b, v1.16b
     saddw v16.4s, v16.4s, v8.4h
     saddw2 v17.4s, v17.4s, v8.8h
     saddw v18.4s, v18.4s, v9.4h
@@ -8666,46 +8695,59 @@ pmoI8PackedTapsUseFour:
     mov x9, #2
 pmoI8PackedTapsFourGroup:
     tbz x16, #0, pmoI8PackedTapsPair
+    ld1 {v4.16b}, [x10], #16
     ld1 {v0.16b}, [x1], x2
-    ld1 {v1.16b}, [x1], x2
-    ld1 {v2.16b}, [x1], x2
-    ld1 {v3.16b}, [x1], x2
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smull v8.8h, v0.8b, v4.8b
-    smull2 v9.8h, v0.16b, v4.16b
-    smull v10.8h, v0.8b, v5.8b
-    smull2 v11.8h, v0.16b, v5.16b
-    smull v12.8h, v0.8b, v6.8b
-    smull2 v13.8h, v0.16b, v6.16b
-    smull v14.8h, v0.8b, v7.8b
-    smull2 v15.8h, v0.16b, v7.16b
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smlal v8.8h, v1.8b, v4.8b
-    smlal2 v9.8h, v1.16b, v4.16b
-    smlal v10.8h, v1.8b, v5.8b
-    smlal2 v11.8h, v1.16b, v5.16b
-    smlal v12.8h, v1.8b, v6.8b
-    smlal2 v13.8h, v1.16b, v6.16b
-    smlal v14.8h, v1.8b, v7.8b
-    smlal2 v15.8h, v1.16b, v7.16b
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smlal v8.8h, v2.8b, v4.8b
-    smlal2 v9.8h, v2.16b, v4.16b
-    smlal v10.8h, v2.8b, v5.8b
-    smlal2 v11.8h, v2.16b, v5.16b
-    smlal v12.8h, v2.8b, v6.8b
-    smlal2 v13.8h, v2.16b, v6.16b
-    smlal v14.8h, v2.8b, v7.8b
-    smlal2 v15.8h, v2.16b, v7.16b
-    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
-    smlal v8.8h, v3.8b, v4.8b
-    smlal2 v9.8h, v3.16b, v4.16b
-    smlal v10.8h, v3.8b, v5.8b
-    smlal2 v11.8h, v3.16b, v5.16b
-    smlal v12.8h, v3.8b, v6.8b
-    smlal2 v13.8h, v3.16b, v6.16b
-    smlal v14.8h, v3.8b, v7.8b
-    smlal2 v15.8h, v3.16b, v7.16b
+    dup v1.16b, v4.b[0]
+    smull v8.8h, v0.8b, v1.8b
+    smull2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[1]
+    smull v10.8h, v0.8b, v1.8b
+    smull2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[2]
+    smull v12.8h, v0.8b, v1.8b
+    smull2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[3]
+    smull v14.8h, v0.8b, v1.8b
+    smull2 v15.8h, v0.16b, v1.16b
+    ld1 {v0.16b}, [x1], x2
+    dup v1.16b, v4.b[4]
+    smlal v8.8h, v0.8b, v1.8b
+    smlal2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[5]
+    smlal v10.8h, v0.8b, v1.8b
+    smlal2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[6]
+    smlal v12.8h, v0.8b, v1.8b
+    smlal2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[7]
+    smlal v14.8h, v0.8b, v1.8b
+    smlal2 v15.8h, v0.16b, v1.16b
+    ld1 {v0.16b}, [x1], x2
+    dup v1.16b, v4.b[8]
+    smlal v8.8h, v0.8b, v1.8b
+    smlal2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[9]
+    smlal v10.8h, v0.8b, v1.8b
+    smlal2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[10]
+    smlal v12.8h, v0.8b, v1.8b
+    smlal2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[11]
+    smlal v14.8h, v0.8b, v1.8b
+    smlal2 v15.8h, v0.16b, v1.16b
+    ld1 {v0.16b}, [x1], x2
+    dup v1.16b, v4.b[12]
+    smlal v8.8h, v0.8b, v1.8b
+    smlal2 v9.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[13]
+    smlal v10.8h, v0.8b, v1.8b
+    smlal2 v11.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[14]
+    smlal v12.8h, v0.8b, v1.8b
+    smlal2 v13.8h, v0.16b, v1.16b
+    dup v1.16b, v4.b[15]
+    smlal v14.8h, v0.8b, v1.8b
+    smlal2 v15.8h, v0.16b, v1.16b
     saddw v16.4s, v16.4s, v8.4h
     saddw2 v17.4s, v17.4s, v8.8h
     saddw v18.4s, v18.4s, v9.4h

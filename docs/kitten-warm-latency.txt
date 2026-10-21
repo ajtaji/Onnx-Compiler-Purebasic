@@ -492,3 +492,29 @@ accumulators from the first product group(no useful direct gain), and reuse
 alone in the four-position transposed kernel(mixed small direct results).
 No Bluetooth/audio/map tests, reset/flash/storage write. Installed app unchanged.
 Speaker onset and Bluetooth-active/map headroom remain unverified.
+
+2026-10-21: exact packed INT8 convolution weight-block loads.
+The native four-row/sixteen-position kernel now loads a proved four/eight
+input-channel packed weight block once and obtains row broadcasts with lane
+DUPs. This removes repeated LD4R structure loads from the hot multiply path.
+Existing immutable packed layout, eligibility, proof bits, memory capacity,
+two-product fallback, signed integer sums, tap scales, FP32 rounding/order
+and ABI preservation are unchanged. No model identity check or extra cache.
+
+Real four-core Pi4/Anvil same-image old/new warm Kitten comparison, eight
+pairs: generation8910.440->8483.473ms,4.7918% less. Ordinary convolution
+3749.543->3328.886ms,11.2189% less. All eight new requests faster with exact
+complete waveform CRCs and no error/cancel/profile faults. New first PCM
+427.3..816.5ms; silent real-time factors .596..702 (about30..40% compute
+margin). First PCM is not audible Bluetooth onset. No map/audio test ran.
+
+36 direct and canonical public cases compare every output word, quantized
+scratch and guards with the prior kernel, including eight/four proof limits,
+unrestricted weights, INT16/stride fallbacks, dilation geometry, missing bias,
+both residual operand orders and exceptional values. Fresh standard-compiler
+exports of independent dynamic Conv/Add graphs (IC64/K3/D1 and IC128/K7/D3)
+pass12 batch/width cases each versus unpacked reference, arena balanced.
+Both standard compiler applications rebuilt; self-test PASS.
+tests/pi4_conv_lane_gate.pi4 contains the prior-kernel reference comparison.
+No prerecorded speech, Bluetooth connection, reset, flash or storage writes.
+Installed TruckGPS unchanged; Bluetooth-active/map headroom remains untested.
