@@ -16,6 +16,7 @@ CompilerIf #PMD_NATIVE_BYTES=8
 Global Dim PmRandomParts.i[40]
 Global Dim PmRandomConstants.l[22]
 Procedure.i PmRandomRangeA64(dst.i,first.i,count.i,node.i,hasSeed.i,seedBits.i,kind.i,p1Bits.i,p2Bits.i,request.i)
+  Protected Dim normalArgs.i[9]
   Protected words.PmRandomPair
   Protected n0.i
   Protected n1.i
@@ -37,6 +38,12 @@ Procedure.i PmRandomRangeA64(dst.i,first.i,count.i,node.i,hasSeed.i,seedBits.i,k
   span=p2-p1
   i=0
   If kind=0 : i=PmRandomUniformFourA64(dst,first,count,n0,n1,request,p1Bits,p2Bits) : EndIf
+  If kind=1
+    normalArgs[0]=dst : normalArgs[1]=first : normalArgs[2]=count
+    normalArgs[3]=n0 : normalArgs[4]=n1 : normalArgs[5]=request
+    normalArgs[6]=@PmRandomConstants[0] : normalArgs[7]=p1Bits : normalArgs[8]=p2Bits
+    i=PmRandomNormalFourA64(@normalArgs[0])
+  EndIf
   For i=i To count-1
     If (i & 1023)=0 : PmKernelIdle() : EndIf
     PmRandomThreefryA64(n0,n1,first+i,request,@words)

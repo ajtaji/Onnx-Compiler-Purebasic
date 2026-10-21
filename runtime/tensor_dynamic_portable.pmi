@@ -2427,6 +2427,13 @@ Procedure.i DMatMulInt8(*g.PmI8MatMulArgs)
     If parts>4 : parts=4 : EndIf
   EndIf
   CompilerEndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If *g\M>=32 And *g\M<=128 And *g\N>=64 And *g\K* *g\N>=1048576
+    If PmI8PackFind(*g\B,*g\K,*g\N,*g\Wide)<>0
+      columns=1 : parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
+    EndIf
+  EndIf
+  CompilerEndIf
   bytes=PmI8ScratchBytes(*g\M* *g\K,*g\M,*g\Wide)
   If parts>1
     bytesPerPart=PmI8ScratchBytes(((*g\M+parts-1)/parts+4)* *g\K,(*g\M+parts-1)/parts+4,*g\Wide)
@@ -3024,6 +3031,34 @@ Procedure DConv()
       DFail("Convolution scratch exceeds available working memory.")
     EndIf
   EndIf
+EndProcedure
+
+; The compiler delays only a single-use intermediate whose lifetime ends at
+; this Add. Exact-shape FLOAT residuals join the INT8 convolution epilogue;
+; every unsupported case executes the original two operators. Inputs whose
+; last use was the convolution are released at the same logical boundary.
+Procedure DConvThenAdd(Y.i,T.i,C.i,Order.i,ConvNode.i,ReleaseMask.i)
+ Protected a.i=DCall(1),w.i=DCall(2),b.i=DCall(3),at.i,ow.i,addNode.i=DNode,fast.i=0
+ CompilerIf #PMD_NATIVE_BYTES=8 And #PMO_USE_INT8=1
+ If Dt(a)\Kind=1 And (Dt(w)\Kind=3 Or Dt(w)\Kind=33) And Dt(C)\Kind=1 And Dt(a)\Rank=3 And Dt(w)\Rank=3 And Dt(C)\Rank=3 And DCall(6)>0 And DCall(8)>0
+  ow=(DDims(a*8+2)+DCall(4)+DCall(5)-DCall(7)*(DDims(w*8+2)-1)-1)/DCall(6)+1
+  If ow>0 And DDims(C*8)=DDims(a*8) And DDims(C*8+1)=DDims(w*8) And DDims(C*8+2)=ow
+   fast=1 : PmConvAddBase=Dt(C)\Data : PmConvAddOrder=Order : DCall(0)=Y
+  EndIf
+ EndIf
+ CompilerEndIf
+ DNode=ConvNode : DConv()
+ CompilerIf #PMD_NATIVE_BYTES=8 And #PMO_USE_INT8=1
+ PmConvAddBase=0 : PmConvAddOrder=0
+ CompilerEndIf
+ DCall(0)=T
+ If DError Or DCancel : ProcedureReturn : EndIf
+ If ReleaseMask & 1 : DRelease(a) : EndIf
+ If ReleaseMask & 2 : DRelease(w) : EndIf
+ If ReleaseMask & 4 : DRelease(b) : EndIf
+ DNode=addNode
+ If fast : ProcedureReturn : EndIf
+ If Order=0 : DBinary(Y,T,C,0) : Else : DBinary(Y,C,T,0) : EndIf
 EndProcedure
 
 Procedure DConvTranspose()

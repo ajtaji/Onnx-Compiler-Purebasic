@@ -518,6 +518,45 @@ Procedure PmdCombineMultiplyAdd(List Calls.s(),List ScheduleStatic.i(),Map Last.
   Next
 EndProcedure
 
+; Delay adjacent single-use Conv/Add into one epilogue, preserving both
+; operand order and input lifetimes. Runtime checks retain the two-call path
+; for FLOAT weights, broadcasts, unsupported types and invalid geometries.
+Procedure PmdCombineConvAdd(List Calls.s(),List ScheduleStatic.i(),Map Last.i(),Map Persistent.i())
+  Protected i.i,n.i=ListSize(Calls()),conv.s,add.s,head.s,line.s,t.i,a.i,w.i,b.i,y.i,c.i,order.i,mask.i,j.i,id.i
+  For i=0 To n-2
+    SelectElement(ScheduleStatic(),i) : If ScheduleStatic()<>0 : Continue : EndIf
+    SelectElement(ScheduleStatic(),i+1) : If ScheduleStatic()<>0 : Continue : EndIf
+    SelectElement(Calls(),i) : conv=Calls()
+    SelectElement(Calls(),i+1) : add=Calls()
+    If Left(conv,9)<>"DCall(0)=" Or Right(conv,7)<>"DConv()" Or Left(add,8)<>"DBinary(" Or Right(add,3)<>",0)" : Continue : EndIf
+    t=Val(Mid(StringField(conv,1,Chr(10)),10))
+    a=Val(Mid(StringField(conv,2,Chr(10)),10))
+    w=Val(Mid(StringField(conv,3,Chr(10)),10))
+    b=Val(Mid(StringField(conv,4,Chr(10)),10))
+    y=Val(StringField(Mid(add,9),1,","))
+    If t<=0 Or a<=0 Or w<=0 Or y<=0 Or Last(Str(t))<>i+1 Or Persistent(Str(t)) : Continue : EndIf
+    If Val(StringField(Mid(add,9),2,","))=t
+      c=Val(StringField(Mid(add,9),3,",")) : order=0
+    ElseIf Val(StringField(Mid(add,9),3,","))=t
+      c=Val(StringField(Mid(add,9),2,",")) : order=1
+    Else
+      Continue
+    EndIf
+    If c<=0 Or c=t : Continue : EndIf
+    mask=0
+    For j=0 To 2
+      id=a : If j=1 : id=w : ElseIf j=2 : id=b : EndIf
+      If id>0 And Last(Str(id))=i And Persistent(Str(id))=0
+        mask=mask | (1<<j) : Last(Str(id))=i+1
+      EndIf
+    Next
+    head=Left(conv,Len(conv)-7)
+    SelectElement(Calls(),i) : Calls()="; Convolution evaluated with the following residual Add."
+    SelectElement(Calls(),i+1)
+    Calls()=head+"DConvThenAdd("+Str(y)+","+Str(t)+","+Str(c)+","+Str(order)+","+Str(i)+","+Str(mask)+")"
+  Next
+EndProcedure
+
 Procedure.i PmoDynamicCommand(ModelPath.s)
   ClearList(PmoOpsTableLines()) : PmoOpsTableCount = 0
   Protected model.PmoOnnxModel,ir.PmoIrModel,root.s=PmoCompileProjectRoot()
@@ -667,6 +706,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   EndIf
   If PmdPortable And PmoTargets(targetIndex)\NativeIntegerBytes=8
     PmdCombineMultiplyAdd(calls(),isstatic(),last(),persistent())
+    PmdCombineConvAdd(calls(),isstatic(),last(),persistent())
   EndIf
   If PmoStorageReduce(@ir,precision)=0 : PmoDynamicError=PmoQuantError : Goto Failed : EndIf
   If ir\DecodedWeightBytes>1024*1024*1024 : PmoDynamicError="Decoded resident weights exceed the working-memory limit. Reduced storage is not reduced execution RAM." : Goto Failed : EndIf

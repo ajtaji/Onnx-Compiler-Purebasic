@@ -303,3 +303,13 @@ All eight raw waveform CRCs match. Aggregate convolution time falls4152 to
 First PCM is531/524/538/519/807/971/724/524ms. Silent real-time factors are
 .784/.842/.763/.827/.778/.716/.759/.842. Bluetooth was not played during
 this run; no new Bluetooth onset or listening claim is made.
+
+2026-10-21: residual epilogues, packed matrix traversal and vector normal noise
+
+The AArch64 emitter combines adjacent single-use Conv/Add pairs while keeping operand order and input lifetimes. Exact-shape FLOAT residuals join the INT8 convolution output epilogue. Other shapes and FLOAT weights execute the original two operators. Callback reentry remains refused, and error/cancellation always clears the synchronous residual context. Thirty-two real-Pi cases match exact output words across batches, groups, odd tails/channels, stride, narrow/wide weights, scalar broadcast fallback and NaN/sNaN/signed-zero residuals. Twelve emitter schedule checks pass. Fresh ONNX exports compiled through Forge and ran on the real Pi for both INT8 and FP32 weights; outputs matched the unfused path. Error tests preserve the failing node and clear context.
+
+Packed INT8 MatMul now traverses weight-column tiles before multiple row blocks when a worker has at least eight rows. Large cached matrices with 32-128 input rows can split columns across the four workers. Per-output reduction/scaling order remains unchanged. Across eight complete replies, matrix time fell from 1109 to 968 ms; the Main Street phrase's frontend particularly benefited.
+
+Normal random draws now run four counter streams in SIMD. Exact exponent-field normalization replaces power-of-two division/scaling, with the same log, Newton and Taylor floating operations, scalar tails, mean/scale rounding and zero-radius handling. Every radial mantissa (16777216 values) was checked against the existing scalar method with varied angle octants; all output words matched. Seeded streams, counter/request boundaries and output guards also passed. Large normal-draw cases improved about 2.8 times; full-model random-node time fell from 205 to 75.5 ms across eight replies.
+
+Combined silent four-core measurements (resident weights, fresh text each time): first PCM milliseconds 501/498/509/492/727/920/671/498; complete generation 820/761/856/727/1714/2584/1623/761 ms. Real-time factors .751/.808/.734/.793/.732/.691/.724/.808 leave about 19-31 percent compute margin. All eight full waveform checksums remain unchanged. These are PCM-generation measurements, not Bluetooth packet/speaker onset. No Bluetooth audio or map demo was played; that end-to-end budget remains unproven for this new runtime.

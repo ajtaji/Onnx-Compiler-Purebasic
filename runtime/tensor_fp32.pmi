@@ -5797,6 +5797,9 @@ Procedure.i PmI8PackWeight(source.i, k.i, n.i, wide.i)
   PmI8PackUsed=PmI8PackUsed+bytes : PmI8PackCount=PmI8PackCount+1
   ProcedureReturn 1
 EndProcedure
+; Reuse each immutable packed weight tile across multiple row blocks.
+; Each output keeps its own complete reduction; small/no-cache cases retain
+; the original row-first traversal.
 Procedure.i PmI8MatMulNeonColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,last.i)
   Protected packed.i=PmI8PackFind(*g\B,*g\K,*g\N,*g\Wide)
   Protected ea.PmI8EpiArgs
@@ -5806,6 +5809,24 @@ Procedure.i PmI8MatMulNeonColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,la
   Protected c0.i
   n16 = last & -16
   If n16 = 0 : ProcedureReturn 0 : EndIf
+  If packed<>0 And *g\M>=8
+    c0=first
+    While c0<n16
+      r0=0
+      While r0<*g\M
+        rows=PmI8RowBlock(q,s,*g\M,*g\K,1+ *g\Wide,r0,tile)
+        PmI8ColumnTileNeon(packed+c0* *g\K,(*g\N & -16)* *g\K,16,0,*g\K,*g\Wide,tile)
+        ea\F1=tile : ea\F2=0 : If *g\Wide<>0 : ea\F2=tile+256 : EndIf
+        ea\WS=*g\Scales+c0*4 : ea\Bias=0
+        ea\Dst=*g\Dst+(r0* *g\N+c0)*4 : ea\DStride=*g\N*4
+        ea\Rows=rows : ea\LaneScale=1
+        PmI8EpiNeon(@ea)
+        r0=r0+4
+      Wend
+      c0=c0+16
+    Wend
+    ProcedureReturn n16
+  EndIf
   r0 = 0
   While r0 < *g\M
     rows = PmI8RowBlock(q, s, *g\M, *g\K, 1 + *g\Wide, r0, tile)
@@ -7788,7 +7809,85 @@ pmoI8FourTapsDone:
 pmoI8FourTapsReturn:
   EndASM
 EndProcedure
+; Synchronous Conv/Add fusion context. Written only by DConvThenAdd before
+; dispatch and cleared on every return. Workers only read it; callbacks may
+; not re-enter the model. The normal epilogue remains unchanged.
+Global PmConvAddBase.i,PmConvAddOrder.i
+Procedure PmI8EpiAddNeon(p.i)
+  ASM
+    ldr x10, [x0, #64]
+    ldr x11, [x0, #72]
+    ldr x1, [x0, #0]
+    ldr x2, [x0, #8]
+    ldr x3, [x0, #16]
+    ldr x4, [x0, #24]
+    ldr x5, [x0, #32]
+    ldr x6, [x0, #40]
+    ldr x7, [x0, #48]
+    ldr x8, [x0, #56]
+    movz w9, #0x437e, lsl #16
+    dup v31.4s, w9
+    cbz x8, pmoI8EpiAddRow
+    ld1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x3]
+pmoI8EpiAddRow:
+    cbz x7, pmoI8EpiAddDone
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x1], #64
+    cbz x2, pmoI8EpiAddScale
+    ld1 {v4.4s, v5.4s, v6.4s, v7.4s}, [x2], #64
+    fdiv v4.4s, v4.4s, v31.4s
+    fdiv v5.4s, v5.4s, v31.4s
+    fdiv v6.4s, v6.4s, v31.4s
+    fdiv v7.4s, v7.4s, v31.4s
+    fadd v0.4s, v0.4s, v4.4s
+    fadd v1.4s, v1.4s, v5.4s
+    fadd v2.4s, v2.4s, v6.4s
+    fadd v3.4s, v3.4s, v7.4s
+pmoI8EpiAddScale:
+    cbnz x8, pmoI8EpiAddLane
+    ld1r {v4.4s}, [x3], #4
+    fmul v0.4s, v0.4s, v4.4s
+    fmul v1.4s, v1.4s, v4.4s
+    fmul v2.4s, v2.4s, v4.4s
+    fmul v3.4s, v3.4s, v4.4s
+    b pmoI8EpiAddBias
+pmoI8EpiAddLane:
+    fmul v0.4s, v0.4s, v24.4s
+    fmul v1.4s, v1.4s, v25.4s
+    fmul v2.4s, v2.4s, v26.4s
+    fmul v3.4s, v3.4s, v27.4s
+pmoI8EpiAddBias:
+    cbz x4, pmoI8EpiAddStore
+    ld1r {v4.4s}, [x4], #4
+    fadd v0.4s, v4.4s, v0.4s
+    fadd v1.4s, v4.4s, v1.4s
+    fadd v2.4s, v4.4s, v2.4s
+    fadd v3.4s, v4.4s, v3.4s
+pmoI8EpiAddStore:
+    ld1 {v4.4s, v5.4s, v6.4s, v7.4s}, [x10]
+    cbnz x11, pmoI8EpiAddReverse
+    fadd v0.4s, v0.4s, v4.4s
+    fadd v1.4s, v1.4s, v5.4s
+    fadd v2.4s, v2.4s, v6.4s
+    fadd v3.4s, v3.4s, v7.4s
+    b pmoI8EpiAddAdvance
+pmoI8EpiAddReverse:
+    fadd v0.4s, v4.4s, v0.4s
+    fadd v1.4s, v5.4s, v1.4s
+    fadd v2.4s, v6.4s, v2.4s
+    fadd v3.4s, v7.4s, v3.4s
+pmoI8EpiAddAdvance:
+    add x10, x10, x6
+    st1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    add x5, x5, x6
+    sub x7, x7, #1
+    b pmoI8EpiAddRow
+pmoI8EpiAddDone:
+  EndASM
+EndProcedure
 Procedure PmI8Conv1DNeonPositionRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, ocLast.i, tile.i,positionFirst.i,positionLast.i)
+  Protected Dim addArgs.i[10]
+  Protected Dim addTail.i[32]
+  Protected ra.i,rr.i,ii.i
   Protected ta.PmI8TileArgs
   Protected Dim native.i[17]
   Protected word.i
@@ -7889,10 +7988,27 @@ Procedure PmI8Conv1DNeonPositionRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, oc
       If valid >= 16
         ea\Dst = *g\Dst + ((bn * *g\OutChannels + oc) * *g\OutWidth + p0) * 4
         ea\DStride = *g\OutWidth * 4
-        PmI8EpiNeon(@ea)
+        If PmConvAddBase<>0
+          For word=0 To 7 : addArgs[word]=PeekI(@ea+word*8) : Next
+          addArgs[8]=PmConvAddBase+((bn* *g\OutChannels+oc)* *g\OutWidth+p0)*4 : addArgs[9]=PmConvAddOrder
+          PmI8EpiAddNeon(@addArgs[0])
+        Else
+          PmI8EpiNeon(@ea)
+        EndIf
       Else
         ea\Dst = tile + 512 : ea\DStride = 64
-        PmI8EpiNeon(@ea)
+        If PmConvAddBase<>0
+          For word=0 To 31 : addTail[word]=0 : Next
+          For rr=0 To rows-1
+            ra=PmConvAddBase+((bn* *g\OutChannels+oc+rr)* *g\OutWidth+p0)*4
+            For ii=0 To valid-1 : PokeL(@addTail[0]+rr*64+ii*4,PeekL(ra+ii*4)) : Next
+          Next
+          For word=0 To 7 : addArgs[word]=PeekI(@ea+word*8) : Next
+          addArgs[8]=@addTail[0] : addArgs[9]=PmConvAddOrder
+          PmI8EpiAddNeon(@addArgs[0])
+        Else
+          PmI8EpiNeon(@ea)
+        EndIf
         r = 0
         While r < rows
           i = 0

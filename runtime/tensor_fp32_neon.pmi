@@ -7092,3 +7092,325 @@ pmoResizeExactDone:
   EndASM
 EndProcedure
 CompilerEndIf
+
+CompilerIf #PMD_NATIVE_BYTES=8
+; Four counter-based normal draws. The log and fixed Newton/Taylor chains
+; keep each binary32 operation. Exact power-of-two normalization/rescaling
+; uses exponent fields; zero radius is masked back to positive zero.
+; Only caller-saved registers are used. The nine-word argument block and
+; original scalar tail belong to the calling worker, not shared scratch.
+Procedure.i PmRandomNormalFourA64(args.i)
+  ASM
+    mov x14, x0
+    ldr x0, [x14]
+    ldr x1, [x14, #8]
+    ldr x2, [x14, #16]
+    ldr x3, [x14, #24]
+    ldr x4, [x14, #32]
+    ldr x5, [x14, #40]
+    ldr x11, [x14, #48]
+    ldr w12, [x14, #56]
+    ldr w13, [x14, #64]
+    lsr x9, x2, #2
+    lsl x9, x9, #2
+    cbz x9, pmoNormalFourDone
+    mov x10, x9
+    dup v23.4s, w1
+    movi v31.4s, #0
+    mov w8, #1
+    ins v31.s[1], w8
+    mov w8, #2
+    ins v31.s[2], w8
+    mov w8, #3
+    ins v31.s[3], w8
+    add v23.4s, v23.4s, v31.4s
+    dup v18.4s, w3
+    dup v19.4s, w4
+    dup v25.4s, w5
+    movz w8, #7130
+    movk w8, #7121, lsl #16
+    dup v20.4s, w8
+    eor v20.16b, v20.16b, v18.16b
+    eor v20.16b, v20.16b, v19.16b
+    movi v29.4s, #4
+pmoNormalFourLoop:
+    add v16.4s, v23.4s, v18.4s
+    add v17.4s, v25.4s, v19.4s
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #13
+    ushr v22.4s, v17.4s, #19
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #15
+    ushr v22.4s, v17.4s, #17
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #26
+    ushr v22.4s, v17.4s, #6
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #6
+    ushr v22.4s, v17.4s, #26
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v19.4s
+    add v17.4s, v17.4s, v20.4s
+    movi v30.4s, #1
+    add v17.4s, v17.4s, v30.4s
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #17
+    ushr v22.4s, v17.4s, #15
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #29
+    ushr v22.4s, v17.4s, #3
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #16
+    ushr v22.4s, v17.4s, #16
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #24
+    ushr v22.4s, v17.4s, #8
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v20.4s
+    add v17.4s, v17.4s, v18.4s
+    movi v30.4s, #2
+    add v17.4s, v17.4s, v30.4s
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #13
+    ushr v22.4s, v17.4s, #19
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #15
+    ushr v22.4s, v17.4s, #17
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #26
+    ushr v22.4s, v17.4s, #6
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #6
+    ushr v22.4s, v17.4s, #26
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v18.4s
+    add v17.4s, v17.4s, v19.4s
+    movi v30.4s, #3
+    add v17.4s, v17.4s, v30.4s
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #17
+    ushr v22.4s, v17.4s, #15
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #29
+    ushr v22.4s, v17.4s, #3
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #16
+    ushr v22.4s, v17.4s, #16
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #24
+    ushr v22.4s, v17.4s, #8
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v19.4s
+    add v17.4s, v17.4s, v20.4s
+    movi v30.4s, #4
+    add v17.4s, v17.4s, v30.4s
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #13
+    ushr v22.4s, v17.4s, #19
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #15
+    ushr v22.4s, v17.4s, #17
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #26
+    ushr v22.4s, v17.4s, #6
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v17.4s
+    shl v21.4s, v17.4s, #6
+    ushr v22.4s, v17.4s, #26
+    orr v17.16b, v21.16b, v22.16b
+    eor v17.16b, v17.16b, v16.16b
+    add v16.4s, v16.4s, v20.4s
+    add v17.4s, v17.4s, v18.4s
+    movi v30.4s, #5
+    add v17.4s, v17.4s, v30.4s
+    ldr w8, [x11, #64]
+    dup v26.4s, w8
+    ldr w8, [x11, #68]
+    dup v27.4s, w8
+    ushr v0.4s, v16.4s, #8
+    movi v1.4s, #1
+    add v0.4s, v0.4s, v1.4s
+    ucvtf v0.4s, v0.4s
+    ushr v21.4s, v0.4s, #23
+    movi v1.4s, #127
+    sub v21.4s, v21.4s, v1.4s
+    shl v0.4s, v0.4s, #9
+    ushr v0.4s, v0.4s, #9
+    orr v0.16b, v0.16b, v26.16b
+    ldr w8, [x11, #8]
+    dup v5.4s, w8
+    fcmge v4.4s, v0.4s, v5.4s
+    movi v6.4s, #1
+    and v5.16b, v4.16b, v6.16b
+    add v21.4s, v21.4s, v5.4s
+    fmul v6.4s, v0.4s, v27.4s
+    bsl v4.16b, v6.16b, v0.16b
+    mov v0.16b, v4.16b
+    fsub v1.4s, v0.4s, v26.4s
+    fadd v2.4s, v0.4s, v26.4s
+    fdiv v1.4s, v1.4s, v2.4s
+    fmul v2.4s, v1.4s, v1.4s
+    ldr w8, [x11, #28]
+    dup v3.4s, w8
+    fmul v3.4s, v3.4s, v2.4s
+    ldr w8, [x11, #24]
+    dup v4.4s, w8
+    fadd v3.4s, v3.4s, v4.4s
+    fmul v3.4s, v3.4s, v2.4s
+    ldr w8, [x11, #20]
+    dup v4.4s, w8
+    fadd v3.4s, v3.4s, v4.4s
+    fmul v3.4s, v3.4s, v2.4s
+    ldr w8, [x11, #16]
+    dup v4.4s, w8
+    fadd v3.4s, v3.4s, v4.4s
+    fmul v3.4s, v3.4s, v2.4s
+    fadd v3.4s, v3.4s, v26.4s
+    fmul v1.4s, v1.4s, v3.4s
+    fadd v1.4s, v1.4s, v1.4s
+    movi v4.4s, #24
+    sub v4.4s, v4.4s, v21.4s
+    scvtf v2.4s, v4.4s
+    ldr w8, [x11, #4]
+    dup v3.4s, w8
+    fmul v2.4s, v2.4s, v3.4s
+    fsub v2.4s, v2.4s, v1.4s
+    fadd v2.4s, v2.4s, v2.4s
+    fcmgt v28.4s, v2.4s, #0.0
+    ushr v4.4s, v2.4s, #23
+    movi v5.4s, #127
+    sub v4.4s, v4.4s, v5.4s
+    sshr v24.4s, v4.4s, #1
+    shl v5.4s, v24.4s, #24
+    sub v2.4s, v2.4s, v5.4s
+    ldr w8, [x11, #80]
+    dup v3.4s, w8
+    fmul v3.4s, v2.4s, v3.4s
+    ldr w8, [x11, #84]
+    dup v4.4s, w8
+    fadd v3.4s, v3.4s, v4.4s
+    fdiv v4.4s, v2.4s, v3.4s
+    fadd v3.4s, v3.4s, v4.4s
+    fmul v3.4s, v3.4s, v27.4s
+    fdiv v4.4s, v2.4s, v3.4s
+    fadd v3.4s, v3.4s, v4.4s
+    fmul v3.4s, v3.4s, v27.4s
+    fdiv v4.4s, v2.4s, v3.4s
+    fadd v3.4s, v3.4s, v4.4s
+    fmul v3.4s, v3.4s, v27.4s
+    fdiv v4.4s, v2.4s, v3.4s
+    fadd v3.4s, v3.4s, v4.4s
+    fmul v3.4s, v3.4s, v27.4s
+    shl v24.4s, v24.4s, #23
+    add v3.4s, v3.4s, v24.4s
+    and v16.16b, v3.16b, v28.16b
+    ushr v21.4s, v17.4s, #29
+    shl v0.4s, v17.4s, #3
+    ushr v0.4s, v0.4s, #11
+    shl v4.4s, v21.4s, #31
+    sshr v4.4s, v4.4s, #31
+    movi v5.4s, #0x20, lsl #16
+    sub v5.4s, v5.4s, v0.4s
+    bsl v4.16b, v5.16b, v0.16b
+    scvtf v0.4s, v4.4s
+    ldr w8, [x11, #12]
+    dup v1.4s, w8
+    fmul v0.4s, v0.4s, v1.4s
+    fmul v1.4s, v0.4s, v0.4s
+    movi v30.4s, #0
+    ldr w8, [x11, #60]
+    dup v2.4s, w8
+    fsub v2.4s, v30.4s, v2.4s
+    fmul v2.4s, v2.4s, v1.4s
+    ldr w8, [x11, #52]
+    dup v3.4s, w8
+    fadd v2.4s, v2.4s, v3.4s
+    fmul v2.4s, v2.4s, v1.4s
+    ldr w8, [x11, #44]
+    dup v3.4s, w8
+    fsub v2.4s, v2.4s, v3.4s
+    fmul v2.4s, v2.4s, v1.4s
+    ldr w8, [x11, #36]
+    dup v3.4s, w8
+    fadd v2.4s, v2.4s, v3.4s
+    fmul v2.4s, v2.4s, v1.4s
+    fsub v2.4s, v2.4s, v27.4s
+    fmul v2.4s, v2.4s, v1.4s
+    fadd v2.4s, v2.4s, v26.4s
+    ldr w8, [x11, #56]
+    dup v3.4s, w8
+    fmul v3.4s, v3.4s, v1.4s
+    ldr w8, [x11, #48]
+    dup v7.4s, w8
+    fsub v3.4s, v3.4s, v7.4s
+    fmul v3.4s, v3.4s, v1.4s
+    ldr w8, [x11, #40]
+    dup v7.4s, w8
+    fadd v3.4s, v3.4s, v7.4s
+    fmul v3.4s, v3.4s, v1.4s
+    ldr w8, [x11, #32]
+    dup v7.4s, w8
+    fsub v3.4s, v3.4s, v7.4s
+    fmul v3.4s, v3.4s, v1.4s
+    fadd v3.4s, v3.4s, v26.4s
+    fmul v3.4s, v3.4s, v0.4s
+    movi v4.4s, #1
+    add v5.4s, v21.4s, v4.4s
+    shl v5.4s, v5.4s, #30
+    sshr v5.4s, v5.4s, #31
+    bsl v5.16b, v3.16b, v2.16b
+    movi v4.4s, #2
+    add v4.4s, v21.4s, v4.4s
+    shl v4.4s, v4.4s, #29
+    sshr v4.4s, v4.4s, #31
+    fsub v2.4s, v30.4s, v5.4s
+    bsl v4.16b, v2.16b, v5.16b
+    fmul v16.4s, v16.4s, v4.4s
+    dup v0.4s, w13
+    dup v1.4s, w12
+    fmul v16.4s, v0.4s, v16.4s
+    fadd v16.4s, v1.4s, v16.4s
+    st1 {v16.4s}, [x0], #16
+    add v23.4s, v23.4s, v29.4s
+    sub x10, x10, #4
+    cbnz x10, pmoNormalFourLoop
+pmoNormalFourDone:
+    mov x0, x9
+  EndASM
+EndProcedure
+
+
+CompilerEndIf
