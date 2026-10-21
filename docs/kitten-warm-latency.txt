@@ -232,7 +232,24 @@ Boolean Where broadcasts now compute each operand's index once per output
 row. A contiguous chosen row is copied in bulk; other rows use the word
 selector or the same scalar pointer loop.32 broadcast shapes matched every
 output byte and balanced arena accounting. Whole-model Where dropped from
-175ms originally to roughly2ms. The combined run produced first PCM at
+175ms originally to10.75ms. The combined run produced first PCM at
 542/536/550/531/819/981/735/536ms, RTF0.739-0.868. Complete waveform CRCs remain
 identical. This meets0.5-1second PCM readiness for this eight-text sample,
-with14-26percent generation-time margin; Bluetooth onset is not included.
+with13-26percent generation-time margin; Bluetooth onset is not included.
+
+
+The narrow stride-one convolution can now keep its tap walk in native code
+for64/128 input channels and kernel widths above one. Each tap still resets
+its integer reduction and contributes the same separately rounded scaled
+FLOAT result in ascending order. Wide activations, other channel counts and
+strides retain the existing loop. The argument block is private128-byte
+worker storage; there is no per-worker packing array. Existing24 exact
+operator comparisons were followed by complete four-core model runs before
+and after removing unused wide branches from this narrow entry.
+
+Final silent sample: first PCM538/531/545/527/813/976/730/531ms. RTF0.730-0.860,
+corresponding to14-27percent generation-time margin. Total generation is
+about11percent faster than the starting whole-model baseline; all eight
+raw waveform CRCs are unchanged, including the repeated Turn left request.
+No worker faults or accounting errors occurred. The PCM-ready target is met
+for this sample; Bluetooth delivery and speaker latency are separate checks.
