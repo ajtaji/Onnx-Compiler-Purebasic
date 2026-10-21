@@ -7954,11 +7954,60 @@ Procedure.i PmConvFourCacheWeight(weight.i,cg.i,oc.i,k.i)
  PmConvFourCacheUsed=PmConvFourCacheUsed+bytes : PmConvFourCacheCount=PmConvFourCacheCount+1
  ProcedureReturn 1
 EndProcedure
+; Optional caller-owned cache for immutable INT8 convolution weights.
+; Packed order is output-row group, tap, input channel, four output rows.
+Global PmConvPackedCacheBase.i,PmConvPackedCacheBytes.i,PmConvPackedCacheUsed.i,PmConvPackedCacheCount.i
+Global PmConvPackedWeight.i,PmConvPackedBase.i
+Global Dim PmConvPackedCacheKeys.i[64*5]
+Procedure PmConvPackedCacheReset(base.i,bytes.i)
+ PmConvPackedCacheBase=0 : PmConvPackedCacheBytes=0 : PmConvPackedCacheUsed=0 : PmConvPackedCacheCount=0
+ PmConvPackedWeight=0 : PmConvPackedBase=0
+ If base>0 And (base & 15)=0 And bytes>0 : PmConvPackedCacheBase=base : PmConvPackedCacheBytes=bytes : EndIf
+EndProcedure
+Procedure.i PmConvPackedCacheFind(weight.i,cg.i,oc.i,k.i)
+ Protected i.i,at.i
+ For i=0 To PmConvPackedCacheCount-1
+  at=i*5
+  If PmConvPackedCacheKeys[at]=weight And PmConvPackedCacheKeys[at+1]=cg And PmConvPackedCacheKeys[at+2]=oc And PmConvPackedCacheKeys[at+3]=k
+   ProcedureReturn PmConvPackedCacheKeys[at+4]
+  EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i PmConvPackedCacheWeight(weight.i,cg.i,oc.i,k.i)
+ Protected bytes.i,dst.i,at.i,row.i,tap.i,channel.i,output.i
+ If PmConvPackedCacheFind(weight,cg,oc,k)<>0 : ProcedureReturn 1 : EndIf
+ If weight=0 Or PmConvPackedCacheBase=0 Or PmConvPackedCacheCount>=64 : ProcedureReturn 0 : EndIf
+ If cg<>64 And cg<>128 : ProcedureReturn 0 : EndIf
+ If oc<4 Or (oc & 3)<>0 Or k<2 : ProcedureReturn 0 : EndIf
+ If oc/4>(PmConvPackedCacheBytes-PmConvPackedCacheUsed)/cg/k/4 : ProcedureReturn 0 : EndIf
+ bytes=oc*cg*k : dst=PmConvPackedCacheBase+PmConvPackedCacheUsed : at=dst
+ For output=0 To oc-1 Step 4
+  For tap=0 To k-1
+   For channel=0 To cg-1
+    For row=0 To 3
+     PokeA(at,PeekA(weight+((output+row)*cg+channel)*k+tap)) : at=at+1
+    Next
+   Next
+  Next
+ Next
+ at=PmConvPackedCacheCount*5
+ PmConvPackedCacheKeys[at]=weight : PmConvPackedCacheKeys[at+1]=cg : PmConvPackedCacheKeys[at+2]=oc
+ PmConvPackedCacheKeys[at+3]=k : PmConvPackedCacheKeys[at+4]=dst
+ PmConvPackedCacheUsed=PmConvPackedCacheUsed+bytes : PmConvPackedCacheCount=PmConvPackedCacheCount+1
+ ProcedureReturn 1
+EndProcedure
+
 Procedure PmConvFourPrepare(*g.PmTensorConv1DArgs)
  PmConvFourWeight=0 : PmConvFourMaskBase=0
+ PmConvPackedWeight=0 : PmConvPackedBase=0
  If *g\Groups<>1 Or *g\Stride<>1 Or *g\Wide<>0 : ProcedureReturn : EndIf
  PmConvFourMaskBase=PmConvFourCacheFind(*g\Weight,*g\InChannels,*g\OutChannels,*g\Kernel)
- If PmConvFourMaskBase<>0 : PmConvFourWeight=*g\Weight : EndIf
+ If PmConvFourMaskBase<>0
+  PmConvFourWeight=*g\Weight
+  PmConvPackedBase=PmConvPackedCacheFind(*g\Weight,*g\InChannels,*g\OutChannels,*g\Kernel)
+  If PmConvPackedBase<>0 : PmConvPackedWeight=*g\Weight : EndIf
+ EndIf
 EndProcedure
 ; Interleave four independent row accumulators; preserve the full q8-q15
 ; contents in128bytes until all taps finish. Integer and tap scaling order
@@ -8475,6 +8524,403 @@ pmoI8EpiAddAdvance:
 pmoI8EpiAddDone:
   EndASM
 EndProcedure
+Procedure PmI8PackedTapsA64(p.i)
+  ASM
+    stp q8, q9, [sp, #-128]!
+    stp q10, q11, [sp, #32]
+    stp q12, q13, [sp, #64]
+    stp q14, q15, [sp, #96]
+pmoI8PackedTapsBegin:
+    ldr x1, [x0, #0]
+    ldr x2, [x0, #8]
+    ldr x10, [x0, #16]
+    ldr x11, [x0, #24]
+    ldr x12, [x0, #32]
+    ldr x13, [x0, #40]
+    ldr x14, [x0, #48]
+    ldr x3, [x0, #56]
+    ldr x15, [x0, #128]
+    ldr x16, [x15]
+    lsr x15, x16, #32
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    movi v20.4s, #0
+    movi v21.4s, #0
+    movi v22.4s, #0
+    movi v23.4s, #0
+    movi v24.4s, #0
+    movi v25.4s, #0
+    movi v26.4s, #0
+    movi v27.4s, #0
+    movi v28.4s, #0
+    movi v29.4s, #0
+    movi v30.4s, #0
+    movi v31.4s, #0
+    cbz x3, pmoI8PackedTapsFlush
+pmoI8PackedTapsK0:
+    cbz x3, pmoI8PackedTapsFlush
+    tbz x15, #0, pmoI8PackedTapsUseFour
+    ld1 {v0.16b}, [x1], x2
+    ld1 {v1.16b}, [x1], x2
+    ld1 {v2.16b}, [x1], x2
+    ld1 {v3.16b}, [x1], x2
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smull v8.8h, v0.8b, v4.8b
+    smull2 v9.8h, v0.16b, v4.16b
+    smull v10.8h, v0.8b, v5.8b
+    smull2 v11.8h, v0.16b, v5.16b
+    smull v12.8h, v0.8b, v6.8b
+    smull2 v13.8h, v0.16b, v6.16b
+    smull v14.8h, v0.8b, v7.8b
+    smull2 v15.8h, v0.16b, v7.16b
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smlal v8.8h, v1.8b, v4.8b
+    smlal2 v9.8h, v1.16b, v4.16b
+    smlal v10.8h, v1.8b, v5.8b
+    smlal2 v11.8h, v1.16b, v5.16b
+    smlal v12.8h, v1.8b, v6.8b
+    smlal2 v13.8h, v1.16b, v6.16b
+    smlal v14.8h, v1.8b, v7.8b
+    smlal2 v15.8h, v1.16b, v7.16b
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smlal v8.8h, v2.8b, v4.8b
+    smlal2 v9.8h, v2.16b, v4.16b
+    smlal v10.8h, v2.8b, v5.8b
+    smlal2 v11.8h, v2.16b, v5.16b
+    smlal v12.8h, v2.8b, v6.8b
+    smlal2 v13.8h, v2.16b, v6.16b
+    smlal v14.8h, v2.8b, v7.8b
+    smlal2 v15.8h, v2.16b, v7.16b
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smlal v8.8h, v3.8b, v4.8b
+    smlal2 v9.8h, v3.16b, v4.16b
+    smlal v10.8h, v3.8b, v5.8b
+    smlal2 v11.8h, v3.16b, v5.16b
+    smlal v12.8h, v3.8b, v6.8b
+    smlal2 v13.8h, v3.16b, v6.16b
+    smlal v14.8h, v3.8b, v7.8b
+    smlal2 v15.8h, v3.16b, v7.16b
+    ld1 {v0.16b}, [x1], x2
+    ld1 {v1.16b}, [x1], x2
+    ld1 {v2.16b}, [x1], x2
+    ld1 {v3.16b}, [x1], x2
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smlal v8.8h, v0.8b, v4.8b
+    smlal2 v9.8h, v0.16b, v4.16b
+    smlal v10.8h, v0.8b, v5.8b
+    smlal2 v11.8h, v0.16b, v5.16b
+    smlal v12.8h, v0.8b, v6.8b
+    smlal2 v13.8h, v0.16b, v6.16b
+    smlal v14.8h, v0.8b, v7.8b
+    smlal2 v15.8h, v0.16b, v7.16b
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smlal v8.8h, v1.8b, v4.8b
+    smlal2 v9.8h, v1.16b, v4.16b
+    smlal v10.8h, v1.8b, v5.8b
+    smlal2 v11.8h, v1.16b, v5.16b
+    smlal v12.8h, v1.8b, v6.8b
+    smlal2 v13.8h, v1.16b, v6.16b
+    smlal v14.8h, v1.8b, v7.8b
+    smlal2 v15.8h, v1.16b, v7.16b
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smlal v8.8h, v2.8b, v4.8b
+    smlal2 v9.8h, v2.16b, v4.16b
+    smlal v10.8h, v2.8b, v5.8b
+    smlal2 v11.8h, v2.16b, v5.16b
+    smlal v12.8h, v2.8b, v6.8b
+    smlal2 v13.8h, v2.16b, v6.16b
+    smlal v14.8h, v2.8b, v7.8b
+    smlal2 v15.8h, v2.16b, v7.16b
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smlal v8.8h, v3.8b, v4.8b
+    smlal2 v9.8h, v3.16b, v4.16b
+    smlal v10.8h, v3.8b, v5.8b
+    smlal2 v11.8h, v3.16b, v5.16b
+    smlal v12.8h, v3.8b, v6.8b
+    smlal2 v13.8h, v3.16b, v6.16b
+    smlal v14.8h, v3.8b, v7.8b
+    smlal2 v15.8h, v3.16b, v7.16b
+    saddw v16.4s, v16.4s, v8.4h
+    saddw2 v17.4s, v17.4s, v8.8h
+    saddw v18.4s, v18.4s, v9.4h
+    saddw2 v19.4s, v19.4s, v9.8h
+    saddw v20.4s, v20.4s, v10.4h
+    saddw2 v21.4s, v21.4s, v10.8h
+    saddw v22.4s, v22.4s, v11.4h
+    saddw2 v23.4s, v23.4s, v11.8h
+    saddw v24.4s, v24.4s, v12.4h
+    saddw2 v25.4s, v25.4s, v12.8h
+    saddw v26.4s, v26.4s, v13.4h
+    saddw2 v27.4s, v27.4s, v13.8h
+    saddw v28.4s, v28.4s, v14.4h
+    saddw2 v29.4s, v29.4s, v14.8h
+    saddw v30.4s, v30.4s, v15.4h
+    saddw2 v31.4s, v31.4s, v15.8h
+    sub x3, x3, #8
+    lsr x16, x16, #2
+    lsr x15, x15, #1
+    b pmoI8PackedTapsK0
+pmoI8PackedTapsUseFour:
+    mov x9, #2
+pmoI8PackedTapsFourGroup:
+    tbz x16, #0, pmoI8PackedTapsPair
+    ld1 {v0.16b}, [x1], x2
+    ld1 {v1.16b}, [x1], x2
+    ld1 {v2.16b}, [x1], x2
+    ld1 {v3.16b}, [x1], x2
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smull v8.8h, v0.8b, v4.8b
+    smull2 v9.8h, v0.16b, v4.16b
+    smull v10.8h, v0.8b, v5.8b
+    smull2 v11.8h, v0.16b, v5.16b
+    smull v12.8h, v0.8b, v6.8b
+    smull2 v13.8h, v0.16b, v6.16b
+    smull v14.8h, v0.8b, v7.8b
+    smull2 v15.8h, v0.16b, v7.16b
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smlal v8.8h, v1.8b, v4.8b
+    smlal2 v9.8h, v1.16b, v4.16b
+    smlal v10.8h, v1.8b, v5.8b
+    smlal2 v11.8h, v1.16b, v5.16b
+    smlal v12.8h, v1.8b, v6.8b
+    smlal2 v13.8h, v1.16b, v6.16b
+    smlal v14.8h, v1.8b, v7.8b
+    smlal2 v15.8h, v1.16b, v7.16b
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smlal v8.8h, v2.8b, v4.8b
+    smlal2 v9.8h, v2.16b, v4.16b
+    smlal v10.8h, v2.8b, v5.8b
+    smlal2 v11.8h, v2.16b, v5.16b
+    smlal v12.8h, v2.8b, v6.8b
+    smlal2 v13.8h, v2.16b, v6.16b
+    smlal v14.8h, v2.8b, v7.8b
+    smlal2 v15.8h, v2.16b, v7.16b
+    ld4r {v4.16b, v5.16b, v6.16b, v7.16b}, [x10], #4
+    smlal v8.8h, v3.8b, v4.8b
+    smlal2 v9.8h, v3.16b, v4.16b
+    smlal v10.8h, v3.8b, v5.8b
+    smlal2 v11.8h, v3.16b, v5.16b
+    smlal v12.8h, v3.8b, v6.8b
+    smlal2 v13.8h, v3.16b, v6.16b
+    smlal v14.8h, v3.8b, v7.8b
+    smlal2 v15.8h, v3.16b, v7.16b
+    saddw v16.4s, v16.4s, v8.4h
+    saddw2 v17.4s, v17.4s, v8.8h
+    saddw v18.4s, v18.4s, v9.4h
+    saddw2 v19.4s, v19.4s, v9.8h
+    saddw v20.4s, v20.4s, v10.4h
+    saddw2 v21.4s, v21.4s, v10.8h
+    saddw v22.4s, v22.4s, v11.4h
+    saddw2 v23.4s, v23.4s, v11.8h
+    saddw v24.4s, v24.4s, v12.4h
+    saddw2 v25.4s, v25.4s, v12.8h
+    saddw v26.4s, v26.4s, v13.4h
+    saddw2 v27.4s, v27.4s, v13.8h
+    saddw v28.4s, v28.4s, v14.4h
+    saddw2 v29.4s, v29.4s, v14.8h
+    saddw v30.4s, v30.4s, v15.4h
+    saddw2 v31.4s, v31.4s, v15.8h
+    sub x3, x3, #4
+    b pmoI8PackedTapsNextGroup
+pmoI8PackedTapsPair:
+    mov x17, #2
+pmoI8PackedTapsPairLoop:
+    ld1 {v0.16b}, [x1], x2
+    ld1 {v1.16b}, [x1], x2
+    ld4r {v2.16b, v3.16b, v4.16b, v5.16b}, [x10], #4
+    ld4r {v6.16b, v7.16b, v8.16b, v9.16b}, [x10], #4
+    smull v10.8h, v0.8b, v2.8b
+    smull2 v11.8h, v0.16b, v2.16b
+    smlal v10.8h, v1.8b, v6.8b
+    smlal2 v11.8h, v1.16b, v6.16b
+    saddw v16.4s, v16.4s, v10.4h
+    saddw2 v17.4s, v17.4s, v10.8h
+    saddw v18.4s, v18.4s, v11.4h
+    saddw2 v19.4s, v19.4s, v11.8h
+    smull v10.8h, v0.8b, v3.8b
+    smull2 v11.8h, v0.16b, v3.16b
+    smlal v10.8h, v1.8b, v7.8b
+    smlal2 v11.8h, v1.16b, v7.16b
+    saddw v20.4s, v20.4s, v10.4h
+    saddw2 v21.4s, v21.4s, v10.8h
+    saddw v22.4s, v22.4s, v11.4h
+    saddw2 v23.4s, v23.4s, v11.8h
+    smull v10.8h, v0.8b, v4.8b
+    smull2 v11.8h, v0.16b, v4.16b
+    smlal v10.8h, v1.8b, v8.8b
+    smlal2 v11.8h, v1.16b, v8.16b
+    saddw v24.4s, v24.4s, v10.4h
+    saddw2 v25.4s, v25.4s, v10.8h
+    saddw v26.4s, v26.4s, v11.4h
+    saddw2 v27.4s, v27.4s, v11.8h
+    smull v10.8h, v0.8b, v5.8b
+    smull2 v11.8h, v0.16b, v5.16b
+    smlal v10.8h, v1.8b, v9.8b
+    smlal2 v11.8h, v1.16b, v9.16b
+    saddw v28.4s, v28.4s, v10.4h
+    saddw2 v29.4s, v29.4s, v10.8h
+    saddw v30.4s, v30.4s, v11.4h
+    saddw2 v31.4s, v31.4s, v11.8h
+    sub x3, x3, #2
+    subs x17, x17, #1
+    b.ne pmoI8PackedTapsPairLoop
+pmoI8PackedTapsNextGroup:
+    lsr x16, x16, #1
+    subs x9, x9, #1
+    b.ne pmoI8PackedTapsFourGroup
+    lsr x15, x15, #1
+    b pmoI8PackedTapsK0
+pmoI8PackedTapsFlush:
+    ldr x5, [x0, #64]
+    ldr x6, [x0, #72]
+    ldr x7, [x0, #80]
+    ldr x8, [x0, #96]
+    scvtf v16.4s, v16.4s
+    scvtf v17.4s, v17.4s
+    scvtf v18.4s, v18.4s
+    scvtf v19.4s, v19.4s
+    scvtf v20.4s, v20.4s
+    scvtf v21.4s, v21.4s
+    scvtf v22.4s, v22.4s
+    scvtf v23.4s, v23.4s
+    scvtf v24.4s, v24.4s
+    scvtf v25.4s, v25.4s
+    scvtf v26.4s, v26.4s
+    scvtf v27.4s, v27.4s
+    scvtf v28.4s, v28.4s
+    scvtf v29.4s, v29.4s
+    scvtf v30.4s, v30.4s
+    scvtf v31.4s, v31.4s
+    cbnz x7, pmoI8PackedTapsRowScale
+    ld1 {v4.4s, v5.4s, v6.4s, v7.4s}, [x6]
+    fmul v16.4s, v16.4s, v4.4s
+    fmul v17.4s, v17.4s, v5.4s
+    fmul v18.4s, v18.4s, v6.4s
+    fmul v19.4s, v19.4s, v7.4s
+    fmul v20.4s, v20.4s, v4.4s
+    fmul v21.4s, v21.4s, v5.4s
+    fmul v22.4s, v22.4s, v6.4s
+    fmul v23.4s, v23.4s, v7.4s
+    fmul v24.4s, v24.4s, v4.4s
+    fmul v25.4s, v25.4s, v5.4s
+    fmul v26.4s, v26.4s, v6.4s
+    fmul v27.4s, v27.4s, v7.4s
+    fmul v28.4s, v28.4s, v4.4s
+    fmul v29.4s, v29.4s, v5.4s
+    fmul v30.4s, v30.4s, v6.4s
+    fmul v31.4s, v31.4s, v7.4s
+    b pmoI8PackedTapsAdd
+pmoI8PackedTapsRowScale:
+    ld1r {v4.4s}, [x6], #4
+    fmul v16.4s, v16.4s, v4.4s
+    fmul v17.4s, v17.4s, v4.4s
+    fmul v18.4s, v18.4s, v4.4s
+    fmul v19.4s, v19.4s, v4.4s
+    ld1r {v4.4s}, [x6], #4
+    fmul v20.4s, v20.4s, v4.4s
+    fmul v21.4s, v21.4s, v4.4s
+    fmul v22.4s, v22.4s, v4.4s
+    fmul v23.4s, v23.4s, v4.4s
+    ld1r {v4.4s}, [x6], #4
+    fmul v24.4s, v24.4s, v4.4s
+    fmul v25.4s, v25.4s, v4.4s
+    fmul v26.4s, v26.4s, v4.4s
+    fmul v27.4s, v27.4s, v4.4s
+    ld1r {v4.4s}, [x6], #4
+    fmul v28.4s, v28.4s, v4.4s
+    fmul v29.4s, v29.4s, v4.4s
+    fmul v30.4s, v30.4s, v4.4s
+    fmul v31.4s, v31.4s, v4.4s
+pmoI8PackedTapsAdd:
+    cbnz x8, pmoI8PackedTapsZero
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v16.4s, v0.4s, v16.4s
+    fadd v17.4s, v1.4s, v17.4s
+    fadd v18.4s, v2.4s, v18.4s
+    fadd v19.4s, v3.4s, v19.4s
+    st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5], #64
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v20.4s, v0.4s, v20.4s
+    fadd v21.4s, v1.4s, v21.4s
+    fadd v22.4s, v2.4s, v22.4s
+    fadd v23.4s, v3.4s, v23.4s
+    st1 {v20.4s, v21.4s, v22.4s, v23.4s}, [x5], #64
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v24.4s, v0.4s, v24.4s
+    fadd v25.4s, v1.4s, v25.4s
+    fadd v26.4s, v2.4s, v26.4s
+    fadd v27.4s, v3.4s, v27.4s
+    st1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x5], #64
+    ld1 {v0.4s, v1.4s, v2.4s, v3.4s}, [x5]
+    fadd v28.4s, v0.4s, v28.4s
+    fadd v29.4s, v1.4s, v29.4s
+    fadd v30.4s, v2.4s, v30.4s
+    fadd v31.4s, v3.4s, v31.4s
+    st1 {v28.4s, v29.4s, v30.4s, v31.4s}, [x5]
+    b pmoI8PackedTapsDone
+pmoI8PackedTapsZero:
+    movi v0.4s, #0
+    fadd v16.4s, v0.4s, v16.4s
+    fadd v17.4s, v0.4s, v17.4s
+    fadd v18.4s, v0.4s, v18.4s
+    fadd v19.4s, v0.4s, v19.4s
+    fadd v20.4s, v0.4s, v20.4s
+    fadd v21.4s, v0.4s, v21.4s
+    fadd v22.4s, v0.4s, v22.4s
+    fadd v23.4s, v0.4s, v23.4s
+    fadd v24.4s, v0.4s, v24.4s
+    fadd v25.4s, v0.4s, v25.4s
+    fadd v26.4s, v0.4s, v26.4s
+    fadd v27.4s, v0.4s, v27.4s
+    fadd v28.4s, v0.4s, v28.4s
+    fadd v29.4s, v0.4s, v29.4s
+    fadd v30.4s, v0.4s, v30.4s
+    fadd v31.4s, v0.4s, v31.4s
+    st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5], #64
+    st1 {v20.4s, v21.4s, v22.4s, v23.4s}, [x5], #64
+    st1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x5], #64
+    st1 {v28.4s, v29.4s, v30.4s, v31.4s}, [x5]
+pmoI8PackedTapsDone:
+    ldr x8, [x0, #104]
+    subs x8, x8, #1
+    str x8, [x0, #104]
+    b.eq pmoI8PackedTapsReturn
+    ldr x8, [x0, #112]
+    ldr x1, [x0]
+    add x1, x1, x8
+    str x1, [x0]
+    ldr x8, [x0, #56]
+    ldr x1, [x0, #16]
+    add x1, x1, x8, lsl #2
+    str x1, [x0, #16]
+    ldr x1, [x0, #24]
+    add x1, x1, #1
+    str x1, [x0, #24]
+    ldr x1, [x0, #32]
+    add x1, x1, #1
+    str x1, [x0, #32]
+    ldr x1, [x0, #40]
+    add x1, x1, #1
+    str x1, [x0, #40]
+    ldr x8, [x0, #120]
+    ldr x1, [x0, #72]
+    add x1, x1, x8
+    str x1, [x0, #72]
+    str xzr, [x0, #96]
+    ldr x8, [x0, #128]
+    add x8, x8, #8
+    str x8, [x0, #128]
+    b pmoI8PackedTapsBegin
+pmoI8PackedTapsReturn:
+    ldp q10, q11, [sp, #32]
+    ldp q12, q13, [sp, #64]
+    ldp q14, q15, [sp, #96]
+    ldp q8, q9, [sp], #128
+  EndASM
+EndProcedure
+
 Procedure PmI8Conv1DNeonPositionRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, ocLast.i, tile.i,positionFirst.i,positionLast.i)
   Protected Dim addArgs.i[10]
   Protected Dim addTail.i[32]
@@ -8544,7 +8990,12 @@ Procedure PmI8Conv1DNeonPositionRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, oc
           native[13]=*g\Kernel : native[14]=*g\Dilation*es : native[15]=*g\Dilation*4
           If PmConvFourWeight=*g\Weight And *g\Groups=1 And (oc & 3)=0
             native[16]=PmConvFourMaskBase+(oc/4)* *g\Kernel*8
-            PmI8FourTapsA64(@native[0])
+            If PmConvPackedWeight=*g\Weight
+              native[2]=PmConvPackedBase+(oc/4)* *g\Kernel*cg*4
+              PmI8PackedTapsA64(@native[0])
+            Else
+              PmI8FourTapsA64(@native[0])
+            EndIf
           Else
             PmI8AllTapsA64(@native[0])
           EndIf

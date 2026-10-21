@@ -412,3 +412,47 @@ by binary operations1135ms, MatMul890ms and fused trig/square750ms.
 No Bluetooth or map demo. First PCM is not measured speaker onset; audible
 under1s and simultaneous map headroom remain unverified. Installed TruckGPS
 is unchanged. Tests are fresh inference with resident weights.
+
+2026-10-21: optional immutable packed convolution weights. A64 native CG64/
+128, stride1, Groups1, narrow INT8, complete four-output-row blocks and K>1
+can use [oc4][tap][input-channel][row4] packed bytes. LD4R replaces four
+independent row-weight replicate loads. Four/eight-product bounds, paired
+fallback, integer totals, FP32 tap order and scaling are unchanged. Full
+q8-q15 preservation and the original17-word private argument block remain.
+The original kernel handles missing caches and unsupported geometries.
+
+General runtime API, no model identity checks:
+  PmConvPackedCacheReset(base,bytes)
+  PmConvPackedCacheWeight(weight,cg,oc,k) ;1=prepared/already present,0=declined
+The caller owns a16-byte-aligned cache, separate from weights/arena/scratch.
+Prepare once for immutable narrow INT8 weights while loading, alongside the
+existing PmConvFourCacheWeight proof. A cache holds up to64 shape/pointer
+keys and oc*cg*k packed bytes per key. Capacity/unsupported shapes decline
+without allocating; an absent prepared cache retains the old kernel. Reset
+with(0,0) before freeing/rebinding/mutating the corresponding weight memory.
+Do not build packed copies during a warm reply. The optional cache is outside
+the model arena and must be included in the caller's memory budget.
+
+tests/pi4_conv_packed_gate.pi4 is a returning real-hardware regression gate:
+36 exact narrow/wide/stride/tail/value comparisons plus independent every-byte
+packing checks, duplicate/capacity/overflow/alignment/reset guards. All pass.
+Three explicit q8-q15 ABI cases (eight/four/pair paths) also pass. Two fresh
+dynamic INT8 ONNX Conv+Add models,64/128 input channels,K3/K7,dilation1/3,
+12 batch/width cases each match the uncached runtime exactly. The larger
+dilated cases improve full graph execution about1.07-1.10x; the smaller
+residual graph gains only0-2%. Tiny first cases include warmup bias and are
+not speedup claims. Both standard compiler applications rebuilt/selftestPASS.
+
+R42 full four-core Kitten:50 packed keys use2179072bytes (2.08MiB); unchanged
+proof41728bytes. Cold load/bind/packing0.609s vsR40 0.582s. FirstPCMms
+453.7/448.5/460.3/445.1/659.3/832.7/596.2/448.8; generationms
+741.0/687.0/772.3/658.3/1557.3/2341.6/1457.7/687.2. All8 full waveformCRCs
+unchanged. Conv+ConvThenAdd3851.76->3735.95ms across8 (~3.0% less). Total
+generation1.46% belowR40,24.13% belowR1. SilentRTF.626-.730,27-37% compute
+margin. These PCM times do not establish speaker onset under Bluetooth.
+
+Rejected experiments this cycle: preloading all four row weights(0-2% direct
+gain only), wider output preloads (~1%slower),64-position cache blocking(no
+gain), and per-row eight-product proof (R41 whole model0.39%slower despite
+some direct gains). None retained. No Bluetooth connection/playback, map
+demo, reset/flash/storage write. Installed TruckGPS remains unchanged.

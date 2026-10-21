@@ -1,0 +1,184 @@
+; Returning real-Pi4 regression gate, no audio or storage writes.
+; Compile with Forge --compile, -t pi4, --load-addr 0x1000000,
+; --stack-addr 0x4F00000, --entry-returns and --wants-services.
+; Requires a returning Anvil RAM loader and four healthy real cores.
+; x0=0 means all exact comparisons/cache guards passed.
+EnableFloatingPoint
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMO_USE_BATCHNORM=1
+#PMO_USE_STFT=1
+#PMO_USE_RESIZE=1
+#PMO_USE_CONVTRANSPOSE=1
+#PMO_USE_CONV=1
+#PMO_USE_LSTM=1
+#PMO_USE_INT8=1
+#PMO_USE_EXPLOG=1
+#PMO_USE_TRIG=1
+#PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+Global *gatePet
+Procedure.i QuantClock()
+ ASM
+  mrs x0, cntpct_el0
+ EndASM
+EndProcedure
+Procedure.i GateRun(services.i)
+ Protected g.PmTensorConv1DArgs,c.i,i.i,bad.i,start.i,old.i,fast.i,bytes.i,used.i,ok1.i,ok2.i,outputBytes.i
+ If PmSetAnvilServices(services)=0 : ProcedureReturn 1 : EndIf
+ *gatePet=pmAnvilSlot(6)
+ If PmParallelCores()<>4 : ProcedureReturn 2 : EndIf
+ For c=0 To 35
+  gatePet()
+  g\Src=$43000000 : g\Batches=1 : g\InChannels=64 : g\OutChannels=64
+  g\Kernel=11 : g\Dilation=1 : g\Stride=1 : g\PadLeft=5 : g\Groups=1 : g\Wide=c & 1
+  g\InWidth=520
+  If c % 6=0 : g\InWidth=129 : g\InChannels=128 : EndIf
+  If c % 6=1 : g\InWidth=513 : g\InChannels=128 : EndIf
+  If c % 6=2 : g\InWidth=3121 : EndIf
+  If c % 6=3 : g\InWidth=65 : g\InChannels=256 : EndIf
+  If c % 6=4 : g\Stride=3 : EndIf
+  If c % 6=5 : g\Stride=10 : g\PadLeft=7 : EndIf
+  g\OutWidth=(g\InWidth+g\PadLeft*2-g\Kernel)/g\Stride+1
+  For i=0 To g\InWidth*g\InChannels-1
+   PmTensorPut(g\Src,i,((i*1337) % 997-498)/123.0)
+   If i % 41=0 : PokeL(g\Src+i*4,$80000000) : EndIf
+   If i % 29=0 : PokeL(g\Src+i*4,1) : EndIf
+   If i % 43=0 : PokeL(g\Src+i*4,$0DA24260) : EndIf
+  Next
+  If c=35 : PokeL(g\Src+(g\InWidth-1)*4,$7FC00342) : EndIf
+
+  g\Weight=$43100000 : g\WeightScales=$431F0000 : g\Bias=$431F1000
+  For i=0 To g\OutChannels*g\InChannels*g\Kernel*(1+g\Wide)-1
+   PokeA(g\Weight+i,(i*19) % 256-128)
+   If c<6 : PokeA(g\Weight+i,(i*19) % 65-32) : EndIf
+   If c>=6 And c<18
+    If ((i/g\Kernel) % 8)=7
+     PokeA(g\Weight+i,34+Bool(c>=12))
+    Else
+     PokeA(g\Weight+i,32)
+    EndIf
+   EndIf
+  Next
+  For i=0 To g\OutChannels-1
+   PmTensorPut(g\WeightScales,i,0.0003+i/1000000.0)
+   PmTensorPut(g\Bias,i,(i-31)/97.0)
+  Next
+  outputBytes=g\OutChannels*g\OutWidth*4
+  bytes=PmI8ConvScratchBytes(@g)
+  used=PmI8Align(g\InChannels*PmI8ConvRow(@g)*(1+g\Wide))+PmI8Align(PmI8ConvRow(@g)*4)*2
+  For i=0 To bytes+16 Step 8
+   PokeI($43800000+i,$12345678) : PokeI($43A00000+i,$12345678)
+  Next
+  PmConvPackedCacheReset(0,0)
+  PmTensorInt8Scratch=$43800000 : PmTensorInt8ScratchBytes=bytes : PmTensorInt8Fault=0
+  PmConvFourCacheReset($43C00000,$40000)
+  If g\Wide=0 And g\Stride=1 And (g\InChannels=64 Or g\InChannels=128)
+   If PmConvFourCacheWeight(g\Weight,g\InChannels,g\OutChannels,g\Kernel)=0 : ProcedureReturn 20 : EndIf
+  EndIf
+  PmConvFourPrepare(@g)
+  start=QuantClock() : ok1=PmParallelConvQuantize(@g,0)
+  If ok1
+   start=QuantClock()
+   g\Dst=$43200000 : g\QuantBatch=0 : PmI8Conv1DNeonPositionRange(@g,0,0,g\OutChannels,PmI8ConvTile(@g,0),0,g\OutWidth)
+  EndIf
+  old=QuantClock()-start
+  PmTensorInt8Scratch=$43A00000 : PmTensorInt8Fault=0
+  PokeI($433FFFF8,$12345678) : PokeI($43400000+outputBytes,$12345678)
+  start=QuantClock() : ok2=PmParallelConvQuantize(@g,0)
+  If ok2
+   PmConvFourCacheReset($43C00000,$40000)
+   If g\Wide=0 And g\Stride=1 And (g\InChannels=64 Or g\InChannels=128)
+    If PmConvFourCacheWeight(g\Weight,g\InChannels,g\OutChannels,g\Kernel)=0 : ProcedureReturn 5 : EndIf
+    If PmConvFourCacheWeight(g\Weight,g\InChannels,g\OutChannels,g\Kernel)=0 : ProcedureReturn 6 : EndIf
+    If PmConvFourCacheCount<>1 : ProcedureReturn 7 : EndIf
+   EndIf
+   If PmConvFourCacheCount=1
+    PmConvEightMaskA64(g\Weight,PmConvFourCacheBase,g\InChannels,g\OutChannels,g\Kernel)
+   EndIf
+   PmConvPackedCacheReset($43D00000,$100000)
+   If g\Wide=0 And g\Stride=1 And (g\InChannels=64 Or g\InChannels=128)
+    If PmConvPackedCacheWeight(g\Weight,g\InChannels,g\OutChannels,g\Kernel)=0 : ProcedureReturn 30 : EndIf
+    If PmConvPackedCacheWeight(g\Weight,g\InChannels,g\OutChannels,g\Kernel)=0 Or PmConvPackedCacheCount<>1 : ProcedureReturn 31 : EndIf
+    ; Independent scalar inverse of the entire packed byte layout.
+    Protected oc.i,tap.i,ch.i,row.i,at.i=$43D00000
+    For oc=0 To g\OutChannels-1 Step 4
+     For tap=0 To g\Kernel-1
+      For ch=0 To g\InChannels-1
+       For row=0 To 3
+        If PeekA(at)<>PeekA(g\Weight+((oc+row)*g\InChannels+ch)*g\Kernel+tap) : ProcedureReturn 32 : EndIf
+        at=at+1
+       Next
+      Next
+     Next
+    Next
+   EndIf
+   PmConvFourPrepare(@g)
+   start=QuantClock()
+   g\Dst=$43400000 : g\QuantBatch=0 : PmI8Conv1DNeonPositionRange(@g,0,0,g\OutChannels,PmI8ConvTile(@g,0),0,g\OutWidth)
+  EndIf
+  fast=QuantClock()-start
+  If ok1<>ok2 : bad+1 : EndIf
+  If ok1
+   For i=0 To used-1
+    If PeekA($43800010+i)<>PeekA($43A00010+i) : bad+1 : EndIf
+   Next
+  EndIf
+  If ok1
+   For i=0 To outputBytes-1 Step 4
+    If PeekL($43200000+i)<>PeekL($43400000+i) : bad+1 : EndIf
+   Next
+  EndIf
+  If PeekI($433FFFF8)<>$12345678 Or PeekI($43400000+outputBytes)<>$12345678 : ProcedureReturn 4 : EndIf
+  If PeekI($43A00000+bytes)<>$12345678 : ProcedureReturn 3 : EndIf
+  PokeI($41374000+c*32,used) : PokeI($41374008+c*32,bad)
+  PokeI($41374010+c*32,old) : PokeI($41374018+c*32,fast)
+ Next
+ PmConvPackedCacheReset(0,0)
+ If PmConvPackedCacheWeight($43100000,64,4,2)<>0 : ProcedureReturn 33 : EndIf
+ PokeI($43D00000,$12345678) : PokeI($43D00200,$12345678)
+ PmConvPackedCacheReset($43D00000,511)
+ If PmConvPackedCacheWeight($43100000,64,4,2)<>0 : ProcedureReturn 34 : EndIf
+ If PeekI($43D00000)<>$12345678 : ProcedureReturn 35 : EndIf
+ PmConvPackedCacheReset($43D00000,512)
+ If PmConvPackedCacheWeight($43100000,64,4,2)<>1 : ProcedureReturn 36 : EndIf
+ If PmConvPackedCacheUsed<>512 Or PmConvPackedCacheCount<>1 Or PeekI($43D00200)<>$12345678 : ProcedureReturn 37 : EndIf
+ If PmConvPackedCacheWeight($43100001,64,4,2)<>0 : ProcedureReturn 38 : EndIf
+ If PmConvPackedCacheWeight($43100000,64,$7FFFFFFFFFFFFFFC,$7FFFFFFFFFFFFFFF)<>0 : ProcedureReturn 39 : EndIf
+ PmConvPackedCacheReset($43D00001,1024)
+ If PmConvPackedCacheWeight($43100000,64,4,2)<>0 : ProcedureReturn 40 : EndIf
+ PmConvPackedCacheReset(0,0)
+ If PmConvPackedBase<>0 Or PmConvPackedWeight<>0 Or PmConvPackedCacheCount<>0 : ProcedureReturn 41 : EndIf
+ PmConvFourCacheReset(0,0)
+ If PmConvFourCacheWeight($43100000,64,4,2)<>0 : ProcedureReturn 8 : EndIf
+ PokeI($43C00000,$12345678)
+ PmConvFourCacheReset($43C00000,7)
+ If PmConvFourCacheWeight($43100000,64,4,2)<>0 : ProcedureReturn 9 : EndIf
+ If PeekI($43C00000)<>$12345678 : ProcedureReturn 10 : EndIf
+ PmConvFourCacheReset($43C00000,16)
+ PokeI($43C00010,$12345678)
+ If PmConvFourCacheWeight($43100000,64,4,2)<>1 : ProcedureReturn 11 : EndIf
+ If PmConvFourCacheWeight($43100000,64,4,2)<>1 Or PmConvFourCacheUsed<>16 Or PmConvFourCacheCount<>1 : ProcedureReturn 12 : EndIf
+ If PeekI($43C00010)<>$12345678 : ProcedureReturn 13 : EndIf
+ If PmConvFourCacheWeight($43100001,64,4,2)<>0 : ProcedureReturn 14 : EndIf
+ If PmConvFourCacheWeight($43100000,64,$7FFFFFFFFFFFFFFC,$7FFFFFFFFFFFFFFF)<>0 : ProcedureReturn 15 : EndIf
+ PmConvFourCacheReset(0,0)
+ If PmConvFourWeight<>0 Or PmConvFourMaskBase<>0 Or PmConvFourCacheCount<>0 : ProcedureReturn 16 : EndIf
+ ProcedureReturn bad
+EndProcedure
+Procedure.i Main(services.i)
+  Protected rc.i
+  MmuClearNc()
+  MmuAddNc($08A00000,$09200000)
+  MmuAddNc($08100000,$08180000)
+  If MmuBuildTables($00800000)<>0 : ProcedureReturn 8 : EndIf
+  MmuEnableCached()
+  rc=GateRun(services)
+  MmuDisableCachedFlushed()
+  ProcedureReturn rc
+EndProcedure
