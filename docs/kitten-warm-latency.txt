@@ -548,3 +548,44 @@ IC64/K3/D1 and IC128/K7/D3 pass12 batch/width cases each, arena balanced.
 Both compiler applications rebuilt; self-test PASS. Public reproduction is
 tests/pi4_conv_span_gate.pi4. No Bluetooth connection/playback or map demo;
 installed TruckGPS unchanged. Bluetooth-active/map headroom remains untested.
+
+2026-10-21: contiguous private input windows for packed INT8 convolution.
+Each worker gathers its quantized64-position window and required tap halo
+into64-byte-aligned scratch, then reuses it across output-channel blocks.
+Channel stride128 keeps the active window contiguous. A batched native row
+copy uses only caller-saved registers; copies round up inside the original
+16-byte-padded source rows. Arithmetic, source scales, proof metadata,
+packed weights and reduction/rounding order are unchanged. No model check.
+
+Eligible native paths use IC64/128, OCmultiple4 and>=16, groups1, stride1,
+narrow INT8, OW>=64, K>1 and effective halo<=64. A partition must reuse the
+window across at least4 output-row blocks; other work keeps its original
+input path. The geometry reserves up to65,664 extra scratch bytes outside
+the4KiB core stacks. The working-memory API includes this stable capacity,
+even when an optional weight cache is absent; no new persistent cache/heap.
+Scalar/desktop, grouped, wide, short and unsupported geometries are unchanged.
+
+Whole four-core Pi4/Anvil paired old/new test including old/new scratch
+allocation: convolution3145.235->3028.394ms,3.7149% less across8 replies;
+total8317.401->8203.534ms,1.3690% less. Every new reply and first PCM faster,
+all complete waveform CRCs identical, fault fields0. Final canonical first
+PCM417.0..805.2ms; silentRTF.579..663, approximately34..42% compute margin.
+This is a further modest gain. Speaker onset is still unmeasured.
+
+58 canonical four-core cases check complete outputs, quantized batch data,
+guards, halo64/68, grouped/strided/wide fallback, absent packed cache,
+small/fragmented channel counts, residual order and exceptional values.
+10 row-copy cases check exact bytes, zero work, gaps and guards. Two fresh
+dynamic ONNX Conv/Add graphs pass12 batch/width cases each. Fixed exports
+also reserve the new capacity in the compiler planner; eligible/grouped/
+small/desktop golden capacities pass. A fresh fixed-shape INT8 Conv passes
+8 requests on the Pi with exactly its advertised arena. The fixed exporter
+now emits PMD_NATIVE_BYTES, required by shared native runtime declarations.
+A native Windows fixed export builds/runs3 requests with its arena guard.
+Both standard compiler applications rebuilt; self-test PASS. Public tests:
+tests/pi4_conv_gather_gate.pi4 and tests/conv_gather_fixed_exports.py.
+
+Excluded: minimal stride padding (mixed regressions), broad odd-cache-line
+row padding (0.177% total but several reply starts slower), and unused native
+argument trimming (0.074% total, within noise). No Bluetooth connection,
+audio/map demo, reset/flash/storage writes. Installed TruckGPS unchanged.

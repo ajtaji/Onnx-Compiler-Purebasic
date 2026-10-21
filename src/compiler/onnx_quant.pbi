@@ -325,6 +325,10 @@ Procedure.i PmoQuantPlanScratch(*Ir.PmoIrModel, TileBytes.q)
   Protected Stride.q
   Protected Span.q
   Protected Pad.q
+  Protected ConvNeeded.q
+  Protected ConvOutputChannels.q
+  Protected ConvGroups.q
+  Protected ConvDilation.q
   Protected *Activation.PmoIrValue
   Protected *Weight.PmoIrValue
   Protected *Recurrent.PmoIrValue
@@ -376,13 +380,26 @@ Procedure.i PmoQuantPlanScratch(*Ir.PmoIrModel, TileBytes.q)
           If SelectElement(*Output\Dims(), 2) : OutWidth = *Output\Dims() : EndIf
         EndIf
         Stride = PmoQuantAttrFirst(*Ir\Nodes()\Node, "strides", 1) : If Stride < 1 : Stride = 1 : EndIf
-        Span = (Kernel - 1) * PmoQuantAttrFirst(*Ir\Nodes()\Node, "dilations", 1)
+        ConvDilation = PmoQuantAttrFirst(*Ir\Nodes()\Node, "dilations", 1)
+        Span = (Kernel - 1) * ConvDilation
         ; an absent pads (auto_pad) never puts more than Span in front
         Pad = PmoQuantAttrFirst(*Ir\Nodes()\Node, "pads", Span)
         Padded = (Pad + Width + Stride - 1) / Stride
         If ((OutWidth + 15) & ~15) + Span / Stride + 1 > Padded : Padded = ((OutWidth + 15) & ~15) + Span / Stride + 1 : EndIf
         Padded = ((Padded + 15) & ~15) * Stride
-        If PmoQuantScratchBytes(Channels * Padded, Padded, TileBytes) > Needed : Needed = PmoQuantScratchBytes(Channels * Padded, Padded, TileBytes) : EndIf
+        ConvNeeded = PmoQuantScratchBytes(Channels * Padded, Padded, TileBytes)
+        ; Match PmI8ConvInputPackStride on the native64-bit Arm backend.
+        ; Fixed exports must reserve the same four private128-byte rows per
+        ; input channel plus alignment space as runtime-dimension exports.
+        ConvOutputChannels = 0 : ConvGroups = 1
+        If FirstElement(*Weight\Dims()) : ConvOutputChannels = *Weight\Dims() : EndIf
+        ForEach *Ir\Nodes()\Node\Attributes()
+          If *Ir\Nodes()\Node\Attributes()\Name = "group" : ConvGroups = *Ir\Nodes()\Node\Attributes()\IntegerValue : EndIf
+        Next
+        If TileBytes = 4096 And (Channels = 64 Or Channels = 128) And Stride = 1 And ConvGroups = 1 And OutWidth >= 64 And ConvOutputChannels >= 16 And (ConvOutputChannels & 3) = 0 And Kernel > 1 And ConvDilation > 0 And ConvDilation <= 64
+          If Kernel - 1 <= 64 / ConvDilation : ConvNeeded + 128 * (4 * Channels + 1) : EndIf
+        EndIf
+        If ConvNeeded > Needed : Needed = ConvNeeded : EndIf
       EndIf
     ElseIf Operation = "LSTM"
       If (WeightName <> "" And FindMapElement(*Ir\QuantByName(), WeightName)) Or

@@ -1585,6 +1585,7 @@ Procedure.i PmoEmitSource(*Ir.PmoIrModel, *Profile.PmoTargetProfile, Destination
     PmoEmitLine(File, "#PMO_USE_ATAN = " + Str(Bool(FindMapElement(UsedOps(), "Atan"))))
   EndIf
   PmoEmitLine(File, "#PMO_INT64_SPLIT = " + Str(Bool(*Profile\NativeIntegerBytes = 4)))
+  PmoEmitLine(File, "#PMD_NATIVE_BYTES = " + Str(*Profile\NativeIntegerBytes))
   PmoEmitLine(File, "#PMO_INT8_BACKEND = " + Str(1+Bool(*Profile\NativeIntegerBytes=4)+Bool(*Profile\Id="pico2")))
   PmoEmitLine(File)
   If *Profile\MathInclude <> "" : PmoEmitLine(File, "XIncludeFile " + Chr(34) + *Profile\MathInclude + Chr(34)) : EndIf

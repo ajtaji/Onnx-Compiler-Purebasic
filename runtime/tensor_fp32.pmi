@@ -7426,10 +7426,23 @@ Procedure.i PmI8ConvRow(*g.PmTensorConv1DArgs)
   ProcedureReturn PmI8ConvPhase(*g) * *g\Stride
 EndProcedure
 
+; Eligible four-core spatial work uses128 bytes per input channel per
+; partition, after the existing arithmetic tiles. One extra128-byte unit
+; covers rounding the shared pack base up to a64-byte cache line. Reserve
+; by shape so capacity never depends on mutable cache-preparation state.
+Procedure.i PmI8ConvInputPackStride(*g.PmTensorConv1DArgs)
+ CompilerIf #PMO_INT8_BACKEND=1
+ If *g\Wide=0 And *g\Stride=1 And *g\Groups=1 And (*g\InChannels=64 Or *g\InChannels=128) And *g\OutChannels>=16 And (*g\OutChannels & 3)=0 And *g\OutWidth>=64 And *g\Kernel>1 And *g\Dilation>0 And *g\Dilation<=64
+  If *g\Kernel-1<=64/ *g\Dilation : ProcedureReturn 128 : EndIf
+ EndIf
+ CompilerEndIf
+ ProcedureReturn 0
+EndProcedure
+
 Procedure.i PmI8ConvScratchBytes(*g.PmTensorConv1DArgs)
   Protected qp.i
   qp = PmI8ConvRow(*g)
-  ProcedureReturn PmI8ScratchBytes(*g\InChannels * qp, qp, *g\Wide)
+  ProcedureReturn PmI8ScratchBytes(*g\InChannels * qp, qp, *g\Wide)+PmI8ConvInputPackStride(*g)*(4* *g\InChannels+1)
 EndProcedure
 
 ; Tile area `part` (0..3) of a Conv1D's working memory.
@@ -9584,7 +9597,10 @@ pmoI8SpanTapsReturn:
   EndASM
 EndProcedure
 
-Procedure PmI8Conv1DNeonPositionRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, ocLast.i, tile.i,positionFirst.i,positionLast.i)
+; A gathered input changes only its base and channel stride. Position
+; scales still come from the original quantized batch. The caller supplies
+; a single-group, narrow, unit-stride window with at most64 output positions.
+Procedure PmI8Conv1DNeonPackedRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, ocLast.i, tile.i,positionFirst.i,positionLast.i,inputPack.i,inputStep.i)
   Protected Dim addArgs.i[10]
   Protected Dim addTail.i[32]
   Protected ra.i,rr.i,ii.i
@@ -9628,6 +9644,7 @@ Procedure PmI8Conv1DNeonPositionRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, oc
   s = q + PmI8Align(*g\InChannels * qp * es)
   elements = *g\OutChannels * cg * *g\Kernel
   ta\LStep = qp * es : ta\PStep = *g\Kernel : ta\RowScale = 0 : ta\Kind = *g\Wide
+  If inputPack<>0 : ta\LStep=inputStep : EndIf
   oc = ocFirst
   While oc < ocLast
     grp = oc / og
@@ -9640,6 +9657,7 @@ Procedure PmI8Conv1DNeonPositionRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, oc
     w2 = wlast : If rows > 2 : w2 = w1 + cg * *g\Kernel : EndIf
     w3 = wlast : If rows > 3 : w3 = w2 + cg * *g\Kernel : EndIf
     qrow = q + grp * cg * qp * es
+    If inputPack<>0 : qrow=inputPack-positionFirst : EndIf
     p0 = positionFirst
     While p0 < positionLast
       If (p0 & 255)=0 : PmKernelIdle() : EndIf
@@ -9746,6 +9764,10 @@ Procedure PmI8Conv1DNeonPositionRange(*g.PmTensorConv1DArgs, bn.i, ocFirst.i, oc
     oc = oc + rows
   Wend
 EndProcedure
+Procedure PmI8Conv1DNeonPositionRange(*g.PmTensorConv1DArgs,bn.i,ocFirst.i,ocLast.i,tile.i,first.i,last.i)
+ PmI8Conv1DNeonPackedRange(*g,bn,ocFirst,ocLast,tile,first,last,0,0)
+EndProcedure
+
 Procedure PmI8Conv1DNeonRange(*g.PmTensorConv1DArgs,bn.i,ocFirst.i,ocLast.i,tile.i)
   PmI8Conv1DNeonPositionRange(*g,bn,ocFirst,ocLast,tile,0,*g\OutWidth)
 EndProcedure

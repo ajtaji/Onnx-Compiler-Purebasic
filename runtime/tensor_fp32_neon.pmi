@@ -2546,11 +2546,54 @@ EndProcedure
 ; Position tiles allow all cores to work even when output channels are few.
 ; Every tile owns complete reductions and disjoint output positions.
 Global Dim PmConvWorkParts.i[24]
+; Forward copy of disjoint rows. Caller supplies a positive byte count
+; divisible by16, not exceeding either row's accessible extent.
+Procedure PmTensorCopyRowsAlignedNeon(src.i,dst.i,srcStep.i,dstStep.i,bytes.i,rows.i)
+ ASM
+  cmp x5, #0
+  b.le pmoCopyRowsDone
+  cmp x4, #0
+  b.le pmoCopyRowsDone
+pmoCopyRowsRow:
+  mov x6, x0
+  mov x7, x1
+  mov x8, x4
+pmoCopyRowsSixtyFour:
+  cmp x8, #64
+  b.lt pmoCopyRowsSixteen
+  ld1 {v0.16b-v3.16b}, [x6], #64
+  st1 {v0.16b-v3.16b}, [x7], #64
+  sub x8, x8, #64
+  b pmoCopyRowsSixtyFour
+pmoCopyRowsSixteen:
+  cbz x8, pmoCopyRowsNext
+  ld1 {v0.16b}, [x6], #16
+  st1 {v0.16b}, [x7], #16
+  sub x8, x8, #16
+  b pmoCopyRowsSixteen
+pmoCopyRowsNext:
+  add x0, x0, x2
+  add x1, x1, x3
+  subs x5, x5, #1
+  b.gt pmoCopyRowsRow
+pmoCopyRowsDone:
+ EndASM
+EndProcedure
+
 Procedure.i PmConvWorkWorker(*p.i)
   Protected *g.PmTensorConv1DArgs=PeekI(*p),bn.i=PeekI(*p+8),tile.i=PeekI(*p+16)
   Protected first.i=PeekI(*p+24),last.i=PeekI(*p+32)
   Protected og.i=*g\OutChannels/ *g\Groups,blocks.i=(og+3)/4
   Protected group.i,oc.i,ocLast.i,finish.i,pFirst.i,pLast.i
+  ; Each partition owns its input window. Gather once per spatial span,
+  ; then reuse it across that span's output-channel blocks. No reduction
+  ; or output write is shared; short/unsupported paths use the original Q.
+  Protected inputPack.i=0,inputStep.i=PmI8ConvInputPackStride(*g),packPart.i,packTake.i,packSrc.i,packDst.i
+  Protected qp.i=PmI8ConvRow(*g)
+  If inputStep<>0 And PmConvPackedWeight=*g\Weight And PmConvFourWeight=*g\Weight
+   packPart=(tile-PmI8ConvTile(*g,0))/#PMI8_TILE_STRIDE
+   inputPack=((PmI8ConvTile(*g,0)+#PMI8_TILE_BYTES+63) & -64)+packPart*inputStep* *g\InChannels
+  EndIf
   While first<last
     ; Sixty-four positions keep the input window hot across output channels.
     ; Complete reductions and disjoint writes are unchanged by the tile size.
@@ -2560,7 +2603,19 @@ Procedure.i PmConvWorkWorker(*p.i)
     ocLast=oc+(finish-first)*4 : If ocLast>(group+1)*og : ocLast=(group+1)*og : EndIf
     pFirst=(first/(blocks* *g\Groups))*64
     pLast=pFirst+64 : If pLast>*g\OutWidth : pLast=*g\OutWidth : EndIf
-    PmI8Conv1DNeonPositionRange(*g,bn,oc,ocLast,tile,pFirst,pLast)
+    ; Copy only when at least four output-row blocks reuse this window.
+    ; Small channel counts and partition fragments keep the original path.
+    If inputPack<>0 And finish-first>=4
+     ; Both ends of the source row are padded to16 bytes. Rounding this
+     ; private copy up therefore remains inside the original row, including
+     ; the final partial output span. The reserved destination row is128.
+     packTake=PmI8Align(((pLast-pFirst+15) & -16)+(*g\Kernel-1)* *g\Dilation)
+     packSrc=PmI8Base()+pFirst : packDst=inputPack
+     PmTensorCopyRowsAlignedNeon(packSrc,packDst,qp,inputStep,packTake,*g\InChannels)
+     PmI8Conv1DNeonPackedRange(*g,bn,oc,ocLast,tile,pFirst,pLast,inputPack,inputStep)
+    Else
+     PmI8Conv1DNeonPositionRange(*g,bn,oc,ocLast,tile,pFirst,pLast)
+    EndIf
     first=finish
   Wend
   ProcedureReturn 0
