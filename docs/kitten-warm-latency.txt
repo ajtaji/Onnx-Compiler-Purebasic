@@ -313,3 +313,15 @@ Packed INT8 MatMul now traverses weight-column tiles before multiple row blocks 
 Normal random draws now run four counter streams in SIMD. Exact exponent-field normalization replaces power-of-two division/scaling, with the same log, Newton and Taylor floating operations, scalar tails, mean/scale rounding and zero-radius handling. Every radial mantissa (16777216 values) was checked against the existing scalar method with varied angle octants; all output words matched. Seeded streams, counter/request boundaries and output guards also passed. Large normal-draw cases improved about 2.8 times; full-model random-node time fell from 205 to 75.5 ms across eight replies.
 
 Combined silent four-core measurements (resident weights, fresh text each time): first PCM milliseconds 501/498/509/492/727/920/671/498; complete generation 820/761/856/727/1714/2584/1623/761 ms. Real-time factors .751/.808/.734/.793/.732/.691/.724/.808 leave about 19-31 percent compute margin. All eight full waveform checksums remain unchanged. These are PCM-generation measurements, not Bluetooth packet/speaker onset. No Bluetooth audio or map demo was played; that end-to-end budget remains unproven for this new runtime.
+
+2026-10-21: exact native softmax. The FP32 maximum and ascending sum retain
+reference ordering; subtraction and division are independent SIMD lanes.
+Binary64 Exp uses a midpoint guard and the original scalar fallback.
+32 Exp cases and 40 softmax cases matched every output word and guards on
+the real Pi, including exceptional values and in-place operation. R31 full
+four-core model preserved all eight waveform CRCs. First PCM milliseconds:
+496/491/503/487/718/895/646/492. Total generation milliseconds:
+813/754/851/721/1709/2560/1600/755. Silent RTF range .684-.802 (20-32%
+compute margin), approximately 17% less aggregate generation time than R1.
+Weights resident; text preparation included. No Bluetooth playback/map test;
+speaker onset and Bluetooth-active margin still require verification.

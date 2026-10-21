@@ -2824,7 +2824,11 @@ EndProcedure
 
 Procedure PmNormRowsRange(src.i,scale.i,bias.i,dst.i,rows.i,width.i,epsilon.f,op.i)
   If op=0
+    CompilerIf #PMD_NATIVE_BYTES=8 And #PMO_USE_EXPLOG=1
+    PmTensorSoftmaxExactA64(src,dst,rows,width)
+    CompilerElse
     PmTensorSoftmaxLast(src,dst,rows,width)
+    CompilerEndIf
   Else
     CompilerIf #PMD_NATIVE_BYTES=8
     Protected norm.PmTensorLayerNormArgs

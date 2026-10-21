@@ -7414,3 +7414,297 @@ EndProcedure
 
 
 CompilerEndIf
+
+CompilerIf #PMD_NATIVE_BYTES=8 And #PMO_USE_EXPLOG=1
+; Softmax retains the reference maximum, sequential FP32 sum and division.
+; Exp admits finite |x|<=87 only (normal FP32 results). A degree-12 binary64
+; Horner chain on |r|<=ln(2)/2 has relative error below 2e-14 including range
+; reduction. A 1024-binary64-ULP guard around every FP32 midpoint exceeds
+; that bound. Guarded groups, exceptional inputs and scalar tails use the
+; original correctly rounded ExpBits. No FP32 reduction is contracted.
+Procedure PmTensorExpExactA64(src.i,dst.i,count.i)
+  ASM
+    cmp x2, #0
+    b.le pmoExpExactDone
+pmoExpExactSetup:
+    adrp x9, pmoExpExactC16
+    add x9, x9, #:lo12:pmoExpExactC16
+    ld1 {v16.2d}, [x9]
+    adrp x9, pmoExpExactC17
+    add x9, x9, #:lo12:pmoExpExactC17
+    ld1 {v17.2d}, [x9]
+    adrp x9, pmoExpExactC18
+    add x9, x9, #:lo12:pmoExpExactC18
+    ld1 {v18.2d}, [x9]
+    adrp x9, pmoExpExactC19
+    add x9, x9, #:lo12:pmoExpExactC19
+    ld1 {v19.2d}, [x9]
+    adrp x9, pmoExpExactC20
+    add x9, x9, #:lo12:pmoExpExactC20
+    ld1 {v20.2d}, [x9]
+    adrp x9, pmoExpExactC21
+    add x9, x9, #:lo12:pmoExpExactC21
+    ld1 {v21.2d}, [x9]
+    adrp x9, pmoExpExactC22
+    add x9, x9, #:lo12:pmoExpExactC22
+    ld1 {v22.2d}, [x9]
+    adrp x9, pmoExpExactC23
+    add x9, x9, #:lo12:pmoExpExactC23
+    ld1 {v23.2d}, [x9]
+    adrp x9, pmoExpExactC24
+    add x9, x9, #:lo12:pmoExpExactC24
+    ld1 {v24.2d}, [x9]
+    adrp x9, pmoExpExactC25
+    add x9, x9, #:lo12:pmoExpExactC25
+    ld1 {v25.2d}, [x9]
+    adrp x9, pmoExpExactC26
+    add x9, x9, #:lo12:pmoExpExactC26
+    ld1 {v26.2d}, [x9]
+    adrp x9, pmoExpExactC27
+    add x9, x9, #:lo12:pmoExpExactC27
+    ld1 {v27.2d}, [x9]
+    adrp x9, pmoExpExactC28
+    add x9, x9, #:lo12:pmoExpExactC28
+    ld1 {v28.2d}, [x9]
+    adrp x9, pmoExpExactC29
+    add x9, x9, #:lo12:pmoExpExactC29
+    ld1 {v29.2d}, [x9]
+    adrp x9, pmoExpExactC30
+    add x9, x9, #:lo12:pmoExpExactC30
+    ld1 {v30.2d}, [x9]
+    adrp x9, pmoExpExactC31
+    add x9, x9, #:lo12:pmoExpExactC31
+    ld1 {v31.2d}, [x9]
+pmoExpExactLoop:
+    cmp x2, #4
+    b.lt pmoExpExactTail
+    ld1 {v7.4s}, [x0]
+    shl v6.4s, v7.4s, #1
+    movz w9, #34140, lsl #16
+    dup v5.4s, w9
+    cmhi v6.4s, v6.4s, v5.4s
+    umaxv s6, v6.4s
+    fmov w9, s6
+    cbnz w9, pmoExpExactGroup
+    .word 0x0E6178E0
+    .word 0x4E6178E1
+    fmul v2.2d, v0.2d, v16.2d
+    fmul v3.2d, v1.2d, v16.2d
+    frintn v2.2d, v2.2d
+    frintn v3.2d, v3.2d
+    fmls v0.2d, v2.2d, v17.2d
+    fmls v1.2d, v3.2d, v17.2d
+    fmls v0.2d, v2.2d, v18.2d
+    fmls v1.2d, v3.2d, v18.2d
+    fcvtzs v2.2d, v2.2d
+    fcvtzs v3.2d, v3.2d
+    mov x9, #1023
+    dup v4.2d, x9
+    add v2.2d, v2.2d, v4.2d
+    add v3.2d, v3.2d, v4.2d
+    shl v2.2d, v2.2d, #52
+    shl v3.2d, v3.2d, #52
+    mov v4.16b, v19.16b
+    mov v5.16b, v19.16b
+    mov v6.16b, v20.16b
+    fmla v6.2d, v4.2d, v0.2d
+    mov v7.16b, v20.16b
+    fmla v7.2d, v5.2d, v1.2d
+    mov v4.16b, v21.16b
+    fmla v4.2d, v6.2d, v0.2d
+    mov v5.16b, v21.16b
+    fmla v5.2d, v7.2d, v1.2d
+    mov v6.16b, v22.16b
+    fmla v6.2d, v4.2d, v0.2d
+    mov v7.16b, v22.16b
+    fmla v7.2d, v5.2d, v1.2d
+    mov v4.16b, v23.16b
+    fmla v4.2d, v6.2d, v0.2d
+    mov v5.16b, v23.16b
+    fmla v5.2d, v7.2d, v1.2d
+    mov v6.16b, v24.16b
+    fmla v6.2d, v4.2d, v0.2d
+    mov v7.16b, v24.16b
+    fmla v7.2d, v5.2d, v1.2d
+    mov v4.16b, v25.16b
+    fmla v4.2d, v6.2d, v0.2d
+    mov v5.16b, v25.16b
+    fmla v5.2d, v7.2d, v1.2d
+    mov v6.16b, v26.16b
+    fmla v6.2d, v4.2d, v0.2d
+    mov v7.16b, v26.16b
+    fmla v7.2d, v5.2d, v1.2d
+    mov v4.16b, v27.16b
+    fmla v4.2d, v6.2d, v0.2d
+    mov v5.16b, v27.16b
+    fmla v5.2d, v7.2d, v1.2d
+    mov v6.16b, v28.16b
+    fmla v6.2d, v4.2d, v0.2d
+    mov v7.16b, v28.16b
+    fmla v7.2d, v5.2d, v1.2d
+    mov v4.16b, v29.16b
+    fmla v4.2d, v6.2d, v0.2d
+    mov v5.16b, v29.16b
+    fmla v5.2d, v7.2d, v1.2d
+    mov v6.16b, v30.16b
+    fmla v6.2d, v4.2d, v0.2d
+    mov v7.16b, v30.16b
+    fmla v7.2d, v5.2d, v1.2d
+    mov v4.16b, v31.16b
+    mov v5.16b, v31.16b
+    fmla v4.2d, v6.2d, v0.2d
+    fmla v5.2d, v7.2d, v1.2d
+    fmul v6.2d, v4.2d, v2.2d
+    fmul v7.2d, v5.2d, v3.2d
+    movz x9, #8192, lsl #32
+    dup v4.2d, x9
+    shl v0.2d, v6.2d, #35
+    shl v1.2d, v7.2d, #35
+    fneg v0.2d, v0.2d
+    fneg v1.2d, v1.2d
+    abs v0.2d, v0.2d
+    abs v1.2d, v1.2d
+    cmhi v0.2d, v4.2d, v0.2d
+    cmhi v1.2d, v4.2d, v1.2d
+    orr v0.16b, v0.16b, v1.16b
+    addp v0.2d, v0.2d, v0.2d
+    fmov x9, d0
+    cbnz x9, pmoExpExactGroup
+    .word 0x0E6168C0
+    .word 0x4E6168E0
+    st1 {v0.4s}, [x1]
+    add x0, x0, #16
+    add x1, x1, #16
+    sub x2, x2, #4
+    b pmoExpExactLoop
+pmoExpExactGroup:
+    stp x0, x1, [sp, #-32]!
+    str x2, [sp, #16]
+    ldr x9, [sp]
+    ldr w0, [x9, #0]
+    bl pmtensorexpbits
+    ldr x9, [sp, #8]
+    str w0, [x9, #0]
+    ldr x9, [sp]
+    ldr w0, [x9, #4]
+    bl pmtensorexpbits
+    ldr x9, [sp, #8]
+    str w0, [x9, #4]
+    ldr x9, [sp]
+    ldr w0, [x9, #8]
+    bl pmtensorexpbits
+    ldr x9, [sp, #8]
+    str w0, [x9, #8]
+    ldr x9, [sp]
+    ldr w0, [x9, #12]
+    bl pmtensorexpbits
+    ldr x9, [sp, #8]
+    str w0, [x9, #12]
+    ldp x0, x1, [sp]
+    ldr x2, [sp, #16]
+    add sp, sp, #32
+    add x0, x0, #16
+    add x1, x1, #16
+    sub x2, x2, #4
+    cmp x2, #4
+    b.ge pmoExpExactSetup
+pmoExpExactTail:
+    cmp x2, #0
+    b.le pmoExpExactDone
+    stp x0, x1, [sp, #-32]!
+    str x2, [sp, #16]
+    ldr w0, [x0]
+    bl pmtensorexpbits
+    ldr x9, [sp, #8]
+    str w0, [x9]
+    ldp x0, x1, [sp]
+    ldr x2, [sp, #16]
+    add sp, sp, #32
+    add x0, x0, #4
+    add x1, x1, #4
+    sub x2, x2, #1
+    b pmoExpExactTail
+pmoExpExactDone:
+  EndASM
+EndProcedure
+DataSection
+ pmoExpExactC16:
+ Data.l $652B82FE,$3FF71547,$652B82FE,$3FF71547
+ pmoExpExactC17:
+ Data.l $FEE00000,$3FE62E42,$FEE00000,$3FE62E42
+ pmoExpExactC18:
+ Data.l $00000000,$3DEA39EF,$00000000,$3DEA39EF
+ pmoExpExactC19:
+ Data.l $EFF8D898,$3E21EED8,$EFF8D898,$3E21EED8
+ pmoExpExactC20:
+ Data.l $67F544E4,$3E5AE645,$67F544E4,$3E5AE645
+ pmoExpExactC21:
+ Data.l $B7789F5C,$3E927E4F,$B7789F5C,$3E927E4F
+ pmoExpExactC22:
+ Data.l $A556C734,$3EC71DE3,$A556C734,$3EC71DE3
+ pmoExpExactC23:
+ Data.l $1A01A01A,$3EFA01A0,$1A01A01A,$3EFA01A0
+ pmoExpExactC24:
+ Data.l $1A01A01A,$3F2A01A0,$1A01A01A,$3F2A01A0
+ pmoExpExactC25:
+ Data.l $16C16C17,$3F56C16C,$16C16C17,$3F56C16C
+ pmoExpExactC26:
+ Data.l $11111111,$3F811111,$11111111,$3F811111
+ pmoExpExactC27:
+ Data.l $55555555,$3FA55555,$55555555,$3FA55555
+ pmoExpExactC28:
+ Data.l $55555555,$3FC55555,$55555555,$3FC55555
+ pmoExpExactC29:
+ Data.l $00000000,$3FE00000,$00000000,$3FE00000
+ pmoExpExactC30:
+ Data.l $00000000,$3FF00000,$00000000,$3FF00000
+ pmoExpExactC31:
+ Data.l $00000000,$3FF00000,$00000000,$3FF00000
+EndDataSection
+
+Procedure.i PmSoftmaxMaxBitsA64(src.i,count.i)
+ ASM
+  ldr s0, [x0], #4
+  sub x1, x1, #1
+pmoSoftmaxMaxLoop:
+  cmp x1, #0
+  b.le pmoSoftmaxMaxDone
+  ldr s1, [x0], #4
+  fcmp s1, s0
+  b.le pmoSoftmaxMaxKeep
+  fmov s0, s1
+pmoSoftmaxMaxKeep:
+  sub x1, x1, #1
+  b pmoSoftmaxMaxLoop
+pmoSoftmaxMaxDone:
+  fmov w0, s0
+ EndASM
+EndProcedure
+Procedure.i PmSoftmaxSumBitsA64(src.i,count.i)
+ ASM
+  movi v0.4s, #0
+pmoSoftmaxSumLoop:
+  cmp x1, #0
+  b.le pmoSoftmaxSumDone
+  ldr s1, [x0], #4
+  fadd s0, s0, s1
+  sub x1, x1, #1
+  b pmoSoftmaxSumLoop
+pmoSoftmaxSumDone:
+  fmov w0, s0
+ EndASM
+EndProcedure
+Procedure PmTensorSoftmaxExactA64(src.i,dst.i,outer.i,width.i)
+ Protected row.i,ps.i,pd.i,mx.f,sum.f
+ If width<1 Or outer<1 : ProcedureReturn : EndIf
+ For row=0 To outer-1
+  ps=src+row*width*4 : pd=dst+row*width*4
+  PokeL(@mx,PmSoftmaxMaxBitsA64(ps,width))
+  PmTensorBinaryFp32Neon(ps,@mx,pd,width,1,0,1)
+  PmTensorExpExactA64(pd,pd,width)
+  PokeL(@sum,PmSoftmaxSumBitsA64(pd,width))
+  PmTensorBinaryFp32Neon(pd,@sum,pd,width,1,0,3)
+ Next
+EndProcedure
+
+CompilerEndIf
