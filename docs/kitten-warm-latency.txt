@@ -113,3 +113,29 @@ SBC frames, despite reducing the maximum whole-model step from74.4 to42.8ms.
 This resize improvement does not establish sufficient whole-application audio
 headroom. Further compiler-runtime kernel work is required before another
 route listening test; the30FPS experiment is not the installed application.
+
+Convolution quantization now converts four independent column maxima into
+scales and reciprocals with exact FP32 divides, preserving zero/tiny handling
+and stopping at the same invalid magnitude as the scalar conversion.24 real
+Pi cases matched both arrays, failure return, unwritten suffix and guards.
+4097 conversions improved from0.495ms to0.0246ms per pass, approximately20x.
+
+Four-core convolution quantization now starts at128 input positions when
+there are at least16384 channel-position elements, instead of1024 positions.
+Its contiguous and phase-scattered workers use the exact vector scale helper.
+24 complete quantization cases and24 complete convolution comparisons passed
+on the Pi, including odd widths129/513/3121/65, strides1/3/10, narrow/wide
+activations and weights, signed zero, subnormals, tiny threshold and NaN fault
+rejection. Valid quantized bytes, scale/reciprocal bits, output bits and guards
+matched. Representative strided quantization improved6.3-6.5ms to0.23ms;
+complete strided convolutions improved6.8-7.0ms to0.74-0.77ms. Large stride-one
+convolutions gained little in total, despite faster quantization. These are
+operator measurements, not a whole-Kitten headroom or reply-latency claim.
+
+Rejected experiments: widening the narrow integer tile was slower; simply
+rescheduling independent FP32 transposed-convolution operations did not help.
+A register-tiled stride-six prototype matched20 cases and improved one large
+case about30percent but remains experimental. Keeping all taps inside one
+native integer tile improved tested stride-one cases only2-6percent on one
+core; it is not shipped. Further work should target the dominant stride-one
+convolutions rather than extrapolating the strided quantization gain.

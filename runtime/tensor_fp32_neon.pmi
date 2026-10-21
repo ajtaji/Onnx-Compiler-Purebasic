@@ -2095,12 +2095,9 @@ Procedure.i PmConvQuantWorker(*p.i)
   ca\Src=src+first*4 : ca\Rows=*g\InChannels : ca\RowBytes=*g\InWidth*4
   ca\Cols=last-first : ca\Out=scales+(*g\PadLeft+first)*4
   PmI8ColMaxNeon(@ca)
-  For x=first To last-1
-    If PmI8RowScale(PeekL(scales+(*g\PadLeft+x)*4),qmax,scales+(*g\PadLeft+x)*4,inv+(*g\PadLeft+x)*4)=0
-      PmTensorInt8Fault=1
-      ProcedureReturn 1
-    EndIf
-  Next
+  If PmI8RowScalesA64(scales+(*g\PadLeft+first)*4,qmax,scales+(*g\PadLeft+first)*4,inv+(*g\PadLeft+first)*4,last-first)=0
+    PmTensorInt8Fault=1 : ProcedureReturn 1
+  EndIf
   For c=0 To *g\InChannels-1
     PmI8QuantLanes(src+(c* *g\InWidth+first)*4,inv+(*g\PadLeft+first)*4,last-first,qmax,q+(c*qp+ *g\PadLeft+first)*es)
   Next
@@ -2129,12 +2126,13 @@ Procedure.i PmConvQuantStridedWorker(*p.i)
     PmKernelIdle()
     take=last-x : If take>16 : take=16 : EndIf
     ca\Src=src+x*4 : ca\Cols=take : PmI8ColMaxNeon(@ca)
+    If PmI8RowScalesA64(@maxima(0),qmax,@maxima(0),@inverses(0),take)=0
+      PmTensorInt8Fault=1 : ProcedureReturn 1
+    EndIf
     For lane=0 To take-1
       at=((*g\PadLeft+x+lane)% *g\Stride)*phase+(*g\PadLeft+x+lane)/ *g\Stride
       positions(lane)=at
-      If PmI8RowScale(PeekL(@maxima(0)+lane*4),qmax,scales+at*4,@inverses(0)+lane*4)=0
-        PmTensorInt8Fault=1 : ProcedureReturn 1
-      EndIf
+      PokeL(scales+at*4,PeekL(@maxima(0)+lane*4))
       PokeL(inv+at*4,PeekL(@inverses(0)+lane*4))
     Next
     For c=0 To *g\InChannels-1
@@ -2161,7 +2159,9 @@ Procedure.i PmParallelConvQuantize(*g.PmTensorConv1DArgs,bn.i)
   Protected last.i
   Protected c.i
   Protected x.i
-  If *g\Stride>=1 And *g\InWidth>=1024 And *g\InWidth* *g\InChannels>=16384
+  ; Short vocoder rows still contain substantial channel work. At least
+  ;128 positions gives each partition a useful aligned column range.
+  If *g\Stride>=1 And *g\InWidth>=128 And *g\InWidth* *g\InChannels>=16384
     parts=PmParallelCores()
     If parts>4 : parts=4 : EndIf
   EndIf
