@@ -5718,35 +5718,17 @@ Procedure PmI8SingleRowTileA64(*a.PmI8TileArgs)
   movi v18.4s, #0
   movi v19.4s, #0
   cbz x3, pmoI8SingleFlush
-; Quantized activations are within [-127,127]; two signed8 products
-; sum within signed16 (maximum magnitude32512) before widening.
 pmoI8SingleLoop:
-  cmp x3,#2
-  b.lt pmoI8SingleTail
-  ld1 {v0.16b},[x1],x2
-  ld1 {v1.16b},[x1],x2
-  ld1r {v4.16b},[x10],x14
-  ld1r {v5.16b},[x10],x14
-  smull v6.8h,v0.8b,v4.8b
-  smull2 v7.8h,v0.16b,v4.16b
-  smlal v6.8h,v1.8b,v5.8b
-  smlal2 v7.8h,v1.16b,v5.16b
-  saddw v16.4s,v16.4s,v6.4h
-  saddw2 v17.4s,v17.4s,v6.8h
-  saddw v18.4s,v18.4s,v7.4h
-  saddw2 v19.4s,v19.4s,v7.8h
-  sub x3,x3,#2
-  b pmoI8SingleLoop
-pmoI8SingleTail:
-  cbz x3,pmoI8SingleFlush
-  ld1 {v0.16b},[x1],x2
-  ld1r {v4.16b},[x10],x14
-  smull v6.8h,v0.8b,v4.8b
-  smull2 v7.8h,v0.16b,v4.16b
-  saddw v16.4s,v16.4s,v6.4h
-  saddw2 v17.4s,v17.4s,v6.8h
-  saddw v18.4s,v18.4s,v7.4h
-  saddw2 v19.4s,v19.4s,v7.8h
+  ld1 {v0.16b}, [x1], x2
+  ld1r {v4.16b}, [x10], x14
+  smull v6.8h, v0.8b, v4.8b
+  smull2 v7.8h, v0.16b, v4.16b
+  saddw v16.4s, v16.4s, v6.4h
+  saddw2 v17.4s, v17.4s, v6.8h
+  saddw v18.4s, v18.4s, v7.4h
+  saddw2 v19.4s, v19.4s, v7.8h
+  subs x3, x3, #1
+  b.ne pmoI8SingleLoop
 pmoI8SingleFlush:
   scvtf v16.4s, v16.4s
   scvtf v17.4s, v17.4s
