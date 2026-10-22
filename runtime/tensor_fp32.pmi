@@ -5703,6 +5703,58 @@ CompilerIf #PMO_INT8_BACKEND = 1
 ; F1 (and F2) of rows at the four pointers stored at tile+784 against sixteen
 ; columns c0.. of a [K][N] INT8 weight: lanes are weight columns, the
 ; broadcast rows are quantized activations, one scale per row at tile+768.
+
+; One real activation row against sixteen INT8 columns. The surrounding
+; quantization, binary32 scaling and output epilogue remain unchanged.
+Procedure PmI8SingleRowTileA64(*a.PmI8TileArgs)
+ ASM
+  ldr x1, [x0, #0]
+  ldr x2, [x0, #8]
+  ldr x10, [x0, #16]
+  ldr x14, [x0, #48]
+  ldr x3, [x0, #56]
+  movi v16.4s, #0
+  movi v17.4s, #0
+  movi v18.4s, #0
+  movi v19.4s, #0
+  cbz x3, pmoI8SingleFlush
+pmoI8SingleLoop:
+  ld1 {v0.16b}, [x1], x2
+  ld1r {v4.16b}, [x10], x14
+  smull v6.8h, v0.8b, v4.8b
+  smull2 v7.8h, v0.16b, v4.16b
+  saddw v16.4s, v16.4s, v6.4h
+  saddw2 v17.4s, v17.4s, v6.8h
+  saddw v18.4s, v18.4s, v7.4h
+  saddw2 v19.4s, v19.4s, v7.8h
+  subs x3, x3, #1
+  b.ne pmoI8SingleLoop
+pmoI8SingleFlush:
+  scvtf v16.4s, v16.4s
+  scvtf v17.4s, v17.4s
+  scvtf v18.4s, v18.4s
+  scvtf v19.4s, v19.4s
+  ldr x5, [x0, #64]
+  ldr x6, [x0, #72]
+  ld1r {v4.4s}, [x6]
+  fmul v16.4s, v16.4s, v4.4s
+  fmul v17.4s, v17.4s, v4.4s
+  fmul v18.4s, v18.4s, v4.4s
+  fmul v19.4s, v19.4s, v4.4s
+  movi v0.4s, #0
+  fadd v16.4s, v0.4s, v16.4s
+  fadd v17.4s, v0.4s, v17.4s
+  fadd v18.4s, v0.4s, v18.4s
+  fadd v19.4s, v0.4s, v19.4s
+  st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5]
+ EndASM
+EndProcedure
+Procedure PmI8ColumnOneNeon(b.i,n.i,c0.i,k.i,tile.i)
+ Protected ta.PmI8TileArgs
+ ta\L=b+c0 : ta\LStep=n : ta\P0=PeekI(tile+784) : ta\PStep=1
+ ta\Count=k : ta\F=tile : ta\S=tile+768
+ PmI8SingleRowTileA64(@ta)
+EndProcedure
 Procedure PmI8ColumnTileNeon(*b.i, elements.i, n.i, c0.i, k.i, wide.i, tile.i)
   Protected ta.PmI8TileArgs
   Protected k0.i
@@ -6212,7 +6264,9 @@ Procedure.i PmI8MatMulNeonColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,la
       r0=0
       While r0<*g\M
         rows=PmI8RowBlock(q,s,*g\M,*g\K,1+ *g\Wide,r0,tile)
-        If mask<>0
+        If rows=1 And *g\Wide=0
+          PmI8ColumnOneNeon(packed+c0* *g\K,16,0,*g\K,tile)
+        ElseIf mask<>0
           PmMatrixFourColumn(packed+c0* *g\K,*g\K,tile,mask+(c0/16)*(*g\K/4))
         Else
           PmI8ColumnTileNeon(packed+c0* *g\K,(*g\N & -16)* *g\K,16,0,*g\K,*g\Wide,tile)
@@ -6234,13 +6288,19 @@ Procedure.i PmI8MatMulNeonColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,la
     c0 = first
     While c0 < n16
       If packed<>0
-        If mask<>0
+        If rows=1 And *g\Wide=0
+          PmI8ColumnOneNeon(packed+c0* *g\K,16,0,*g\K,tile)
+        ElseIf mask<>0
           PmMatrixFourColumn(packed+c0* *g\K,*g\K,tile,mask+(c0/16)*(*g\K/4))
         Else
           PmI8ColumnTileNeon(packed+c0* *g\K, (*g\N & -16)* *g\K, 16, 0, *g\K, *g\Wide, tile)
         EndIf
       Else
-        PmI8ColumnTileNeon(*g\B, *g\Elements, *g\N, c0, *g\K, *g\Wide, tile)
+        If rows=1 And *g\Wide=0
+          PmI8ColumnOneNeon(*g\B,*g\N,c0,*g\K,tile)
+        Else
+          PmI8ColumnTileNeon(*g\B, *g\Elements, *g\N, c0, *g\K, *g\Wide, tile)
+        EndIf
       EndIf
       ea\F1 = tile : ea\F2 = 0 : If *g\Wide <> 0 : ea\F2 = tile + 256 : EndIf
       ea\WS = *g\Scales + c0 * 4 : ea\Bias = 0

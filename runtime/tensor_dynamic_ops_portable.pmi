@@ -44,10 +44,10 @@ Procedure.i DOpUnaryWorker(p.i)
 EndProcedure
 CompilerEndIf
 Procedure DOpRunUnary(src.i,dst.i,count.i,op.i,kind.i)
- If (op=6 Or op=13) And kind=1 : PmOpInit() : EndIf
+ If (op=4 Or op=6 Or op=13) And kind=1 : PmOpInit() : EndIf
  CompilerIf #PMD_NATIVE_BYTES=8
  Protected parts.i=1,i.i,first.i,last.i,at.i
- If kind=1 And (op=0 Or op=6 Or op=12 Or op=13) And count>=1024
+ If kind=1 And (op=0 Or op=4 Or op=6 Or op=12 Or op=13) And count>=1024
   PmOpInit() : PmOpTrigInit()
   parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
   If parts>1

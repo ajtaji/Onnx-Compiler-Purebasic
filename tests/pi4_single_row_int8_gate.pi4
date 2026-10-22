@@ -1,0 +1,233 @@
+; Single-row INT8 matrix/tail dispatch checked against the preceding full matrix path.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+
+Procedure.i RefMatMulColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,last.i)
+  Protected packed.i=PmI8PackFind(*g\B,*g\K,*g\N,*g\Wide)
+  Protected mask.i
+  If *g\Wide=0 : mask=PmMatrixFourCacheFind(*g\B,*g\K,*g\N) : EndIf
+  Protected ea.PmI8EpiArgs
+  Protected n16.i
+  Protected r0.i
+  Protected rows.i
+  Protected c0.i
+  n16 = last & -16
+  If n16 = 0 : ProcedureReturn 0 : EndIf
+  If packed<>0 And *g\M>=8
+    c0=first
+    While c0<n16
+      r0=0
+      While r0<*g\M
+        rows=PmI8RowBlock(q,s,*g\M,*g\K,1+ *g\Wide,r0,tile)
+        If mask<>0
+          PmMatrixFourColumn(packed+c0* *g\K,*g\K,tile,mask+(c0/16)*(*g\K/4))
+        Else
+          PmI8ColumnTileNeon(packed+c0* *g\K,(*g\N & -16)* *g\K,16,0,*g\K,*g\Wide,tile)
+        EndIf
+        ea\F1=tile : ea\F2=0 : If *g\Wide<>0 : ea\F2=tile+256 : EndIf
+        ea\WS=*g\Scales+c0*4 : ea\Bias=0
+        ea\Dst=*g\Dst+(r0* *g\N+c0)*4 : ea\DStride=*g\N*4
+        ea\Rows=rows : ea\LaneScale=1
+        PmI8EpiNeon(@ea)
+        r0=r0+4
+      Wend
+      c0=c0+16
+    Wend
+    ProcedureReturn n16
+  EndIf
+  r0 = 0
+  While r0 < *g\M
+    rows = PmI8RowBlock(q, s, *g\M, *g\K, 1 + *g\Wide, r0, tile)
+    c0 = first
+    While c0 < n16
+      If packed<>0
+        If mask<>0
+          PmMatrixFourColumn(packed+c0* *g\K,*g\K,tile,mask+(c0/16)*(*g\K/4))
+        Else
+          PmI8ColumnTileNeon(packed+c0* *g\K, (*g\N & -16)* *g\K, 16, 0, *g\K, *g\Wide, tile)
+        EndIf
+      Else
+        PmI8ColumnTileNeon(*g\B, *g\Elements, *g\N, c0, *g\K, *g\Wide, tile)
+      EndIf
+      ea\F1 = tile : ea\F2 = 0 : If *g\Wide <> 0 : ea\F2 = tile + 256 : EndIf
+      ea\WS = *g\Scales + c0 * 4 : ea\Bias = 0
+      ea\Dst = *g\Dst + (r0 * *g\N + c0) * 4 : ea\DStride = *g\N * 4
+      ea\Rows = rows : ea\LaneScale = 1
+      PmI8EpiNeon(@ea)
+      c0 = c0 + 16
+    Wend
+    r0 = r0 + 4
+  Wend
+  ProcedureReturn n16
+EndProcedure
+Procedure.i RefMatMulScratch(*g.PmI8MatMulArgs,scratch.i,scratchBytes.i,first.i,last.i)
+  Protected es.i
+  Protected qmax.i
+  Protected need.i
+  Protected q.i
+  Protected s.i
+  Protected inv.i
+  Protected tile.i
+  Protected r.i
+  Protected c.i
+  Protected col0.i
+  Protected f1.f
+  Protected f2.f
+  Protected v.f
+  If *g\M <= 0 Or *g\N <= 0 : ProcedureReturn 1 : EndIf
+  es = 1 + *g\Wide
+  qmax = 127 : If *g\Wide <> 0 : qmax = 32767 : EndIf
+  need = PmI8ScratchBytes(*g\M * *g\K, *g\M, *g\Wide)
+  If scratch = 0 Or need > scratchBytes
+    PmTensorInt8Fault = 2 : ProcedureReturn 0
+  EndIf
+  q = PmI8Align(scratch)
+  s = q + PmI8Align(*g\M * *g\K * es)
+  inv = s + PmI8Align(*g\M * 4)
+  tile = inv + PmI8Align(*g\M * 4)
+  r = 0
+  While r < *g\M
+    CompilerIf #PMO_INT8_BACKEND=1
+    PmKernelIdle()
+    CompilerEndIf
+    If PmI8QuantRow(*g\A + r * *g\K * 4, *g\K, 4, qmax, q + r * *g\K * es, s + r * 4, inv + r * 4) = 0
+      PmTensorInt8Fault = 1 : ProcedureReturn 0
+    EndIf
+    r = r + 1
+  Wend
+  col0 = first
+  CompilerIf #PMO_INT8_BACKEND = 1
+  col0 = RefMatMulColumns(*g, q, s, tile,first,last)
+  CompilerEndIf
+  r = 0
+  While r < *g\M
+    CompilerIf #PMO_INT8_BACKEND=1
+    PmKernelIdle()
+    CompilerEndIf
+    c = col0
+    While c < last
+      f1 = PmI8RowF(0.0, q + r * *g\K * es, es, *g\B + c, *g\N, *g\K, *g\Wide, PmI8GetF(s + r * 4))
+      f2 = 0.0
+      If *g\Wide <> 0
+        f2 = PmI8RowF(0.0, q + r * *g\K * es, es, *g\B + *g\Elements + c, *g\N, *g\K, 1, PmI8GetF(s + r * 4))
+      EndIf
+      v = PmI8Finish(f1, f2, *g\Wide, PmI8GetF(*g\Scales + c * 4))
+      PmI8PutF(*g\Dst + (r * *g\N + c) * 4, v)
+      c = c + 1
+    Wend
+    r = r + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main(services.i)
+ Protected i.i,j.i,row.i,col.i,plane.i,source.i,dest.i,k.i,n.i,wide.i,count.i,rc.i,mi.i,ki.i,ni.i,tests.i,bytes.i,expected.i
+ Protected value.f
+ Protected g.PmI8MatMulArgs
+ Protected Dim ms.i(5)
+ Protected Dim ks.i(7)
+ Protected Dim ns.i(7)
+ Protected *pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ PmI8PackReset($D6900000,$100000)
+ For i=0 To 255
+  source=$D6800000+i*1024 : wide=i & 1
+  For j=0 To 1023 : PokeA(source+j,(i*19+j*37) & 255) : Next
+  If PmI8PackWeight(source,32,16,wide)=0 : rc=21 : Break : EndIf
+  dest=PmI8PackFind(source,32,16,wide)
+  If dest=0 : rc=22 : Break : EndIf
+  For j=0 To 512*(1+wide)-1
+   If PeekA(dest+j)<>PeekA(source+j) : rc=23 : Break : EndIf
+  Next
+  If rc : Break : EndIf
+ Next
+ If rc=0 And PmI8PackCount<>256 : rc=24 : EndIf
+ If rc=0 And PmI8PackWeight($D6880000,32,16,0)<>0 : rc=25 : EndIf
+ If rc=0 And PmI8PackWeight($D6800000,32,16,0)<>1 : rc=26 : EndIf
+ If rc=0 And PmI8PackCount<>256 : rc=27 : EndIf
+ PokeI($E1C01F00,PmI8PackCount) : PokeI($E1C01F08,rc)
+ If rc : PmI8PackReset(0,0) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+ ms(0)=1 : ms(1)=4 : ms(2)=9 : ms(3)=5 : ms(4)=2
+ ks(0)=31 : ks(1)=32 : ks(2)=33 : ks(3)=1 : ks(4)=511 : ks(5)=512 : ks(6)=1024
+ ns(0)=16 : ns(1)=31 : ns(2)=32 : ns(3)=33 : ns(4)=1 : ns(5)=63 : ns(6)=64
+ For wide=0 To 1
+ For mi=0 To 4
+ For ki=0 To 6
+ For ni=0 To 6
+  g\M=ms(mi) : g\K=ks(ki) : g\N=ns(ni) : g\Wide=wide : g\Elements=g\K*g\N
+  g\A=$D6800000 : g\B=$D6810000 : g\Scales=$D68A0000 : g\Dst=$D68B0000
+  For i=0 To g\M*g\K-1 : value=(i % 17-8)/7.0 : DWriteF(g\A+i*4,value) : Next
+  For i=0 To g\Elements*(1+wide)-1 : PokeA(g\B+i,(i*37+ki*19) & 255) : Next
+  For i=0 To g\N-1 : value=(i+1)/1000.0 : DWriteF(g\Scales+i*4,value) : Next
+  PmI8PackReset(0,0) : PmTensorInt8Fault=0
+  If RefMatMulScratch(@g,$D6B00000,$100000,0,g\N)=0 : rc=31 : Break : EndIf
+  g\Dst=$D68C0000
+  If PmI8MatMulScratch(@g,$D6B00000,$100000)=0 : rc=36 : Break : EndIf
+  For i=0 To g\M*g\N*4-1
+   If PeekA($D68B0000+i)<>PeekA($D68C0000+i) : rc=37 : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  PmI8PackReset($D6900000,$100000)
+  If g\N>=16 And PmI8PackWeight(g\B,g\K,g\N,wide)=0 : rc=32 : Break : EndIf
+  dest=PmI8PackFind(g\B,g\K,g\N,wide) : n=g\N & -16
+  For plane=0 To wide
+  For col=0 To n-1 Step 16
+  For row=0 To g\K-1
+  For j=0 To 15
+   If PeekA(dest+plane*g\K*n+col*g\K+row*16+j)<>PeekA(g\B+plane*g\Elements+row*g\N+col+j) : rc=33 : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  g\Dst=$D68C0000
+  If PmI8MatMulScratch(@g,$D6B00000,$100000)=0 : rc=34 : Break : EndIf
+  For i=0 To g\M*g\N*4-1
+   If PeekA($D68B0000+i)<>PeekA($D68C0000+i) : rc=35 : Break : EndIf
+  Next
+  tests+1 : If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ PokeI($E1C01FD0,tests) : PokeI($E1C01FD8,rc) : PokeI($E1C01FE0,PmTensorInt8Fault)
+ PmI8PackReset(0,0) : MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
