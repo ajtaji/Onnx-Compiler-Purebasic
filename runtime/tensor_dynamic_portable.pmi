@@ -2766,6 +2766,7 @@ EndProcedure
 
 Procedure DGemm(Y.i,A.i,B.i,C.i,TransA.i,TransB.i,Alpha.f,Beta.f)
   Protected g.PmTensorGemmArgs
+  Protected scratch.i,bytes.i,bptr.i,at.i,ci.i,sum.f,bias.f
   DZero(@g,SizeOf(PmTensorGemmArgs))
   If Dt(A)\Kind<>1 Or (Dt(B)\Kind<>1 And Dt(B)\Kind<>3 And Dt(B)\Kind<>33) Or (C<>0 And Dt(C)\Kind<>1) Or TransA<0 Or TransA>1 Or TransB<0 Or TransB>1
     DFail("Gemm requires FLOAT activations, FLOAT/INT8 weights and valid transpose flags.")
@@ -2805,6 +2806,37 @@ Procedure DGemm(Y.i,A.i,B.i,C.i,TransA.i,TransB.i,Alpha.f,Beta.f)
     EndIf
     g\WeightScales=Dt(B)\Scales
   EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If Dt(B)\Kind=1 And (TransA=0 Or g\M=1) And g\K>0 And g\N>=16 And g\M*g\K*g\N>=1024 And (g\CCount=0 Or g\CCount=1 Or g\CCount=g\N Or g\CCount=g\M*g\N)
+    bptr=g\B
+    If TransB
+      bytes=g\K*g\N*4
+      If bytes<=DLimit-DLive : scratch=DAcquire(bytes) : EndIf
+      If scratch
+        DLive+bytes : DPeak=DMax(DPeak,DLive)
+        PmTransposeMatrixWords(g\B,scratch,g\N,g\K)
+        bptr=scratch
+      EndIf
+    EndIf
+    If TransB=0 Or scratch
+      PmFastGemm(g\A,bptr,g\Dst,g\M,g\K,g\N)
+      If scratch : DFree(scratch) : DLive-bytes : EndIf
+      For at=0 To g\M*g\N-1
+        sum=DReadF(g\Dst+at*4)
+        sum=sum*g\Alpha
+        If g\C And g\CCount>0
+          ci=at
+          If g\CCount=1 : ci=0 : ElseIf g\CCount=g\N : ci=at % g\N : EndIf
+          bias=g\Beta*DReadF(g\C+ci*4)
+          sum=sum+bias
+        EndIf
+        DWriteF(g\Dst+at*4,sum)
+        If (at & 255)=255 : PmKernelIdle() : EndIf
+      Next
+      ProcedureReturn
+    EndIf
+  EndIf
+  CompilerEndIf
   PmTensorGemm(@g)
   If Dt(B)\Kind=3 Or Dt(B)\Kind=33
     DInt8End()

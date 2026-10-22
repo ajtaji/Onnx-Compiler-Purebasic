@@ -791,3 +791,24 @@ its original waveform bytes while generation falls from2.277 to2.113s for
 2.320s of speech (ratio0.911). About9% margin is not a simultaneous-map
 proof; text tokens are prepared and the independent upstream/native FLOAT
 gate remains unmet. There is no new Bluetooth or acoustic-onset claim.
+
+
+@SECTION Gemm reuses the exact matrix kernel
+
+Eligible FLOAT Gemm nodes reuse the existing exact matrix kernel while
+retaining the original alpha multiply and beta/bias arithmetic afterward.
+Transposed B is rearranged as raw words in bounded temporary arena space;
+a shortfall retains scalar execution. Transposed A is admitted only for a
+single row, where its physical input order is unchanged. INT8 Gemm retains
+its existing path. The selection uses types, shapes and memory budget.
+
+960 independent Pi cases compare every output byte against the unchanged
+scalar Gemm, across transpose combinations, scalar/vector/full/no bias,
+signed zero, subnormal/extreme/nonfinite values, odd dimensions, empty
+reductions and unsupported-small/transpose fallback layouts. No scratch
+memory remains live after each case. The complete Pocket2m direction stays
+waveform-byte-identical and falls from2.113 to1.926 seconds for2.320 seconds
+of speech (ratio0.830). Its Gemm nodes fall from0.180 to0.024 seconds.
+This is about17% silent compute margin, using prepared text IDs. Native
+text frontend, acoustic onset and simultaneous map margin are unverified;
+the separate strict upstream/native FLOAT gate remains unmet.

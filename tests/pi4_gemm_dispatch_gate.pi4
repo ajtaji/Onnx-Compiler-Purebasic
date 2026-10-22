@@ -1,0 +1,167 @@
+; Gemm reuse of the exact matrix kernel versus the old scalar Gemm.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldDGemm(Y.i,A.i,B.i,C.i,TransA.i,TransB.i,Alpha.f,Beta.f)
+  Protected g.PmTensorGemmArgs
+  DZero(@g,SizeOf(PmTensorGemmArgs))
+  If Dt(A)\Kind<>1 Or (Dt(B)\Kind<>1 And Dt(B)\Kind<>3 And Dt(B)\Kind<>33) Or (C<>0 And Dt(C)\Kind<>1) Or TransA<0 Or TransA>1 Or TransB<0 Or TransB>1
+    DFail("Gemm requires FLOAT activations, FLOAT/INT8 weights and valid transpose flags.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Rank<>2 Or Dt(B)\Rank<>2
+    DFail("Gemm requires matrices.")
+    ProcedureReturn
+  EndIf
+  g\M=DDims((A)*8+(TransA))
+  g\K=DDims((A)*8+(1-TransA))
+  g\N=DDims((B)*8+(1-TransB))
+  If g\K<>DDims((B)*8+(TransB))
+    DFail("Gemm contraction mismatch.")
+    ProcedureReturn
+  EndIf
+  If DShape(Y,1,2,g\M,g\N,0,0)=0
+    ProcedureReturn
+  EndIf
+  g\A=Dt(A)\Data
+  g\B=Dt(B)\Data
+  g\C=Dt(C)\Data
+  g\Dst=Dt(Y)\Data
+  g\CCount=Dt(C)\Count
+  g\TransA=TransA
+  g\TransB=TransB
+  g\Alpha=Alpha
+  g\Beta=Beta
+  If Dt(B)\Kind=3 Or Dt(B)\Kind=33
+    If Dt(B)\Scales=0 Or (Dt(B)\Kind=3 And g\K>133144)
+      DFail("INT8 Gemm scales are missing or its reduction exceeds the INT32 bound.")
+      ProcedureReturn
+    EndIf
+    g\Wide=Bool(Dt(B)\Kind=33)
+    If DInt8Begin(PmI8ScratchBytes(g\M*g\K,g\M,g\Wide))=0
+      ProcedureReturn
+    EndIf
+    g\WeightScales=Dt(B)\Scales
+  EndIf
+  PmTensorGemm(@g)
+  If Dt(B)\Kind=3 Or Dt(B)\Kind=33
+    DInt8End()
+  EndIf
+EndProcedure
+Procedure.i CheckGemm(shape.i,ta.i,tb.i,biasKind.i,params.i,pattern.i)
+ Protected m.i=1,k.i=257,n.i=67,i.i,j.i,count.i,rc.i,seed.i=$12345678,bits.i,x.f,alpha.f=1.0,beta.f=1.0
+ If shape=1 : m=3 : k=127 : n=65 : EndIf
+ If shape=2 : m=2 : k=19 : n=33 : EndIf
+ If shape=3 : m=1 : k=0 : n=17 : EndIf
+ If shape=4 : m=0 : k=7 : n=19 : EndIf
+ If ta=0 : rc=DShape(1,1,2,m,k,0,0) : Else : rc=DShape(1,1,2,k,m,0,0) : EndIf
+ If rc=0 : ProcedureReturn 1 : EndIf
+ If tb=0 : rc=DShape(2,1,2,k,n,0,0) : Else : rc=DShape(2,1,2,n,k,0,0) : EndIf
+ If rc=0 : ProcedureReturn 2 : EndIf
+ count=0
+ If biasKind=1 : count=1 : EndIf
+ If biasKind=2 : count=n : EndIf
+ If biasKind=3 : count=m*n : EndIf
+ If biasKind
+  If DShape(3,1,1,count,0,0,0)=0 : ProcedureReturn 3 : EndIf
+ EndIf
+ For i=1 To 3
+  For j=0 To Dt(i)\Count-1
+   seed=(seed*1664525+1013904223) & $FFFFFFFF
+   x=(seed & $FFFF)/65536.0 : x=x-0.5 : bits=PeekL(@x)
+   If pattern
+    Select j % 16
+     Case 0 : bits=0
+     Case 1 : bits=$80000000
+     Case 2 : bits=1
+     Case 3 : bits=$007FFFFF
+     Case 4 : bits=$7F7FFFFF
+     Case 5 : bits=$7F800000
+     Case 6 : bits=$FF800000
+     Case 7 : bits=$7FC12345
+     Case 8 : bits=$7FA12345
+    EndSelect
+   EndIf
+   PokeL(Dt(i)\Data+j*4,bits)
+  Next
+ Next
+ Select params
+  Case 1 : alpha=-1.25 : beta=0.5
+  Case 2 : PokeL(@alpha,$80000000) : PokeL(@beta,$80000000)
+  Case 3 : PokeL(@alpha,$7FC12345) : PokeL(@beta,$7F800000)
+  Case 4 : PokeL(@alpha,$7FA12345) : PokeL(@beta,$FF800000)
+  Case 5 : PokeL(@alpha,$7F7FFFFF) : PokeL(@beta,1)
+ EndSelect
+ i=0 : If biasKind : i=3 : EndIf
+ DError=0 : OldDGemm(4,1,2,i,ta,tb,alpha,beta)
+ If DError : ProcedureReturn 4 : EndIf
+ DGemm(5,1,2,i,ta,tb,alpha,beta)
+ If DError : ProcedureReturn 5 : EndIf
+ If Dt(4)\Count<>Dt(5)\Count : ProcedureReturn 6 : EndIf
+ For j=0 To Dt(4)\Bytes-1
+  If PeekA(Dt(4)\Data+j)<>PeekA(Dt(5)\Data+j)
+   PokeI($E1C01F80,j) : PokeI($E1C01F88,PeekL(Dt(4)\Data+(j/4)*4)) : PokeI($E1C01F90,PeekL(Dt(5)\Data+(j/4)*4))
+   ProcedureReturn j+10
+  EndIf
+ Next
+ For i=1 To 5 : DRelease(i) : Next
+ If DLive<>0 : ProcedureReturn 7 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected shape.i,ta.i,tb.i,biasKind.i,params.i,pattern.i,rc.i,cases.i,*pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PokeI($E1C01FF0,PmParallelCores())
+ If DHeapBind($EA000000,$1000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ For shape=0 To 4
+ For ta=0 To 1
+ For tb=0 To 1
+ For biasKind=0 To 3
+ For params=0 To 5
+ For pattern=0 To 1
+  rc=CheckGemm(shape,ta,tb,biasKind,params,pattern)
+  If cases<960 : PokeI($E1C00000+cases*8,rc) : EndIf
+  cases+1 : If *pet : pet() : EndIf
+  If rc
+   PokeI($E1C01F00,shape) : PokeI($E1C01F08,ta) : PokeI($E1C01F10,tb) : PokeI($E1C01F18,biasKind) : PokeI($E1C01F20,params) : PokeI($E1C01F28,pattern)
+   PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn rc
+  EndIf
+ Next
+ Next
+ Next
+ Next
+ Next
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,DLive)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
