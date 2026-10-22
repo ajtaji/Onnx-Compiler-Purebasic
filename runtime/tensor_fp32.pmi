@@ -5809,7 +5809,12 @@ EndProcedure
 ; Reset only when inference is idle; Reset(0,0) disables the cache. Packed
 ; columns retain the exact reduction/scaling order and tail uses original B.
 Global PmI8PackBase.i, PmI8PackLimit.i, PmI8PackUsed.i, PmI8PackCount.i
-Global Dim PmI8PackKeys.i[256 * 5]
+CompilerIf #PMO_INT8_BACKEND=1
+#PMI8_PACK_CAPACITY=1024
+CompilerElse
+#PMI8_PACK_CAPACITY=256
+CompilerEndIf
+Global Dim PmI8PackKeys.i[#PMI8_PACK_CAPACITY * 5]
 Procedure PmI8PackReset(base.i, bytes.i)
   PmI8PackBase=0 : PmI8PackLimit=0 : PmI8PackUsed=0 : PmI8PackCount=0
   If base>0 And bytes>0 : PmI8PackBase=base : PmI8PackLimit=bytes : EndIf
@@ -5827,7 +5832,7 @@ EndProcedure
 Procedure.i PmI8PackWeight(source.i, k.i, n.i, wide.i)
   Protected n16.i=n & -16, bytes.i, dest.i, plane.i, col.i, row.i, a.i, b.i, at.i
   If PmI8PackFind(source,k,n,wide)<>0 : ProcedureReturn 1 : EndIf
-  If k<1 Or n16<16 Or wide<0 Or wide>1 Or PmI8PackCount>=256 : ProcedureReturn 0 : EndIf
+  If k<1 Or n16<16 Or wide<0 Or wide>1 Or PmI8PackCount>=#PMI8_PACK_CAPACITY : ProcedureReturn 0 : EndIf
   If source=0 Or PmI8PackBase=0 : ProcedureReturn 0 : EndIf
   ; Check before multiplying so an oversized request cannot wrap the bound.
   If k>(PmI8PackLimit-PmI8PackUsed)/n16/(1+wide) : ProcedureReturn 0 : EndIf

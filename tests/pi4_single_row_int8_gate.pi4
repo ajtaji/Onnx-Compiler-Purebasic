@@ -161,7 +161,7 @@ Procedure.i Main(services.i)
  If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
  MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
  PmI8PackReset($D6900000,$100000)
- For i=0 To 255
+ For i=0 To #PMI8_PACK_CAPACITY-1
   source=$D6800000+i*1024 : wide=i & 1
   For j=0 To 1023 : PokeA(source+j,(i*19+j*37) & 255) : Next
   If PmI8PackWeight(source,32,16,wide)=0 : rc=21 : Break : EndIf
@@ -172,10 +172,10 @@ Procedure.i Main(services.i)
   Next
   If rc : Break : EndIf
  Next
- If rc=0 And PmI8PackCount<>256 : rc=24 : EndIf
- If rc=0 And PmI8PackWeight($D6880000,32,16,0)<>0 : rc=25 : EndIf
+ If rc=0 And PmI8PackCount<>#PMI8_PACK_CAPACITY : rc=24 : EndIf
+ If rc=0 And PmI8PackWeight($D6A00000,32,16,0)<>0 : rc=25 : EndIf
  If rc=0 And PmI8PackWeight($D6800000,32,16,0)<>1 : rc=26 : EndIf
- If rc=0 And PmI8PackCount<>256 : rc=27 : EndIf
+ If rc=0 And PmI8PackCount<>#PMI8_PACK_CAPACITY : rc=27 : EndIf
  PokeI($E1C01F00,PmI8PackCount) : PokeI($E1C01F08,rc)
  If rc : PmI8PackReset(0,0) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
  ms(0)=1 : ms(1)=4 : ms(2)=9 : ms(3)=5 : ms(4)=2
