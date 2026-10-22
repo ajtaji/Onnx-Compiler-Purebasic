@@ -389,6 +389,46 @@ Procedure DRelease(Id.i)
     DDims(Id*8+i)=0
   Next
 EndProcedure
+; Bind caller-owned immutable input/state storage without allocating or copying.
+; The caller keeps the complete span valid until request reset/rebinding. This
+; does not retain another tensor's allocation or permit concurrent mutation.
+Procedure.i DBindBorrowed(Id.i,Kind.i,Rank.i,DimsAddress.i,Address.i,Available.i)
+  Protected Dim dims.i(8)
+  Protected count.i=1,size.i,bytes.i,extent.i,i.i
+  If DError<>0 Or DCancel<>0 : ProcedureReturn DFail("Request cancelled or an earlier operation failed.") : EndIf
+  If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
+  size=DSize(Kind)
+  If Id<=0 Or Id>#PMD_TENSOR_COUNT Or Rank<0 Or Rank>8 Or size=0 Or (Rank>0 And DimsAddress=0)
+    ProcedureReturn DFail("Unsupported borrowed tensor rank, type or dimensions.")
+  EndIf
+  For i=0 To Rank-1
+    CompilerIf #PMD_NATIVE_BYTES=8
+    extent=PeekN(DimsAddress+i*8)
+    CompilerElse
+    extent=PeekL(DimsAddress+i*4)
+    CompilerEndIf
+    If extent<0 Or extent>DLimit : ProcedureReturn DFail("Invalid borrowed tensor dimension.") : EndIf
+    If extent>0 And count>DLimit/extent : ProcedureReturn DFail("Borrowed tensor count exceeds the arena limit.") : EndIf
+    dims(i)=extent : count=count*extent
+  Next
+  If count>DLimit/size : ProcedureReturn DFail("Borrowed tensor bytes exceed the arena limit.") : EndIf
+  bytes=count*size
+  If Available<0 Or bytes>Available Or (bytes>0 And Address=0)
+    ProcedureReturn DFail("Borrowed tensor storage is smaller than its shape.")
+  EndIf
+  ; Releasing this same tensor must not invalidate its new backing span.
+  If Dt(Id)\Owned And Dt(Id)\Bytes>0 And bytes>0
+    If (Address>=Dt(Id)\Data And Address-Dt(Id)\Data<Dt(Id)\Bytes) Or (Address<Dt(Id)\Data And Dt(Id)\Data-Address<bytes)
+      ProcedureReturn DFail("Borrowed storage overlaps the tensor's owned allocation.")
+    EndIf
+  EndIf
+  DRelease(Id)
+  Dt(Id)\Data=Address : Dt(Id)\Kind=Kind : Dt(Id)\Rank=Rank
+  Dt(Id)\Count=count : Dt(Id)\Bytes=bytes : Dt(Id)\Owned=0
+  For i=0 To Rank-1 : DDims(Id*8+i)=dims(i) : Next
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i DAllocCore(Id.i,Kind.i,Rank.i,DimsAddress.i,clear.i)
   Protected i.i=0
   Protected count.i=0
@@ -1969,7 +2009,7 @@ Procedure DTranspose(Y.i,A.i,Perm.i)
   Next
 EndProcedure
 
-Procedure DGather(Y.i,A.i,Indices.i,Axis.i)
+Procedure PmGatherAliased(Y.i,A.i,Indices.i,Axis.i)
   Protected Dim dims.i(8)
   Protected rank.i=Dt(A)\Rank+Dt(Indices)\Rank-1
   Protected i.i=0
@@ -2018,6 +2058,77 @@ Procedure DGather(Y.i,A.i,Indices.i,Axis.i)
       DCopy(Dt(A)\Data+(i*DDims((A)*8+(Axis))+idx)*inner*size,Dt(Y)\Data+(i*Dt(Indices)\Count+j)*inner*size,inner*size)
     Next
   Next
+EndProcedure
+
+Procedure DGather(Y.i,A.i,Indices.i,Axis.i)
+  Protected Dim dims.i(8)
+  Protected rank.i=Dt(A)\Rank+Dt(Indices)\Rank-1
+  Protected i.i=0
+  Protected j.i=0
+  Protected k.i=0
+  Protected p.i=0
+  Protected idx.i=0
+  Protected inner.i=0
+  Protected outer.i=0
+  Protected size.i=DSize(Dt(A)\Kind)
+  Protected extent.i,take.i,look.i,bytes.i,srcStep.i,dstStep.i
+  If Y=A Or Y=Indices
+    PmGatherAliased(Y,A,Indices,Axis)
+    ProcedureReturn
+  EndIf
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Axis<0
+    Axis+Dt(A)\Rank
+  EndIf
+  If rank>8 Or Axis<0 Or Axis>=Dt(A)\Rank
+    DFail("Invalid Gather rank or axis.")
+    ProcedureReturn
+  EndIf
+  For i=0 To Axis-1
+    dims(p)=DDims((A)*8+(i))
+    p+1
+  Next
+  For i=0 To Dt(Indices)\Rank-1
+    dims(p)=DDims((Indices)*8+(i))
+    p+1
+  Next
+  For i=Axis+1 To Dt(A)\Rank-1
+    dims(p)=DDims((A)*8+(i))
+    p+1
+  Next
+  If DAllocOverwrite(Y,Dt(A)\Kind,rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  inner=DProduct(A,Axis+1,Dt(A)\Rank-1)
+  outer=DProduct(A,0,Axis-1)
+  ; Index geometry is shared by every outer row. Consecutive source indices
+  ; form a contiguous raw-byte span; destination rows remain independent.
+  If outer<1 : ProcedureReturn : EndIf
+  extent=DDims(A*8+Axis) : bytes=inner*size
+  srcStep=extent*bytes : dstStep=Dt(Indices)\Count*bytes
+  j=0
+  While j<Dt(Indices)\Count
+    idx=DInt(Indices,j)
+    If idx<0 : idx+extent : EndIf
+    If idx<0 Or idx>=extent
+      DFail("Gather index is out of bounds.")
+      ProcedureReturn
+    EndIf
+    take=1
+    While take<Dt(Indices)\Count-j And take<extent-idx
+      look=DInt(Indices,j+take)
+      If look<0 : look+extent : EndIf
+      If look<>idx+take : Break : EndIf
+      take+1
+    Wend
+    For i=0 To outer-1
+      CompilerIf #PMD_NATIVE_BYTES=8
+      If (i & 255)=0 : PmKernelIdle() : EndIf
+      CompilerEndIf
+      DCopy(Dt(A)\Data+i*srcStep+idx*bytes,Dt(Y)\Data+i*dstStep+j*bytes,take*bytes)
+    Next
+    j+take
+  Wend
 EndProcedure
 
 Procedure DConcat(Y.i,Inputs.i,Axis.i)
@@ -2542,8 +2653,11 @@ Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
     DFail("ScatterND update count mismatch.")
     ProcedureReturn
   EndIf
-  If DLike(Y,A,0)=0
-    ProcedureReturn
+  If Y=A Or Y=Indices Or Y=Updates
+    If DLike(Y,A,0)=0 : ProcedureReturn : EndIf
+  Else
+    ; The following source copy overwrites every destination byte.
+    If DLikeOverwrite(Y,A,0)=0 : ProcedureReturn : EndIf
   EndIf
   DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
   For i=0 To tuples-1

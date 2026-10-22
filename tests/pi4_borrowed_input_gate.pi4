@@ -1,0 +1,98 @@
+; Exact sequential softmax reductions versus the previous native implementation.
+; Gemm reuse of the exact matrix kernel versus the old scalar Gemm.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+
+Procedure.i Main(services.i)
+ Protected Dim ds.i(8)
+ Protected Dim kinds.i(6)
+ Protected rank.i,ki.i,empty.i,i.i,bytes.i,count.i,rc.i,cases.i,kind.i,*pet,old.i,test.i
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PmTensorInt64Ok=1 : PokeI($E1C01FF0,PmParallelCores())
+ If DHeapBind($EA000000,$1000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ kinds(0)=1 : kinds(1)=6 : kinds(2)=7 : kinds(3)=9 : kinds(4)=2 : kinds(5)=3
+ For rank=0 To 4
+ For ki=0 To 5
+ For empty=0 To 1
+  count=1 : For i=0 To rank-1 : ds(i)=2+i : count=count*ds(i) : Next
+  If rank And empty : ds(rank-1)=0 : count=0 : EndIf
+  kind=kinds(ki) : bytes=count*DSize(kind)
+  For i=0 To bytes+31 : PokeA($E9000000+i,(i*37+11) & 255) : Next
+  If DAlloc(1,kind,rank,@ds(0))=0 : rc=1 : Break : EndIf
+  cases+1
+  If DBindBorrowed(1,kind,rank,@ds(0),$E9000003,bytes)=0 : rc=2 : Break : EndIf
+  If DLive<>0 Or Dt(1)\Owned Or Dt(1)\Count<>count Or Dt(1)\Bytes<>bytes Or Dt(1)\Data<>$E9000003 : rc=3 : Break : EndIf
+  For i=0 To rank-1
+   If DDims(8+i)<>ds(i) : rc=4 : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  DRelease(1)
+  For i=0 To bytes+31
+   If PeekA($E9000000+i)<>((i*37+11) & 255) : rc=5 : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  If *pet : pet() : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next
+ If rc=0
+  For test=0 To 15
+   DError=0 : DCancel=0 : ds(0)=4
+   If DAlloc(1,1,1,@ds(0))=0 : rc=6 : Break : EndIf
+   old=Dt(1)\Data : cases+1
+   Select test
+    Case 0 : i=DBindBorrowed(0,1,1,@ds(0),$E9000000,16)
+    Case 1 : i=DBindBorrowed(1,1,9,@ds(0),$E9000000,16)
+    Case 2 : i=DBindBorrowed(1,99,1,@ds(0),$E9000000,16)
+    Case 3 : i=DBindBorrowed(1,1,1,0,$E9000000,16)
+    Case 4 : ds(0)=-1 : i=DBindBorrowed(1,1,1,@ds(0),$E9000000,16)
+    Case 5 : ds(0)=DLimit : i=DBindBorrowed(1,1,1,@ds(0),$E9000000,16)
+    Case 6 : i=DBindBorrowed(1,1,1,@ds(0),$E9000000,15)
+    Case 7 : i=DBindBorrowed(1,1,1,@ds(0),0,16)
+    Case 8 : i=DBindBorrowed(1,1,1,@ds(0),old,16)
+    Case 9 : DCancel=1 : i=DBindBorrowed(1,1,1,@ds(0),$E9000000,16)
+    Case 10 : DError=1 : i=DBindBorrowed(1,1,1,@ds(0),$E9000000,16)
+    Case 11 : DProgressActive=1 : i=DBindBorrowed(1,1,1,@ds(0),$E9000000,16)
+    Case 12 : PmIdleActive=1 : i=DBindBorrowed(1,1,1,@ds(0),$E9000000,16)
+    Case 13 : i=DBindBorrowed(1,1,1,@ds(0),old+4,16)
+    Case 14 : i=DBindBorrowed(1,1,1,@ds(0),old-4,16)
+    Case 15 : i=DBindBorrowed(1,1,1,@ds(0),$E9000000,-1)
+   EndSelect
+   If i<>0 Or DError=0 Or Dt(1)\Data<>old Or DLive<>16 Or Dt(1)\Owned<>1 : rc=7 : Break : EndIf
+   DProgressActive=0 : PmIdleActive=0 : DError=0 : DCancel=0 : DRelease(1)
+  Next
+ EndIf
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,rc) : PokeI($E1C01FE0,DLive)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
