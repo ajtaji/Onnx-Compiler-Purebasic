@@ -1305,6 +1305,21 @@ Procedure PmOpCopyBytes(src.i, dst.i, bytes.i)
     ProcedureReturn
   EndIf
   i = 0
+  CompilerIf #PMO_OPS_INT32 = 0
+    ; Wider raw copies only where forward overlap cannot change old word order.
+    If dst<src Or dst-src>=bytes
+      While i+32<=bytes
+        PokeI(dst+i,PeekI(src+i))
+        PokeI(dst+i+8,PeekI(src+i+8))
+        PokeI(dst+i+16,PeekI(src+i+16))
+        PokeI(dst+i+24,PeekI(src+i+24))
+        i=i+32
+      Wend
+      While i+8<=bytes
+        PokeI(dst+i,PeekI(src+i)) : i=i+8
+      Wend
+    EndIf
+  CompilerEndIf
   While i + 4 <= bytes
     PokeL(dst + i, PeekL(src + i))
     i = i + 4

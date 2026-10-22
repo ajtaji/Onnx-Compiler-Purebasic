@@ -815,3 +815,11 @@ of speech (ratio0.830). Its Gemm nodes fall from0.180 to0.024 seconds.
 This is about17% silent compute margin, using prepared text IDs. Native
 text frontend, acoustic onset and simultaneous map margin are unverified;
 the separate strict upstream/native FLOAT gate remains unmet.
+
+
+@SECTION Larger raw-word copies
+On native64-bit targets PmOpCopyBytes copies disjoint buffers and safe backwards-address spans in32-byte groups, then8-byte words. Harmful forward overlap retains the original4-byte copy order, and32-bit targets retain their existing path. Arbitrary element payloads are copied without numerical conversion.
+
+An independent physical Pi4 oracle passes15,600 cases spanning byte alignments0..7, lengths0..129, identical pointers, disjoint buffers and overlap offsets on either side. Entire surrounding buffers are compared. Eight complete actual-text Pocket directions remain waveform-byte-identical; silent generation ratio improves from0.835..0.844 to0.792..0.797. Native prompt preparation/tokenization passes1,024 upstream text fixtures on both PC and Pi. First PCM is available in0.071..0.084s with weights resident.
+
+A separate speech-only Bluetooth run keeps the speaker connected across eight freshly generated replies. All waveforms remain byte-identical, with zero waveform underruns, HCI receive faults, late events and primary-core callback faults, plus a clean disconnect. Scheduled nonzero speech starts0.203..0.224s after text submission; this excludes the speaker's acoustic buffering. Including Bluetooth servicing, synthesis ratio is0.947..0.959, leaving only4..5 percent margin. This is not a simultaneous map proof. Listening reports clear and continuous. Full native/upstream FLOAT comparisons still miss their existing strict tolerance; no voice/default replacement or full-port numerical acceptance is implied.

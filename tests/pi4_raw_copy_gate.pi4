@@ -1,0 +1,78 @@
+; Exact four-element ELU checked against the independent scalar kernel.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_fp32.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_fp32_neon.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_trig_a64.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_norm_small.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_ops.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldCopy(src.i, dst.i, bytes.i)
+  Protected i.i
+  If src = dst
+    ProcedureReturn
+  EndIf
+  i = 0
+  While i + 4 <= bytes
+    PokeL(dst + i, PeekL(src + i))
+    i = i + 4
+  Wend
+  While i < bytes
+    PokeA(dst + i, PeekA(src + i))
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i Main(services.i)
+ Protected i.i,j.i,k.i,n.i,offset.i,src.i,dst.i,cases.i,rc.i,bytes.i
+ Protected *pet
+ Protected Dim offsets.i(15)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ offsets(0)=-129 : offsets(1)=-17 : offsets(2)=-8 : offsets(3)=-4 : offsets(4)=-1 : offsets(5)=0
+ offsets(6)=1 : offsets(7)=3 : offsets(8)=4 : offsets(9)=7 : offsets(10)=8 : offsets(11)=9 : offsets(12)=16 : offsets(13)=129 : offsets(14)=4096
+ For n=0 To 129
+  For j=0 To 7
+   For k=0 To 14
+    For i=0 To 8191 : PokeA($D6800000+i,(i*37+n*19+j) & 255) : Next
+    DCopy($D6800000,$D6810000,8192)
+    src=512+j : dst=src+offsets(k)
+    OldCopy($D6800000+src,$D6800000+dst,n)
+    PmOpCopyBytes($D6810000+src,$D6810000+dst,n)
+    For i=0 To 8191
+     If PeekA($D6800000+i)<>PeekA($D6810000+i) : rc=31 : Break : EndIf
+    Next
+    cases+1 : If rc : Break : EndIf
+   Next
+   If rc : Break : EndIf
+  Next
+  If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next
+ PokeI($E1C00000,cases) : PokeI($E1C00008,rc) : PokeI($E1C00010,n) : PokeI($E1C00018,j) : PokeI($E1C00020,k)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
