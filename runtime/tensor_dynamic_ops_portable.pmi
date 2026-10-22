@@ -13,6 +13,11 @@ EndProcedure
 Procedure DOpUnaryChunk(src.i,dst.i,count.i,op.i,kind.i)
  CompilerIf #PMD_NATIVE_BYTES=8
  Protected done.i
+ If op=4 And kind=1 And count>=4
+  done=PmOpSoftplusVectorA64(src,dst,count)
+  PmOpUnary(src+done*4,dst+done*4,count-done,op,kind)
+  ProcedureReturn
+ EndIf
  If op=13 And kind=1 And count>=4
   done=PmOpGeluVectorA64(src,dst,count)
   PmOpUnary(src+done*4,dst+done*4,count-done,op,kind)
