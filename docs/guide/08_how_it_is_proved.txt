@@ -735,3 +735,21 @@ exposing the costly generic Expand path. It is an experimental export recipe,
 not an automatically applied compiler transform. The upstream cumulative
 FLOAT comparison still exceeds the original strict tolerance; these speed
 results establish optimization parity, not a validated complete voice port.
+
+
+@SECTION Integer broadcast rows and identity casts
+
+Another 100 independent Pi 4 cases covered native-64 INT64 broadcasting
+and FLOAT-to-FLOAT Cast: scalar and empty tensors, ranks up to four,
+full signed extrema, overflow/division refusals, odd tails and raw NaN,
+infinity, signed-zero and subnormal bits. The row path retains the existing
+checked arithmetic and services primary idle work at bounded intervals;
+an identity FLOAT cast copies bytes after ordinary allocation checks.
+
+On the complete Pocket7m direction, generation fell from 12.492 to9.498
+seconds for2.400 seconds of audio, with every waveform byte unchanged.
+First80ms PCM fell from0.402 to0.326 seconds. The resulting ratio3.958 is
+still slower than realtime; a prompt first chunk does not prove sustained
+streaming. These are silent physical Pi results with prepared text IDs,
+not Bluetooth, map or acoustic-onset measurements. The separate strict
+upstream/native numerical comparisons remain unmet.

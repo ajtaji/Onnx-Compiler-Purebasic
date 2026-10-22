@@ -1,0 +1,424 @@
+; Independent INT64 broadcast rows, checked refusals and FLOAT identity-cast parity.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+Procedure OldDBinary(Y.i,A.i,B.i,Op.i)
+  Protected i.i=0
+  Protected ai.i=0
+  Protected bi.i=0
+  Protected kind.i=Dt(A)\Kind
+  Protected av.f=0.0
+  Protected bv.f=0.0
+  Protected v.f=0.0
+  Protected ia.i=0
+  Protected ib.i=0
+  Protected iv.i=0
+  Protected width.i=0
+  Protected row.i=0
+  Protected astep.i=0
+  Protected bstep.i=0
+  Protected fastrow.i=0
+  Protected amap.i=0
+  Protected bmap.i=0
+  If Op<=3
+    fastrow=1
+  EndIf
+  If Op=4 And Dt(A)\Kind=1 And Dt(B)\Kind=1 And Dt(B)\Count=1
+    fastrow=DPowWholeExponent(DReadF(Dt(B)\Data))
+  EndIf
+  If Op>=5
+    kind=9
+  EndIf
+  If DBroadcast(Y,A,B,kind)=0
+    ProcedureReturn
+  EndIf
+  If kind=1 And Dt(B)\Kind=1 And fastrow=1
+    width=1
+    If Dt(Y)\Rank
+      width=DDims((Y)*8+(Dt(Y)\Rank-1))
+    EndIf
+    If width=0
+      ProcedureReturn
+    EndIf
+    ; ONE CALL FOR THE WHOLE TENSOR when neither operand needs a per-row index.
+    ; If A holds exactly Y's element count then A's index map IS the identity:
+    ; every dimension of A is either Y's or a one where Y is also one, because
+    ; a one against a larger Y dimension would have left A with fewer elements.
+    ; And if A holds ONE element it is that same element for every output. The
+    ; same two cases for B, and then DBroadcastIndex has nothing to say.
+    ;
+    ; The row loop below is otherwise Count/width copies of one call, and the
+    ; model has a tensor shaped [1,102000,9]: 102,000 calls of nine elements.
+    ; Measured on the board (V5 node ticks, request 2), the same operators run
+    ; at 38-43 ns per element there against 3.2 ns per element on the
+    ; generator's contiguous [1,128,20401] rows, which is the per-call cost and
+    ; not the arithmetic.
+    If (Dt(A)\Count=Dt(Y)\Count Or Dt(A)\Count=1) And (Dt(B)\Count=Dt(Y)\Count Or Dt(B)\Count=1)
+      PmFastBinary(Dt(A)\Data,Dt(B)\Data,Dt(Y)\Data,Dt(Y)\Count,Bool(Dt(A)\Count<>1),Bool(Dt(B)\Count<>1),Op)
+      ProcedureReturn
+    EndIf
+    If Dt(A)\Rank
+      astep=Bool(DDims((A)*8+(Dt(A)\Rank-1))<>1)
+    EndIf
+    If Dt(B)\Rank
+      bstep=Bool(DDims((B)*8+(Dt(B)\Rank-1))<>1)
+    EndIf
+    PmBroadcastRows(Y,A,B,Op,width,astep,bstep)
+    ProcedureReturn
+  EndIf
+  ; Pow with one broadcast exponent that is NOT a whole number in [-64,64]:
+  ; Exp(y*Log(x)) per element, which is what Pow computes and the only thing
+  ; that computes it.  The whole-number exponents left through the row path
+  ; above and never arrive here.
+  If Op=4 And Dt(A)\Kind=1 And Dt(B)\Kind=1 And Dt(B)\Count=1 And Dt(A)\Count=Dt(Y)\Count
+    bv=DReadF(Dt(B)\Data)
+    For i=0 To Dt(Y)\Count-1
+      DWriteF(Dt(Y)\Data+i*4,Pow(DReadF(Dt(A)\Data+i*4),bv))
+    Next
+    ProcedureReturn
+  EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If Op>=5 And Op<=9 And Dt(A)\Kind=1 And Dt(B)\Kind=1 And (Dt(A)\Count=1 Or Dt(A)\Count=Dt(Y)\Count) And (Dt(B)\Count=1 Or Dt(B)\Count=Dt(Y)\Count)
+    PmTensorCompareFp32Neon(Dt(A)\Data,Dt(B)\Data,Dt(Y)\Data,Dt(Y)\Count,Bool(Dt(A)\Count<>1),Bool(Dt(B)\Count<>1),Op)
+    ProcedureReturn
+  EndIf
+  If Op>=5 And Op<=9 And Dt(A)\Kind=1 And Dt(B)\Kind=1
+    width=1
+    If Dt(Y)\Rank : width=DDims(Y*8+Dt(Y)\Rank-1) : EndIf
+    If width=0 : ProcedureReturn : EndIf
+    astep=0 : bstep=0
+    If Dt(A)\Rank : astep=Bool(DDims(A*8+Dt(A)\Rank-1)<>1) : EndIf
+    If Dt(B)\Rank : bstep=Bool(DDims(B*8+Dt(B)\Rank-1)<>1) : EndIf
+    For row=0 To Dt(Y)\Count/width-1
+      ai=DBroadcastIndex(row*width,Y,A)
+      bi=DBroadcastIndex(row*width,Y,B)
+      PmTensorCompareFp32Neon(Dt(A)\Data+ai*4,Dt(B)\Data+bi*4,Dt(Y)\Data+row*width,width,astep,bstep,Op)
+      PmKernelIdle()
+    Next
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+  If Op=9 And Dt(A)\Kind=9 And Dt(B)\Kind=9 And (Dt(A)\Count=1 Or Dt(A)\Count=Dt(Y)\Count) And (Dt(B)\Count=1 Or Dt(B)\Count=Dt(Y)\Count)
+    ai=Dt(A)\Data : bi=Dt(B)\Data
+    astep=Bool(Dt(A)\Count<>1) : bstep=Bool(Dt(B)\Count<>1)
+    For i=0 To Dt(Y)\Count-1
+      PokeA(Dt(Y)\Data+i,Bool(PeekA(ai)<>0 And PeekA(bi)<>0))
+      ai+astep : bi+bstep
+    Next
+    ProcedureReturn
+  EndIf
+  If Op=9 And Dt(A)\Kind=9 And Dt(B)\Kind=9
+    width=1
+    If Dt(Y)\Rank : width=DDims(Y*8+Dt(Y)\Rank-1) : EndIf
+    If width=0 : ProcedureReturn : EndIf
+    astep=0 : bstep=0
+    If Dt(A)\Rank : astep=Bool(DDims(A*8+Dt(A)\Rank-1)<>1) : EndIf
+    If Dt(B)\Rank : bstep=Bool(DDims(B*8+Dt(B)\Rank-1)<>1) : EndIf
+    For row=0 To Dt(Y)\Count/width-1
+      ai=Dt(A)\Data+DBroadcastIndex(row*width,Y,A)
+      bi=Dt(B)\Data+DBroadcastIndex(row*width,Y,B)
+      For i=row*width To (row+1)*width-1
+        PokeA(Dt(Y)\Data+i,Bool(PeekA(ai)<>0 And PeekA(bi)<>0))
+        ai+astep : bi+bstep
+      Next
+      PmKernelIdle()
+    Next
+    ProcedureReturn
+  EndIf
+  ; The same two index maps the row path above hoists, hoisted here too, and
+  ; this is where they are worth the most.  DBroadcastIndex walks the output
+  ; rank with an integer division and a modulo PER AXIS, twice per element:
+  ; the model's two Greater/Less nodes over 224,411 elements cost 644 ns an
+  ; element on the board, which is about a thousand cycles for one comparison.
+  ; A HOLDS Y'S COUNT means its index map is the identity; A holds ONE element
+  ; means the index is zero.  Anything else still asks.
+  amap=2
+  bmap=2
+  If Dt(A)\Count=Dt(Y)\Count
+    amap=0
+  ElseIf Dt(A)\Count=1
+    amap=1
+  EndIf
+  If Dt(B)\Count=Dt(Y)\Count
+    bmap=0
+  ElseIf Dt(B)\Count=1
+    bmap=1
+  EndIf
+  For i=0 To Dt(Y)\Count-1
+    If amap=0
+      ai=i
+    ElseIf amap=1
+      ai=0
+    Else
+      ai=DBroadcastIndex(i,Y,A)
+    EndIf
+    If bmap=0
+      bi=i
+    ElseIf bmap=1
+      bi=0
+    Else
+      bi=DBroadcastIndex(i,Y,B)
+    EndIf
+    If Dt(A)\Kind=1
+      av=DGet(A,ai)
+      bv=DGet(B,bi)
+      Select Op
+        Case 0
+          v=av+bv
+        Case 1
+          v=av-bv
+        Case 2
+          v=av*bv
+        Case 3
+          v=av/bv
+        Case 4
+          v=Pow(av,bv)
+        Case 5
+          v=DFloat(Bool(av=bv))
+        Case 6
+          v=DFloat(Bool(av>bv))
+        Case 7
+          v=DFloat(Bool(av<bv))
+        Case 8
+          v=DFloat(Bool(av>=bv))
+        Case 9
+          v=DFloat(Bool(av<>0 And bv<>0))
+      EndSelect
+      DPut(Y,i,v)
+    Else
+      ia=DInt(A,ai)
+      ib=DInt(B,bi)
+      Select Op
+        Case 0
+          iv=DIntegerOp(ia,ib,0)
+        Case 1
+          iv=DIntegerOp(ia,ib,1)
+        Case 2
+          iv=DIntegerOp(ia,ib,2)
+        Case 3
+          If ib=0
+            DFail("Integer division by zero.")
+            ProcedureReturn
+          EndIf
+          iv=DIntegerOp(ia,ib,3)
+        Case 4
+          If Dt(B)\Kind<>6 And Dt(B)\Kind<>7
+            DFail("Integer power requires an integer exponent tensor; check the exponent type.")
+            ProcedureReturn
+          EndIf
+          iv=DIntegerPower(ia,ib)
+        Case 5
+          iv=Bool(ia=ib)
+        Case 6
+          iv=Bool(ia>ib)
+        Case 7
+          iv=Bool(ia<ib)
+        Case 8
+          iv=Bool(ia>=ib)
+        Case 9
+          iv=Bool(ia<>0 And ib<>0)
+        Default
+          DFail("Unsupported integer arithmetic.")
+          ProcedureReturn
+      EndSelect
+      If DError<>0
+        ProcedureReturn
+      EndIf
+      If kind=7
+        DWriteI64(Dt(Y)\Data+i*8,iv)
+      ElseIf kind=6
+        If iv< -2147483648 Or iv>2147483647
+          DFail("INT32 arithmetic overflow.")
+          ProcedureReturn
+        EndIf
+        PokeL(Dt(Y)\Data+i*4,iv)
+      Else
+        DPut(Y,i,DFloat(iv))
+      EndIf
+    EndIf
+  Next
+EndProcedure
+Procedure OldDCast(Y.i,A.i,Kind.i)
+  Protected i.i=0
+  Protected value.i=0
+  If DLikeOverwrite(Y,A,Kind)=0
+    ProcedureReturn
+  EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If (Dt(A)\Kind=2 Or Dt(A)\Kind=3 Or Dt(A)\Kind=6 Or Dt(A)\Kind=9) And Kind=1
+    PmTensorCastIntFloatNeon(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count,Dt(A)\Kind)
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Kind=7 And Kind=1
+    PmTensorCastI64FloatNeon(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count)
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+  For i=0 To Dt(A)\Count-1
+    If Dt(A)\Kind<>1 And Kind<>1
+      value=DInt(A,i)
+      If Kind=7
+        DWriteI64(Dt(Y)\Data+i*8,value)
+      ElseIf Kind=6
+        If value< -2147483648 Or value>2147483647
+          DFail("Cast exceeds INT32 execution range.")
+          ProcedureReturn
+        EndIf
+        PokeL(Dt(Y)\Data+i*4,value)
+      ElseIf Kind=9
+        PokeA(Dt(Y)\Data+i,Bool(value<>0))
+      ElseIf Kind=2 Or Kind=3
+        PokeA(Dt(Y)\Data+i,value & 255)
+      EndIf
+    Else
+      DPut(Y,i,DGet(A,i))
+    EndIf
+  Next
+EndProcedure
+
+Procedure.i SameError(a.i,b.i)
+ Protected i.i,x.i,y.i
+ If a=0 Or b=0 : ProcedureReturn Bool(a=b) : EndIf
+ For i=0 To 127
+  x=PeekA(a+i) : y=PeekA(b+i)
+  If x<>y : ProcedureReturn 0 : EndIf
+  If x=0 : ProcedureReturn 1 : EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i CheckBinary(variant.i,op.i,edge.i)
+ Protected Dim da.i(8)
+ Protected Dim db.i(8)
+ Protected ra.i=2,rb.i=2,i.i,j.i,ea.i,eb.i,va.i,vb.i
+ da(0)=3 : da(1)=1 : db(0)=1 : db(1)=5
+ Select variant
+  Case 0 : ra=0 : rb=0
+  Case 1 : ra=1 : rb=1 : da(0)=17 : db(0)=1
+  Case 2 : ra=3 : rb=3 : da(0)=2 : da(1)=1 : da(2)=7 : db(0)=1 : db(1)=4 : db(2)=1
+  Case 3 : ra=4 : rb=4 : da(0)=2 : da(1)=1 : da(2)=3 : da(3)=1 : db(0)=1 : db(1)=4 : db(2)=1 : db(3)=9
+  Case 4 : da(0)=2 : da(1)=0 : db(0)=1 : db(1)=1
+  Case 5 : da(0)=1 : da(1)=257 : db(0)=33 : db(1)=1
+  Case 6 : da(0)=3 : da(1)=11 : db(0)=3 : db(1)=11
+  Case 7 : ra=3 : rb=1 : da(0)=2 : da(1)=3 : da(2)=17 : db(0)=1
+  Case 8 : ra=1 : rb=3 : da(0)=1 : db(0)=2 : db(1)=7 : db(2)=3
+ EndSelect
+ If DAlloc(1,7,ra,@da(0))=0 Or DAlloc(2,7,rb,@db(0))=0 : ProcedureReturn 1 : EndIf
+ For i=0 To Dt(1)\Count-1 : PokeI(Dt(1)\Data+i*8,(i*17)%43-21) : Next
+ For i=0 To Dt(2)\Count-1 : PokeI(Dt(2)\Data+i*8,(i*11)%31+1) : Next
+ If edge
+  va=#PMD_INTEGER_MAX : vb=1
+  Select edge
+   Case 2 : va=#PMD_INTEGER_MIN : vb=-1
+   Case 3 : va=#PMD_INTEGER_MAX : vb=0
+   Case 4 : va=#PMD_INTEGER_MIN : vb=0
+   Case 5 : va=#PMD_INTEGER_MIN : vb=1
+   Case 6 : va=#PMD_INTEGER_MAX : vb=-1
+   Case 7 : va=#PMD_INTEGER_MAX : vb=2
+   Case 8 : va=#PMD_INTEGER_MIN : vb=-1
+   Case 9 : va=#PMD_INTEGER_MIN : vb=-1
+   Case 10 : va=7 : vb=0
+   Case 11 : va=#PMD_INTEGER_MIN : vb=1
+   Case 12 : va=#PMD_INTEGER_MAX : vb=#PMD_INTEGER_MIN
+  EndSelect
+  PokeI(Dt(1)\Data,va) : PokeI(Dt(2)\Data,vb)
+ EndIf
+ OldDBinary(3,1,2,op) : ea=DError : DError=0
+ DBinary(4,1,2,op) : eb=DError : DError=0
+ If SameError(ea,eb)=0 : ProcedureReturn 2 : EndIf
+ If ea=0
+  If Dt(3)\Kind<>Dt(4)\Kind Or Dt(3)\Bytes<>Dt(4)\Bytes : ProcedureReturn 3 : EndIf
+  For i=0 To Dt(3)\Bytes-1
+   If PeekA(Dt(3)\Data+i)<>PeekA(Dt(4)\Data+i) : ProcedureReturn i+10 : EndIf
+  Next
+ EndIf
+ DRelease(4) : DRelease(3) : DRelease(2) : DRelease(1)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i CheckCast(count.i)
+ Protected i.i,bits.i,seed.i=$C0FFEE
+ If DAlloc(1,1,1,@count)=0 : ProcedureReturn 1 : EndIf
+ For i=0 To count-1
+  seed=(seed*1664525+1013904223) & $FFFFFFFF : bits=seed
+  Select i % 16
+   Case 0 : bits=0
+   Case 1 : bits=$80000000
+   Case 2 : bits=$7FA12345
+   Case 3 : bits=$7FC54321
+   Case 4 : bits=$7F800000
+   Case 5 : bits=$FF800000
+   Case 6 : bits=1
+   Case 7 : bits=$7F7FFFFF
+  EndSelect
+  PokeL(Dt(1)\Data+i*4,bits)
+ Next
+ OldDCast(3,1,1) : DCast(4,1,1)
+ If DError Or DCancel : ProcedureReturn 2 : EndIf
+ For i=0 To count*4-1
+  If PeekA(Dt(3)\Data+i)<>PeekA(Dt(4)\Data+i) : ProcedureReturn i+10 : EndIf
+ Next
+ DRelease(4) : DRelease(3) : DRelease(1)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected variant.i,k.i,op.i,edge.i,rc.i,cases.i,*pet
+ Protected Dim counts.i[7]
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PokeI($E1C01FF0,PmParallelCores())
+ If DHeapBind($EA000000,$100000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ PmTensorInt64Ok=1
+ For variant=0 To 8
+  For k=0 To 8
+   op=k : If k>=4 : op=k+1 : EndIf
+   rc=CheckBinary(variant,op,0)
+   PokeI($E1C00000+cases*32,variant) : PokeI($E1C00000+cases*32+8,op) : PokeI($E1C00000+cases*32+24,rc)
+   cases+1 : If *pet : pet() : EndIf
+   If rc : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+  Next
+ Next
+ For edge=1 To 12
+  op=0 : If edge>=5 : op=1 : EndIf : If edge>=7 : op=2 : EndIf : If edge>=9 : op=3 : EndIf : If edge=12 : op=7 : EndIf
+  rc=CheckBinary(0,op,edge)
+  PokeI($E1C00000+cases*32,edge) : PokeI($E1C00000+cases*32+8,op) : PokeI($E1C00000+cases*32+24,rc)
+  cases+1
+  If rc : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+ Next
+ counts[0]=0 : counts[1]=1 : counts[2]=17 : counts[3]=127 : counts[4]=1024 : counts[5]=16387 : counts[6]=65539
+ For k=0 To 6
+  rc=CheckCast(counts[k])
+  PokeI($E1C00000+cases*32,counts[k]) : PokeI($E1C00000+cases*32+8,100) : PokeI($E1C00000+cases*32+24,rc)
+  cases+1 : If *pet : pet() : EndIf
+  If rc : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,DLive)
+ If DLive<>0 : rc=99 : EndIf
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

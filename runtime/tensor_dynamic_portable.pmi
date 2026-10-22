@@ -1175,6 +1175,49 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
   If DBroadcast(Y,A,B,kind)=0
     ProcedureReturn
   EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If Dt(A)\Kind=7 And Dt(B)\Kind=7 And ((Op>=0 And Op<=3) Or (Op>=5 And Op<=9))
+    If PmTensorInt64Ok=0
+      DFail("INT64 value exceeds the native signed execution range.") : ProcedureReturn
+    EndIf
+    width=1
+    If Dt(Y)\Rank : width=DDims(Y*8+Dt(Y)\Rank-1) : EndIf
+    If width=0 : ProcedureReturn : EndIf
+    astep=0 : bstep=0
+    If Dt(A)\Rank : astep=Bool(DDims(A*8+Dt(A)\Rank-1)<>1) : EndIf
+    If Dt(B)\Rank : bstep=Bool(DDims(B*8+Dt(B)\Rank-1)<>1) : EndIf
+    If (Dt(A)\Count=1 Or Dt(A)\Count=Dt(Y)\Count) And (Dt(B)\Count=1 Or Dt(B)\Count=Dt(Y)\Count)
+      width=Dt(Y)\Count : astep=Bool(Dt(A)\Count<>1) : bstep=Bool(Dt(B)\Count<>1)
+    EndIf
+    If width=0 : ProcedureReturn : EndIf
+    For row=0 To Dt(Y)\Count/width-1
+      ai=Dt(A)\Data+DBroadcastIndex(row*width,Y,A)*8
+      bi=Dt(B)\Data+DBroadcastIndex(row*width,Y,B)*8
+      For i=row*width To (row+1)*width-1
+        ia=PeekI(ai) : ib=PeekI(bi)
+        If Op<=3
+          If Op=3 And ib=0 : DFail("Integer division by zero.") : ProcedureReturn : EndIf
+          iv=DIntegerOp(ia,ib,Op)
+          If DError : ProcedureReturn : EndIf
+          PokeI(Dt(Y)\Data+i*8,iv)
+        Else
+          Select Op
+            Case 5 : iv=Bool(ia=ib)
+            Case 6 : iv=Bool(ia>ib)
+            Case 7 : iv=Bool(ia<ib)
+            Case 8 : iv=Bool(ia>=ib)
+            Case 9 : iv=Bool(ia<>0 And ib<>0)
+          EndSelect
+          PokeA(Dt(Y)\Data+i,iv)
+        EndIf
+        ai=ai+astep*8 : bi=bi+bstep*8
+        If (i & 255)=255 : PmKernelIdle() : EndIf
+      Next
+      PmKernelIdle()
+    Next
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
   If kind=1 And Dt(B)\Kind=1 And fastrow=1
     width=1
     If Dt(Y)\Rank
@@ -1642,6 +1685,11 @@ Procedure DCast(Y.i,A.i,Kind.i)
   If DLikeOverwrite(Y,A,Kind)=0
     ProcedureReturn
   EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If Dt(A)\Kind=1 And Kind=1
+    DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes) : ProcedureReturn
+  EndIf
+  CompilerEndIf
   CompilerIf #PMD_NATIVE_BYTES=8
   If (Dt(A)\Kind=2 Or Dt(A)\Kind=3 Or Dt(A)\Kind=6 Or Dt(A)\Kind=9) And Kind=1
     PmTensorCastIntFloatNeon(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Count,Dt(A)\Kind)
