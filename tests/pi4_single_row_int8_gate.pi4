@@ -228,6 +228,24 @@ Procedure.i Main(services.i)
  Next
  If rc : Break : EndIf
  Next
+ For plane=0 To 1
+  g\M=1 : g\K=133144 : g\N=16 : g\Wide=0 : g\Elements=g\K*g\N
+  g\A=$E9000000 : g\B=$EA000000 : g\Scales=$EA400000 : g\Dst=$EA410000
+  For i=0 To g\K-1 : DWriteF(g\A+i*4,1.0-plane*2.0) : Next
+  For i=0 To g\Elements-1 : PokeA(g\B+i,127) : Next
+  For i=0 To 15 : DWriteF(g\Scales+i*4,1.0/127.0) : Next
+  PmI8PackReset(0,0)
+  If RefMatMulScratch(@g,$EC000000,$100000,0,g\N)=0 : rc=41 : Break : EndIf
+  PmI8PackReset($EB000000,$400000)
+  If PmI8PackWeight(g\B,g\K,g\N,0)=0 : rc=42 : Break : EndIf
+  g\Dst=$EA420000
+  If PmI8MatMulScratch(@g,$EC000000,$100000)=0 : rc=43 : Break : EndIf
+  For i=0 To 63
+   If PeekA($EA410000+i)<>PeekA($EA420000+i) : rc=44 : Break : EndIf
+  Next
+  tests+1 : If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next
  PokeI($E1C01FD0,tests) : PokeI($E1C01FD8,rc) : PokeI($E1C01FE0,PmTensorInt8Fault)
  PmI8PackReset(0,0) : MmuDisableCachedFlushed() : ProcedureReturn rc
 EndProcedure
