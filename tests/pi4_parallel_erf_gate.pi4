@@ -1,0 +1,97 @@
+; Independent Erf/exact-Gelu parity, guard, tail and primary-core idle checks.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+Global GateServices.i,GateCalls.i,GateFaults.i
+Global *GatePet
+Procedure GateIdle()
+ If PmKernelCore()<>0 : GateFaults+1 : EndIf
+ GateCalls+1
+EndProcedure
+Procedure.i GateOne(count.i,op.i,inplace.i)
+ Protected i.i,seed.i=$12345678,b.i,src.i=$E9000010,ref.i=$E9100010,dst.i=$E9200010
+ PokeI(ref-8,$1122334455667788) : PokeI(ref+count*4,$1122334455667788)
+ PokeI(dst-8,$1122334455667788) : PokeI(dst+count*4,$1122334455667788)
+ For i=0 To count-1
+  seed=(seed*1664525+1013904223) & $FFFFFFFF
+  b=seed
+  Select i%32
+   Case 0 : b=0
+   Case 1 : b=$80000000
+   Case 2 : b=$7F800000
+   Case 3 : b=$FF800000
+   Case 4 : b=$7FC12345
+   Case 5 : b=$7FA12345
+   Case 6 : b=$3F57FFFF
+   Case 7 : b=$3F580000
+   Case 8 : b=$3F580001
+   Case 9 : b=$3F9FFFFF
+   Case 10 : b=$3FA00000
+   Case 11 : b=$3FA00001
+  EndSelect
+  PokeL(src+i*4,b) : PokeL(dst+i*4,b)
+ Next
+ PmOpUnary(src,ref,count,op,1)
+ If inplace : src=dst : EndIf
+ DOpRunUnary(src,dst,count,op,1)
+ For i=0 To count-1
+  If PeekL(ref+i*4)<>PeekL(dst+i*4) : ProcedureReturn i+1 : EndIf
+ Next
+ If PeekI(ref-8)<>$1122334455667788 Or PeekI(ref+count*4)<>$1122334455667788 : ProcedureReturn -1 : EndIf
+ If PeekI(dst-8)<>$1122334455667788 Or PeekI(dst+count*4)<>$1122334455667788 : ProcedureReturn -2 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected cores.i,i.i,j.i,k.i,rc.i,cases.i,count.i
+ Protected Dim counts.i(8)
+ GateServices=services
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000)<>0 : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : cores=1 : If PmSetAnvilServices(services) : cores=PmParallelCores() : EndIf : *GatePet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PokeI($E1C01FF0,cores)
+ If cores<>4 : MmuDisableCachedFlushed() : ProcedureReturn 11 : EndIf
+ PmSetIdleCallback(@GateIdle)
+ counts(0)=0 : counts(1)=1 : counts(2)=17 : counts(3)=1023
+ counts(4)=1024 : counts(5)=1025 : counts(6)=4099 : counts(7)=32771
+ For k=0 To 1
+  For j=0 To 1
+   For i=0 To 7
+    rc=GateOne(counts(i),k*12,j)
+    PokeI($E1C00000+cases*32,counts(i)) : PokeI($E1C00000+cases*32+8,k*12)
+    PokeI($E1C00000+cases*32+16,j) : PokeI($E1C00000+cases*32+24,rc)
+    cases+1 : If *GatePet : GatePet() : EndIf
+    If rc : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+   Next
+  Next
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,GateCalls) : PokeI($E1C01FE0,GateFaults)
+ If GateFaults : rc=99 : EndIf
+ PmSetIdleCallback(0) : MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

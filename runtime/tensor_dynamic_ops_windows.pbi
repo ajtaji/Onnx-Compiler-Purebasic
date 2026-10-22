@@ -7,3 +7,8 @@
 Procedure.i DOpDim(Id.i, Axis.i)
   ProcedureReturn Dt(Id)\D[Axis]
 EndProcedure
+
+; The Windows adapter retains the portable scalar arithmetic.
+Procedure DOpRunUnary(src.i,dst.i,count.i,op.i,kind.i)
+  PmOpUnary(src,dst,count,op,kind)
+EndProcedure

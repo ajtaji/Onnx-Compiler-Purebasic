@@ -7,3 +7,40 @@
 Procedure.i DOpDim(Id.i, Axis.i)
   ProcedureReturn DDims(Id * 8 + Axis)
 EndProcedure
+
+
+; Erf and exact Gelu use read-only coefficients after initialization. Split
+; independent output elements, preserving each scalar arithmetic chain.
+CompilerIf #PMD_NATIVE_BYTES=8
+Global Dim DOpUnaryParts.i[20]
+Procedure.i DOpUnaryWorker(p.i)
+ Protected src.i=PeekI(p),dst.i=PeekI(p+8),count.i=PeekI(p+16),op.i=PeekI(p+24),kind.i=PeekI(p+32)
+ Protected at.i,take.i
+ While at<count
+  take=count-at : If take>128 : take=128 : EndIf
+  PmOpUnary(src+at*4,dst+at*4,take,op,kind)
+  PmKernelIdle()
+  at+take
+ Wend
+ ProcedureReturn 0
+EndProcedure
+CompilerEndIf
+Procedure DOpRunUnary(src.i,dst.i,count.i,op.i,kind.i)
+ CompilerIf #PMD_NATIVE_BYTES=8
+ Protected parts.i=1,i.i,first.i,last.i,at.i
+ If kind=1 And (op=0 Or op=12) And count>=1024
+  PmOpInit() : PmOpTrigInit()
+  parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
+  If parts>1
+   For i=0 To parts-1
+    last=count : If i<parts-1 : last=(count*(i+1)/parts)/16*16 : EndIf
+    at=i*5 : DOpUnaryParts[at]=src+first*4 : DOpUnaryParts[at+1]=dst+first*4
+    DOpUnaryParts[at+2]=last-first : DOpUnaryParts[at+3]=op : DOpUnaryParts[at+4]=kind
+    first=last
+   Next
+   If pmSvcParRun(@DOpUnaryWorker,@DOpUnaryParts[0],40,parts)=#PMP_SVC_OK : ProcedureReturn : EndIf
+  EndIf
+ EndIf
+ CompilerEndIf
+ PmOpUnary(src,dst,count,op,kind)
+EndProcedure

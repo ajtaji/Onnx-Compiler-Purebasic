@@ -46,7 +46,25 @@ CompilerEndIf
 Procedure PmNsCopyBytes(*src.i, *dst.i, bytes.i)
   Protected i.i
   i = 0
+  CompilerIf #PMO_INT8_BACKEND = 1
+  If ((*src | *dst) & 15)=0 And bytes>=16
+    If *dst<=*src Or *dst-*src>=bytes
+      PmTensorCopyAlignedNeon(*src,*dst,bytes) : ProcedureReturn
+    EndIf
+  EndIf
+  CompilerEndIf
   If ((*src | *dst) & 3)=0
+    While i+32<=bytes
+      PokeL(*dst+i+0,PeekL(*src+i+0))
+      PokeL(*dst+i+4,PeekL(*src+i+4))
+      PokeL(*dst+i+8,PeekL(*src+i+8))
+      PokeL(*dst+i+12,PeekL(*src+i+12))
+      PokeL(*dst+i+16,PeekL(*src+i+16))
+      PokeL(*dst+i+20,PeekL(*src+i+20))
+      PokeL(*dst+i+24,PeekL(*src+i+24))
+      PokeL(*dst+i+28,PeekL(*src+i+28))
+      i=i+32
+    Wend
     While i+4<=bytes
       PokeL(*dst+i,PeekL(*src+i))
       i=i+4
@@ -964,6 +982,7 @@ Procedure.i PmNsPadCoordinate(c.i, before.i, srcExtent.i, dstExtent.i, mode.i)
 EndProcedure
 
 Procedure.i PmTensorPad(*g.PmTensorPadArgs)
+  Protected zeroFilled.i=0
   Protected runFirst.i=0
   Protected runLast.i=0
   Protected scan.i
@@ -1030,6 +1049,14 @@ Procedure.i PmTensorPad(*g.PmTensorPadArgs)
       If scan-run>runLast-runFirst : runFirst=run : runLast=scan : EndIf
     EndIf
   Wend
+  ; With an implicit constant zero, initialize the destination once.
+  ; Each surviving source row then needs only its contiguous interior copy.
+  CompilerIf #PMO_INT8_BACKEND = 1
+  If *g\Mode=0 And *g\Value=0
+    PmTensorZeroFillNeon(*g\Dst,count*size)
+    zeroFilled=1
+  EndIf
+  CompilerEndIf
   row = 0
   While row < rows
     n = row
@@ -1050,6 +1077,14 @@ Procedure.i PmTensorPad(*g.PmTensorPadArgs)
       EndIf
       d = d - 1
     Wend
+    If zeroFilled
+      If outside=0 And runLast>runFirst
+        coord=PmNsWord(*g\Map,runFirst)
+        PmNsCopyBytes(*g\Src+(source+coord)*size,*g\Dst+(row*width+runFirst)*size,(runLast-runFirst)*size)
+      EndIf
+      row=row+1
+      Continue
+    EndIf
     x = 0
     While x < width
       If outside=0 And x=runFirst And runLast>runFirst

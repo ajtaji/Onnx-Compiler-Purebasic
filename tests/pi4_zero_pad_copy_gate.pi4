@@ -1,0 +1,117 @@
+; Independent constant-zero padding and forward-copy checks.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+Global Dim GSrc.i[3]
+Global Dim GDst.i[3]
+Global Dim GBeg.i[3]
+Global Dim GMap.i[64]
+Global GP.PmTensorPadArgs
+Global *GPet
+Procedure.i PadCase(kind.i,variant.i)
+ Protected x.i,y.i,z.i,k.i,size.i=PmNsElementBytes(kind),src.i=$E9000020+(variant%4)*4,dst.i=$E9100020+(variant%4)*4
+ Protected nx.i,ny.i,nz.i,ix.i,iy.i,iz.i,i.i,j.i,bytes.i,at.i,source.i,expected.i,bits.i
+ GSrc[0]=2 : GSrc[1]=3 : GSrc[2]=5
+ GBeg[0]=0 : GBeg[1]=0 : GBeg[2]=0
+ GDst[0]=2 : GDst[1]=3 : GDst[2]=5
+ Select variant
+  Case 1 : GBeg[2]=2 : GDst[2]=10
+  Case 2 : GBeg[0]=1 : GBeg[1]=2 : GBeg[2]=1 : GDst[0]=4 : GDst[1]=6 : GDst[2]=8
+  Case 3 : GBeg[0]=-1 : GBeg[2]=-2 : GDst[0]=2 : GDst[1]=4 : GDst[2]=6
+  Case 4 : GBeg[0]=-2 : GDst[0]=0
+  Case 5 : GBeg[0]=1 : GBeg[1]=-2 : GDst[0]=3 : GDst[1]=2 : GDst[2]=2
+ EndSelect
+ For i=0 To 30*size-1 : PokeA(src+i,(i*73+19)%256) : Next
+ If kind=1 : PokeL(src,$7FA12345) : PokeL(src+4,$80000000) : EndIf
+ bytes=GDst[0]*GDst[1]*GDst[2]*size
+ For i=-16 To bytes+15 : PokeA(dst+i,$5A) : Next
+ GP\Src=src : GP\Dst=dst : GP\Rank=3 : GP\SrcDims=@GSrc[0] : GP\DstDims=@GDst[0]
+ GP\Begins=@GBeg[0] : GP\Mode=0 : GP\Kind=kind : GP\Value=0 : GP\Map=@GMap[0]
+ If PmTensorPad(@GP) : ProcedureReturn 1 : EndIf
+ For x=0 To GDst[0]-1
+  For y=0 To GDst[1]-1
+   For z=0 To GDst[2]-1
+    ix=x-GBeg[0] : iy=y-GBeg[1] : iz=z-GBeg[2]
+    For k=0 To size-1
+     expected=0
+     If ix>=0 And ix<2 And iy>=0 And iy<3 And iz>=0 And iz<5
+      expected=PeekA(src+((ix*3+iy)*5+iz)*size+k)
+     EndIf
+     at=((x*GDst[1]+y)*GDst[2]+z)*size+k
+     If PeekA(dst+at)<>expected : ProcedureReturn at+2 : EndIf
+    Next
+   Next
+  Next
+ Next
+ For i=1 To 16
+  If PeekA(dst-i)<>$5A Or PeekA(dst+bytes+i-1)<>$5A : ProcedureReturn -1 : EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i CopyCase(bytes.i,delta.i)
+ Protected a.i=$E9200000,b.i=$E9300000,i.i
+ For i=0 To 511 : PokeA(a+i,(i*73+11)%256) : PokeA(b+i,PeekA(a+i)) : Next
+ ; Independent byte-by-byte forward-copy contract, including overlaps.
+ For i=0 To bytes-1 : PokeA(b+32+delta+i,PeekA(b+32+i)) : Next
+ PmNsCopyBytes(a+32,a+32+delta,bytes)
+ For i=0 To 511
+  If PeekA(a+i)<>PeekA(b+i) : ProcedureReturn i+1 : EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected kind.i,variant.i,cases.i,rc.i,i.i,j.i
+ Protected Dim kinds.i[4]
+ Protected Dim lengths.i[8]
+ kinds[0]=1 : kinds[1]=6 : kinds[2]=7 : kinds[3]=9
+ lengths[0]=0 : lengths[1]=1 : lengths[2]=15 : lengths[3]=16
+ lengths[4]=17 : lengths[5]=31 : lengths[6]=33 : lengths[7]=257
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *GPet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PokeI($E1C01FF0,PmParallelCores())
+ For kind=0 To 3
+  For variant=0 To 5
+   rc=PadCase(kinds[kind],variant)
+   PokeI($E1C00000+cases*32,kinds[kind]) : PokeI($E1C00000+cases*32+8,variant) : PokeI($E1C00000+cases*32+24,rc)
+   cases+1 : If *GPet : GPet() : EndIf
+   If rc : PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+  Next
+ Next
+ For i=0 To 7
+  For j=-2 To 2
+   rc=CopyCase(lengths[i],j*4)
+   PokeI($E1C00000+cases*32,lengths[i]) : PokeI($E1C00000+cases*32+8,j*4) : PokeI($E1C00000+cases*32+24,rc)
+   cases+1
+   If rc : PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+  Next
+ Next
+ PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn 0
+EndProcedure

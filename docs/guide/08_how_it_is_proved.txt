@@ -676,3 +676,36 @@ Eligible cases improved by roughly 8 to 45 percent, with a tiny case
 near parity. Two paired whole-model Kokoro runs also preserved every
 sample bit; their timing and limitations are in chapter 7. This proves
 those shapes on Pi 4, not arbitrary models or other hardware.
+
+
+@SECTION Four-core exact unary and broadcast work
+
+On 21 October 2026, 32 independent Pi 4 checks covered parallel Erf and
+exact Gelu, preserving the existing scalar arithmetic per output element.
+Cases include the dispatch threshold, tails, in-place output, signed zero,
+infinities and NaN bit patterns, memory guards and primary-core-only idle
+callbacks. Bit conversion scratch is local to each invocation. Windows
+retains scalar unary execution; this is not a new approximate Erf formula.
+
+A further 64 native cases covered constant-zero padding and byte-copy
+tails/overlap, and 35 covered FLOAT comparison broadcasting, rank changes,
+empty extents and exceptional values. Eligible AArch64 broadcast rows use
+the existing comparison kernel and service idle work between rows. Implicit
+zero padding initializes its destination once and copies surviving rows;
+already-zero allocated constants avoid a second fill. These paths select
+by operator, type and shape, without identifying any speech model.
+
+Whole Piper Low streaming outputs remained bit identical after these
+runtime changes. With resident mixed-INT8 weights and Bluetooth active,
+eight native text requests used 0.490--0.518 seconds of generation per
+second of audio. The maximum primary Bluetooth service gap fell from
+32.9 ms in the earlier baseline to 6.6 ms. Whole-sentence scheduled first
+nonzero audio was 0.593--1.017 seconds; acoustic onset was not measured.
+
+A separate caller experiment split distance cues at a comma and kept
+one continuous Bluetooth queue. This yielded 0.457--0.624 second scheduled
+nonzero onsets, generation ratios 0.490--0.589 and zero recorded underruns.
+The distance/road-name joins were heard clear and natural with no gaps. Native text
+uses a general English word dictionary, not recorded phrase audio or a
+complete eSpeak implementation. These are speech-only results; concurrent
+map rendering and arbitrary text remain separate validation work.

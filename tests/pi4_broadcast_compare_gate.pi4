@@ -1,0 +1,94 @@
+; Independent FLOAT broadcast comparison checks.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+Procedure.i OneCompare(variant.i,op.i)
+ Protected Dim da.i(8)
+ Protected Dim db.i(8)
+ Protected ra.i=2,rb.i=2,i.i,j.i,a.i,b.i,bits.i,expected.i
+ Protected av.f,bv.f
+ da(0)=3 : da(1)=1 : db(0)=1 : db(1)=5
+ Select variant
+  Case 1 : ra=3 : rb=3 : da(0)=2 : da(1)=1 : da(2)=7 : db(0)=1 : db(1)=4 : db(2)=1
+  Case 2 : ra=3 : rb=3 : da(0)=1 : da(1)=3 : da(2)=1 : db(0)=2 : db(1)=1 : db(2)=17
+  Case 3 : da(0)=2 : da(1)=0 : db(0)=1 : db(1)=1
+  Case 4 : ra=1 : rb=1 : da(0)=1 : db(0)=13
+  Case 5 : ra=3 : rb=3 : da(0)=3 : da(1)=2 : da(2)=1 : db(0)=3 : db(1)=1 : db(2)=19
+  Case 6 : ra=4 : rb=4 : da(0)=2 : da(1)=1 : da(2)=3 : da(3)=1 : db(0)=1 : db(1)=4 : db(2)=1 : db(3)=9
+ EndSelect
+ If DAlloc(1,1,ra,@da(0))=0 Or DAlloc(2,1,rb,@db(0))=0 : ProcedureReturn 1 : EndIf
+ For j=1 To 2
+  For i=0 To Dt(j)\Count-1
+   bits=(i*1664525+1013904223+j*29179) & $FFFFFFFF
+   Select i%8
+    Case 0 : bits=$7FA12345
+    Case 1 : bits=$80000000
+    Case 2 : bits=0
+    Case 3 : bits=$7F800000
+    Case 4 : bits=$FF800000
+   EndSelect
+   PokeL(Dt(j)\Data+i*4,bits)
+  Next
+ Next
+ DBinary(3,1,2,op)
+ If DError Or DCancel : ProcedureReturn 2 : EndIf
+ For i=0 To Dt(3)\Count-1
+  a=DBroadcastIndex(i,3,1) : b=DBroadcastIndex(i,3,2)
+  av=DGet(1,a) : bv=DGet(2,b)
+  Select op
+   Case 5 : expected=Bool(av=bv)
+   Case 6 : expected=Bool(av>bv)
+   Case 7 : expected=Bool(av<bv)
+   Case 8 : expected=Bool(av>=bv)
+   Case 9 : expected=Bool(av<>0 And bv<>0)
+  EndSelect
+  If PeekA(Dt(3)\Data+i)<>expected : ProcedureReturn i+10 : EndIf
+ Next
+ DRelease(3) : DRelease(2) : DRelease(1)
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected op.i,variant.i,cases.i,rc.i
+ Protected *pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PokeI($E1C01FF0,PmParallelCores())
+ If DHeapBind($EA000000,$100000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ For op=5 To 9
+  For variant=0 To 6
+   rc=OneCompare(variant,op)
+   PokeI($E1C00000+cases*32,op) : PokeI($E1C00000+cases*32+8,variant) : PokeI($E1C00000+cases*32+24,rc)
+   cases+1 : If *pet : pet() : EndIf
+   If rc : PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+  Next
+ Next
+ PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn 0
+EndProcedure

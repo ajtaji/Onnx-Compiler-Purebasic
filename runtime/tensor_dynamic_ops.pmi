@@ -132,7 +132,7 @@ Procedure DOpUnary(Y.i, A.i, Op.i)
     ProcedureReturn
   EndIf
   PmOpStatus = 0
-  PmOpUnary(Dt(A)\Data, Dt(Y)\Data, Dt(A)\Count, Op, kind)
+  DOpRunUnary(Dt(A)\Data, Dt(Y)\Data, Dt(A)\Count, Op, kind)
   DOpStatus()
 EndProcedure
 

@@ -1225,6 +1225,21 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
     PmTensorCompareFp32Neon(Dt(A)\Data,Dt(B)\Data,Dt(Y)\Data,Dt(Y)\Count,Bool(Dt(A)\Count<>1),Bool(Dt(B)\Count<>1),Op)
     ProcedureReturn
   EndIf
+  If Op>=5 And Op<=9 And Dt(A)\Kind=1 And Dt(B)\Kind=1
+    width=1
+    If Dt(Y)\Rank : width=DDims(Y*8+Dt(Y)\Rank-1) : EndIf
+    If width=0 : ProcedureReturn : EndIf
+    astep=0 : bstep=0
+    If Dt(A)\Rank : astep=Bool(DDims(A*8+Dt(A)\Rank-1)<>1) : EndIf
+    If Dt(B)\Rank : bstep=Bool(DDims(B*8+Dt(B)\Rank-1)<>1) : EndIf
+    For row=0 To Dt(Y)\Count/width-1
+      ai=DBroadcastIndex(row*width,Y,A)
+      bi=DBroadcastIndex(row*width,Y,B)
+      PmTensorCompareFp32Neon(Dt(A)\Data+ai*4,Dt(B)\Data+bi*4,Dt(Y)\Data+row*width,width,astep,bstep,Op)
+      PmKernelIdle()
+    Next
+    ProcedureReturn
+  EndIf
   CompilerEndIf
   If Op=9 And Dt(A)\Kind=9 And Dt(B)\Kind=9 And (Dt(A)\Count=1 Or Dt(A)\Count=Dt(Y)\Count) And (Dt(B)\Count=1 Or Dt(B)\Count=Dt(Y)\Count)
     ai=Dt(A)\Data : bi=Dt(B)\Data
@@ -2138,6 +2153,8 @@ Procedure DConstantShape(Y.i,Shape.i,Kind.i,Value.f)
     dims(i)=DInt(Shape,i)
   Next
   If DAlloc(Y,Kind,Dt(Shape)\Count,@dims(0))
+    ; DAlloc already wrote positive zero to every output byte.
+    If PeekL(@Value)=0 : ProcedureReturn : EndIf
     For i=0 To Dt(Y)\Count-1
       DPut(Y,i,Value)
     Next

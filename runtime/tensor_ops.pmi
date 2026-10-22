@@ -52,7 +52,6 @@ Global PmOpStatus.i
 
 ; Constants, loaded from their bit patterns once.
 Global PmOpReady.i
-Global PmOpScratchF.f
 Global PmOpOne.f
 Global PmOpHalf.f
 Global PmOpTwo.f
@@ -211,13 +210,14 @@ EndProcedure
 ; are ever compared, so the width of the native integer does not matter.
 ; ----------------------------------------------------------------------
 Procedure.i PmOpBits(x.f)
-  PmOpScratchF = x
-  ProcedureReturn PeekL(@PmOpScratchF) & $FFFFFFFF
+  Protected bitsValue.f = x
+  ProcedureReturn PeekL(@bitsValue) & $FFFFFFFF
 EndProcedure
 
 Procedure.f PmOpFromBits(b.i)
-  PokeL(@PmOpScratchF, b)
-  ProcedureReturn PmOpScratchF
+  Protected bitsValue.f
+  PokeL(@bitsValue, b)
+  ProcedureReturn bitsValue
 EndProcedure
 
 Procedure.i PmOpIsNan(x.f)
