@@ -7970,3 +7970,91 @@ pmoLeakyDone:
 EndProcedure
 
 CompilerEndIf
+
+; Exact binary32 PmOpExp polynomial, across four independent ELU elements.
+; Negative values below -80 and short tails retain the scalar reference.
+; Nonnegative and unordered inputs preserve source bits, including -0 and NaN.
+CompilerIf #PMD_NATIVE_BYTES=8
+Procedure.i PmOpEluVectorA64(src.i,dst.i,count.i,alphaBits.i)
+ ASM
+  mov x4, #0
+  lsl w9, w3, #1
+  movz w10, #65280, lsl #16
+  cmp w9, w10
+  b.hs pmoEluVectorDone
+  cmp x2, #4
+  b.lt pmoEluVectorDone
+  adrp x9, pmoEluVectorConstants
+  add x9, x9, #:lo12:pmoEluVectorConstants
+  ld1r {v16.4s}, [x9], #4
+  ld1r {v17.4s}, [x9], #4
+  ld1r {v18.4s}, [x9], #4
+  ld1r {v19.4s}, [x9], #4
+  ld1r {v20.4s}, [x9], #4
+  ld1r {v21.4s}, [x9], #4
+  ld1r {v22.4s}, [x9], #4
+  ld1r {v23.4s}, [x9], #4
+  ld1r {v24.4s}, [x9], #4
+  ld1r {v25.4s}, [x9], #4
+  ld1r {v26.4s}, [x9], #4
+  ld1r {v31.4s}, [x9]
+  dup v30.4s, w3
+pmoEluVectorLoop:
+  ld1 {v0.4s}, [x0]
+  fcmlt v1.4s, v0.4s, #0.0
+  fcmgt v2.4s, v31.4s, v0.4s
+  umaxv s2, v2.4s
+  fmov w9, s2
+  cbnz w9, pmoEluVectorDone
+  and v2.16b, v0.16b, v1.16b
+  fmul v3.4s, v2.4s, v16.4s
+  fadd v3.4s, v3.4s, v17.4s
+  shl v3.4s, v3.4s, #9
+  ushr v3.4s, v3.4s, #9
+  movz w9, #64, lsl #16
+  dup v4.4s, w9
+  sub v3.4s, v3.4s, v4.4s
+  scvtf v4.4s, v3.4s
+  fmul v5.4s, v4.4s, v18.4s
+  fsub v2.4s, v2.4s, v5.4s
+  fmul v5.4s, v4.4s, v19.4s
+  fsub v2.4s, v2.4s, v5.4s
+  fmul v4.4s, v21.4s, v2.4s
+  fadd v4.4s, v4.4s, v22.4s
+  fmul v4.4s, v4.4s, v2.4s
+  fadd v4.4s, v4.4s, v23.4s
+  fmul v4.4s, v4.4s, v2.4s
+  fadd v4.4s, v4.4s, v24.4s
+  fmul v4.4s, v4.4s, v2.4s
+  fadd v4.4s, v4.4s, v25.4s
+  fmul v4.4s, v4.4s, v2.4s
+  fadd v4.4s, v4.4s, v26.4s
+  fmul v4.4s, v4.4s, v2.4s
+  fadd v4.4s, v4.4s, v20.4s
+  fmul v4.4s, v4.4s, v2.4s
+  fadd v4.4s, v4.4s, v20.4s
+  movi v5.4s, #127
+  add v3.4s, v3.4s, v5.4s
+  shl v3.4s, v3.4s, #23
+  fmul v4.4s, v4.4s, v3.4s
+  fsub v4.4s, v4.4s, v20.4s
+  fmul v4.4s, v30.4s, v4.4s
+  bsl v1.16b, v4.16b, v0.16b
+  st1 {v1.4s}, [x1]
+  add x0, x0, #16
+  add x1, x1, #16
+  add x4, x4, #4
+  sub x2, x2, #4
+  cmp x2, #4
+  b.ge pmoEluVectorLoop
+  b pmoEluVectorDone
+  .align 4
+pmoEluVectorConstants:
+  .word 0x3FB8AA3B, 0x4B400000, 0x3F317200, 0x35BFBE8E
+  .word 0x3F800000, 0x39500D01, 0x3AB60B61, 0x3C088889
+  .word 0x3D2AAAAB, 0x3E2AAAAB, 0x3F000000, 0xC2A00000
+pmoEluVectorDone:
+  mov x0, x4
+ EndASM
+EndProcedure
+CompilerEndIf

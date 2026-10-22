@@ -753,3 +753,41 @@ still slower than realtime; a prompt first chunk does not prove sustained
 streaming. These are silent physical Pi results with prepared text IDs,
 not Bluetooth, map or acoustic-onset measurements. The separate strict
 upstream/native numerical comparisons remain unmet.
+
+
+@SECTION Exact four-element ELU
+
+The AArch64 ELU path evaluates four independent FLOAT elements with the
+same binary32 range reduction, degree-seven exponential polynomial,
+separate multiply/add operations and final alpha multiplication as the
+scalar reference. It preserves nonnegative and unordered source bits.
+Negative values below -80, nonfinite alpha attributes and tails retain
+scalar execution; subnormal scaling is not approximated by this path.
+
+On the physical four-core Pi 4, 362 independent cases compare raw bytes
+with the unchanged scalar kernel, including two cases of over a million
+elements, in-place outputs, boundaries, odd tails, NaN payloads, signed
+zero, infinities and extreme/subnormal/nonfinite alpha attributes. Output
+canaries and primary-only idle callbacks also pass. A whole Pocket2m
+direction drops from3.118 to2.444 seconds for2.320 seconds of speech with
+every waveform byte unchanged. This is still slower than realtime.
+The graph's separate strict upstream/native FLOAT comparison is unmet;
+there is no Bluetooth, acoustic-onset or simultaneous-map timing claim.
+
+
+@SECTION Concat span geometry and full overwrites
+
+Concat validates the same ranks, element widths, axes and extents, then
+hoists input-list parsing and constant span geometry out of its row loop.
+Each input writes disjoint destination spans. Every output byte is written,
+so an initial zero fill is omitted; empty spans need no copy. Primary idle
+work is serviced after bounded batches of rows on AArch64.
+
+An independent physical Pi gate compares the old complete implementation
+across96 cases: FLOAT/INT32/INT64/BOOL raw bytes, ranks1..4, negative axes,
+empty tensors, many tiny rows, contiguous blocks, repeated inputs, metadata
+and invalid-axis/extent refusals. The complete Pocket2m direction retains
+its original waveform bytes while generation falls from2.277 to2.113s for
+2.320s of speech (ratio0.911). About9% margin is not a simultaneous-map
+proof; text tokens are prepared and the independent upstream/native FLOAT
+gate remains unmet. There is no new Bluetooth or acoustic-onset claim.

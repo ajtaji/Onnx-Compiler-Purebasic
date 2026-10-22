@@ -2030,6 +2030,7 @@ Procedure DConcat(Y.i,Inputs.i,Axis.i)
   Protected inner.i=0
   Protected offset.i=0
   Protected span.i=0
+  Protected src.i,dst.i,bytes.i,step.i
   Protected size.i=DSize(Dt(a)\Kind)
   DZero(@dims(0),8*#PMD_NATIVE_BYTES)
   If Axis<0
@@ -2057,19 +2058,31 @@ Procedure DConcat(Y.i,Inputs.i,Axis.i)
     Next
     dims(Axis)=dims(Axis)+DDims((a)*8+(Axis))
   Next
-  If DAlloc(Y,Dt(a)\Kind,Dt(a)\Rank,@dims(0))=0
+  If DAllocOverwrite(Y,Dt(a)\Kind,Dt(a)\Rank,@dims(0))=0
     ProcedureReturn
   EndIf
   outer=DProduct(Y,0,Axis-1)
   inner=DProduct(Y,Axis+1,Dt(Y)\Rank-1)
-  For j=0 To outer-1
-    offset=j*dims(Axis)*inner
-    For i=1 To count
-      a=DListValue(Inputs,i)
-      span=DDims((a)*8+(Axis))*inner
-      DCopy(Dt(a)\Data+j*span*size,Dt(Y)\Data+offset*size,span*size)
-      offset+span
-    Next
+  ; Each input contributes disjoint output spans. Hoist its list parsing
+  ; and row geometry, then write every byte without an initial zero fill.
+  step=dims(Axis)*inner*size
+  offset=0
+  For i=1 To count
+    a=DListValue(Inputs,i)
+    span=DDims(a*8+Axis)*inner
+    bytes=span*size
+    src=Dt(a)\Data
+    dst=Dt(Y)\Data+offset*size
+    If bytes
+      For j=0 To outer-1
+        DCopy(src,dst,bytes)
+        src+bytes : dst+step
+        CompilerIf #PMD_NATIVE_BYTES=8
+        If (j & 255)=255 : PmKernelIdle() : EndIf
+        CompilerEndIf
+      Next
+    EndIf
+    offset+span
   Next
 EndProcedure
 
