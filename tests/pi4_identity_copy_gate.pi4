@@ -1,0 +1,94 @@
+; Exact four-element ELU checked against the independent scalar kernel.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldIdentity(Y.i,A.i)
+  If A=0
+    DFail("Identity has no input tensor.")
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Data=0
+    DFail("Identity has no input tensor.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y,A,0)
+    DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+  EndIf
+EndProcedure
+
+Procedure.i CheckIdentity(kind.i,rank.i,variant.i,alias.i)
+ Protected Dim dims.i(8)
+ Protected i.i,j.i,left.i=3,right.i=4
+ For i=0 To rank-1 : dims(i)=2+i : Next
+ If variant=1 And rank>0 : dims(rank-1)=0 : EndIf
+ If variant=2 And rank=2 : dims(0)=16 : dims(1)=24064 : EndIf
+ If DAlloc(1,kind,rank,@dims(0))=0 : ProcedureReturn 21 : EndIf
+ If DAlloc(2,kind,rank,@dims(0))=0 : ProcedureReturn 22 : EndIf
+ For i=0 To Dt(1)\Bytes-1 : PokeA(Dt(1)\Data+i,(i*37+variant*19) & 255) : Next
+ DCopy(Dt(1)\Data,Dt(2)\Data,Dt(1)\Bytes)
+ If alias : left=1 : right=2 : EndIf
+ OldIdentity(left,1) : If DError : ProcedureReturn 23 : EndIf
+ DIdentity(right,2) : If DError : ProcedureReturn 24 : EndIf
+ If Dt(left)\Kind<>Dt(right)\Kind Or Dt(left)\Rank<>Dt(right)\Rank Or Dt(left)\Count<>Dt(right)\Count Or Dt(left)\Bytes<>Dt(right)\Bytes : ProcedureReturn 25 : EndIf
+ For i=0 To rank-1 : If DDims(left*8+i)<>DDims(right*8+i) : ProcedureReturn 26 : EndIf : Next
+ For i=0 To Dt(left)\Bytes-1
+  If PeekA(Dt(left)\Data+i)<>PeekA(Dt(right)\Data+i) : ProcedureReturn 27 : EndIf
+ Next
+ For i=1 To 4 : DRelease(i) : Next
+ If DLive<>0 : ProcedureReturn 28 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected i.i,j.i,k.i,a.i,rc.i,cases.i
+ Protected Dim kinds.i(4)
+ Protected *pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ If DHeapBind($EA000000,$1000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 20 : EndIf
+ PmTensorInt64Ok=1 : kinds(0)=1 : kinds(1)=6 : kinds(2)=7 : kinds(3)=9
+ For i=0 To 3
+ For j=0 To 3
+ For k=0 To 2
+ For a=0 To 1
+  rc=CheckIdentity(kinds(i),j,k,a) : PokeI($E1C00000+cases*8,rc) : cases+1
+  If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,DLive)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

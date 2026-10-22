@@ -405,6 +405,7 @@ EndProcedure
 
 ; Identity: a tensor copied into a new tensor of the same type and shape.
 Procedure DIdentity(Y.i,A.i)
+  Protected copied.i
   If A=0
     DFail("Identity has no input tensor.")
     ProcedureReturn
@@ -413,7 +414,13 @@ Procedure DIdentity(Y.i,A.i)
     DFail("Identity has no input tensor.")
     ProcedureReturn
   EndIf
-  If DLike(Y,A,0)
+  ; Distinct outputs overwrite every byte, so no initial zero fill is needed.
+  If Y=A
+    copied=DLike(Y,A,0)
+  Else
+    copied=DLikeOverwrite(Y,A,0)
+  EndIf
+  If copied
     DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
   EndIf
 EndProcedure
