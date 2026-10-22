@@ -7861,11 +7861,37 @@ DataSection
  Data.l $00000000,$3FF00000,$00000000,$3FF00000
 EndDataSection
 
+; Four source values per loop; comparisons and sums retain source order.
+; Paired loads reduce loop overhead without reassociation or a tree reduction.
 Procedure.i PmSoftmaxMaxBitsA64(src.i,count.i)
  ASM
   ldr s0, [x0], #4
   sub x1, x1, #1
-pmoSoftmaxMaxLoop:
+  cmp x1, #4
+  b.lt pmoSoftmaxMaxTail
+pmoSoftmaxMaxFour:
+  ldp s1, s2, [x0], #8
+  fcmp s1, s0
+  b.le pmoSoftmaxMaxKeep0
+  fmov s0, s1
+pmoSoftmaxMaxKeep0:
+  fcmp s2, s0
+  b.le pmoSoftmaxMaxKeep1
+  fmov s0, s2
+pmoSoftmaxMaxKeep1:
+  ldp s1, s2, [x0], #8
+  fcmp s1, s0
+  b.le pmoSoftmaxMaxKeep2
+  fmov s0, s1
+pmoSoftmaxMaxKeep2:
+  fcmp s2, s0
+  b.le pmoSoftmaxMaxKeep3
+  fmov s0, s2
+pmoSoftmaxMaxKeep3:
+  sub x1, x1, #4
+  cmp x1, #4
+  b.ge pmoSoftmaxMaxFour
+pmoSoftmaxMaxTail:
   cmp x1, #0
   b.le pmoSoftmaxMaxDone
   ldr s1, [x0], #4
@@ -7874,7 +7900,7 @@ pmoSoftmaxMaxLoop:
   fmov s0, s1
 pmoSoftmaxMaxKeep:
   sub x1, x1, #1
-  b pmoSoftmaxMaxLoop
+  b pmoSoftmaxMaxTail
 pmoSoftmaxMaxDone:
   fmov w0, s0
  EndASM
@@ -7882,13 +7908,25 @@ EndProcedure
 Procedure.i PmSoftmaxSumBitsA64(src.i,count.i)
  ASM
   movi v0.4s, #0
-pmoSoftmaxSumLoop:
+  cmp x1, #4
+  b.lt pmoSoftmaxSumTail
+pmoSoftmaxSumFour:
+  ldp s1, s2, [x0], #8
+  fadd s0, s0, s1
+  fadd s0, s0, s2
+  ldp s1, s2, [x0], #8
+  fadd s0, s0, s1
+  fadd s0, s0, s2
+  sub x1, x1, #4
+  cmp x1, #4
+  b.ge pmoSoftmaxSumFour
+pmoSoftmaxSumTail:
   cmp x1, #0
   b.le pmoSoftmaxSumDone
   ldr s1, [x0], #4
   fadd s0, s0, s1
   sub x1, x1, #1
-  b pmoSoftmaxSumLoop
+  b pmoSoftmaxSumTail
 pmoSoftmaxSumDone:
   fmov w0, s0
  EndASM

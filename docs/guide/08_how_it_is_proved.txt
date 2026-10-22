@@ -886,3 +886,12 @@ A paired-term INT8 single-row experiment passes492 old-full-matrix cases, includ
 
 
 Final normal-compiler verification emits all11 shared runtime files exactly and preserves the complete227,775,168-byte USB-verified weight file. After restoring the previous single-row arithmetic, the full PMF is byte-for-byte identical to the faster retained payload. Two warm requests measure32.91695/32.91653s, produce61440finite samples each, and preserve every original-native waveform byte with no error/cancellation and healthy four-core return. These remain2.56s diagnostic decoder waveforms, not complete real-time speech or watermark/upstream numerical acceptance.
+
+
+@SECTION Exact attention reductions
+
+The AArch64 softmax maximum and sum loops now process four consecutive source values per iteration using paired loads. Comparisons and additions still occur in their original order; no tree reduction, fused arithmetic or tolerance change is introduced. A physical Pi gate compares 104 cases against the previous native implementation, covering widths 1 through 1255, odd tails, signed zeros, subnormals, NaNs, infinities and complete three-row softmax outputs with canaries.
+
+With the shared change, two warm conditional-decoder requests take 32.84185 and 32.84455 seconds versus the retained 32.91695 and 32.91653 seconds. Mean softmax cost falls from 2.90752 to 2.83237 seconds, about 2.6 percent. Every complete waveform byte matches the original native decoder. This is a small whole-workload gain of about 0.22 percent, still approximately 12.83 times real time for 2.56 seconds of diagnostic decoder output. It does not establish complete text-to-speech latency, upstream numerical/random alignment, watermark delivery or simultaneous map/audio performance.
+
+Independent FLOAT multiply scheduling, paired reduction-loop iterations, eight-by-eight and four-by-eight packed tiles, and a six-by-sixteen tile with saved vector registers all preserve complete output bytes but fail to improve total decoder time. They are excluded. Operator improvements apply to eligible networks by shape and operation, without a voice identity check.

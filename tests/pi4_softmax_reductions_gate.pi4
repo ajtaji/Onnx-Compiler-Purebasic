@@ -1,0 +1,118 @@
+; Exact sequential softmax reductions versus the previous native implementation.
+; Gemm reuse of the exact matrix kernel versus the old scalar Gemm.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure.i OldSoftmaxMaxBitsA64(src.i,count.i)
+ ASM
+  ldr s0, [x0], #4
+  sub x1, x1, #1
+pmoOldSoftmaxMaxLoop:
+  cmp x1, #0
+  b.le pmoOldSoftmaxMaxDone
+  ldr s1, [x0], #4
+  fcmp s1, s0
+  b.le pmoOldSoftmaxMaxKeep
+  fmov s0, s1
+pmoOldSoftmaxMaxKeep:
+  sub x1, x1, #1
+  b pmoOldSoftmaxMaxLoop
+pmoOldSoftmaxMaxDone:
+  fmov w0, s0
+ EndASM
+EndProcedure
+Procedure.i OldSoftmaxSumBitsA64(src.i,count.i)
+ ASM
+  movi v0.4s, #0
+pmoOldSoftmaxSumLoop:
+  cmp x1, #0
+  b.le pmoOldSoftmaxSumDone
+  ldr s1, [x0], #4
+  fadd s0, s0, s1
+  sub x1, x1, #1
+  b pmoOldSoftmaxSumLoop
+pmoOldSoftmaxSumDone:
+  fmov w0, s0
+ EndASM
+EndProcedure
+Procedure OldTensorSoftmaxExactA64(src.i,dst.i,outer.i,width.i)
+ Protected row.i,ps.i,pd.i,mx.f,sum.f
+ If width<1 Or outer<1 : ProcedureReturn : EndIf
+ For row=0 To outer-1
+  ps=src+row*width*4 : pd=dst+row*width*4
+  PokeL(@mx,OldSoftmaxMaxBitsA64(ps,width))
+  PmTensorBinaryFp32Neon(ps,@mx,pd,width,1,0,1)
+  PmTensorExpExactA64(pd,pd,width)
+  PokeL(@sum,OldSoftmaxSumBitsA64(pd,width))
+  PmTensorBinaryFp32Neon(pd,@sum,pd,width,1,0,3)
+ Next
+EndProcedure
+
+Procedure.i Main(services.i)
+ Protected width.i,wi.i,pattern.i,i.i,bits.i,seed.i=$12345678,cases.i,rc.i,src.i=$E9000010,ref.i=$EA000010,dst.i=$EB000010,*pet
+ Protected Dim widths.i(13)
+ widths(0)=1 : widths(1)=2 : widths(2)=3 : widths(3)=4 : widths(4)=5 : widths(5)=7 : widths(6)=8 : widths(7)=15 : widths(8)=16 : widths(9)=17 : widths(10)=64 : widths(11)=628 : widths(12)=1255
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PokeI($E1C01FF0,PmParallelCores())
+ For wi=0 To 12
+ width=widths(wi)
+ For pattern=0 To 7
+  For i=0 To width*3-1
+   seed=seed*1664525+1013904223 : bits=(seed & $807FFFFF) | $3E800000
+   If pattern=1 : bits=(i % 7)*$80000000 : EndIf
+   If pattern=2 : bits=$7FC12345+(i % 7)*$100 : EndIf
+   If pattern=3 : bits=$7F800001+(i % 7)*$100 : EndIf
+   If pattern=4 : bits=$7F800000+(i % 2)*$80000000 : EndIf
+   If pattern=5 : bits=(i % 31)+(i % 2)*$80000000 : EndIf
+   If pattern=6 And i % 7=0 : bits=$FFC12345 : EndIf
+   If pattern=7 : bits=$7F7FFFFF+(i % 2)*$80000000 : EndIf
+   PokeL(src+i*4,bits)
+  Next
+  cases+1
+  If PmSoftmaxMaxBitsA64(src,width)<>OldSoftmaxMaxBitsA64(src,width) : rc=1 : Break : EndIf
+  If PmSoftmaxSumBitsA64(src,width)<>OldSoftmaxSumBitsA64(src,width) : rc=2 : Break : EndIf
+  PokeI(ref-8,$1122334455667788) : PokeI(ref+width*12,$1122334455667788)
+  PokeI(dst-8,$1122334455667788) : PokeI(dst+width*12,$1122334455667788)
+  OldTensorSoftmaxExactA64(src,ref,3,width) : PmTensorSoftmaxExactA64(src,dst,3,width)
+  For i=0 To width*12-1
+   If PeekA(ref+i)<>PeekA(dst+i) : rc=100+i : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  If PeekI(dst-8)<>$1122334455667788 Or PeekI(dst+width*12)<>$1122334455667788 : rc=3 : Break : EndIf
+  If *pet : pet() : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,rc)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
