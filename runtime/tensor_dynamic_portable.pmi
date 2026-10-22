@@ -233,6 +233,26 @@ Procedure DCopy(Source.i,Destination.i,Bytes.i)
     i=i+1
   Wend
 EndProcedure
+; Inference/state transfers may service the primary between aligned chunks.
+; Raw DCopy stays callback-safe: transport callbacks can copy without a call
+; cycle back into PmKernelIdle. Upward-overlap and unaligned ranges retain
+; the raw primitive's forward-copy behavior.
+Procedure DCopyServiced(Source.i,Destination.i,Bytes.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected offset.i=0
+  If ((Source | Destination) & 15)=0 And Bytes>=65536
+    If Destination<=Source Or Destination-Source>=Bytes
+      While Bytes-offset>=65536
+        DCopy(Source+offset,Destination+offset,65536)
+        offset+65536 : PmKernelIdle()
+      Wend
+      DCopy(Source+offset,Destination+offset,Bytes-offset)
+      ProcedureReturn
+    EndIf
+  EndIf
+  CompilerEndIf
+  DCopy(Source,Destination,Bytes)
+EndProcedure
 ; DZero is the arena's zero-fill primitive and the only one: DAcquire's
 ; contract is that a freshly acquired block reads as zero over its whole
 ; payload, and every other caller here clears its dimension scratch through
@@ -1746,7 +1766,7 @@ Procedure DCast(Y.i,A.i,Kind.i)
   EndIf
   CompilerIf #PMD_NATIVE_BYTES=8
   If Dt(A)\Kind=1 And Kind=1
-    DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes) : ProcedureReturn
+    DCopyServiced(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes) : ProcedureReturn
   EndIf
   CompilerEndIf
   CompilerIf #PMD_NATIVE_BYTES=8
@@ -1846,7 +1866,7 @@ Procedure DReshape(Y.i,A.i,Shape.i,AllowZero.i)
     ProcedureReturn
   EndIf
   If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))
-    DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+    DCopyServiced(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
   EndIf
 EndProcedure
 
@@ -1906,7 +1926,7 @@ Procedure DViewAxes(Y.i,A.i,Axes.i,Unsqueeze.i)
     rank=j
   EndIf
   If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))
-    DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+    DCopyServiced(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
   EndIf
 EndProcedure
 
@@ -2012,7 +2032,7 @@ Procedure DTranspose(Y.i,A.i,Perm.i)
         coord=n%dims(j) : n/dims(j)
         src+coord*strides(j)
       Next
-      DCopy(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,contiguous*size)
+      DCopyServiced(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,contiguous*size)
     Next
     ProcedureReturn
   EndIf
@@ -2024,7 +2044,7 @@ Procedure DTranspose(Y.i,A.i,Perm.i)
       n/dims(j)
       src+coord*strides(j)
     Next
-    DCopy(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
+    DCopyServiced(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
   Next
 EndProcedure
 
@@ -2074,7 +2094,7 @@ Procedure PmGatherAliased(Y.i,A.i,Indices.i,Axis.i)
         DFail("Gather index is out of bounds.")
         ProcedureReturn
       EndIf
-      DCopy(Dt(A)\Data+(i*DDims((A)*8+(Axis))+idx)*inner*size,Dt(Y)\Data+(i*Dt(Indices)\Count+j)*inner*size,inner*size)
+      DCopyServiced(Dt(A)\Data+(i*DDims((A)*8+(Axis))+idx)*inner*size,Dt(Y)\Data+(i*Dt(Indices)\Count+j)*inner*size,inner*size)
     Next
   Next
 EndProcedure
@@ -2144,7 +2164,7 @@ Procedure DGather(Y.i,A.i,Indices.i,Axis.i)
       CompilerIf #PMD_NATIVE_BYTES=8
       If (i & 255)=0 : PmKernelIdle() : EndIf
       CompilerEndIf
-      DCopy(Dt(A)\Data+i*srcStep+idx*bytes,Dt(Y)\Data+i*dstStep+j*bytes,take*bytes)
+      DCopyServiced(Dt(A)\Data+i*srcStep+idx*bytes,Dt(Y)\Data+i*dstStep+j*bytes,take*bytes)
     Next
     j+take
   Wend
@@ -2205,7 +2225,7 @@ Procedure DConcat(Y.i,Inputs.i,Axis.i)
     dst=Dt(Y)\Data+offset*size
     If bytes
       For j=0 To outer-1
-        DCopy(src,dst,bytes)
+        DCopyServiced(src,dst,bytes)
         src+bytes : dst+step
         CompilerIf #PMD_NATIVE_BYTES=8
         If (j & 255)=255 : PmKernelIdle() : EndIf
@@ -2302,7 +2322,7 @@ Procedure DSlice(Y.i,A.i,Starts.i,Ends.i,Axes.i,Steps.i)
         c=n % dims(j) : n=n/dims(j)
         src=src+c*stepv(j)*stride(j)
       Next
-      DCopy(Dt(A)\Data+src*size,Dt(Y)\Data+i*block*size,block*size)
+      DCopyServiced(Dt(A)\Data+src*size,Dt(Y)\Data+i*block*size,block*size)
     Next
     ProcedureReturn
   EndIf
@@ -2314,7 +2334,7 @@ Procedure DSlice(Y.i,A.i,Starts.i,Ends.i,Axes.i,Steps.i)
       n/dims(j)
       src+(start(j)+c*stepv(j))*stride(j)
     Next
-    DCopy(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
+    DCopyServiced(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
   Next
 EndProcedure
 
@@ -2348,7 +2368,7 @@ Procedure DExpand(Y.i,A.i,Shape.i)
   EndIf
   If Dt(Y)\Count=0 : ProcedureReturn : EndIf
   If Dt(A)\Count=Dt(Y)\Count
-    DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Bytes) : ProcedureReturn
+    DCopyServiced(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Bytes) : ProcedureReturn
   EndIf
   width=1 : If rank : width=dims(rank-1) : EndIf
   step=0
@@ -2356,10 +2376,10 @@ Procedure DExpand(Y.i,A.i,Shape.i)
   For row=0 To Dt(Y)\Count/width-1
     source=Dt(A)\Data+DBroadcastIndex(row*width,Y,A)*size
     If step
-      DCopy(source,Dt(Y)\Data+row*width*size,width*size)
+      DCopyServiced(source,Dt(Y)\Data+row*width*size,width*size)
     Else
       For x=0 To width-1
-        DCopy(source,Dt(Y)\Data+(row*width+x)*size,size)
+        DCopyServiced(source,Dt(Y)\Data+(row*width+x)*size,size)
       Next
     EndIf
     PmKernelIdle()
@@ -2540,7 +2560,7 @@ Procedure DWhere(Y.i,Cond.i,A.i,B.i)
       If size=4
         PokeL(dp,PeekL(src))
       Else
-        DCopy(src,dp,size)
+        DCopyServiced(src,dp,size)
       EndIf
       ap+astep : bp+bstep : cp+cstep : dp+size
     Next
@@ -2574,7 +2594,7 @@ Procedure DWhere(Y.i,Cond.i,A.i,B.i)
         EndIf
       EndIf
       If src<>0
-        DCopy(src,dp,width*4)
+        DCopyServiced(src,dp,width*4)
       Else
         vector=0
         CompilerIf #PMD_NATIVE_BYTES=8
@@ -2601,7 +2621,7 @@ Procedure DWhere(Y.i,Cond.i,A.i,B.i)
       src=B
     EndIf
     index=DBroadcastIndex(i,Y,src)
-    DCopy(Dt(src)\Data+index*size,Dt(Y)\Data+i*size,size)
+    DCopyServiced(Dt(src)\Data+index*size,Dt(Y)\Data+i*size,size)
   Next
 EndProcedure
 
@@ -2678,7 +2698,7 @@ Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
     ; The following source copy overwrites every destination byte.
     If DLikeOverwrite(Y,A,0)=0 : ProcedureReturn : EndIf
   EndIf
-  DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+  DCopyServiced(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
   For i=0 To tuples-1
     offset=0
     For j=0 To k-1
@@ -2692,7 +2712,7 @@ Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
       EndIf
       offset=offset*DDims((A)*8+(j))+idx
     Next
-    DCopy(Dt(Updates)\Data+i*block*size,Dt(Y)\Data+offset*block*size,block*size)
+    DCopyServiced(Dt(Updates)\Data+i*block*size,Dt(Y)\Data+offset*block*size,block*size)
   Next
 EndProcedure
 
@@ -3154,7 +3174,7 @@ Procedure DReduceNoopEmpty(Y.i,A.i,Axes.i,Keep.i,Mean.i)
   EndIf
   If empty
     If DLike(Y,A,0)
-      DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+      DCopyServiced(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
     EndIf
     ProcedureReturn
   EndIf
