@@ -2,6 +2,8 @@
 ; graph interpreter, host process, or compiler is used by generated programs.
 ; Arena blocks use 16-byte headers and 16-byte alignment. First-fit allocation
 ; splits blocks; free coalesces adjacent blocks. Capacity includes all headers.
+; Header words: span at +0, occupied at +4, previous span at +8. The
+; boundary length permits local coalescing without a full arena walk.
 Structure PmDynamicTensor
   Data.i
   Kind.i
@@ -263,6 +265,7 @@ Procedure.i DHeapBind(Address.i,Bytes.i)
   DHeapPeak=0
   PokeL(DHeap,DHeapBytes)
   PokeL(DHeap+4,0)
+  PokeL(DHeap+8,0)
   ProcedureReturn 1
 EndProcedure
 Procedure.i DAcquireCore(Bytes.i,clear.i)
@@ -286,6 +289,8 @@ Procedure.i DAcquireCore(Bytes.i,clear.i)
       If span-needed>=32
         PokeL(DHeap+offset+needed,span-needed)
         PokeL(DHeap+offset+needed+4,0)
+        PokeL(DHeap+offset+needed+8,needed)
+        If offset+span<DHeapBytes : PokeL(DHeap+offset+span+8,span-needed) : EndIf
         span=needed
         PokeL(DHeap+offset,span)
       EndIf
@@ -337,20 +342,34 @@ Procedure DFree(Address.i)
     DFail("Invalid or duplicate arena release.")
     ProcedureReturn
   EndIf
+  ; Boundary lengths in the unused header word identify both neighbours.
+  ; Eager coalescing leaves no other free pair elsewhere in the arena.
+  Protected previous.i=PeekL(DHeap+offset+8),nextOffset.i=offset+span
+  If previous<0 Or previous>offset Or (previous & 15)<>0
+    DFail("Arena previous-block metadata is invalid.") : ProcedureReturn
+  EndIf
+  If previous>0
+    If PeekL(DHeap+offset-previous)<>previous
+      DFail("Arena previous-block length is invalid.") : ProcedureReturn
+    EndIf
+  ElseIf offset<>0
+    DFail("Arena previous-block boundary is missing.") : ProcedureReturn
+  EndIf
+  If nextOffset<DHeapBytes
+    nextSpan=PeekL(DHeap+nextOffset)
+    If nextSpan<32 Or nextSpan>DHeapBytes-nextOffset Or PeekL(DHeap+nextOffset+8)<>span
+      DFail("Arena next-block metadata is invalid.") : ProcedureReturn
+    EndIf
+  EndIf
   PokeL(DHeap+offset+4,0)
   DHeapUsed=DHeapUsed-span
-  offset=0
-  While offset<DHeapBytes
-    span=PeekL(DHeap+offset)
-    If PeekL(DHeap+offset+4)=0 And offset+span<DHeapBytes
-      If PeekL(DHeap+offset+span+4)=0
-        nextSpan=PeekL(DHeap+offset+span)
-        PokeL(DHeap+offset,span+nextSpan)
-        Continue
-      EndIf
-    EndIf
-    offset=offset+span
-  Wend
+  If nextOffset<DHeapBytes And PeekL(DHeap+nextOffset+4)=0
+    span+nextSpan : PokeL(DHeap+offset,span)
+  EndIf
+  If previous>0 And PeekL(DHeap+offset-previous+4)=0
+    offset-previous : span+previous : PokeL(DHeap+offset,span)
+  EndIf
+  If offset+span<DHeapBytes : PokeL(DHeap+offset+span+8,span) : EndIf
 EndProcedure
 Procedure.i DSize(Kind.i)
   Select Kind

@@ -1,0 +1,165 @@
+; Gemm reuse of the exact matrix kernel versus the old scalar Gemm.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_fp32.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_fp32_neon.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_trig_a64.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_norm_small.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_ops.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_ops_portable.pmi"
+
+Global RefDHeap.i,RefDHeapBytes.i,RefDLimit.i,RefDHeapUsed.i,RefDHeapPeak.i,RefError.i
+Procedure.i RefDFail(message.i)
+ RefError=1 : ProcedureReturn 0
+EndProcedure
+Procedure.i RefDHeapBind(Address.i,Bytes.i)
+  If Address=0 Or (Address & 15)<>0 Or Bytes<32 Or Bytes>$7FFFFF00
+    ProcedureReturn RefDFail("Bind an aligned arena between 32 bytes and the signed addressable size limit.")
+  EndIf
+  RefDHeap=Address
+  RefDHeapBytes=Bytes & -16
+  RefDLimit=RefDHeapBytes
+  RefDHeapUsed=0
+  RefDHeapPeak=0
+  PokeL(RefDHeap,RefDHeapBytes)
+  PokeL(RefDHeap+4,0)
+  ProcedureReturn 1
+EndProcedure
+Procedure.i RefDAcquireCore(Bytes.i,clear.i)
+  Protected offset.i=0
+  Protected span.i=0
+  Protected needed.i=0
+  Protected address.i=0
+  If RefDHeap=0 Or Bytes<0 Or Bytes>RefDHeapBytes-16
+    RefDFail("Allocation exceeds the bound arena.")
+    ProcedureReturn 0
+  EndIf
+  needed=((DMax(Bytes,1)+15) & -16)+16
+  offset=0
+  While offset<RefDHeapBytes
+    span=PeekL(RefDHeap+offset)
+    If span<32 Or span>RefDHeapBytes-offset
+      RefDFail("Arena block metadata is invalid.")
+      ProcedureReturn 0
+    EndIf
+    If PeekL(RefDHeap+offset+4)=0 And span>=needed
+      If span-needed>=32
+        PokeL(RefDHeap+offset+needed,span-needed)
+        PokeL(RefDHeap+offset+needed+4,0)
+        span=needed
+        PokeL(RefDHeap+offset,span)
+      EndIf
+      PokeL(RefDHeap+offset+4,1)
+      RefDHeapUsed=RefDHeapUsed+span
+      RefDHeapPeak=DMax(RefDHeapPeak,RefDHeapUsed)
+      address=RefDHeap+offset+16
+      ; THE WHOLE PAYLOAD IS ZEROED, NOT ONLY THE REQUESTED BYTES.  An
+      ; acquired block reads as zero: DAlloc's consumers rely on it where a
+      ; kernel writes only part of its output - ONNX LSTM leaves Y at zero
+      ; for every timestep past a batch's sequence length, and the kernel
+      ; skips those stores rather than writing zeros over them - and the
+      ; rounding slack past the requested length is zeroed too so that a
+      ; vector kernel reading a tail never meets a stale bit pattern.
+      If clear
+        DZero(address,span-16)
+      Else
+        ; Full-overwrite kernels own every requested byte. Keep the rounded
+        ; tail zero for kernels whose vector loads may inspect that slack.
+        DZero(address+Bytes,span-16-Bytes)
+      EndIf
+      ProcedureReturn address
+    EndIf
+    offset=offset+span
+  Wend
+  RefDFail("Request cannot fit in the remaining contiguous arena memory.")
+  ProcedureReturn 0
+EndProcedure
+Procedure.i RefDAcquire(Bytes.i)
+  ProcedureReturn RefDAcquireCore(Bytes,1)
+EndProcedure
+Procedure.i RefDAcquireOverwrite(Bytes.i)
+  ProcedureReturn RefDAcquireCore(Bytes,0)
+EndProcedure
+Procedure RefDFree(Address.i)
+  Protected offset.i=0
+  Protected span.i=0
+  Protected nextSpan.i=0
+  If Address=0
+    ProcedureReturn
+  EndIf
+  offset=Address-RefDHeap-16
+  If offset<0 Or offset>=RefDHeapBytes Or (offset & 15)<>0
+    RefDFail("Invalid arena release.")
+    ProcedureReturn
+  EndIf
+  span=PeekL(RefDHeap+offset)
+  If span<32 Or span>RefDHeapBytes-offset Or PeekL(RefDHeap+offset+4)<>1
+    RefDFail("Invalid or duplicate arena release.")
+    ProcedureReturn
+  EndIf
+  PokeL(RefDHeap+offset+4,0)
+  RefDHeapUsed=RefDHeapUsed-span
+  offset=0
+  While offset<RefDHeapBytes
+    span=PeekL(RefDHeap+offset)
+    If PeekL(RefDHeap+offset+4)=0 And offset+span<RefDHeapBytes
+      If PeekL(RefDHeap+offset+span+4)=0
+        nextSpan=PeekL(RefDHeap+offset+span)
+        PokeL(RefDHeap+offset,span+nextSpan)
+        Continue
+      EndIf
+    EndIf
+    offset=offset+span
+  Wend
+EndProcedure
+
+
+Procedure.i Main(services.i)
+ Protected test.i,a.i,b.i,c.i,at.i,old.i,used.i,rc.i,cases.i
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : DZero($E1C00000,8192)
+ For test=0 To 4
+  DError=0 : DHeapBind($EA000000,512)
+  a=DAcquire(32) : b=DAcquire(32) : c=DAcquire(32) : used=DHeapUsed
+  Select test
+   Case 0 : at=b-8
+   Case 1 : at=b-8
+   Case 2 : at=a-16
+   Case 3 : at=c-8
+   Case 4 : at=c-16
+  EndSelect
+  old=PeekL(at)
+  If test=1 : PokeL(at,4096) : Else : PokeL(at,0) : EndIf
+  DFree(b)
+  If DError=0 Or DHeapUsed<>used Or PeekL(b-12)<>1 : rc=test+1 : Break : EndIf
+  PokeL(at,old) : DError=0
+  DFree(b) : DFree(a) : DFree(c)
+  If DError Or DHeapUsed<>0 Or PeekL(DHeap)<>512 : rc=test+10 : Break : EndIf
+  cases+1
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,DHeapUsed)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
