@@ -63,6 +63,17 @@ Procedure.i GateOne(count.i,pattern.i,inplace.i)
     Case 14 : b=$BF800000
    EndSelect
   EndIf
+  If pattern=2
+   b=PeekL(@x)
+   If (i % 16)=((count+inplace) % 4)
+    Select (count+inplace) % 4
+     Case 0 : b=$7FC12345
+     Case 1 : b=$7FA12345
+     Case 2 : b=$FFC12345
+     Case 3 : b=$FFA12345
+    EndSelect
+   EndIf
+  EndIf
   PokeL(src+i*4,b) : PokeL(dst+i*4,b)
  Next
  If pattern=0
@@ -110,13 +121,13 @@ Procedure.i Main(services.i)
    Case 8 : PokeL(@PmOpF(0),$00000001)
    Case 9 : PokeL(@PmOpF(0),$7F7FFFFF)
   EndSelect
-  For k=0 To 1
+  For k=0 To 2
    For j=0 To 1
     For i=0 To 8
      rc=GateOne(counts(i),k,j)
-     PokeI($E1C00000+cases*16,((alpha*4+k*2+j)<<32)+counts(i)) : PokeI($E1C00000+cases*16+8,rc)
+     PokeI($E1C00000+cases*8,rc)
      cases+1 : If *GatePet : GatePet() : EndIf
-     If rc : PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+     If rc : PokeI($E1C01F40,counts(i)) : PokeI($E1C01F48,alpha*8+k*2+j) : PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
     Next
    Next
   Next
@@ -124,7 +135,7 @@ Procedure.i Main(services.i)
  PmOpF(0)=1.0
  For j=0 To 1
   rc=GateOne(1048583,0,j)
-  PokeI($E1C00000+cases*16,(j<<32)+1048583) : PokeI($E1C00000+cases*16+8,rc)
+  PokeI($E1C00000+cases*8,rc)
   cases+1 : If *GatePet : GatePet() : EndIf
   If rc : PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
  Next

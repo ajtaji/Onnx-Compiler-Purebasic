@@ -760,15 +760,18 @@ upstream/native numerical comparisons remain unmet.
 The AArch64 ELU path evaluates four independent FLOAT elements with the
 same binary32 range reduction, degree-seven exponential polynomial,
 separate multiply/add operations and final alpha multiplication as the
-scalar reference. It preserves nonnegative and unordered source bits.
+scalar reference. It preserves nonnegative source bits; a group containing any NaN lane
+retains the scalar canonical-NaN store.
 Negative values below -80, nonfinite alpha attributes and tails retain
 scalar execution; subnormal scaling is not approximated by this path.
 
-On the physical four-core Pi 4, 362 independent cases compare raw bytes
+On the physical four-core Pi 4, 542 independent cases compare raw bytes
 with the unchanged scalar kernel, including two cases of over a million
 elements, in-place outputs, boundaries, odd tails, NaN payloads, signed
 zero, infinities and extreme/subnormal/nonfinite alpha attributes. Output
-canaries and primary-only idle callbacks also pass. A whole Pocket2m
+canaries and primary-only idle callbacks also pass. Mixed finite/NaN groups
+explicitly exercise all four lanes without another exception forcing fallback.
+This fixes the separately reported vector NaN-payload mismatch. A whole Pocket2m
 direction drops from3.118 to2.444 seconds for2.320 seconds of speech with
 every waveform byte unchanged. This is still slower than realtime.
 The graph's separate strict upstream/native FLOAT comparison is unmet;
