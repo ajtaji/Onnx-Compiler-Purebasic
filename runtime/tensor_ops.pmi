@@ -2483,33 +2483,33 @@ EndProcedure
 ; Tile-13: output dims in PmOpDY, input dims in PmOpDA; output coordinate
 ; c reads input coordinate c mod extent on every axis.
 Procedure PmOpTile(src.i, dst.i, rank.i, bytes.i)
-  Protected d.i
-  Protected s.i
-  Protected count.i
-  Protected i.i
-  Protected n.i
-  Protected at.i
-  s = 1
-  count = 1
-  d = rank - 1
-  While d >= 0
-    PmOpStride(d) = s
-    s = s * PmOpDA(d)
-    count = count * PmOpDY(d)
-    d = d - 1
+  ; Shape validation guarantees whole repeats. Map outer axes once per row
+  ; and copy contiguous source rows without changing any element bits.
+  Protected d.i,s.i=1,count.i=1,row.i,n.i,at.i,width.i,sourceWidth.i,x.i
+  If rank=0
+    PmOpCopyBytes(src,dst,bytes) : ProcedureReturn
+  EndIf
+  d=rank-1
+  While d>=0
+    PmOpStride(d)=s : s=s*PmOpDA(d) : count=count*PmOpDY(d)
+    d=d-1
   Wend
-  i = 0
-  While i < count
-    n = i
-    at = 0
-    d = rank - 1
-    While d >= 0
-      at = at + ((n % PmOpDY(d)) % PmOpDA(d)) * PmOpStride(d)
-      n = n / PmOpDY(d)
-      d = d - 1
+  If count=0 : ProcedureReturn : EndIf
+  width=PmOpDY(rank-1) : sourceWidth=PmOpDA(rank-1)
+  If sourceWidth=0 : ProcedureReturn : EndIf
+  row=0
+  While row<count/width
+    n=row : at=0 : d=rank-2
+    While d>=0
+      at=at+(n%PmOpDY(d)%PmOpDA(d))*PmOpStride(d)
+      n=n/PmOpDY(d) : d=d-1
     Wend
-    PmOpCopyElement(src + at * bytes, dst + i * bytes, bytes)
-    i = i + 1
+    x=0
+    While x<width
+      PmOpCopyBytes(src+at*bytes,dst+(row*width+x)*bytes,sourceWidth*bytes)
+      x=x+sourceWidth
+    Wend
+    row=row+1
   Wend
 EndProcedure
 

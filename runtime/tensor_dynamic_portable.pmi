@@ -1250,6 +1250,24 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
     Next
     ProcedureReturn
   EndIf
+  If Op=9 And Dt(A)\Kind=9 And Dt(B)\Kind=9
+    width=1
+    If Dt(Y)\Rank : width=DDims(Y*8+Dt(Y)\Rank-1) : EndIf
+    If width=0 : ProcedureReturn : EndIf
+    astep=0 : bstep=0
+    If Dt(A)\Rank : astep=Bool(DDims(A*8+Dt(A)\Rank-1)<>1) : EndIf
+    If Dt(B)\Rank : bstep=Bool(DDims(B*8+Dt(B)\Rank-1)<>1) : EndIf
+    For row=0 To Dt(Y)\Count/width-1
+      ai=Dt(A)\Data+DBroadcastIndex(row*width,Y,A)
+      bi=Dt(B)\Data+DBroadcastIndex(row*width,Y,B)
+      For i=row*width To (row+1)*width-1
+        PokeA(Dt(Y)\Data+i,Bool(PeekA(ai)<>0 And PeekA(bi)<>0))
+        ai+astep : bi+bstep
+      Next
+      PmKernelIdle()
+    Next
+    ProcedureReturn
+  EndIf
   ; The same two index maps the row path above hoists, hoisted here too, and
   ; this is where they are worth the most.  DBroadcastIndex walks the output
   ; rank with an integer division and a modulo PER AXIS, twice per element:
@@ -2115,6 +2133,7 @@ Procedure DExpand(Y.i,A.i,Shape.i)
   Protected rank.i=Dt(Shape)\Count
   Protected size.i=DSize(Dt(A)\Kind)
   Protected ax.i=0
+  Protected width.i,step.i,row.i,source.i,x.i
   DZero(@dims(0),8*#PMD_NATIVE_BYTES)
   If rank>8 Or rank<Dt(A)\Rank
     DFail("Invalid Expand rank.")
@@ -2136,8 +2155,23 @@ Procedure DExpand(Y.i,A.i,Shape.i)
   If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))=0
     ProcedureReturn
   EndIf
-  For i=0 To Dt(Y)\Count-1
-    DCopy(Dt(A)\Data+DBroadcastIndex(i,Y,A)*size,Dt(Y)\Data+i*size,size)
+  If Dt(Y)\Count=0 : ProcedureReturn : EndIf
+  If Dt(A)\Count=Dt(Y)\Count
+    DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(Y)\Bytes) : ProcedureReturn
+  EndIf
+  width=1 : If rank : width=dims(rank-1) : EndIf
+  step=0
+  If Dt(A)\Rank : step=Bool(DDims(A*8+Dt(A)\Rank-1)<>1) : EndIf
+  For row=0 To Dt(Y)\Count/width-1
+    source=Dt(A)\Data+DBroadcastIndex(row*width,Y,A)*size
+    If step
+      DCopy(source,Dt(Y)\Data+row*width*size,width*size)
+    Else
+      For x=0 To width-1
+        DCopy(source,Dt(Y)\Data+(row*width+x)*size,size)
+      Next
+    EndIf
+    PmKernelIdle()
   Next
 EndProcedure
 

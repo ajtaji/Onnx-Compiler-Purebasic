@@ -709,3 +709,29 @@ The distance/road-name joins were heard clear and natural with no gaps. Native t
 uses a general English word dictionary, not recorded phrase audio or a
 complete eSpeak implementation. These are speech-only results; concurrent
 map rendering and arbitrary text remain separate validation work.
+
+
+@SECTION Stateful speech and data movement
+
+The next Pi 4 investigation covered Pocket TTS 2m's complete stateful
+text/latent/decoder graph. Large ELU and tanh-Gelu tensors now use the same
+independent-element scheduling as Erf. Tile maps outer coordinates once
+per output row and copies contiguous source spans. Portable BOOL broadcasting
+also maps once per row; Expand copies identity layouts directly and maps
+other layouts by rows. These select by operation and shape, without a
+speech-model identity check. The common Tile kernel also compiles on Windows.
+
+Independent native checks passed 104 ELU/Gelu/Tile cases, seven BOOL broadcast
+cases and 32 Expand cases. The complete first direction retained every output
+waveform bit while generation fell from 9.320 to 4.988 seconds for 2.320 seconds
+of speech. First PCM fell from 0.335 to 0.183 seconds. This remains slower
+than realtime: generation ratio 2.150. Timing begins with prepared text token
+IDs, not a complete native tokenizer, and does not include Bluetooth or a map.
+
+A separate batch-one cache-export rewrite preserved all outputs and states
+for 32 consecutive host steps and the entire native waveform. Its final
+generation time was 4.869 seconds, ratio 2.099. Initially it took 17.004 seconds,
+exposing the costly generic Expand path. It is an experimental export recipe,
+not an automatically applied compiler transform. The upstream cumulative
+FLOAT comparison still exceeds the original strict tolerance; these speed
+results establish optimization parity, not a validated complete voice port.

@@ -9,8 +9,8 @@ Procedure.i DOpDim(Id.i, Axis.i)
 EndProcedure
 
 
-; Erf and exact Gelu use read-only coefficients after initialization. Split
-; independent output elements, preserving each scalar arithmetic chain.
+; Nonlinear unary kernels use read-only coefficients and node attributes
+; during execution. Split independent elements, preserving scalar arithmetic.
 CompilerIf #PMD_NATIVE_BYTES=8
 Global Dim DOpUnaryParts.i[20]
 Procedure.i DOpUnaryWorker(p.i)
@@ -28,7 +28,7 @@ CompilerEndIf
 Procedure DOpRunUnary(src.i,dst.i,count.i,op.i,kind.i)
  CompilerIf #PMD_NATIVE_BYTES=8
  Protected parts.i=1,i.i,first.i,last.i,at.i
- If kind=1 And (op=0 Or op=12) And count>=1024
+ If kind=1 And (op=0 Or op=6 Or op=12 Or op=13) And count>=1024
   PmOpInit() : PmOpTrigInit()
   parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
   If parts>1
