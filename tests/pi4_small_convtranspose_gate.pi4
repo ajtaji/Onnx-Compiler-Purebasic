@@ -1,0 +1,270 @@
+; Exact four-element ELU checked against the independent scalar kernel.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldConvRange(*g.PmTensorConvTranspose1DArgs,ocFirst.i,ocLast.i)
+  Protected bn.i
+  Protected ic.i
+  Protected ix.i
+  Protected ocg.i
+  Protected oc.i
+  Protected group.i
+  Protected inPerGroup.i
+  Protected outPerGroup.i
+  Protected baseOx.i
+  Protected firstK.i
+  Protected lastK.i
+  Protected limit.i
+  Protected srcIndex.i
+  Protected weightIndex.i
+  Protected dstIndex.i
+  Protected bits.i
+  Protected rowBase.i
+  Protected wideVectors.i
+  Protected headLast.i
+  Protected tailFirst.i
+  Protected weightRow.i
+  Protected nativeAllowed.i
+  Protected dilationBlock.i
+  Protected wideMaxVectors.i
+  Protected contiguous.i
+  Protected t.PmTensorConvTransposeTapsArgs
+  Protected w.PmTensorConvTransposeWideArgs
+  If *g=0 Or *g\Batches<=0 Or *g\Groups<=0 Or *g\InChannels<=0 Or *g\OutChannels<=0 Or *g\OutWidth<=0 Or *g\Kernel<=0 Or *g\Dilation<=0
+    ProcedureReturn
+  EndIf
+  ; The three widths are NAMED rather than written into the tests, so a control
+  ; build can retire one layer at a time and prove the layer beneath it still
+  ; returns the reference's bits on its own: nativeAllowed=0 retires all of
+  ; this and leaves PmTensorConvTranspose1D, dilationBlock=0 retires the
+  ; contiguous bodies and leaves the strided scatter row, and
+  ; wideMaxVectors=0 retires the register-resident interior and leaves the
+  ; clamped tap body.
+  nativeAllowed=1
+  dilationBlock=1
+  wideMaxVectors=5
+  inPerGroup=*g\InChannels / *g\Groups
+  outPerGroup=*g\OutChannels / *g\Groups
+  ; Every body below indexes a group by multiplying back out, so a channel
+  ; count the group count does not divide would silently address the wrong
+  ; weights.  Hand those to the portable reference, which IS the definition of
+  ; the answer, rather than guessing at what the shape meant.
+  If nativeAllowed=0 Or inPerGroup<=0 Or outPerGroup<=0 Or inPerGroup* *g\Groups<>*g\InChannels Or outPerGroup* *g\Groups<>*g\OutChannels
+    PmTensorConvTranspose1D(*g)
+    ProcedureReturn
+  EndIf
+  contiguous=0
+  If *g\Dilation=1 And dilationBlock>=1 : contiguous=1 : EndIf
+  ; The head/interior/tail split of the ix range.  It depends only on the
+  ; geometry, never on the channel, so it is computed once: headLast is the
+  ; first ix whose tap zero is at or after output position zero, and tailFirst
+  ; is the first ix whose last tap is past the end of the row.
+  wideVectors=0
+  headLast=0
+  tailFirst=0
+  If contiguous=1 And *g\Kernel%4=0 And *g\Kernel/4<=wideMaxVectors And wideMaxVectors>=1
+    wideVectors=*g\Kernel/4
+    headLast=(*g\PadLeft+*g\Stride-1)/ *g\Stride
+    If *g\PadLeft<=0 : headLast=0 : EndIf
+    If headLast>*g\InWidth : headLast=*g\InWidth : EndIf
+    limit=*g\OutWidth+*g\PadLeft-*g\Kernel
+    If limit<0
+      tailFirst=0
+    Else
+      tailFirst=limit/ *g\Stride+1
+    EndIf
+    If tailFirst>*g\InWidth : tailFirst=*g\InWidth : EndIf
+    If tailFirst<headLast : tailFirst=headLast : EndIf
+  EndIf
+  bn=0
+  While bn<*g\Batches
+    ; The bias pass covers every output element before any contribution, as
+    ; the reference's does.
+    oc=ocFirst
+    While oc<ocLast
+      bits=0
+      If *g\Bias<>0 : bits=PeekL(*g\Bias+oc*4) : EndIf
+      dstIndex=(bn* *g\OutChannels+oc)* *g\OutWidth
+      PmTensorConvTransposeFp32Fill(*g\Dst+dstIndex*4,*g\OutWidth,bits)
+      oc+1
+    Wend
+    oc=ocFirst
+    While oc<ocLast
+      group=oc/outPerGroup
+      ocg=oc-group*outPerGroup
+      rowBase=*g\Dst+(bn* *g\OutChannels+oc)* *g\OutWidth*4
+      ic=group*inPerGroup
+      While ic<group*inPerGroup+inPerGroup
+        PmKernelIdle()
+        srcIndex=(bn* *g\InChannels+ic)* *g\InWidth
+        weightRow=*g\Weight+(ic*outPerGroup+ocg)* *g\Kernel*4
+        If contiguous=1
+          ; Head, interior, tail - in ascending ix, so every element still sees
+          ; its contributions in ascending (ic, ix).
+          t\Weight=weightRow : t\Dst=rowBase
+          t\Stride=*g\Stride : t\Kernel=*g\Kernel : t\OutWidth=*g\OutWidth
+          If wideVectors>0
+            t\Src=*g\Src+srcIndex*4
+            t\Count=headLast
+            t\BaseOx=-*g\PadLeft
+            PmTensorConvTransposeFp32Taps(@t)
+            If tailFirst>headLast
+              w\Src=*g\Src+(srcIndex+headLast)*4
+              w\Weight=weightRow
+              w\Dst=rowBase+(headLast* *g\Stride-*g\PadLeft)*4
+              w\Count=tailFirst-headLast
+              w\StrideBytes=*g\Stride*4
+              w\Vectors=wideVectors
+              PmTensorConvTransposeFp32Wide(@w)
+            EndIf
+            t\Src=*g\Src+(srcIndex+tailFirst)*4
+            t\Count=*g\InWidth-tailFirst
+            t\BaseOx=tailFirst* *g\Stride-*g\PadLeft
+            PmTensorConvTransposeFp32Taps(@t)
+          Else
+            t\Src=*g\Src+srcIndex*4
+            t\Count=*g\InWidth
+            t\BaseOx=-*g\PadLeft
+            PmTensorConvTransposeFp32Taps(@t)
+          EndIf
+        Else
+          ix=0
+          While ix<*g\InWidth
+          If (ix & 127)=0 : PmKernelIdle() : EndIf
+            bits=PeekL(*g\Src+(srcIndex+ix)*4)
+            baseOx=ix* *g\Stride-*g\PadLeft
+            firstK=0
+            If baseOx<0 : firstK=(-baseOx+*g\Dilation-1)/ *g\Dilation : EndIf
+            lastK=*g\Kernel
+            limit=*g\OutWidth-1-baseOx
+            If limit<0
+              lastK=0
+            ElseIf limit/ *g\Dilation+1<lastK
+              lastK=limit/ *g\Dilation+1
+            EndIf
+            If firstK<0 : firstK=0 : EndIf
+            If lastK>*g\Kernel : lastK=*g\Kernel : EndIf
+            If firstK<lastK
+              PmTensorConvTransposeFp32Row(weightRow+firstK*4,rowBase+(baseOx+firstK* *g\Dilation)*4,bits,lastK-firstK,*g\Dilation*4)
+            EndIf
+            ix+1
+          Wend
+        EndIf
+        ic+1
+      Wend
+      oc+1
+    Wend
+    bn+1
+  Wend
+EndProcedure
+
+Global ConvCalls.i,ConvFaults.i
+Procedure ConvIdle()
+ If PmKernelCore()<>0 : ConvFaults+1 : EndIf
+ ConvCalls+1
+EndProcedure
+Procedure.i CheckConv(which.i,bias.i,pattern.i)
+ Protected g.PmTensorConvTranspose1DArgs
+ Protected i.i,j.i,bits.i,seed.i=$12345678
+ Protected value.f
+ g\Batches=1 : g\Groups=1 : g\Dilation=1
+ Select which
+  Case 0 : g\InChannels=192 : g\OutChannels=96 : g\InWidth=1 : g\Kernel=12 : g\Stride=6
+  Case 1 : g\InChannels=96 : g\OutChannels=48 : g\InWidth=6 : g\Kernel=10 : g\Stride=5
+  Case 2 : g\InChannels=48 : g\OutChannels=24 : g\InWidth=30 : g\Kernel=8 : g\Stride=4
+  Case 3 : g\InChannels=64 : g\OutChannels=32 : g\InWidth=3 : g\Kernel=5 : g\Stride=2 : g\Groups=2 : g\PadLeft=2
+  Case 4 : g\InChannels=16 : g\OutChannels=8 : g\InWidth=1 : g\Kernel=3 : g\Stride=1 : g\Dilation=2 : g\PadLeft=1
+  Case 5 : g\InChannels=32 : g\OutChannels=4 : g\InWidth=65 : g\Kernel=5 : g\Stride=2 : g\Groups=4 : g\PadLeft=2
+  Case 6 : g\InChannels=2 : g\OutChannels=4 : g\InWidth=500 : g\Kernel=7 : g\Stride=3
+  Case 7 : g\InChannels=3 : g\OutChannels=3 : g\InWidth=100 : g\Kernel=17 : g\Stride=2 : g\Batches=2
+  Case 8 : g\InChannels=64 : g\OutChannels=64 : g\InWidth=64 : g\Kernel=3 : g\Stride=1
+  Case 9 : g\InChannels=8 : g\OutChannels=8 : g\InWidth=256 : g\Kernel=9 : g\Stride=2 : g\PadLeft=4
+ EndSelect
+ g\OutWidth=(g\InWidth-1)*g\Stride+(g\Kernel-1)*g\Dilation+1-2*g\PadLeft
+ g\Src=$D6800010 : g\Weight=$D6900010 : If bias : g\Bias=$D6D00010 : EndIf
+ For j=0 To 2
+  Protected address.i,count.i
+  Select j
+   Case 0 : address=g\Src : count=g\Batches*g\InChannels*g\InWidth
+   Case 1 : address=g\Weight : count=g\InChannels*(g\OutChannels/g\Groups)*g\Kernel
+   Case 2 : address=$D6D00010 : count=g\OutChannels
+  EndSelect
+  For i=0 To count-1
+   seed=(seed*1664525+1013904223) & $FFFFFFFF : value=(seed & $FFFF)/65536.0 : value=value-0.5 : bits=PeekL(@value)
+   If pattern
+    Select i % 37
+     Case 0 : bits=$80000000
+     Case 1 : bits=1
+     Case 2 : bits=$007FFFFF
+     Case 3 : bits=$7FC12345
+     Case 4 : bits=$7FA12345
+     Case 5 : bits=$7F800000
+     Case 6 : bits=$FF800000
+    EndSelect
+   EndIf
+   PokeL(address+i*4,bits)
+  Next
+ Next
+ count=g\Batches*g\OutChannels*g\OutWidth
+ g\Dst=$D6B00010 : PokeI(g\Dst-8,$1122334455667788) : PokeI(g\Dst+count*4,$1122334455667788)
+ OldConvRange(@g,0,g\OutChannels)
+ If PeekI(g\Dst-8)<>$1122334455667788 Or PeekI(g\Dst+count*4)<>$1122334455667788 : ProcedureReturn 21 : EndIf
+ g\Dst=$D6C00010 : PokeI(g\Dst-8,$1122334455667788) : PokeI(g\Dst+count*4,$1122334455667788)
+ PmTensorConvTranspose1DFp32Neon(@g)
+ If PeekI(g\Dst-8)<>$1122334455667788 Or PeekI(g\Dst+count*4)<>$1122334455667788 : ProcedureReturn 22 : EndIf
+ For i=0 To count*4-1
+  If PeekA($D6B00010+i)<>PeekA($D6C00010+i) : PokeI($E1C01F80,i) : ProcedureReturn 23 : EndIf
+ Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected i.i,j.i,k.i,rc.i,cases.i
+ Protected *pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ If PmParallelCores()<>4 : MmuDisableCachedFlushed() : ProcedureReturn 11 : EndIf
+ PmSetIdleCallback(@ConvIdle)
+ For i=0 To 9
+ For j=0 To 1
+ For k=0 To 1
+  rc=CheckConv(i,j,k) : PokeI($E1C00000+cases*8,rc) : cases+1
+  If *pet : pet() : EndIf
+  If rc : PokeI($E1C01F00,i) : PokeI($E1C01F08,j) : PokeI($E1C01F10,k) : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,ConvCalls) : PokeI($E1C01FE0,ConvFaults)
+ If ConvFaults : rc=24 : EndIf
+ PmSetIdleCallback(0) : MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

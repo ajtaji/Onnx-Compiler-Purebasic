@@ -2328,7 +2328,7 @@ Procedure PmTensorConvTranspose1DFp32NeonRange(*g.PmTensorConvTranspose1DArgs,oc
   Protected nativeAllowed.i
   Protected dilationBlock.i
   Protected wideMaxVectors.i
-  Protected contiguous.i
+  Protected contiguous.i,idleStride.i
   Protected t.PmTensorConvTransposeTapsArgs
   Protected w.PmTensorConvTransposeWideArgs
   If *g=0 Or *g\Batches<=0 Or *g\Groups<=0 Or *g\InChannels<=0 Or *g\OutChannels<=0 Or *g\OutWidth<=0 Or *g\Kernel<=0 Or *g\Dilation<=0
@@ -2377,6 +2377,8 @@ Procedure PmTensorConvTranspose1DFp32NeonRange(*g.PmTensorConvTranspose1DArgs,oc
     If tailFirst>*g\InWidth : tailFirst=*g\InWidth : EndIf
     If tailFirst<headLast : tailFirst=headLast : EndIf
   EndIf
+  idleStride=1
+  If *g\InWidth>0 And *g\InWidth<=256/ *g\Kernel : idleStride=16 : EndIf
   bn=0
   While bn<*g\Batches
     ; The bias pass covers every output element before any contribution, as
@@ -2396,7 +2398,7 @@ Procedure PmTensorConvTranspose1DFp32NeonRange(*g.PmTensorConvTranspose1DArgs,oc
       rowBase=*g\Dst+(bn* *g\OutChannels+oc)* *g\OutWidth*4
       ic=group*inPerGroup
       While ic<group*inPerGroup+inPerGroup
-        PmKernelIdle()
+        If idleStride=1 Or (ic & 15)=0 : PmKernelIdle() : EndIf
         srcIndex=(bn* *g\InChannels+ic)* *g\InWidth
         weightRow=*g\Weight+(ic*outPerGroup+ocg)* *g\Kernel*4
         If contiguous=1
@@ -2470,9 +2472,11 @@ Procedure PmTensorConvTranspose1DFp32Neon(*g.PmTensorConvTranspose1DArgs)
   Protected first.i=0
   Protected last.i
   If *g=0 : ProcedureReturn : EndIf
-  If *g\OutChannels>=4 And *g\Groups>0 And *g\InChannels>=*g\Groups And *g\InChannels% *g\Groups=0 And *g\OutChannels% *g\Groups=0 And *g\OutChannels* *g\OutWidth>=16384
+  If *g\OutChannels>=4 And *g\Groups>0 And *g\InChannels>=*g\Groups And *g\InChannels% *g\Groups=0 And *g\OutChannels% *g\Groups=0
+    If *g\OutChannels* *g\OutWidth>=16384 Or *g\OutChannels*(*g\InChannels/ *g\Groups)* *g\Kernel* *g\InWidth>=65536
     parts=PmParallelCores()
     If parts>4 : parts=4 : EndIf
+    EndIf
   EndIf
   If parts>1
     For i=0 To parts-1
@@ -8062,6 +8066,149 @@ pmoEluVectorConstants:
   .word 0x3F800000, 0x39500D01, 0x3AB60B61, 0x3C088889
   .word 0x3D2AAAAB, 0x3E2AAAAB, 0x3F000000, 0xC2A00000
 pmoEluVectorDone:
+  mov x0, x4
+ EndASM
+EndProcedure
+CompilerEndIf
+
+; Four independent exact GELU-tanh lanes within [-5,5]. Other groups
+; retain the scalar definition, including canonical NaN storage.
+CompilerIf #PMD_NATIVE_BYTES=8
+Procedure.i PmOpGeluVectorA64(src.i,dst.i,count.i)
+ ASM
+  mov x4, #0
+  cmp x2, #4
+  b.lt pmoGeluDone
+  adrp x10, pmoGeluConstants
+  add x10, x10, #:lo12:pmoGeluConstants
+  mov x9, x10
+  ld1r {v16.4s}, [x9], #4
+  ld1r {v17.4s}, [x9], #4
+  ld1r {v18.4s}, [x9], #4
+  ld1r {v19.4s}, [x9], #4
+  ld1r {v20.4s}, [x9], #4
+  ld1r {v21.4s}, [x9], #4
+  ld1r {v22.4s}, [x9], #4
+  ld1r {v23.4s}, [x9], #4
+  ld1r {v24.4s}, [x9], #4
+  ld1r {v25.4s}, [x9], #4
+  ld1r {v26.4s}, [x9], #4
+pmoGeluLoop:
+  ld1 {v0.4s}, [x0]
+  shl v2.4s, v0.4s, #1
+  ushr v2.4s, v2.4s, #1
+  cmhi v30.4s, v2.4s, v18.4s
+  umaxv s30, v30.4s
+  fmov w9, s30
+  cbnz w9, pmoGeluDone
+  fmul v1.4s, v0.4s, v0.4s
+  fmul v1.4s, v1.4s, v0.4s
+  fmul v1.4s, v16.4s, v1.4s
+  fadd v1.4s, v0.4s, v1.4s
+  fmul v1.4s, v17.4s, v1.4s
+  ushr v7.4s, v1.4s, #31
+  shl v7.4s, v7.4s, #31
+  fabs v2.4s, v1.4s
+  fadd v2.4s, v2.4s, v2.4s
+  fcmgt v6.4s, v2.4s, v19.4s
+  add x9, x10, #44
+  ld1r {v3.4s}, [x9], #4
+  fmul v3.4s, v3.4s, v2.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v3.4s, v3.4s, v28.4s
+  fmul v3.4s, v3.4s, v2.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v3.4s, v3.4s, v28.4s
+  fmul v3.4s, v3.4s, v2.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v3.4s, v3.4s, v28.4s
+  fmul v3.4s, v3.4s, v2.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v3.4s, v3.4s, v28.4s
+  fmul v3.4s, v3.4s, v2.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v3.4s, v3.4s, v28.4s
+  fmul v3.4s, v3.4s, v2.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v3.4s, v3.4s, v28.4s
+  fmul v3.4s, v3.4s, v2.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v3.4s, v3.4s, v28.4s
+  fmul v3.4s, v3.4s, v2.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v3.4s, v3.4s, v28.4s
+  fmul v3.4s, v3.4s, v2.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v3.4s, v3.4s, v28.4s
+  fmul v3.4s, v3.4s, v2.4s
+  fmul v3.4s, v3.4s, v2.4s
+  fadd v3.4s, v3.4s, v2.4s
+  fmul v5.4s, v2.4s, v20.4s
+  fadd v5.4s, v5.4s, v21.4s
+  shl v5.4s, v5.4s, #9
+  ushr v5.4s, v5.4s, #9
+  movz w9, #64, lsl #16
+  dup v30.4s, w9
+  sub v5.4s, v5.4s, v30.4s
+  scvtf v31.4s, v5.4s
+  fmul v30.4s, v31.4s, v22.4s
+  fsub v30.4s, v2.4s, v30.4s
+  fmul v31.4s, v31.4s, v23.4s
+  fsub v30.4s, v30.4s, v31.4s
+  add x9, x10, #84
+  ld1r {v4.4s}, [x9], #4
+  fmul v4.4s, v4.4s, v30.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v4.4s, v4.4s, v28.4s
+  fmul v4.4s, v4.4s, v30.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v4.4s, v4.4s, v28.4s
+  fmul v4.4s, v4.4s, v30.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v4.4s, v4.4s, v28.4s
+  fmul v4.4s, v4.4s, v30.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v4.4s, v4.4s, v28.4s
+  fmul v4.4s, v4.4s, v30.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v4.4s, v4.4s, v28.4s
+  fmul v4.4s, v4.4s, v30.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v4.4s, v4.4s, v28.4s
+  fmul v4.4s, v4.4s, v30.4s
+  ld1r {v28.4s}, [x9], #4
+  fadd v4.4s, v4.4s, v28.4s
+  movi v30.4s, #127
+  add v5.4s, v5.4s, v30.4s
+  shl v5.4s, v5.4s, #23
+  fmul v4.4s, v4.4s, v5.4s
+  fsub v4.4s, v4.4s, v25.4s
+  bsl v6.16b, v4.16b, v3.16b
+  fadd v3.4s, v6.4s, v26.4s
+  fdiv v3.4s, v6.4s, v3.4s
+  eor v3.16b, v3.16b, v7.16b
+  fadd v3.4s, v25.4s, v3.4s
+  fmul v4.4s, v24.4s, v0.4s
+  fmul v3.4s, v4.4s, v3.4s
+  st1 {v3.4s}, [x1]
+  add x0, x0, #16
+  add x1, x1, #16
+  add x4, x4, #4
+  sub x2, x2, #4
+  cmp x2, #4
+  b.ge pmoGeluLoop
+  b pmoGeluDone
+  .align 4
+pmoGeluConstants:
+  .word 0x3D372713, 0x3F4C422A, 0x40A00000, 0x3F317218
+  .word 0x3FB8AA3B, 0x4B400000, 0x3F317200, 0x35BFBE8E
+  .word 0x3F000000, 0x3F800000, 0x40000000, 0x32D7322B
+  .word 0x3493F27E, 0x3638EF1D, 0x37D00D01, 0x39500D01
+  .word 0x3AB60B61, 0x3C088889, 0x3D2AAAAB, 0x3E2AAAAB
+  .word 0x3F000000, 0x39500D01, 0x3AB60B61, 0x3C088889
+  .word 0x3D2AAAAB, 0x3E2AAAAB, 0x3F000000, 0x3F800000
+  .word 0x3F800000
+pmoGeluDone:
   mov x0, x4
  EndASM
 EndProcedure

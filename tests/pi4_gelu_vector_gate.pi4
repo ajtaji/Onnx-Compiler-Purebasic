@@ -1,0 +1,166 @@
+; Exact four-element GELU-tanh checked against the independent scalar kernel.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Global GateCalls.i,GateFaults.i
+Global *GatePet
+Procedure GateIdle()
+ If PmKernelCore()<>0 : GateFaults+1 : EndIf
+ GateCalls+1
+EndProcedure
+Procedure.i GateOne(count.i,pattern.i,inplace.i)
+ Protected i.i,seed.i=$12345678,b.i,x.f,done.i,src.i=$E9000010,ref.i=$E9800010,dst.i=$EA000010
+ PokeI(ref-8,$1122334455667788) : PokeI(ref+count*4,$1122334455667788)
+ PokeI(dst-8,$1122334455667788) : PokeI(dst+count*4,$1122334455667788)
+ For i=0 To count-1
+  seed=(seed*1664525+1013904223) & $FFFFFFFF
+  x=(seed & $FFFFFF)/16777216.0 : x=x*10.0 : x=x-5.0 : b=PeekL(@x)
+  If pattern
+   b=seed
+   Select i % 32
+    Case 0 : b=0
+    Case 1 : b=$80000000
+    Case 2 : b=$7F800000
+    Case 3 : b=$FF800000
+    Case 4 : b=$7FC12345
+    Case 5 : b=$7FA12345
+    Case 6 : b=$FFC12345
+    Case 7 : b=$FFA12345
+    Case 8 : b=$C2A00000
+    Case 9 : b=$C2A00001
+    Case 10 : b=$C29FFFFF
+    Case 11 : b=$80000001
+    Case 12 : b=$80800000
+    Case 13 : b=$3F800000
+    Case 14 : b=$BF800000
+   EndSelect
+  EndIf
+  If pattern=2
+   b=PeekL(@x)
+   If (i % 16)=((count+inplace) % 4)
+    Select (count+inplace) % 4
+     Case 0 : b=$7FC12345
+     Case 1 : b=$7FA12345
+     Case 2 : b=$FFC12345
+     Case 3 : b=$FFA12345
+    EndSelect
+   EndIf
+  EndIf
+  If pattern=3
+   b=PeekL(@x)
+   Select i % 20
+    Case 0 : b=$40A00000
+    Case 1 : b=$40A00001
+    Case 2 : b=$409FFFFF
+    Case 3 : b=$C0A00000
+    Case 4 : b=$C0A00001
+    Case 5 : b=$C09FFFFF
+    Case 6 : b=$3EDC9099
+    Case 7 : b=$3EDC909A
+    Case 8 : b=$3EDC909B
+    Case 9 : b=$3EDC909C
+    Case 10 : b=$3EDC909D
+    Case 11 : b=$3EDC909E
+    Case 12 : b=$3EDC909F
+    Case 13 : b=$BEDC9099
+    Case 14 : b=$BEDC909A
+    Case 15 : b=$BEDC909B
+    Case 16 : b=$BEDC909C
+    Case 17 : b=$BEDC909D
+    Case 18 : b=$BEDC909E
+    Case 19 : b=$BEDC909F
+   EndSelect
+  EndIf
+  PokeL(src+i*4,b) : PokeL(dst+i*4,b)
+ Next
+ If pattern=0
+  done=PmOpGeluVectorA64(src,$EB000010,count)
+  If done<>(count/4)*4 : ProcedureReturn -3 : EndIf
+ EndIf
+ PmOpUnary(src,ref,count,13,1)
+ If inplace : src=dst : EndIf
+ DOpRunUnary(src,dst,count,13,1)
+ For i=0 To count-1
+  If PeekL(ref+i*4)<>PeekL(dst+i*4)
+   PokeI($E1C01F80,PeekL(ref+i*4)) : PokeI($E1C01F88,PeekL(dst+i*4)) : PokeI($E1C01F90,PeekL(src+i*4))
+   ProcedureReturn i+1
+  EndIf
+ Next
+ If PeekI(ref-8)<>$1122334455667788 Or PeekI(ref+count*4)<>$1122334455667788 : ProcedureReturn -1 : EndIf
+ If PeekI(dst-8)<>$1122334455667788 Or PeekI(dst+count*4)<>$1122334455667788 : ProcedureReturn -2 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected cores.i,i.i,j.i,k.i,alpha.i,count.i,rc.i,cases.i
+ Protected Dim counts.i(9)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000)<>0 : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : cores=1 : If PmSetAnvilServices(services) : cores=PmParallelCores() : EndIf : *GatePet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PokeI($E1C01FF0,cores)
+ If cores<>4 : MmuDisableCachedFlushed() : ProcedureReturn 11 : EndIf
+ PmOpInit() : PmOpTrigInit() : PmSetIdleCallback(@GateIdle)
+ counts(0)=0 : counts(1)=1 : counts(2)=3 : counts(3)=4 : counts(4)=5
+ counts(5)=17 : counts(6)=1023 : counts(7)=1024 : counts(8)=4099
+ For alpha=0 To 9
+  PmOpF(0)=1.0
+  Select alpha
+   Case 1 : PmOpF(0)=0.5
+   Case 2 : PmOpF(0)=-1.25
+   Case 3 : PokeL(@PmOpF(0),$80000000)
+   Case 4 : PokeL(@PmOpF(0),$7FC12345)
+   Case 5 : PokeL(@PmOpF(0),$7FA12345)
+   Case 6 : PokeL(@PmOpF(0),$7F800000)
+   Case 7 : PokeL(@PmOpF(0),$FF800000)
+   Case 8 : PokeL(@PmOpF(0),$00000001)
+   Case 9 : PokeL(@PmOpF(0),$7F7FFFFF)
+  EndSelect
+  For k=0 To 3
+   For j=0 To 1
+    For i=0 To 8
+     rc=GateOne(counts(i),k,j)
+     PokeI($E1C00000+cases*8,rc)
+     cases+1 : If *GatePet : GatePet() : EndIf
+     If rc : PokeI($E1C01F40,counts(i)) : PokeI($E1C01F48,alpha*8+k*2+j) : PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+    Next
+   Next
+  Next
+ Next
+ PmOpF(0)=1.0
+ For j=0 To 1
+  rc=GateOne(1048583,0,j)
+  PokeI($E1C00000+cases*8,rc)
+  cases+1 : If *GatePet : GatePet() : EndIf
+  If rc : PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,GateCalls) : PokeI($E1C01FE0,GateFaults)
+ If GateFaults : rc=99 : EndIf
+ PmSetIdleCallback(0) : MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

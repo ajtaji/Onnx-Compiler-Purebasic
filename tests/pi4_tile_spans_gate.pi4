@@ -20,17 +20,17 @@ EnableFloatingPoint
  #PMO_USE_TRIG=1
  #PMO_USE_ATAN=1
 XIncludeFile "RaspberryPi4/Lib/math.pi4"
-XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_fp32.pmi"
-XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_fp32_neon.pmi"
-XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_trig_a64.pmi"
-XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_portable.pmi"
-XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_norm_small.pmi"
-XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_norm_small_portable.pmi"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
 #PMO_OPS_INT32=0
-XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_ops.pmi"
-XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_ops_portable.pmi"
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
 
-XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops.pmi"
 Procedure OldCopy(src.i, dst.i, bytes.i)
   Protected i.i
   If src = dst
