@@ -1,0 +1,173 @@
+; Exact four-element ELU checked against the independent scalar kernel.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_fp32.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_fp32_neon.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_trig_a64.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_norm_small.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_ops.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_ops_portable.pmi"
+
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_ops.pmi"
+Procedure OldCopy(src.i, dst.i, bytes.i)
+  Protected i.i
+  If src = dst
+    ProcedureReturn
+  EndIf
+  i = 0
+  While i + 4 <= bytes
+    PokeL(dst + i, PeekL(src + i))
+    i = i + 4
+  Wend
+  While i < bytes
+    PokeA(dst + i, PeekA(src + i))
+    i = i + 1
+  Wend
+EndProcedure
+Procedure OldPmOpTile(src.i, dst.i, rank.i, bytes.i)
+  ; Shape validation guarantees whole repeats. Map outer axes once per row
+  ; and copy contiguous source rows without changing any element bits.
+  Protected d.i,s.i=1,count.i=1,row.i,n.i,at.i,width.i,sourceWidth.i,x.i
+  If rank=0
+    OldCopy(src,dst,bytes) : ProcedureReturn
+  EndIf
+  d=rank-1
+  While d>=0
+    PmOpStride(d)=s : s=s*PmOpDA(d) : count=count*PmOpDY(d)
+    d=d-1
+  Wend
+  If count=0 : ProcedureReturn : EndIf
+  width=PmOpDY(rank-1) : sourceWidth=PmOpDA(rank-1)
+  If sourceWidth=0 : ProcedureReturn : EndIf
+  row=0
+  While row<count/width
+    n=row : at=0 : d=rank-2
+    While d>=0
+      at=at+(n%PmOpDY(d)%PmOpDA(d))*PmOpStride(d)
+      n=n/PmOpDY(d) : d=d-1
+    Wend
+    x=0
+    While x<width
+      OldCopy(src+at*bytes,dst+(row*width+x)*bytes,sourceWidth*bytes)
+      x=x+sourceWidth
+    Wend
+    row=row+1
+  Wend
+EndProcedure
+Procedure OldDOpTile(Y.i, A.i, Repeats.i)
+  Protected Dim dims.i(8)
+  Protected rank.i
+  Protected d.i
+  Protected r.i
+  If A = 0 Or Repeats = 0
+    DFail("Tile requires input and repeats.")
+    ProcedureReturn
+  EndIf
+  rank = Dt(A)\Rank
+  If Dt(Repeats)\Kind <> 7 Or Dt(Repeats)\Count <> rank
+    DFail("Tile repeats must be an INT64 tensor with one count per input axis.")
+    ProcedureReturn
+  EndIf
+  d = 0
+  While d < rank
+    r = DInt(Repeats, d)
+    If r < 0
+      DFail("Tile repeats must not be negative.")
+      ProcedureReturn
+    EndIf
+    PmOpDA(d) = DOpDim(A, d)
+    dims(d) = DOpDim(A, d) * r
+    PmOpDY(d) = dims(d)
+    d = d + 1
+  Wend
+  If DAlloc(Y, Dt(A)\Kind, rank, @dims(0)) = 0
+    ProcedureReturn
+  EndIf
+  If Dt(A)\Count > 0
+    OldPmOpTile(Dt(A)\Data, Dt(Y)\Data, rank, PmOpKindBytes(Dt(A)\Kind))
+  EndIf
+EndProcedure
+
+Procedure.i CheckTile(kind.i,rank.i,pattern.i)
+ Protected Dim shape.i(8)
+ Protected Dim repShape.i(1)
+ Protected i.i,j.i,r.i,n.i,rc.i
+ repShape(0)=rank
+ For i=0 To rank-1
+  shape(i)=2+(i % 2)
+  If i=rank-1 And pattern>=4 : shape(i)=17 : EndIf
+  If i=1 And pattern=7 : shape(i)=0 : EndIf
+ Next
+ If DAlloc(1,kind,rank,@shape(0))=0 : ProcedureReturn 21 : EndIf
+ If DAlloc(2,7,1,@repShape(0))=0 : ProcedureReturn 22 : EndIf
+ For i=0 To rank-1
+  r=1
+  Select pattern
+   Case 0 : r=2
+   Case 1 : If i=0 : r=3 : EndIf
+   Case 2 : If i=rank-1 : r=2 : EndIf
+   Case 3 : r=1+i % 3
+   Case 4 : If i=0 : r=2 : EndIf
+   Case 5 : r=1
+   Case 6 : If i=0 : r=0 : EndIf
+  EndSelect
+  PokeI(Dt(2)\Data+i*8,r)
+ Next
+ For i=0 To Dt(1)\Bytes-1 : PokeA(Dt(1)\Data+i,(i*37+rank*19+pattern) & 255) : Next
+ OldDOpTile(3,1,2) : If DError : ProcedureReturn 23 : EndIf
+ DOpTile(4,1,2) : If DError : ProcedureReturn 24 : EndIf
+ If Dt(3)\Kind<>Dt(4)\Kind Or Dt(3)\Rank<>Dt(4)\Rank Or Dt(3)\Bytes<>Dt(4)\Bytes : ProcedureReturn 25 : EndIf
+ For i=0 To rank-1 : If DDims(3*8+i)<>DDims(4*8+i) : ProcedureReturn 26 : EndIf : Next
+ For i=0 To Dt(3)\Bytes-1
+  If PeekA(Dt(3)\Data+i)<>PeekA(Dt(4)\Data+i) : ProcedureReturn 27 : EndIf
+ Next
+ For i=1 To 4 : DRelease(i) : Next
+ If DLive<>0 : ProcedureReturn 28 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected kind.i,rank.i,pattern.i,i.i,rc.i,cases.i
+ Protected *pet
+ Protected Dim kinds.i(4)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ If DHeapBind($EA000000,$1000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 20 : EndIf
+ PmTensorInt64Ok=1 : PmOpInit()
+ kinds(0)=1 : kinds(1)=6 : kinds(2)=7 : kinds(3)=9
+ For kind=0 To 3
+ For rank=0 To 5
+ For pattern=0 To 7
+  rc=CheckTile(kinds(kind),rank,pattern) : PokeI($E1C00000+cases*8,rc) : cases+1
+  If *pet : pet() : EndIf
+  If rc : PokeI($E1C01F00,kind) : PokeI($E1C01F08,rank) : PokeI($E1C01F10,pattern) : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,DLive)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

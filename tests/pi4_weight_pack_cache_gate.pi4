@@ -1,0 +1,108 @@
+; Exact four-element ELU checked against the independent scalar kernel.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_fp32.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_fp32_neon.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_trig_a64.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_norm_small.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_ops.pmi"
+XIncludeFile "C:/Users/ajtaj/Desktop/Onnx-Compiler-Purebasic/runtime/tensor_dynamic_ops_portable.pmi"
+
+
+Procedure.i Main(services.i)
+ Protected i.i,j.i,row.i,col.i,plane.i,source.i,dest.i,k.i,n.i,wide.i,count.i,rc.i,mi.i,ki.i,ni.i,tests.i,bytes.i,expected.i
+ Protected value.f
+ Protected g.PmI8MatMulArgs
+ Protected Dim ms.i(3)
+ Protected Dim ks.i(3)
+ Protected Dim ns.i(4)
+ Protected *pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ PmI8PackReset($D6900000,$100000)
+ For i=0 To 255
+  source=$D6800000+i*1024 : wide=i & 1
+  For j=0 To 1023 : PokeA(source+j,(i*19+j*37) & 255) : Next
+  If PmI8PackWeight(source,32,16,wide)=0 : rc=21 : Break : EndIf
+  dest=PmI8PackFind(source,32,16,wide)
+  If dest=0 : rc=22 : Break : EndIf
+  For j=0 To 512*(1+wide)-1
+   If PeekA(dest+j)<>PeekA(source+j) : rc=23 : Break : EndIf
+  Next
+  If rc : Break : EndIf
+ Next
+ If rc=0 And PmI8PackCount<>256 : rc=24 : EndIf
+ If rc=0 And PmI8PackWeight($D6880000,32,16,0)<>0 : rc=25 : EndIf
+ If rc=0 And PmI8PackWeight($D6800000,32,16,0)<>1 : rc=26 : EndIf
+ If rc=0 And PmI8PackCount<>256 : rc=27 : EndIf
+ PokeI($E1C01F00,PmI8PackCount) : PokeI($E1C01F08,rc)
+ If rc : PmI8PackReset(0,0) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+ ms(0)=1 : ms(1)=4 : ms(2)=9 : ks(0)=31 : ks(1)=32 : ks(2)=33
+ ns(0)=16 : ns(1)=31 : ns(2)=32 : ns(3)=33
+ For wide=0 To 1
+ For mi=0 To 2
+ For ki=0 To 2
+ For ni=0 To 3
+  g\M=ms(mi) : g\K=ks(ki) : g\N=ns(ni) : g\Wide=wide : g\Elements=g\K*g\N
+  g\A=$D6800000 : g\B=$D6810000 : g\Scales=$D6820000 : g\Dst=$D6830000
+  For i=0 To g\M*g\K-1 : value=(i % 17-8)/7.0 : DWriteF(g\A+i*4,value) : Next
+  For i=0 To g\Elements*(1+wide)-1 : PokeA(g\B+i,(i*37+ki*19) & 255) : Next
+  For i=0 To g\N-1 : value=(i+1)/1000.0 : DWriteF(g\Scales+i*4,value) : Next
+  PmI8PackReset(0,0) : PmTensorInt8Fault=0
+  If PmI8MatMulScratch(@g,$D6B00000,$10000)=0 : rc=31 : Break : EndIf
+  PmI8PackReset($D6900000,$100000)
+  If PmI8PackWeight(g\B,g\K,g\N,wide)=0 : rc=32 : Break : EndIf
+  dest=PmI8PackFind(g\B,g\K,g\N,wide) : n=g\N & -16
+  For plane=0 To wide
+  For col=0 To n-1 Step 16
+  For row=0 To g\K-1
+  For j=0 To 15
+   If PeekA(dest+plane*g\K*n+col*g\K+row*16+j)<>PeekA(g\B+plane*g\Elements+row*g\N+col+j) : rc=33 : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  Next
+  If rc : Break : EndIf
+  g\Dst=$D6840000
+  If PmI8MatMulScratch(@g,$D6B00000,$10000)=0 : rc=34 : Break : EndIf
+  For i=0 To g\M*g\N*4-1
+   If PeekA($D6830000+i)<>PeekA($D6840000+i) : rc=35 : Break : EndIf
+  Next
+  tests+1 : If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ PokeI($E1C01FD0,tests) : PokeI($E1C01FD8,rc) : PokeI($E1C01FE0,PmTensorInt8Fault)
+ PmI8PackReset(0,0) : MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

@@ -618,7 +618,7 @@ Procedure DOpTile(Y.i, A.i, Repeats.i)
   Protected Dim dims.i(8)
   Protected rank.i
   Protected d.i
-  Protected r.i
+  Protected r.i,axis.i,span.i,blocks.i,block.i,n.i,offset.i,stride.i,bytes.i
   If A = 0 Or Repeats = 0
     DFail("Tile requires input and repeats.")
     ProcedureReturn
@@ -640,10 +640,29 @@ Procedure DOpTile(Y.i, A.i, Repeats.i)
     PmOpDY(d) = dims(d)
     d = d + 1
   Wend
-  If DAlloc(Y, Dt(A)\Kind, rank, @dims(0)) = 0
+  If DAllocOverwrite(Y, Dt(A)\Kind, rank, @dims(0)) = 0
     ProcedureReturn
   EndIf
-  If Dt(A)\Count > 0
+  If Dt(A)\Count>0 And Dt(Y)\Count>0
+    axis=rank-1 : span=1
+    While axis>=0
+      If DInt(Repeats,axis)<>1 : Break : EndIf
+      span=span*PmOpDA(axis) : axis=axis-1
+    Wend
+    bytes=PmOpKindBytes(Dt(A)\Kind)
+    If span>=16 Or axis<0
+      blocks=Dt(Y)\Count/span
+      For block=0 To blocks-1
+        n=block : offset=0 : stride=span
+        For d=axis To 0 Step -1
+          offset=offset+(n % PmOpDY(d) % PmOpDA(d))*stride
+          n=n/PmOpDY(d) : stride=stride*PmOpDA(d)
+        Next
+        DCopy(Dt(A)\Data+offset*bytes,Dt(Y)\Data+block*span*bytes,span*bytes)
+        If (block & 127)=127 : PmKernelIdle() : EndIf
+      Next
+      ProcedureReturn
+    EndIf
     PmOpTile(Dt(A)\Data, Dt(Y)\Data, rank, PmOpKindBytes(Dt(A)\Kind))
   EndIf
 EndProcedure
