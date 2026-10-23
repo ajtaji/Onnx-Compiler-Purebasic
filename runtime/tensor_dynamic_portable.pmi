@@ -273,6 +273,25 @@ Procedure DCopyServiced(Source.i,Destination.i,Bytes.i)
   CompilerEndIf
   DCopy(Source,Destination,Bytes)
 EndProcedure
+Procedure DCopyRowsServiced(Source.i,Destination.i,Bytes.i,SourceStep.i,DestinationStep.i,Rows.i)
+ Protected row.i=0,wordRows.i=0
+ If ((Source | Destination | SourceStep | DestinationStep) & 3)=0 And (Bytes=4 Or Bytes=8 Or Bytes=16) : wordRows=1 : EndIf
+ While row<Rows
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If (row & 255)=0 : PmKernelIdle() : EndIf
+  CompilerEndIf
+  If wordRows
+   PokeL(Destination,PeekL(Source))
+   If Bytes>=8 : PokeL(Destination+4,PeekL(Source+4)) : EndIf
+   If Bytes=16
+    PokeL(Destination+8,PeekL(Source+8)) : PokeL(Destination+12,PeekL(Source+12))
+   EndIf
+  Else
+   DCopyServiced(Source,Destination,Bytes)
+  EndIf
+  Source+SourceStep : Destination+DestinationStep : row+1
+ Wend
+EndProcedure
 ; DZero is the arena's zero-fill primitive and the only one: DAcquire's
 ; contract is that a freshly acquired block reads as zero over its whole
 ; payload, and every other caller here clears its dimension scratch through
@@ -2180,12 +2199,7 @@ Procedure DGather(Y.i,A.i,Indices.i,Axis.i)
       If look<>idx+take : Break : EndIf
       take+1
     Wend
-    For i=0 To outer-1
-      CompilerIf #PMD_NATIVE_BYTES=8
-      If (i & 255)=0 : PmKernelIdle() : EndIf
-      CompilerEndIf
-      DCopyServiced(Dt(A)\Data+i*srcStep+idx*bytes,Dt(Y)\Data+i*dstStep+j*bytes,take*bytes)
-    Next
+    DCopyRowsServiced(Dt(A)\Data+idx*bytes,Dt(Y)\Data+j*bytes,take*bytes,srcStep,dstStep,outer)
     j+take
   Wend
 EndProcedure
@@ -2244,13 +2258,7 @@ Procedure DConcat(Y.i,Inputs.i,Axis.i)
     src=Dt(a)\Data
     dst=Dt(Y)\Data+offset*size
     If bytes
-      For j=0 To outer-1
-        DCopyServiced(src,dst,bytes)
-        src+bytes : dst+step
-        CompilerIf #PMD_NATIVE_BYTES=8
-        If (j & 255)=255 : PmKernelIdle() : EndIf
-        CompilerEndIf
-      Next
+      DCopyRowsServiced(src,dst,bytes,bytes,step,outer)
     EndIf
     offset+span
   Next
