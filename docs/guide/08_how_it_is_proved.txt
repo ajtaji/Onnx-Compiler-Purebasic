@@ -1116,3 +1116,35 @@ previous audible background static.
 The source guide records these results. Its PDF refresh remains explicitly
 pending because the required artifact-operation marker helper is unavailable;
 the existing PDF must not be presented as containing this checkpoint.
+
+
+@SECTION Further copy and decoder proof, 23 October 2026
+
+The native64 four-byte copy dispatch passes 544 physical old-copy comparisons
+across lengths zero through 131073, sixteen-byte boundary neighbors, source
+and destination alignment, disjoint/equal/upward/downward overlaps, serviced
+and raw paths, complete surrounding guards and primary-only callbacks.
+Complete Pocket 18M replies fall from 2.453/3.381 to 2.424/3.346 seconds,
+about 1.0..1.2 percent less time, with every waveform and final state exact.
+
+The stride-five phase extension passes 87 complete physical comparisons
+against the earlier native transposed convolution, also covering stride six.
+Cases include channel bounds, odd widths, interior/tails, pads, absent bias,
+groups, batches, NaN/infinity/signed-zero inputs, scratch/output guards and a
+marked job proving all four physical cores execute. An initial gate fixture
+lost its structure-field separators during generation and exercised no valid
+convolution; it was corrected before these passes. The first compile also
+refused a nonexistent fixture PokeF helper; the actual tensor writer is used.
+
+Full warm fresh-text replies now take 2.329/3.216 seconds for 2.48/3.28 seconds
+of speech, sustained ratios 0.939/0.980. Both full waveforms and final mutable
+state digest remain identical. First PCM is 97/112 ms. The normal CLI/UI and
+self-test pass; nine emitted runtime files and the full mixed weights match
+canonical sources, and the complete normal image is byte-identical to the
+physically tested candidate. Both replies are faster than real time, but the
+longer case has only about two percent margin. Map headroom and safe audible
+subsecond streaming starts remain unproved; no new map/Bluetooth demo is used.
+
+A four-step INT8 reduction unroll passes 1586 exact old-kernel comparisons
+but yields 2.456/3.388 seconds, with no complete-reply gain; it is excluded.
+PDF refresh remains pending the missing required artifact-operation marker.

@@ -745,3 +745,21 @@ Transpose/MatMul boundary. Unsupported kinds, shapes, bounds and layouts use
 the original operators. Native32 and Windows emission keep their earlier
 scheduling. These are shared graph/layout rules, with no voice/model names
 or phrase-specific selection.
+
+
+@SECTION Word-aligned copies and stride-five transposed convolution
+
+Portable native64 tensor copies use the existing exact SIMD forward-copy
+kernel for four-byte-aligned spans, including spans not aligned to sixteen
+bytes. Upward overlap retains the old forward scalar behavior. Non-word
+alignment and short copies retain their prior paths; large serviced copies
+still yield every 64 KiB. Raw copies never invoke inference callbacks.
+
+The shared transposed convolution phase path accepts stride five/kernel ten
+as well as stride six/kernel twelve, with dilation one and the existing
+bounded channel/shape conditions. Five-tap phases are packed into six lanes;
+dummy lanes are discarded before caller output. Real lanes reuse the same
+exact multiply/add tiles and ascending input reduction order. Each worker
+owns a 6400-byte scratch region containing packed weights and a small output
+tile, with no large local array. Other shapes retain the ordinary native
+operator. The legacy internal Six helper names cover both geometries.
