@@ -1,0 +1,151 @@
+; Last-use ownership transfer and ordinary borrowed-input behavior.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldDScatter(Y.i,A.i,Indices.i,Updates.i)
+  Protected k.i=0
+  Protected i.i=0
+  Protected j.i=0
+  Protected offset.i=0
+  Protected idx.i=0
+  Protected block.i=0
+  Protected size.i=DSize(Dt(A)\Kind)
+  Protected tuples.i=0
+  If Dt(Indices)\Rank<1
+    DFail("ScatterND indices need a tuple axis.")
+    ProcedureReturn
+  EndIf
+  k=DDims((Indices)*8+(Dt(Indices)\Rank-1))
+  If k<=0 Or k>Dt(A)\Rank
+    DFail("Invalid ScatterND tuple width.")
+    ProcedureReturn
+  EndIf
+  block=DProduct(A,k,Dt(A)\Rank-1)
+  tuples=Dt(Indices)\Count/k
+  If Dt(Updates)\Count<>tuples*block
+    DFail("ScatterND update count mismatch.")
+    ProcedureReturn
+  EndIf
+  If DLike(Y,A,0)=0
+    ProcedureReturn
+  EndIf
+  DCopy(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+  For i=0 To tuples-1
+    offset=0
+    For j=0 To k-1
+      idx=DInt(Indices,i*k+j)
+      If idx<0
+        idx+DDims((A)*8+(j))
+      EndIf
+      If idx<0 Or idx>=DDims((A)*8+(j))
+        DFail("ScatterND index is out of bounds.")
+        ProcedureReturn
+      EndIf
+      offset=offset*DDims((A)*8+(j))+idx
+    Next
+    DCopy(Dt(Updates)\Data+i*block*size,Dt(Y)\Data+offset*block*size,block*size)
+  Next
+EndProcedure
+
+Procedure.i AliasScatter(mode.i)
+ Protected Dim dims.i(8)
+ Protected i.i,source.i,rc.i
+ dims(0)=4
+ If DAlloc(1,7,1,@dims(0))=0 : ProcedureReturn 10 : EndIf
+ For i=0 To 3 : PokeI(Dt(1)\Data+i*8,i+1) : Next
+ source=Dt(1)\Data
+ dims(0)=2 : dims(1)=1
+ If mode=0
+  If DAlloc(2,7,2,@dims(0))=0 : ProcedureReturn 11 : EndIf
+  PokeI(Dt(2)\Data,1) : PokeI(Dt(2)\Data+8,2)
+  If DBindBorrowed(3,7,1,@dims(0),source,16)=0 : ProcedureReturn 12 : EndIf
+ Else
+  PokeI(source,1) : PokeI(source+8,2)
+  If DBindBorrowed(2,7,2,@dims(0),source,16)=0 : ProcedureReturn 13 : EndIf
+  If DAlloc(3,7,1,@dims(0))=0 : ProcedureReturn 14 : EndIf
+  PokeI(Dt(3)\Data,3) : PokeI(Dt(3)\Data+8,0)
+ EndIf
+ OldDScatter(4,1,2,3) : If DError : ProcedureReturn 15 : EndIf
+ DScatterConsume(5,1,2,3) : If DError : ProcedureReturn 16 : EndIf
+ If Dt(1)\Owned<>1 Or Dt(1)\Data<>source Or Dt(5)\Data=source : ProcedureReturn 17 : EndIf
+ For i=0 To Dt(4)\Bytes-1
+  If PeekA(Dt(4)\Data+i)<>PeekA(Dt(5)\Data+i) : ProcedureReturn 18 : EndIf
+ Next
+ For i=1 To 5 : DRelease(i) : Next
+ If DLive Or DHeapUsed : ProcedureReturn 19 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i GuardConsume(mode.i)
+ Protected Dim dims.i(8)
+ Protected a.i,y.i,oldBytes.i,rc.i,i.i
+ dims(0)=4
+ If DAlloc(1,1,1,@dims(0))=0 : ProcedureReturn 20 : EndIf
+ dims(0)=1
+ If DAlloc(4,1,1,@dims(0))=0 : ProcedureReturn 21 : EndIf
+ a=Dt(1)\Data : y=Dt(4)\Data : oldBytes=Dt(1)\Bytes : dims(0)=4
+ Select mode
+ Case 0 : rc=DConsumeShape(4,1,1,0)
+ Case 1 : PokeL(a-12,0) : rc=DConsumeShape(4,1,1,@dims(0)) : PokeL(a-12,1)
+ Case 2 : Dt(1)\Data=a+4 : rc=DConsumeShape(4,1,1,@dims(0)) : Dt(1)\Data=a
+ Case 3 : Dt(1)\Bytes=1000 : rc=DConsumeShape(4,1,1,@dims(0)) : Dt(1)\Bytes=oldBytes
+ Case 4 : dims(0)=5 : rc=DConsumeShape(4,1,1,@dims(0))
+ Case 5 : DCancel=1 : rc=DConsumeShape(4,1,1,@dims(0))
+ Case 6 : DError=123 : rc=DConsumeShape(4,1,1,@dims(0))
+ Case 7 : rc=DConsumeShape(4,1,9,@dims(0))
+ Case 8 : DProgressActive=1 : rc=DConsumeShape(4,1,1,@dims(0)) : DProgressActive=0
+ Case 9 : PmIdleActive=1 : rc=DConsumeShape(4,1,1,@dims(0)) : PmIdleActive=0
+ EndSelect
+ If rc Or (mode<>5 And DError=0) Or Dt(1)\Owned<>1 Or Dt(4)\Data<>y Or Dt(1)\Data<>a : ProcedureReturn 22 : EndIf
+ DError=0 : DCancel=0
+ For i=1 To 5 : DRelease(i) : Next
+ If DLive Or DHeapUsed : ProcedureReturn 23 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected cases.i,rc.i,i.i,*pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PmTensorInt64Ok=1
+ If DHeapBind($EA000000,$1000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ For i=0 To 1
+  rc=AliasScatter(i) : cases+1
+  If rc : Break : EndIf
+ Next
+ If rc=0
+  For i=0 To 9
+   rc=GuardConsume(i) : cases+1
+   If rc : Break : EndIf
+  Next
+ EndIf
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,DLive)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

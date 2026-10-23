@@ -487,6 +487,27 @@ XIncludeFile "onnx_control_emit.pbi"
 ; Combine adjacent single-use FLOAT multiply/add work in the AArch64
 ; runtime. Both arithmetic instructions still round separately. The runtime
 ; retains the original two-call fallback for other types and broadcast maps.
+; Reuse an owned last-use input for a shape view or ScatterND source.
+; Constants, graph outputs and later uses stay on the ordinary copy path.
+; Borrowed inputs are checked by the runtime and retain their copy path.
+Procedure PmdConsumeDeadInputs(List Calls.s(),List ScheduleStatic.i(),Map Last.i(),Map Persistent.i())
+  Protected i.i,call.s,op.s,open.i,a.i,y.i,key.s
+  ForEach Calls()
+    i=ListIndex(Calls())
+    SelectElement(ScheduleStatic(),i) : If ScheduleStatic()<>0 : Continue : EndIf
+    call=Trim(Calls()) : open=FindString(call,"(")
+    If open<1 : Continue : EndIf
+    op=Left(call,open-1)
+    If op<>"DReshape" And op<>"DViewAxes" And op<>"DScatter" : Continue : EndIf
+    y=Val(StringField(Mid(call,open+1),1,","))
+    a=Val(StringField(Mid(call,open+1),2,",")) : key=Str(a)
+    If a<=0 Or y<=0 Or y=a Or Persistent(key) : Continue : EndIf
+    If FindMapElement(Last(),key)=0 : Continue : EndIf
+    If Last()<>i : Continue : EndIf
+    Calls()=op+"Consume"+Mid(call,open)
+  Next
+EndProcedure
+
 Procedure PmdCombineMultiplyAdd(List Calls.s(),List ScheduleStatic.i(),Map Last.i(),Map Persistent.i())
   Protected i.i,n.i=ListSize(Calls()),mulCall.s,addCall.s,t.i,a.i,b.i,y.i,c.i,order.i,releaseMask.i
   For i=0 To n-2
@@ -736,6 +757,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
     PmdCombineMultiplyAdd(calls(),isstatic(),last(),persistent())
     PmdCombineConvAdd(calls(),isstatic(),last(),persistent())
     PmdCombineTrigSquare(calls(),isstatic(),last(),persistent())
+    PmdConsumeDeadInputs(calls(),isstatic(),last(),persistent())
   EndIf
   If PmoStorageReduce(@ir,precision)=0 : PmoDynamicError=PmoQuantError : Goto Failed : EndIf
   If ir\DecodedWeightBytes>1024*1024*1024 : PmoDynamicError="Decoded resident weights exceed the working-memory limit. Reduced storage is not reduced execution RAM." : Goto Failed : EndIf

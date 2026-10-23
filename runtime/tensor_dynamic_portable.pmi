@@ -1850,7 +1850,45 @@ Procedure DShapeOf(Y.i,A.i)
   Next
 EndProcedure
 
-Procedure DReshape(Y.i,A.i,Shape.i,AllowZero.i)
+; Consume only a graph-proven last-use owned input. Borrowed or same-ID
+; inputs retain the copy path. The schedule releases the old input metadata.
+Procedure.i DConsumeShape(Y.i,A.i,Rank.i,DimsAddress.i)
+ Protected Dim dims.i(8)
+ Protected i.i,count.i=1,extent.i,size.i,offset.i,span.i
+ If A<=0 Or A>#PMD_TENSOR_COUNT Or Y<=0 Or Y>#PMD_TENSOR_COUNT Or Y=A : ProcedureReturn 0 : EndIf
+ If Dt(A)\Owned<>1 : ProcedureReturn 0 : EndIf
+ If DError Or DCancel Or DRejectProgressReentry() : ProcedureReturn 0 : EndIf
+ If Rank<0 Or Rank>8 Or (Rank>0 And DimsAddress=0) : ProcedureReturn DFail("Consumed view rank or dimensions are invalid.") : EndIf
+ offset=Dt(A)\Data-DHeap-16
+ If offset<0 Or offset>=DHeapBytes Or (offset & 15)<>0 : ProcedureReturn DFail("Consumed input has no owned arena block.") : EndIf
+ span=PeekL(DHeap+offset)
+ If span<32 Or span>DHeapBytes-offset Or PeekL(DHeap+offset+4)<>1 Or Dt(A)\Bytes<0 Or Dt(A)\Bytes>span-16 : ProcedureReturn DFail("Consumed input storage is invalid.") : EndIf
+ size=DSize(Dt(A)\Kind) : If size=0 : ProcedureReturn DFail("Consumed view type is invalid.") : EndIf
+ For i=0 To Rank-1
+  CompilerIf #PMD_NATIVE_BYTES=8
+  extent=PeekN(DimsAddress+i*8)
+  CompilerElse
+  extent=PeekL(DimsAddress+i*4)
+  CompilerEndIf
+  If extent<0 Or extent>DLimit : ProcedureReturn DFail("Consumed view extent is invalid.") : EndIf
+  If extent>0 And count>DLimit/extent : ProcedureReturn DFail("Consumed view count exceeds the arena limit.") : EndIf
+  dims(i)=extent : count=count*extent
+ Next
+ If count>DLimit/size Or count<>Dt(A)\Count Or count*size<>Dt(A)\Bytes : ProcedureReturn DFail("Consumed view changes its element storage.") : EndIf
+ DRelease(Y)
+ If DError Or DCancel : ProcedureReturn 0 : EndIf
+ Dt(Y)\Data=Dt(A)\Data : Dt(Y)\Kind=Dt(A)\Kind : Dt(Y)\Rank=Rank
+ Dt(Y)\Count=count : Dt(Y)\Bytes=Dt(A)\Bytes : Dt(Y)\Owned=1 : Dt(Y)\Scales=0
+ For i=0 To Rank-1 : DDims(Y*8+i)=dims(i) : Next
+ Dt(A)\Owned=0
+ ProcedureReturn 1
+EndProcedure
+Procedure.i DSpansOverlap(a.i,an.i,b.i,bn.i)
+ If an<=0 Or bn<=0 : ProcedureReturn 0 : EndIf
+ If a<=b : ProcedureReturn Bool(b-a<an) : EndIf
+ ProcedureReturn Bool(a-b<bn)
+EndProcedure
+Procedure DReshapeCore(Y.i,A.i,Shape.i,AllowZero.i,Consume.i)
   Protected extent.i=0
   Protected Dim dims.i(8)
   Protected i.i=0
@@ -1904,12 +1942,20 @@ Procedure DReshape(Y.i,A.i,Shape.i,AllowZero.i)
     DFail("Reshape changes the element count.")
     ProcedureReturn
   EndIf
+  If Consume And DConsumeShape(Y,A,rank,@dims(0)) : ProcedureReturn : EndIf
   If DAllocCore(Y,Dt(A)\Kind,rank,@dims(0),Bool(Y=A))
     DCopyServiced(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
   EndIf
 EndProcedure
 
-Procedure DViewAxes(Y.i,A.i,Axes.i,Unsqueeze.i)
+Procedure DReshape(Y.i,A.i,Shape.i,AllowZero.i)
+ DReshapeCore(Y,A,Shape,AllowZero,0)
+EndProcedure
+Procedure DReshapeConsume(Y.i,A.i,Shape.i,AllowZero.i)
+ DReshapeCore(Y,A,Shape,AllowZero,1)
+EndProcedure
+
+Procedure DViewAxesCore(Y.i,A.i,Axes.i,Unsqueeze.i,Consume.i)
   Protected Dim dims.i(8)
   Protected Dim mask.i(8)
   Protected i.i=0
@@ -1964,9 +2010,17 @@ Procedure DViewAxes(Y.i,A.i,Axes.i,Unsqueeze.i)
     Next
     rank=j
   EndIf
+  If Consume And DConsumeShape(Y,A,rank,@dims(0)) : ProcedureReturn : EndIf
   If DAllocCore(Y,Dt(A)\Kind,rank,@dims(0),Bool(Y=A))
     DCopyServiced(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
   EndIf
+EndProcedure
+
+Procedure DViewAxes(Y.i,A.i,Axes.i,Unsqueeze.i)
+ DViewAxesCore(Y,A,Axes,Unsqueeze,0)
+EndProcedure
+Procedure DViewAxesConsume(Y.i,A.i,Axes.i,Unsqueeze.i)
+ DViewAxesCore(Y,A,Axes,Unsqueeze,1)
 EndProcedure
 
 Procedure DTranspose(Y.i,A.i,Perm.i)
@@ -2701,7 +2755,7 @@ Procedure DNonZero(Y.i,A.i)
   Next
 EndProcedure
 
-Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
+Procedure DScatterCore(Y.i,A.i,Indices.i,Updates.i,Consume.i)
   Protected k.i=0
   Protected i.i=0
   Protected j.i=0
@@ -2709,7 +2763,7 @@ Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
   Protected idx.i=0
   Protected block.i=0
   Protected size.i=DSize(Dt(A)\Kind)
-  Protected tuples.i=0
+  Protected tuples.i=0,taken.i=0
   If Dt(Indices)\Rank<1
     DFail("ScatterND indices need a tuple axis.")
     ProcedureReturn
@@ -2725,6 +2779,12 @@ Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
     DFail("ScatterND update count mismatch.")
     ProcedureReturn
   EndIf
+  If Consume And Y<>A And Y<>Indices And Y<>Updates And A<>Indices And A<>Updates
+    If DSpansOverlap(Dt(A)\Data,Dt(A)\Bytes,Dt(Indices)\Data,Dt(Indices)\Bytes)=0 And DSpansOverlap(Dt(A)\Data,Dt(A)\Bytes,Dt(Updates)\Data,Dt(Updates)\Bytes)=0
+      taken=DConsumeShape(Y,A,Dt(A)\Rank,@DDims(A*8))
+    EndIf
+  EndIf
+  If taken=0
   If Y=A Or Y=Indices Or Y=Updates
     If DLike(Y,A,0)=0 : ProcedureReturn : EndIf
   Else
@@ -2732,6 +2792,7 @@ Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
     If DLikeOverwrite(Y,A,0)=0 : ProcedureReturn : EndIf
   EndIf
   DCopyServiced(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+  EndIf
   For i=0 To tuples-1
     offset=0
     For j=0 To k-1
@@ -2747,6 +2808,13 @@ Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
     Next
     DCopyServiced(Dt(Updates)\Data+i*block*size,Dt(Y)\Data+offset*block*size,block*size)
   Next
+EndProcedure
+
+Procedure DScatter(Y.i,A.i,Indices.i,Updates.i)
+ DScatterCore(Y,A,Indices,Updates,0)
+EndProcedure
+Procedure DScatterConsume(Y.i,A.i,Indices.i,Updates.i)
+ DScatterCore(Y,A,Indices,Updates,1)
 EndProcedure
 
 Procedure.i DMatMulInt8(*g.PmI8MatMulArgs)
