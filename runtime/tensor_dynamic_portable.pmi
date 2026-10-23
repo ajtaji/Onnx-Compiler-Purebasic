@@ -535,6 +535,31 @@ Procedure.i DBindMutableState(Id.i,Kind.i,Rank.i,DimsAddress.i,Address.i,Availab
 EndProcedure
 CompilerEndIf
 
+CompilerIf #PMD_NATIVE_BYTES=8
+; Optional caller-owned output destination. Producers may decline the hint;
+; always retrieve the actual output tensor. Overlap with any live tensor
+; causes ordinary arena allocation, preserving inputs and live aliases.
+Procedure.i DBindOutputStorage(Id.i,Address.i,Available.i)
+ Protected zero.i=0
+ If DBindMutableState(Id,9,1,@zero,Address,Available)=0 : ProcedureReturn 0 : EndIf
+ DMutable(Id)=2
+ Dt(Id)\Kind=0 : Dt(Id)\Rank=0
+ ProcedureReturn 1
+EndProcedure
+Procedure.i DOutputStorageSafe(Id.i,Address.i,Bytes.i)
+ Protected j.i,other.i,n.i
+ For j=1 To #PMD_TENSOR_COUNT
+  If j<>Id
+   other=Dt(j)\Data : n=Dt(j)\Bytes
+   If n>0 And other>0 And Bytes>0
+    If (other>=Address And other-Address<Bytes) Or (other<Address And Address-other<n) : ProcedureReturn 0 : EndIf
+   EndIf
+  EndIf
+ Next
+ ProcedureReturn 1
+EndProcedure
+CompilerEndIf
+
 Procedure.i DAllocCore(Id.i,Kind.i,Rank.i,DimsAddress.i,clear.i)
   Protected i.i=0
   Protected count.i=0
@@ -570,6 +595,16 @@ Procedure.i DAllocCore(Id.i,Kind.i,Rank.i,DimsAddress.i,clear.i)
     ProcedureReturn DFail("Tensor bytes exceed the arena limit.")
   EndIf
   bytes=count*size
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If DMutable(Id)=2 And bytes<=DMutableCapacity(Id)
+    If DOutputStorageSafe(Id,Dt(Id)\Data,bytes)
+      Dt(Id)\Kind=Kind : Dt(Id)\Rank=Rank : Dt(Id)\Count=count : Dt(Id)\Bytes=bytes
+      For i=0 To Rank-1 : DDims(Id*8+i)=dims(i) : Next
+      If clear : DZero(Dt(Id)\Data,bytes) : EndIf
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  CompilerEndIf
   DRelease(Id)
   If bytes>DLimit-DLive
     ProcedureReturn DFail("Request exceeds its working-memory limit.")

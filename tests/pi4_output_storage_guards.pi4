@@ -1,0 +1,124 @@
+; Optional caller output storage; CC arena and CE caller-buffer scratch.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+
+Procedure.i OutputCase(n.i,clear.i,alias.i,small.i)
+ Protected dest.i=$CE200100,bytes.i=n*4,cap.i=1024,aliasAddress.i,aliasBytes.i=64,expectDirect.i=1,i.i,rc.i
+ Protected Dim dims.i(1)
+ dims(0)=n
+ For i=-16 To 1039 : PokeA(dest+i,$5A) : Next
+ If small And bytes>0 : cap=bytes-1 : expectDirect=0 : EndIf
+ Select alias
+ Case 1 : aliasAddress=dest : If bytes>0 : expectDirect=0 : EndIf
+ Case 2 : aliasAddress=dest+4 : If bytes>4 : expectDirect=0 : EndIf
+ Case 3 : aliasAddress=dest-4 : aliasBytes=8 : If bytes>0 : expectDirect=0 : EndIf
+ Case 4 : aliasAddress=dest+bytes
+ Case 5 : aliasAddress=dest-64
+ Case 6 : aliasAddress=dest : aliasBytes=0
+ EndSelect
+ If alias
+  If DBindBorrowed(1,9,1,@aliasBytes,aliasAddress,aliasBytes)=0 : ProcedureReturn 10 : EndIf
+ EndIf
+ If DBindOutputStorage(2,dest,cap)=0 : ProcedureReturn 11 : EndIf
+ If DAllocCore(2,1,1,@dims(0),clear)=0 : ProcedureReturn 12 : EndIf
+ If Bool(Dt(2)\Data=dest)<>expectDirect : rc=20 : EndIf
+ If Dt(2)\Kind<>1 Or Dt(2)\Rank<>1 Or Dt(2)\Count<>n Or Dt(2)\Bytes<>bytes Or DDims(16)<>n : rc=21 : EndIf
+ If expectDirect
+  If Dt(2)\Owned Or DMutable(2)<>2 Or DLive<>0 : rc=22 : EndIf
+ Else
+  If Dt(2)\Owned=0 Or DMutable(2) Or DLive<>bytes : rc=23 : EndIf
+ EndIf
+ If clear
+  For i=0 To bytes-1 : If PeekA(Dt(2)\Data+i)<>0 : rc=24 : Break : EndIf : Next
+ EndIf
+ For i=0 To bytes-1 : PokeA(Dt(2)\Data+i,(i*17) & 255) : Next
+ For i=-16 To 1039
+  If expectDirect And i>=0 And i<bytes
+   If PeekA(dest+i)<>((i*17) & 255) : rc=25 : Break : EndIf
+  Else
+   If PeekA(dest+i)<>$5A : rc=26 : Break : EndIf
+  EndIf
+ Next
+ DRelease(1) : DRelease(2)
+ If DLive Or DHeapUsed Or DMutable(2) Or Dt(2)\Data : rc=27 : EndIf
+ If rc : PokeI($E1C01F80,n) : PokeI($E1C01F88,clear) : PokeI($E1C01F90,alias) : PokeI($E1C01F98,small) : EndIf
+ ProcedureReturn rc
+EndProcedure
+
+Procedure.i OutputGuard(which.i)
+ Protected id.i=2,address.i=$CE200100,cap.i=128,extent.i=8,kind.i=1,rank.i=1,rc.i,i.i
+ For i=-16 To 143 : PokeA($CE200100+i,$5A) : Next
+ Select which
+ Case 0 : address=0
+ Case 1 : address+1
+ Case 2 : cap=-1
+ Case 3 : address=$CC000100
+ Case 4 : cap=DLimit+1
+ Case 5 : address=#PMD_INTEGER_MAX-15 : cap=32
+ Case 6 : id=0
+ Case 7 : id=#PMD_TENSOR_COUNT+1
+ Case 8 : DFail("Prior output binding error.")
+ Case 9 : DCancel=1
+ EndSelect
+ If which<10
+  If DBindOutputStorage(id,address,cap)<>0 Or DError=0 : rc=20 : EndIf
+ Else
+  If DBindOutputStorage(2,address,cap)=0 : ProcedureReturn 21 : EndIf
+  Select which
+  Case 10 : extent=-1
+  Case 11 : rank=9
+  Case 12 : kind=0
+  Case 13 : DFail("Prior output allocation error.")
+  Case 14 : DCancel=1
+  EndSelect
+  If DAllocCore(2,kind,rank,@extent,1)<>0 Or DError=0 : rc=22 : EndIf
+ EndIf
+ For i=-16 To 143 : If PeekA($CE200100+i)<>$5A : rc=23 : Break : EndIf : Next
+ DError=0 : DCancel=0 : DRelease(2)
+ If DLive Or DHeapUsed : rc=24 : EndIf
+ If rc : PokeI($E1C01F80,which) : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i Main(services.i)
+ Protected which.i,rc.i,cases.i,*pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ If DHeapBind($CC000000,$2000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ For which=0 To 14
+  rc=OutputGuard(which) : cases+1
+  If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,DLive) : PokeI($E1C01FE0,DHeapUsed)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
