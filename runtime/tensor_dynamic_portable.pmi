@@ -1311,7 +1311,7 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
   Protected row.i=0
   Protected astep.i=0
   Protected bstep.i=0
-  Protected maskfast.i=0,chunk.i,left.i,offset.i
+  Protected maskfast.i=0,chunk.i,left.i,offset.i,arithfast.i,done.i
   Protected fastrow.i=0
   Protected amap.i=0
   Protected bmap.i=0
@@ -1343,6 +1343,7 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
     EndIf
     If width=0 : ProcedureReturn : EndIf
     maskfast=Bool(Op>=5 And DSpansOverlap(Dt(Y)\Data,Dt(Y)\Bytes,Dt(A)\Data,Dt(A)\Bytes)=0 And DSpansOverlap(Dt(Y)\Data,Dt(Y)\Bytes,Dt(B)\Data,Dt(B)\Bytes)=0)
+    arithfast=Bool(Op>=0 And Op<=1 And DSpansOverlap(Dt(Y)\Data,Dt(Y)\Bytes,Dt(A)\Data,Dt(A)\Bytes)=0 And DSpansOverlap(Dt(Y)\Data,Dt(Y)\Bytes,Dt(B)\Data,Dt(B)\Bytes)=0)
     For row=0 To Dt(Y)\Count/width-1
       ai=Dt(A)\Data+DBroadcastIndex(row*width,Y,A)*8
       bi=Dt(B)\Data+DBroadcastIndex(row*width,Y,B)*8
@@ -1351,6 +1352,14 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
         While offset<width
           chunk=width-offset : If chunk>256 : chunk=256 : EndIf
           PmTensorCompareI64Neon(ai+offset*astep*8,bi+offset*bstep*8,Dt(Y)\Data+row*width+offset,chunk,astep,bstep,Op)
+          offset+chunk : PmKernelIdle()
+        Wend
+      ElseIf arithfast
+        offset=0
+        While offset<width
+          chunk=width-offset : If chunk>256 : chunk=256 : EndIf
+          done=PmTensorAddSubI64Native(ai+offset*astep*8,bi+offset*bstep*8,Dt(Y)\Data+(row*width+offset)*8,chunk,astep,bstep,Op)
+          If done<>chunk : DFail("Integer arithmetic exceeds the native signed execution range.") : ProcedureReturn : EndIf
           offset+chunk : PmKernelIdle()
         Wend
       Else
