@@ -3231,6 +3231,110 @@ Procedure DMatMul(Y.i,A.i,B.i)
   Next
 EndProcedure
 
+CompilerIf #PMD_NATIVE_BYTES=8
+; MatMul of B transposed from [batch,K,head,N] to [batch,head,K,N].
+; B's original row stride feeds the unchanged exact column kernels directly.
+Global Dim PmInterleavedHeadParts.i[52]
+Procedure PmInterleavedHeadRange(a.i,b.i,dst.i,ab.i,ah.i,bb.i,bh.i,m.i,k.i,n.i,outHeads.i,first.i,last.i)
+ Protected job.i,batch.i,head.i,aa.i,ba.i,ap.i,bp.i,dp.i,row.i,col.i,lane.i
+ Protected tile.PmTensorMatMul2ExactArgs
+ tile\Count=k : tile\ARowBytes=k*4 : tile\BRowBytes=bh*n*4 : tile\DstRowBytes=n*4
+ For job=first To last-1
+  batch=job/outHeads : head=job % outHeads : aa=0 : ba=0
+  If ab<>1 : aa=batch*ah*m*k : EndIf
+  If ah<>1 : aa+head*m*k : EndIf
+  If bb<>1 : ba=batch*k*bh*n : EndIf
+  If bh<>1 : ba+head*n : EndIf
+  ap=a+aa*4 : bp=b+ba*4 : dp=dst+job*m*n*4
+    row=0
+    While row<m
+     col=0
+     While col<n
+      tile\A=ap+row*k*4 : tile\B=bp+col*4 : tile\Dst=dp+(row*n+col)*4
+      If m-row>=4
+       If n-col>=16
+        PmTensorMatMul2ExactFourBySixteen(@tile) : col+16
+       ElseIf n-col>=4
+        PmTensorMatMul2ExactFourByFour(@tile) : col+4
+       Else
+        For lane=0 To 3
+         tile\A=ap+(row+lane)*k*4 : tile\Dst=dp+((row+lane)*n+col)*4
+         PmTensorMatMul2ExactOneByOne(@tile)
+        Next
+        col+1
+       EndIf
+      Else
+       If n-col>=64
+        PmTensorMatMul2ExactOneBySixtyFour(@tile) : col+64
+       ElseIf n-col>=16
+        PmTensorMatMul2ExactOneBySixteen(@tile) : col+16
+       ElseIf n-col>=4
+        PmTensorMatMul2ExactOneByFour(@tile) : col+4
+       Else
+        PmTensorMatMul2ExactOneByOne(@tile) : col+1
+       EndIf
+      EndIf
+      PmKernelIdle()
+     Wend
+     If m-row>=4 : row+4 : Else : row+1 : EndIf
+    Wend
+ Next
+EndProcedure
+Procedure.i PmInterleavedHeadWorker(p.i)
+ PmInterleavedHeadRange(PeekI(p),PeekI(p+8),PeekI(p+16),PeekI(p+24),PeekI(p+32),PeekI(p+40),PeekI(p+48),PeekI(p+56),PeekI(p+64),PeekI(p+72),PeekI(p+80),PeekI(p+88),PeekI(p+96))
+ ProcedureReturn 0
+EndProcedure
+
+Procedure DMatMulInterleavedHeads(Y.i,T.i,A.i,B.i,Perm.i,transposeNode.i,releaseB.i)
+ Protected Dim dims.i(8)
+ Protected eligible.i=1,i.i,batch.i,head.i,ab.i,ah.i,bb.i,bh.i,k.i,n.i,col.i,m.i,row.i,lane.i,parts.i=1,totalJobs.i,first.i,last.i,at.i,status.i
+ Protected aa.i,ba.i,ap.i,bp.i,dp.i,matmulNode.i=DNode
+ Protected tile.PmTensorMatMul2ExactArgs
+ If DError Or DCancel Or Dt(A)\Kind<>1 Or Dt(B)\Kind<>1 Or Dt(A)\Rank<>4 Or Dt(B)\Rank<>4 : eligible=0 : EndIf
+ If eligible
+  If DListCount(Perm)<>4 Or DListValue(Perm,1)<>0 Or DListValue(Perm,2)<>2 Or DListValue(Perm,3)<>1 Or DListValue(Perm,4)<>3 : eligible=0 : EndIf
+  ab=DDims(A*8) : ah=DDims(A*8+1) : bb=DDims(B*8) : bh=DDims(B*8+2)
+  k=DDims(B*8+1) : n=DDims(B*8+3) : m=DDims(A*8+2)
+  If m<1 Or m>32 Or DDims(A*8+3)<>k Or k<0 Or k>4096 Or n<1 Or n>4096 Or ab<1 Or ah<1 Or bb<1 Or bh<1 Or ab>4096 Or ah>4096 Or bb>4096 Or bh>4096 : eligible=0 : EndIf
+  If ab<>bb And ab<>1 And bb<>1 : eligible=0 : EndIf
+  If ah<>bh And ah<>1 And bh<>1 : eligible=0 : EndIf
+  totalJobs=DMax(ab,bb)*DMax(ah,bh)
+  If totalJobs>256 Or m*k*n>1048576 Or m*k*n*totalJobs>8388608 : eligible=0 : EndIf
+ EndIf
+ If eligible
+  dims(0)=DMax(ab,bb) : dims(1)=DMax(ah,bh) : dims(2)=m : dims(3)=n
+  If DAllocCore(Y,1,4,@dims(0),Bool(k=0))=0 : ProcedureReturn : EndIf
+  If m*k*n*totalJobs>=65536
+    parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
+    If parts>totalJobs : parts=totalJobs : EndIf
+  EndIf
+  status=-1
+  If parts>1
+   first=0
+   For i=0 To parts-1
+    last=totalJobs*(i+1)/parts : at=i*13
+    PmInterleavedHeadParts[at]=Dt(A)\Data : PmInterleavedHeadParts[at+1]=Dt(B)\Data : PmInterleavedHeadParts[at+2]=Dt(Y)\Data
+    PmInterleavedHeadParts[at+3]=ab : PmInterleavedHeadParts[at+4]=ah : PmInterleavedHeadParts[at+5]=bb : PmInterleavedHeadParts[at+6]=bh
+    PmInterleavedHeadParts[at+7]=m : PmInterleavedHeadParts[at+8]=k : PmInterleavedHeadParts[at+9]=n : PmInterleavedHeadParts[at+10]=dims(1)
+    PmInterleavedHeadParts[at+11]=first : PmInterleavedHeadParts[at+12]=last : first=last
+   Next
+   status=pmSvcParRun(@PmInterleavedHeadWorker,@PmInterleavedHeadParts[0],104,parts)
+  EndIf
+  If status<>#PMP_SVC_OK
+   PmInterleavedHeadRange(Dt(A)\Data,Dt(B)\Data,Dt(Y)\Data,ab,ah,bb,bh,m,k,n,dims(1),0,totalJobs)
+  EndIf
+  If releaseB : DRelease(B) : EndIf
+ Else
+  DNode=transposeNode : DTranspose(T,B,Perm)
+  If DError : ProcedureReturn : EndIf
+  If releaseB : DRelease(B) : EndIf
+  DNode=matmulNode : DMatMul(Y,A,T)
+ EndIf
+EndProcedure
+
+
+CompilerEndIf
+
 Procedure DGemm(Y.i,A.i,B.i,C.i,TransA.i,TransB.i,Alpha.f,Beta.f)
   Protected g.PmTensorGemmArgs
   Protected scratch.i,bytes.i,bptr.i,at.i,ci.i,sum.f,bias.f

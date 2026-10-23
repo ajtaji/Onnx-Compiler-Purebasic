@@ -526,6 +526,30 @@ Procedure PmdConsumeDeadInputs(List Calls.s(),List ScheduleStatic.i(),Map Last.i
   Next
 EndProcedure
 
+; Elide only an adjacent, single-use head-layout temporary. The runtime
+; preserves the original two operators for unsupported shapes and kinds.
+Procedure PmdCombineInterleavedHeads(List Calls.s(),List ScheduleStatic.i(),Map Last.i(),Map Persistent.i())
+  Protected i.i,n.i=ListSize(Calls()),tr.s,mm.s,t.i,b.i,a.i,y.i,releaseB.i
+  For i=0 To n-2
+    SelectElement(ScheduleStatic(),i) : If ScheduleStatic()<>0 : Continue : EndIf
+    SelectElement(ScheduleStatic(),i+1) : If ScheduleStatic()<>0 : Continue : EndIf
+    SelectElement(Calls(),i) : tr=Calls()
+    SelectElement(Calls(),i+1) : mm=Calls()
+    If Left(tr,11)<>"DTranspose(" Or Right(tr,10)<>Chr(34)+"0,2,1,3"+Chr(34)+")" Or Left(mm,8)<>"DMatMul(" : Continue : EndIf
+    t=Val(StringField(Mid(tr,12),1,",")) : b=Val(StringField(Mid(tr,12),2,","))
+    y=Val(StringField(Mid(mm,9),1,",")) : a=Val(StringField(Mid(mm,9),2,","))
+    If t<=0 Or b<=0 Or a<=0 Or y<=0 Or a=t Or b=t Or y=t Or y=a Or y=b : Continue : EndIf
+    If Val(StringField(Mid(mm,9),3,","))<>t Or Last(Str(t))<>i+1 Or Persistent(Str(t)) : Continue : EndIf
+    releaseB=0
+    If Last(Str(b))=i And Persistent(Str(b))=0
+      releaseB=1 : Last(Str(b))=i+1
+    EndIf
+    SelectElement(Calls(),i) : Calls()="; Head layout evaluated with the following matrix multiply."
+    SelectElement(Calls(),i+1)
+    Calls()="DMatMulInterleavedHeads("+Str(y)+","+Str(t)+","+Str(a)+","+Str(b)+","+Chr(34)+"0,2,1,3"+Chr(34)+","+Str(i)+","+Str(releaseB)+")"
+  Next
+EndProcedure
+
 Procedure PmdCombineMultiplyAdd(List Calls.s(),List ScheduleStatic.i(),Map Last.i(),Map Persistent.i())
   Protected i.i,n.i=ListSize(Calls()),mulCall.s,addCall.s,t.i,a.i,b.i,y.i,c.i,order.i,releaseMask.i
   For i=0 To n-2
@@ -775,6 +799,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
     Next
   EndIf
   If PmdPortable And PmoTargets(targetIndex)\NativeIntegerBytes=8
+    PmdCombineInterleavedHeads(calls(),isstatic(),last(),persistent())
     PmdCombineMultiplyAdd(calls(),isstatic(),last(),persistent())
     PmdCombineConvAdd(calls(),isstatic(),last(),persistent())
     PmdCombineTrigSquare(calls(),isstatic(),last(),persistent())
