@@ -1,5 +1,6 @@
 ; Exact direct short-matrix column ranges versus the independent old raw SIMD.
 ; 2048 serial, four-core, dispatcher and one-core fallback cases.
+; Includes 64-column one-row kernels and all 16/4/1-column tails.
 XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
 EnableFloatingPoint
 #PMD_TENSOR_COUNT = 64

@@ -5462,6 +5462,82 @@ Procedure PmTensorMatMul2ParallelNeon(*a.i,*b.i,*dst.i,m.i,k.i,n.i,*pack.i,parts
 EndProcedure
 
 
+; One row by 64 columns uses one A broadcast for four adjacent cache lines.
+; Every lane retains the original sequential, separate multiply/add chain.
+Procedure PmTensorMatMul2ExactOneBySixtyFour(t.i)
+ ASM
+ ldr x1, [x0, #0]
+ ldr x2, [x0, #8]
+ ldr x4, [x0, #24]
+ ldr x6, [x0, #40]
+ movi v16.4s, #0
+ movi v17.4s, #0
+ movi v18.4s, #0
+ movi v19.4s, #0
+ movi v20.4s, #0
+ movi v21.4s, #0
+ movi v22.4s, #0
+ movi v23.4s, #0
+ movi v24.4s, #0
+ movi v25.4s, #0
+ movi v26.4s, #0
+ movi v27.4s, #0
+ movi v28.4s, #0
+ movi v29.4s, #0
+ movi v30.4s, #0
+ movi v31.4s, #0
+ cmp x4, #1
+ b.lt pmoMatMulWideRowStore
+pmoMatMulWideRowLoop:
+ ld1r {v4.4s}, [x1], #4
+ mov x7, x2
+ ld1 {v0.4s-v3.4s}, [x7], #64
+ fmul v5.4s, v4.4s, v0.4s
+ fadd v16.4s, v16.4s, v5.4s
+ fmul v5.4s, v4.4s, v1.4s
+ fadd v17.4s, v17.4s, v5.4s
+ fmul v5.4s, v4.4s, v2.4s
+ fadd v18.4s, v18.4s, v5.4s
+ fmul v5.4s, v4.4s, v3.4s
+ fadd v19.4s, v19.4s, v5.4s
+ ld1 {v0.4s-v3.4s}, [x7], #64
+ fmul v5.4s, v4.4s, v0.4s
+ fadd v20.4s, v20.4s, v5.4s
+ fmul v5.4s, v4.4s, v1.4s
+ fadd v21.4s, v21.4s, v5.4s
+ fmul v5.4s, v4.4s, v2.4s
+ fadd v22.4s, v22.4s, v5.4s
+ fmul v5.4s, v4.4s, v3.4s
+ fadd v23.4s, v23.4s, v5.4s
+ ld1 {v0.4s-v3.4s}, [x7], #64
+ fmul v5.4s, v4.4s, v0.4s
+ fadd v24.4s, v24.4s, v5.4s
+ fmul v5.4s, v4.4s, v1.4s
+ fadd v25.4s, v25.4s, v5.4s
+ fmul v5.4s, v4.4s, v2.4s
+ fadd v26.4s, v26.4s, v5.4s
+ fmul v5.4s, v4.4s, v3.4s
+ fadd v27.4s, v27.4s, v5.4s
+ ld1 {v0.4s-v3.4s}, [x7], #64
+ fmul v5.4s, v4.4s, v0.4s
+ fadd v28.4s, v28.4s, v5.4s
+ fmul v5.4s, v4.4s, v1.4s
+ fadd v29.4s, v29.4s, v5.4s
+ fmul v5.4s, v4.4s, v2.4s
+ fadd v30.4s, v30.4s, v5.4s
+ fmul v5.4s, v4.4s, v3.4s
+ fadd v31.4s, v31.4s, v5.4s
+ add x2, x2, x6
+ subs x4, x4, #1
+ b.ne pmoMatMulWideRowLoop
+pmoMatMulWideRowStore:
+ ldr x3, [x0, #16]
+ st1 {v16.4s-v19.4s}, [x3], #64
+ st1 {v20.4s-v23.4s}, [x3], #64
+ st1 {v24.4s-v27.4s}, [x3], #64
+ st1 {v28.4s-v31.4s}, [x3], #64
+ EndASM
+EndProcedure
 ; Disjoint output-column ranges retain original B/output row strides.
 Procedure PmTensorMatMul2DirectColumnsNeon(*a.i,*b.i,*dst.i,m.i,k.i,n.i,first.i,last.i)
   Protected row.i
@@ -5511,6 +5587,12 @@ Procedure PmTensorMatMul2DirectColumnsNeon(*a.i,*b.i,*dst.i,m.i,k.i,n.i,first.i,
       row+4
     Else
       col=first
+      While last-col>=64
+        PmKernelIdle()
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactOneBySixtyFour(@t)
+        col+64
+      Wend
       While colBlock>=16 And last-col>=16
         PmKernelIdle()
         t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
