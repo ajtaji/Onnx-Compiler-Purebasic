@@ -717,3 +717,31 @@ a preserved operator remains FP32 for every use; it is never quantized for one
 consumer and silently changed for another. Explicitly preserving every eligible
 operator may produce an all-FP32 weight file. This option changes precision and
 requires representative output-quality comparisons, not just finite output.
+
+
+@SECTION Native64 cache ownership and direct attention matrices
+
+The runtime-dimension emitter recognizes last-use Gather and identity Expand
+without changing graph arithmetic. DGatherConsume can transfer an aligned,
+single-index axis-zero slice from explicitly mutable caller state. Other
+sources and geometries retain the copy path. DGatherView borrows a read-only
+slice only when the parent is already pinned as a graph output until request
+completion. Releasing that view never releases or grants mutation of its
+parent. DExpandConsume transfers owned or explicitly mutable storage only
+when expansion adds no broadcast copies, including leading unit axes.
+Immutable inputs, actual broadcasts and unsupported cases keep ordinary
+operator behavior. Graph outputs, persistent tensors and later uses prohibit
+last-use consumption. No allocation metadata or public ownership rule changes.
+
+An adjacent Transpose with permutation 0,2,1,3 feeding only the right input
+of MatMul may use DMatMulInterleavedHeads on portable native64 targets. It
+reads [batch,K,head,N] rows directly instead of materializing their transpose.
+The existing exact FLOAT matrix kernels preserve the original accumulation
+and rounding. Eligible small matrices split disjoint output heads across up
+to four workers, with service on the primary core. The temporary must have
+one adjacent use and cannot be a graph output. The emitter delays a dead
+source release until the combined call; its fallback preserves the original
+Transpose/MatMul boundary. Unsupported kinds, shapes, bounds and layouts use
+the original operators. Native32 and Windows emission keep their earlier
+scheduling. These are shared graph/layout rules, with no voice/model names
+or phrase-specific selection.

@@ -1080,3 +1080,39 @@ them too. These new throughput tests are silent; no later Bluetooth or map
 result is implied. Ratios 1.372/1.437 remain slower than real time, and first
 PCM 0.118/0.134 seconds is not a sustained subsecond-playback or map-headroom
 pass. Strict native/upstream numerical acceptance remains separate and open.
+
+
+@SECTION Physical cache movement and attention proof, 23 October 2026
+
+Four shared changes retain exact mixed-precision Pocket 18M waveforms:
+mutable last-use Gather, pinned read-only Gather, no-broadcast last-use Expand,
+and adjacent interleaved-head Transpose/MatMul. Independent physical Pi gates
+pass respectively 2,520, 5,040 plus 24 fallback, 540, and 7,026 old-versus-new
+comparisons. Cases cover invalid geometry, prior errors/cancellation, complete
+bytes, output kinds/shapes, source canaries and allocation lifecycle. A
+supplemental marked matrix job proves execution on all four physical cores,
+checks complete output again and confirms primary-only callbacks. Compiler
+fixtures cover later uses, outputs, static values, wrong permutations,
+nonadjacent operations and target guards. CLI/UI rebuild and self-test pass.
+
+The initial complete mixed replies take 3.402/4.713 seconds for 2.48/3.28
+seconds of audio. After the first three changes this falls to 2.613/3.646;
+the normal direct parallel attention export reaches 2.453/3.381, about 28 percent
+less generation time overall. Every full waveform and final 29,387,456-byte
+mutable state digest remains identical. These are silent fresh-text runs on
+the physical Pi, with a warm model and no map; they are not cached speech.
+The first PCM appears at 101/117 ms, but sustained ratios 0.990/1.033 still
+do not establish subsecond audible starts with real map headroom. No new map
+demo or default voice is selected. Strict upstream numerical acceptance is
+still separate from equivalence to the existing native implementation.
+
+An owned-subview Gather design, independent INT8 sum chains and unit-axis
+Transpose consumption pass their numeric gates but lack whole-reply gains
+and are excluded. Serial attention variants preserve exact values but gain
+less than splitting independent output heads. Full-width precision policy
+remains unchanged; accepted mixed voice keeps Conv in FP32 to avoid the
+previous audible background static.
+
+The source guide records these results. Its PDF refresh remains explicitly
+pending because the required artifact-operation marker helper is unavailable;
+the existing PDF must not be presented as containing this checkpoint.
