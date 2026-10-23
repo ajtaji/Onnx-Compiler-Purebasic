@@ -702,3 +702,18 @@ cannot fail cleanly will fail dirtily.
 Only then compare a reduced precision on representative data, and compare
 it yourself. A successful generation says the graph was understood. It
 does not say the answer is good enough for what you are doing.
+
+
+@SECTION Selectively preserving FP32 weights in an INT8 compilation
+
+Use `--precision int8 --int8-fp32-ops Conv` to retain eligible Conv weights
+as FP32 while the remaining eligible operators use INT8 weights. The optional
+comma-separated list accepts Conv, Gemm, LSTM and MatMul, ignoring case and
+surrounding spaces and removing duplicates. The manifest records the canonical
+`fp32_weight_operators` policy. The UI offers the same field in INT8 mode.
+Unknown names, empty list members and a nonempty policy outside INT8 are errors.
+The default empty policy retains ordinary INT8 lowering. A weight shared with
+a preserved operator remains FP32 for every use; it is never quantized for one
+consumer and silently changed for another. Explicitly preserving every eligible
+operator may produce an all-FP32 weight file. This option changes precision and
+requires representative output-quality comparisons, not just finite output.

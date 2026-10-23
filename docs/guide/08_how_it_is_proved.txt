@@ -984,3 +984,51 @@ A wider-row instruction scheduling variant also passes 2,048 exact matrix checks
 
 
 A separate ordinary INT8 compilation produces 26,134,976 bytes of weights versus 72,701,504 bytes for FP32, with 108 quantized weight bindings. It is stored separately on the Pi USB medium after complete save/reload SHA verification, preserving FP32 assets. Two fresh-text native INT8 requests produce finite output with no runtime error and generation ratios 1.462/1.537. This is still slower than real time. Their output is not byte-identical to FP32; the second direction emits 41 frames rather than 45, with an earlier end decision. Therefore raw total generation time is not a fixed-output speed comparison, and finite output does not establish intelligibility or voice quality. The INT8 candidate remains experimental and unselected, with Bluetooth, listening, upstream precision checks and map headroom unverified.
+
+
+@SECTION INT8 listening, selective FP32 and checked integer arithmetic
+
+Eight actual-text Pocket 18M directions run with warm INT8 weights and a live
+Bluetooth connection under Anvil on the physical Pi 4. Transport evidence shows
+zero underruns, late events, HCI/A2DP/core faults and disconnect timeout. The
+listener nevertheless rejects static in the background. Successful packet
+delivery is not a voice-quality pass. This narrow INT8 voice remains unselected.
+The conservative 2.56-second prebuffer makes this a quality test, not a
+successful subsecond-startup test; scheduled speech starts after 3.57..4.39s.
+
+A general operator-family precision policy preserves nine Conv weight bindings
+in FP32 and leaves 99 quantized bindings. The complete default INT8 weight file
+remains unchanged. Forty-four synthetic compilation checks cover fixed and
+runtime-dimension emitters, canonical policies, shared weights, all-preserved
+graphs and refusal cases. Mixed weights occupy 26,568,512 bytes, stored separately
+and save/reload SHA verified alongside the original FP32 and narrow INT8 files.
+
+On the first native direction, the tenth-percentile RMS of 25ms waveform windows
+is -69.48dB for FP32, -62.72dB for narrow INT8 and -68.66dB with Conv kept FP32.
+This diagnostic supports a reduced low-level native noise floor; it is not a
+formal perceptual metric or proof of the precise noise cause. Mixed generation
+cost rises less than one percent. Its two-direction Bluetooth replay has zero
+underruns or transport faults, but listener acceptance remains pending. Native
+quality and packet continuity must be judged separately.
+
+A shared native64 INT64 Add/Sub path uses processor signed-overflow flags,
+without passing integers through FLOAT. It writes exactly the valid prefix and
+leaves the overflowing element and suffix unwritten, retaining the previous
+runtime error. Disjoint scalar/row broadcasts use chunks of at most 256 elements
+with primary-only service; overlapping spans retain the previous scalar path.
+A physical gate passes 2,352 raw and distinct-result broadcast cases against the
+preceding integer implementation, including signed limits, overflow locations,
+unaligned buffers, tails, empty and invalid shapes, error/cancel guards, output
+canaries and live allocation accounting.
+
+Two complete mixed-precision actual-text replies fall from 3.649/5.066 seconds
+to 3.570/4.938 seconds, about 2.2..2.5 percent less compute, preserving every
+complete mixed waveform byte, EOS decision and duration. Generation ratios are
+still 1.439/1.506 for 2.48/3.28 seconds of audio. First PCM at 0.125/0.141 seconds
+does not establish sustainable subsecond playback or map headroom. Both normal
+compiler applications rebuild and the self-test passes; nine normally emitted
+runtime files and complete mixed weights match their canonical sources. The
+normal full image is byte-identical to the physically tested candidate. No map
+demo, default voice change, firmware update or relaxed numerical tolerance is
+used to claim these results. Strict native/upstream precision acceptance remains
+a separate open check.
