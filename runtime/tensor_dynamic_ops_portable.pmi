@@ -12,7 +12,7 @@ EndProcedure
 
 Procedure DOpUnaryChunk(src.i,dst.i,count.i,op.i,kind.i)
  CompilerIf #PMD_NATIVE_BYTES=8
- Protected done.i
+ Protected done.i,at.i,take.i
  If op=0 And kind=1 And count>=4
   done=PmOpErfVectorA64(src,dst,count)
   PmOpUnary(src+done*4,dst+done*4,count-done,op,kind)
@@ -21,6 +21,18 @@ Procedure DOpUnaryChunk(src.i,dst.i,count.i,op.i,kind.i)
  If op=4 And kind=1 And count>=4
   done=PmOpSoftplusVectorA64(src,dst,count)
   PmOpUnary(src+done*4,dst+done*4,count-done,op,kind)
+  ProcedureReturn
+ EndIf
+ If op=13 And kind=1 And count>=4 And (src=dst Or DSpansOverlap(src,count*4,dst,count*4)=0)
+  ; A rejected group need not make later independent finite groups scalar.
+  While count-at>=4
+   done=PmOpGeluVectorA64(src+at*4,dst+at*4,count-at)
+   at+done
+   If count-at>=4
+    PmOpUnary(src+at*4,dst+at*4,4,op,kind) : at+4
+   EndIf
+  Wend
+  PmOpUnary(src+at*4,dst+at*4,count-at,op,kind)
   ProcedureReturn
  EndIf
  If op=13 And kind=1 And count>=4

@@ -1,0 +1,112 @@
+; Exact old-chunk comparisons for resumed GELU SIMD groups: 1008 cases.
+; Scratch: CC000000..CC2FFFFF sources, CD000000..CD2FFFFF outputs.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldUnaryChunk(src.i,dst.i,count.i,op.i,kind.i)
+ CompilerIf #PMD_NATIVE_BYTES=8
+ Protected done.i
+ If op=0 And kind=1 And count>=4
+  done=PmOpErfVectorA64(src,dst,count)
+  PmOpUnary(src+done*4,dst+done*4,count-done,op,kind)
+  ProcedureReturn
+ EndIf
+ If op=4 And kind=1 And count>=4
+  done=PmOpSoftplusVectorA64(src,dst,count)
+  PmOpUnary(src+done*4,dst+done*4,count-done,op,kind)
+  ProcedureReturn
+ EndIf
+ If op=13 And kind=1 And count>=4
+  done=PmOpGeluVectorA64(src,dst,count)
+  PmOpUnary(src+done*4,dst+done*4,count-done,op,kind)
+  ProcedureReturn
+ EndIf
+ If op=6 And kind=1 And count>=4
+  done=PmOpEluVectorA64(src,dst,count,PeekL(@PmOpF(0)))
+  PmOpUnary(src+done*4,dst+done*4,count-done,op,kind)
+  ProcedureReturn
+ EndIf
+ CompilerEndIf
+ PmOpUnary(src,dst,count,op,kind)
+EndProcedure
+
+Procedure.i ResumeCase(n.i,off.i,pattern.i,mode.i)
+ Protected src.i=$CC000100+off,refsrc.i=$CC100100+off,dst.i=$CD000100+off,ref.i=$CD100100+off
+ Protected i.i,bits.i,v.f,expected.i
+ For i=-16 To n*4+31 : PokeA(src+i,$5A) : PokeA(refsrc+i,$5A) : PokeA(dst+i,$6B) : PokeA(ref+i,$6B) : Next
+ For i=0 To n-1
+  v=((i*7919) % 10001)/1000.0 : v=v-5.0 : bits=PeekL(@v)
+  If pattern=1 And (i & 31)=1 : bits=$40A00001 : EndIf
+  If pattern=2 And (i & 31)=1 : bits=$7FC12345 : EndIf
+  If pattern=3 And (i & 31)=1 : bits=$FF800000 : EndIf
+  If pattern=4
+   Select i & 7
+   Case 0 : bits=0
+   Case 1 : bits=$80000000
+   Case 2 : bits=1
+   Case 3 : bits=$80000001
+   Case 4 : bits=$40A00000
+   Case 5 : bits=$C0A00000
+   EndSelect
+  EndIf
+  If pattern=5 : v=((i*7919) % 20001)/1000.0 : v=v-10.0 : bits=PeekL(@v) : EndIf
+  PokeL(src+i*4,bits) : PokeL(refsrc+i*4,bits)
+ Next
+ If mode=1 : dst=src : ref=refsrc : EndIf
+ If mode=2 : dst=src+4 : ref=refsrc+4 : EndIf
+ If mode=3 : dst=src-4 : ref=refsrc-4 : EndIf
+ PmOpStatus=0 : OldUnaryChunk(refsrc,ref,n,13,1) : expected=PmOpStatus
+ PmOpStatus=0 : DOpUnaryChunk(src,dst,n,13,1)
+ If PmOpStatus<>expected : ProcedureReturn 20 : EndIf
+ For i=-8 To n*4+15 : If PeekA(dst+i)<>PeekA(ref+i) : PokeI($E1C01F80,i) : PokeI($E1C01F88,n) : PokeI($E1C01F90,pattern) : PokeI($E1C01F98,mode) : ProcedureReturn 21 : EndIf : Next
+ For i=-8 To n*4+15 : If PeekA(src+i)<>PeekA(refsrc+i) : ProcedureReturn 22 : EndIf : Next
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected Dim ns.i(14)
+ Protected ni.i,off.i,pat.i,mode.i,rc.i,cases.i,*pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ ns(0)=0 : ns(1)=1 : ns(2)=2 : ns(3)=3 : ns(4)=4 : ns(5)=5 : ns(6)=7 : ns(7)=8 : ns(8)=15 : ns(9)=16 : ns(10)=127 : ns(11)=128 : ns(12)=129 : ns(13)=4097
+ For ni=0 To 13
+ For off=0 To 2
+ For pat=0 To 5
+ For mode=0 To 3
+  rc=ResumeCase(ns(ni),off,pat,mode) : cases+1 : If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next
+ PokeI($E1C01FD0,cases)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
