@@ -516,7 +516,7 @@ Procedure PmdConsumeDeadInputs(List Calls.s(),List ScheduleStatic.i(),Map Last.i
     call=Trim(Calls()) : open=FindString(call,"(")
     If open<1 : Continue : EndIf
     op=Left(call,open-1)
-    If op<>"DReshape" And op<>"DViewAxes" And op<>"DScatter" And op<>"DGather" : Continue : EndIf
+    If op<>"DReshape" And op<>"DViewAxes" And op<>"DScatter" And op<>"DGather" And op<>"DExpand" : Continue : EndIf
     y=Val(StringField(Mid(call,open+1),1,","))
     a=Val(StringField(Mid(call,open+1),2,",")) : key=Str(a)
     If a<=0 Or y<=0 Or y=a Or Persistent(key) : Continue : EndIf

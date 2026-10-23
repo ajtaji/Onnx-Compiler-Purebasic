@@ -2620,12 +2620,12 @@ Procedure DSlice(Y.i,A.i,Starts.i,Ends.i,Axes.i,Steps.i)
   Next
 EndProcedure
 
-Procedure DExpand(Y.i,A.i,Shape.i)
+Procedure DExpandCore(Y.i,A.i,Shape.i,Consume.i)
   Protected Dim dims.i(8)
   Protected i.i=0
   Protected rank.i=Dt(Shape)\Count
   Protected size.i=DSize(Dt(A)\Kind)
-  Protected ax.i=0
+  Protected ax.i=0,unchanged.i=1
   Protected width.i,step.i,row.i,source.i,x.i,destination.i,filled.i,take.i
   DZero(@dims(0),8*#PMD_NATIVE_BYTES)
   If rank>8 Or rank<Dt(A)\Rank
@@ -2639,12 +2639,18 @@ Procedure DExpand(Y.i,A.i,Shape.i)
       If dims(i)=1
         dims(i)=DDims((A)*8+(ax))
       EndIf
+      If dims(i)<>DDims(A*8+ax) : unchanged=0 : EndIf
       If dims(i)<>DDims((A)*8+(ax)) And DDims((A)*8+(ax))<>1
         DFail("Invalid Expand extent.")
         ProcedureReturn
       EndIf
+    Else
+      If dims(i)<>1 : unchanged=0 : EndIf
     EndIf
   Next
+  If Consume And unchanged
+    If DConsumeShape(Y,A,rank,@dims(0)) : ProcedureReturn : EndIf
+  EndIf
   If DAllocCore(Y,Dt(A)\Kind,rank,@dims(0),Bool(Y=A))=0
     ProcedureReturn
   EndIf
@@ -2672,6 +2678,13 @@ Procedure DExpand(Y.i,A.i,Shape.i)
     PmKernelIdle()
   Next
 EndProcedure
+Procedure DExpand(Y.i,A.i,Shape.i)
+ DExpandCore(Y,A,Shape,0)
+EndProcedure
+Procedure DExpandConsume(Y.i,A.i,Shape.i)
+ DExpandCore(Y,A,Shape,1)
+EndProcedure
+
 
 Procedure DConstantShape(Y.i,Shape.i,Kind.i,Value.f)
   Protected Dim dims.i(8)
