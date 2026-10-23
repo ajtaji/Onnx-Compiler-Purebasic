@@ -238,6 +238,26 @@ EndProcedure
 ; cycle back into PmKernelIdle. Upward-overlap and unaligned ranges retain
 ; the raw primitive's forward-copy behavior.
 Procedure DCopyServiced(Source.i,Destination.i,Bytes.i)
+  ; Exact short forward copies avoid another procedure call. Keep word
+  ; accesses aligned and preserve the original order even for overlap.
+  If Bytes=1
+    PokeA(Destination,PeekA(Source)) : ProcedureReturn
+  EndIf
+  If ((Source | Destination) & 3)=0
+    If Bytes=4
+      PokeL(Destination,PeekL(Source)) : ProcedureReturn
+    EndIf
+    If Bytes=8
+      PokeL(Destination,PeekL(Source))
+      PokeL(Destination+4,PeekL(Source+4)) : ProcedureReturn
+    EndIf
+    If Bytes=16
+      PokeL(Destination,PeekL(Source))
+      PokeL(Destination+4,PeekL(Source+4))
+      PokeL(Destination+8,PeekL(Source+8))
+      PokeL(Destination+12,PeekL(Source+12)) : ProcedureReturn
+    EndIf
+  EndIf
   CompilerIf #PMD_NATIVE_BYTES=8
   Protected offset.i=0
   If ((Source | Destination) & 15)=0 And Bytes>=65536

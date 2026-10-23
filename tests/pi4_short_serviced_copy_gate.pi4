@@ -1,0 +1,115 @@
+; Exact serviced short copies, alignment, overlap and primary-only callbacks.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "C:/Users/ajtaj/Documents/Codex/2026-10-19/c-users-ajtaj-documents-codex-2026/work/pocket-copy-service/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldDCopy(Source.i,Destination.i,Bytes.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If ((Source | Destination) & 15)=0 And Bytes>=16
+    If Destination<=Source Or Destination-Source>=Bytes
+      PmTensorCopyAlignedNeon(Source,Destination,Bytes) : ProcedureReturn
+    EndIf
+  EndIf
+  CompilerEndIf
+  Protected i.i=0
+  i=0
+  ; Aligned words preserve the forward byte-copy contract on every target.
+  If ((Source | Destination) & 3)=0
+    While i+4<=Bytes
+      PokeL(Destination+i,PeekL(Source+i))
+      i=i+4
+    Wend
+  EndIf
+  While i<Bytes
+    PokeA(Destination+i,PeekA(Source+i))
+    i=i+1
+  Wend
+EndProcedure
+
+Global CopyIdleCount.i,CopyIdleFault.i
+Procedure CopyIdle()
+ If PmKernelCore()<>0 : CopyIdleFault+1 : Else : CopyIdleCount+1 : EndIf
+EndProcedure
+Global Dim CopyJobs.i[12]
+Procedure.i CopyWorker(p.i)
+ DCopyServiced(PeekI(p),PeekI(p+8),PeekI(p+16)) : ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected Dim lengths.i(13)
+ Protected li.i,align.i,mode.i,n.i,i.i,src.i,dst.i,rc.i,cases.i,*pet,j.i,bits.i
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ lengths(10)=4 : lengths(11)=8 : lengths(12)=17
+ lengths(0)=0 : lengths(1)=1 : lengths(2)=15 : lengths(3)=16 : lengths(4)=63 : lengths(5)=64 : lengths(6)=65535 : lengths(7)=65536 : lengths(8)=65537 : lengths(9)=1048593
+ For li=0 To 12
+ For align=0 To 15
+ For mode=0 To 3
+  n=lengths(li)
+  For i=0 To n+127 Step 4
+   bits=(i*1664525+1013904223) & $FFFFFFFF
+   PokeL($EC000000+i,bits) : PokeL($ED000000+i,bits)
+   PokeL($EC200000+i,bits!$55555555) : PokeL($ED200000+i,bits!$55555555)
+  Next
+  src=64+align : dst=$200050+align
+  If mode=1 : dst=src : EndIf
+  If mode=2 : dst=src-16 : EndIf
+  If mode=3 : dst=src+4 : EndIf
+  CopyIdleCount=0 : PmSetIdleCallback(@CopyIdle)
+  OldDCopy($EC000000+src,$EC000000+dst,n)
+  DCopyServiced($ED000000+src,$ED000000+dst,n)
+  If n>=65536 And align=0 And mode=0 And CopyIdleCount=0 : rc=1 : Break : EndIf
+  For i=0 To n+127
+   If PeekA($EC000000+i)<>PeekA($ED000000+i) Or PeekA($EC200000+i)<>PeekA($ED200000+i) : rc=2 : Break : EndIf
+  Next
+  If rc Or CopyIdleFault : rc=3 : Break : EndIf
+  cases+1 : If *pet : pet() : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ If rc : Break : EndIf
+ Next
+ If rc=0
+  For j=0 To 3
+   CopyJobs[j*3]=$EC000000 : CopyJobs[j*3+1]=$EE000000+j*$200000 : CopyJobs[j*3+2]=$100000
+  Next
+  CopyIdleCount=0 : PmSetIdleCallback(@CopyIdle)
+  If PmParallelCores()<>4 Or pmSvcParRun(@CopyWorker,@CopyJobs[0],24,4)<>#PMP_SVC_OK : rc=4 : EndIf
+  For j=0 To 3
+   For i=0 To $100000-1
+    If PeekA($EC000000+i)<>PeekA($EE000000+j*$200000+i) : rc=5 : Break : EndIf
+   Next
+   cases+1
+  Next
+  If CopyIdleCount=0 Or CopyIdleFault : rc=6 : EndIf
+ EndIf
+ PmSetIdleCallback(0) : PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,CopyIdleFault) : PokeI($E1C01FE0,CopyIdleCount)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
