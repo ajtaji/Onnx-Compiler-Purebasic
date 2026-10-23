@@ -217,7 +217,7 @@ Procedure DWriteI64(Address.i,Value.i)
 EndProcedure
 Procedure DCopy(Source.i,Destination.i,Bytes.i)
   CompilerIf #PMD_NATIVE_BYTES=8
-  If ((Source | Destination) & 15)=0 And Bytes>=16
+  If ((Source | Destination) & 3)=0 And Bytes>=16
     If Destination<=Source Or Destination-Source>=Bytes
       PmTensorCopyAlignedNeon(Source,Destination,Bytes) : ProcedureReturn
     EndIf
@@ -237,9 +237,9 @@ Procedure DCopy(Source.i,Destination.i,Bytes.i)
     i=i+1
   Wend
 EndProcedure
-; Inference/state transfers may service the primary between aligned chunks.
+; Inference/state transfers may service the primary between word-aligned chunks.
 ; Raw DCopy stays callback-safe: transport callbacks can copy without a call
-; cycle back into PmKernelIdle. Upward-overlap and unaligned ranges retain
+; cycle back into PmKernelIdle. Upward-overlap and non-word-aligned ranges retain
 ; the raw primitive's forward-copy behavior.
 Procedure DCopyServiced(Source.i,Destination.i,Bytes.i)
   ; Exact short forward copies avoid another procedure call. Keep word
@@ -264,7 +264,7 @@ Procedure DCopyServiced(Source.i,Destination.i,Bytes.i)
   EndIf
   CompilerIf #PMD_NATIVE_BYTES=8
   Protected offset.i=0
-  If ((Source | Destination) & 15)=0 And Bytes>=65536
+  If ((Source | Destination) & 3)=0 And Bytes>=65536
     If Destination<=Source Or Destination-Source>=Bytes
       While Bytes-offset>=65536
         DCopy(Source+offset,Destination+offset,65536)

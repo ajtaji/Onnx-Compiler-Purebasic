@@ -15,7 +15,8 @@
 ; registers across calls. General-purpose state uses caller-saved x0..x17.
 ; ======================================================================
 
-; Aligned forward copy. Caller excludes upward-overlapping ranges.
+; Word-aligned forward copy on native normal memory. LD1/ST1 need no
+; sixteen-byte alignment. Caller excludes upward-overlapping ranges.
 Procedure PmTensorCopyAlignedNeon(src.i,dst.i,bytes.i)
  ASM
   cmp x2, #0

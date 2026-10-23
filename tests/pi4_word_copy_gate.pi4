@@ -1,0 +1,144 @@
+; 544 word-aligned copy comparisons, including forward overlap and complete guards.
+; CC/CD scratch; no voice assets or audio.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldCopy(Source.i,Destination.i,Bytes.i)
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If ((Source | Destination) & 15)=0 And Bytes>=16
+    If Destination<=Source Or Destination-Source>=Bytes
+      PmTensorCopyAlignedNeon(Source,Destination,Bytes) : ProcedureReturn
+    EndIf
+  EndIf
+  CompilerEndIf
+  Protected i.i=0
+  i=0
+  ; Aligned words preserve the forward byte-copy contract on every target.
+  If ((Source | Destination) & 3)=0
+    While i+4<=Bytes
+      PokeL(Destination+i,PeekL(Source+i))
+      i=i+4
+    Wend
+  EndIf
+  While i<Bytes
+    PokeA(Destination+i,PeekA(Source+i))
+    i=i+1
+  Wend
+EndProcedure
+; Inference/state transfers may service the primary between aligned chunks.
+; Raw DCopy stays callback-safe: transport callbacks can copy without a call
+; cycle back into PmKernelIdle. Upward-overlap and unaligned ranges retain
+; the raw primitive's forward-copy behavior.
+Procedure OldCopyServiced(Source.i,Destination.i,Bytes.i)
+  ; Exact short forward copies avoid another procedure call. Keep word
+  ; accesses aligned and preserve the original order even for overlap.
+  If Bytes=1
+    PokeA(Destination,PeekA(Source)) : ProcedureReturn
+  EndIf
+  If ((Source | Destination) & 3)=0
+    If Bytes=4
+      PokeL(Destination,PeekL(Source)) : ProcedureReturn
+    EndIf
+    If Bytes=8
+      PokeL(Destination,PeekL(Source))
+      PokeL(Destination+4,PeekL(Source+4)) : ProcedureReturn
+    EndIf
+    If Bytes=16
+      PokeL(Destination,PeekL(Source))
+      PokeL(Destination+4,PeekL(Source+4))
+      PokeL(Destination+8,PeekL(Source+8))
+      PokeL(Destination+12,PeekL(Source+12)) : ProcedureReturn
+    EndIf
+  EndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected offset.i=0
+  If ((Source | Destination) & 15)=0 And Bytes>=65536
+    If Destination<=Source Or Destination-Source>=Bytes
+      While Bytes-offset>=65536
+        OldCopy(Source+offset,Destination+offset,65536)
+        offset+65536 : PmKernelIdle()
+      Wend
+      OldCopy(Source+offset,Destination+offset,Bytes-offset)
+      ProcedureReturn
+    EndIf
+  EndIf
+  CompilerEndIf
+  OldCopy(Source,Destination,Bytes)
+EndProcedure
+
+Global CopyCallbacks.i,CopyFault.i
+Procedure CopyIdle()
+ If PmKernelCore() : CopyFault+1 : EndIf
+ CopyCallbacks+1
+EndProcedure
+Procedure.i CopyCase(n.i,so.i,doff.i,mode.i,serviced.i)
+ Protected ref.i=$CC000000,got.i=$CD000000,src.i=256+so,dst.i=n+1024+doff,i.i,total.i=n*2+2048,rc.i
+ If mode=1 : dst=src+doff : EndIf
+ If mode=2 : dst=src-doff : EndIf
+ If mode=3 : dst=src : EndIf
+ ; Include surrounding guards and both full source/destination regions.
+ For i=0 To total-1 : PokeA(ref+i,(i*37+(i >> 8)) & 255) : PokeA(got+i,PeekA(ref+i)) : Next
+ If serviced
+  OldCopyServiced(ref+src,ref+dst,n) : DCopyServiced(got+src,got+dst,n)
+ Else
+  OldCopy(ref+src,ref+dst,n) : DCopy(got+src,got+dst,n)
+ EndIf
+ For i=0 To total-1
+  If PeekA(ref+i)<>PeekA(got+i) : PokeI($E1C01F80,i) : rc=20 : Break : EndIf
+ Next
+ ProcedureReturn rc
+EndProcedure
+Procedure.i Main(services.i)
+ Protected Dim lengths.i(17)
+ Protected ni.i,so.i,doff.i,mode.i,serviced.i,rc.i,cases.i,*pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ lengths(0)=0 : lengths(1)=1 : lengths(2)=3 : lengths(3)=4 : lengths(4)=8 : lengths(5)=15 : lengths(6)=16 : lengths(7)=17
+ lengths(8)=63 : lengths(9)=64 : lengths(10)=65 : lengths(11)=255 : lengths(12)=65535 : lengths(13)=65536 : lengths(14)=65537 : lengths(15)=131071 : lengths(16)=131073
+ PmSetIdleCallback(@CopyIdle)
+ For ni=0 To 16
+ For so=0 To 3
+ For mode=0 To 3
+ For serviced=0 To 1
+  doff=4*(so+1) : If so=3 : doff=3 : EndIf
+  rc=CopyCase(lengths(ni),so*4+Bool(so=3),doff,mode,serviced) : cases+1
+  If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next
+ PmSetIdleCallback(0)
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,CopyFault) : PokeI($E1C01FE0,CopyCallbacks)
+ If CopyFault : rc=21 : EndIf
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
