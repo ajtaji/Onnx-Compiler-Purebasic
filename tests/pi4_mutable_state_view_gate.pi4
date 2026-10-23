@@ -1,0 +1,239 @@
+; Gemm reuse of the exact matrix kernel versus the old scalar Gemm.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure RefDReshape(Y.i,A.i,Shape.i,AllowZero.i)
+  Protected extent.i=0
+  Protected Dim dims.i(8)
+  Protected i.i=0
+  Protected n.i=1
+  Protected unknown.i=-1
+  Protected rank.i=Dt(Shape)\Count
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If rank>8
+    DFail("Reshape rank exceeds eight.")
+    ProcedureReturn
+  EndIf
+  For i=0 To rank-1
+    dims(i)=DInt(Shape,i)
+    If dims(i)=0 And AllowZero=0
+      If i>=Dt(A)\Rank
+        DFail("Reshape zero axis is missing.")
+        ProcedureReturn
+      EndIf
+      dims(i)=DDims((A)*8+(i))
+    EndIf
+    If dims(i)=-1
+      If unknown>=0
+        DFail("Reshape has multiple inferred axes.")
+        ProcedureReturn
+      EndIf
+      unknown=i
+    Else
+      extent=dims(i)
+      If extent<0
+        DFail("Reshape extent is negative.")
+        ProcedureReturn
+      EndIf
+      If extent>0
+        If n>DLimit/extent
+          DFail("Reshape extent overflow.")
+          ProcedureReturn
+        EndIf
+      EndIf
+      n*dims(i)
+    EndIf
+  Next
+  If unknown>=0
+    If n<=0 Or (Dt(A)\Count % n)<>0
+      DFail("Reshape inferred extent is invalid.")
+      ProcedureReturn
+    EndIf
+    dims(unknown)=Dt(A)\Count/n
+    n=Dt(A)\Count
+  EndIf
+  If n<>Dt(A)\Count
+    DFail("Reshape changes the element count.")
+    ProcedureReturn
+  EndIf
+  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))
+    DCopyServiced(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+  EndIf
+EndProcedure
+
+Procedure RefDViewAxes(Y.i,A.i,Axes.i,Unsqueeze.i)
+  Protected Dim dims.i(8)
+  Protected Dim mask.i(8)
+  Protected i.i=0
+  Protected ax.i=0
+  Protected j.i=0
+  Protected rank.i=Dt(A)\Rank
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  DZero(@mask(0),8*#PMD_NATIVE_BYTES)
+  If Unsqueeze
+    rank+Dt(Axes)\Count
+  EndIf
+  If rank>8
+    DFail("View rank exceeds eight.")
+    ProcedureReturn
+  EndIf
+  If Axes=0 And Unsqueeze=0
+    For i=0 To rank-1
+      mask(i)=Bool(DDims((A)*8+(i))=1)
+    Next
+  EndIf
+  For i=0 To Dt(Axes)\Count-1
+    ax=DInt(Axes,i)
+    If ax<0
+      ax+rank
+    EndIf
+    If ax<0 Or ax>=rank Or mask(ax)<>0
+      DFail("View axis is invalid.")
+      ProcedureReturn
+    EndIf
+    mask(ax)=1
+  Next
+  If Unsqueeze
+    For i=0 To rank-1
+      If mask(i)
+        dims(i)=1
+      Else
+        dims(i)=DDims((A)*8+(j))
+        j+1
+      EndIf
+    Next
+  Else
+    For i=0 To rank-1
+      If mask(i)
+        If DDims((A)*8+(i))<>1
+          DFail("Cannot squeeze a non-unit axis.")
+          ProcedureReturn
+        EndIf
+      Else
+        dims(j)=DDims((A)*8+(i))
+        j+1
+      EndIf
+    Next
+    rank=j
+  EndIf
+  If DAlloc(Y,Dt(A)\Kind,rank,@dims(0))
+    DCopyServiced(Dt(A)\Data,Dt(Y)\Data,Dt(A)\Bytes)
+  EndIf
+EndProcedure
+
+
+Procedure.i CheckView(kind.i,shape.i,alias.i,pattern.i,borrowed.i)
+ Protected Dim src.i(8)
+ Protected Dim target.i(8)
+ Protected sr.i=3,tr.i=1,i.i,y0.i=3,y1.i=4,refused.i,view.i,unsq.i,rc.i
+ src(0)=2 : src(1)=1 : src(2)=3
+ Select shape
+ Case 0 : tr=1 : target(0)=6
+ Case 1 : tr=2 : target(0)=3 : target(1)=-1
+ Case 2 : tr=3 : target(0)=0 : target(1)=1 : target(2)=3
+ Case 3 : tr=2 : target(0)=-1 : target(1)=-1
+ Case 4 : tr=1 : target(0)=7
+ Case 5 : sr=0 : tr=0
+ Case 6 : src(0)=0 : tr=2 : target(0)=0 : target(1)=3
+ Case 7 : tr=1 : target(0)=-2
+ Case 8 : view=1 : target(0)=1
+ Case 9 : view=1 : target(0)=-2
+ Case 10 : view=1 : tr=0
+ Case 11 : view=1 : target(0)=0
+ Case 12 : view=1 : tr=2 : target(0)=1 : target(1)=1
+ Case 13 : view=1 : unsq=1 : target(0)=0
+ Case 14 : view=1 : unsq=1 : target(0)=-1
+ Case 15 : view=1 : unsq=1 : tr=2 : target(0)=0 : target(1)=3
+ Case 16 : view=1 : unsq=1 : tr=2 : target(0)=1 : target(1)=1
+ Case 17 : view=1 : unsq=1 : target(0)=8
+ EndSelect
+ DError=0 : DCancel=0
+ If DAlloc(1,kind,sr,@src(0))=0 Or DAlloc(5,kind,sr,@src(0))=0 : ProcedureReturn 10 : EndIf
+ For i=0 To Dt(1)\Bytes-1
+  PokeA(Dt(1)\Data+i,(i*37+pattern*191) & 255)
+  PokeA(Dt(5)\Data+i,(i*37+pattern*191) & 255)
+ Next
+ If borrowed
+  DCopy(Dt(5)\Data,$EC000000,Dt(5)\Bytes)
+  i=Dt(5)\Bytes
+  DRelease(5)
+  If DBindMutableState(5,kind,sr,@src(0),$EC000000,i)=0 : ProcedureReturn 17 : EndIf
+ EndIf
+ If DShape(2,7,1,tr,0,0,0)=0 : ProcedureReturn 11 : EndIf
+ For i=0 To tr-1 : DWriteI64(Dt(2)\Data+i*8,target(i)) : Next
+ If alias : y0=1 : y1=5 : EndIf
+ If view : RefDViewAxes(y0,1,2,unsq) : Else : RefDReshape(y0,1,2,0) : EndIf
+ refused=Bool(DError<>0) : DError=0
+ If view : DViewAxesConsume(y1,5,2,unsq) : Else : DReshapeConsume(y1,5,2,0) : EndIf
+ If Bool(DError<>0)<>refused : ProcedureReturn 12 : EndIf
+ If refused=0
+  If alias=0
+   If Dt(y1)\Data<>$EC000000 Or Dt(y1)\Owned Or DMutable(y1)<>1 Or DMutable(5) Or DMutableCapacity(y1)<Dt(y1)\Bytes : ProcedureReturn 19 : EndIf
+  EndIf
+  If alias=0 And borrowed=0
+   If Dt(y1)\Data<>Dt(5)\Data Or Dt(5)\Owned Or Dt(y1)\Owned<>1 : ProcedureReturn 18 : EndIf
+  EndIf
+  If Dt(y0)\Kind<>Dt(y1)\Kind Or Dt(y0)\Rank<>Dt(y1)\Rank Or Dt(y0)\Count<>Dt(y1)\Count Or Dt(y0)\Bytes<>Dt(y1)\Bytes : ProcedureReturn 13 : EndIf
+  For i=0 To Dt(y0)\Rank-1 : If DDims(y0*8+i)<>DDims(y1*8+i) : ProcedureReturn 14 : EndIf : Next
+  For i=0 To Dt(y0)\Bytes-1
+   If PeekA(Dt(y0)\Data+i)<>PeekA(Dt(y1)\Data+i) : ProcedureReturn 15 : EndIf
+  Next
+ EndIf
+ For i=1 To 5 : DRelease(i) : Next
+ DError=0
+ If DLive Or DHeapUsed : ProcedureReturn 16 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected Dim kinds.i(6)
+ Protected ki.i,shape.i,alias.i,pattern.i,borrowed.i,cases.i,rc.i,*pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PmTensorInt64Ok=1
+ If DHeapBind($EA000000,$1000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ kinds(0)=1 : kinds(1)=6 : kinds(2)=7 : kinds(3)=2 : kinds(4)=3 : kinds(5)=9
+ For ki=0 To 5
+ For shape=0 To 17
+ For alias=0 To 1
+ For pattern=0 To 1
+ For borrowed=1 To 1
+  rc=CheckView(kinds(ki),shape,alias,pattern,borrowed) : cases+1
+  If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,DLive)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

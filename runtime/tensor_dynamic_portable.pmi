@@ -15,6 +15,10 @@ Structure PmDynamicTensor
 EndStructure
 Global Dim Dt.PmDynamicTensor(#PMD_TENSOR_COUNT+1)
 Global Dim DDims.i((#PMD_TENSOR_COUNT+1)*8)
+CompilerIf #PMD_NATIVE_BYTES=8
+Global Dim DMutable.i(#PMD_TENSOR_COUNT+1)
+Global Dim DMutableCapacity.i(#PMD_TENSOR_COUNT+1)
+CompilerEndIf
 Global Dim DCall.i(16)
 Global DError.i
 Global DNode.i
@@ -463,6 +467,9 @@ Procedure DRelease(Id.i)
   Dt(Id)\Bytes=0
   Dt(Id)\Owned=0
   Dt(Id)\Scales=0
+  CompilerIf #PMD_NATIVE_BYTES=8
+  DMutable(Id)=0 : DMutableCapacity(Id)=0
+  CompilerEndIf
   For i=0 To 7
     DDims(Id*8+i)=0
   Next
@@ -506,6 +513,27 @@ Procedure.i DBindBorrowed(Id.i,Kind.i,Rank.i,DimsAddress.i,Address.i,Available.i
   For i=0 To Rank-1 : DDims(Id*8+i)=dims(i) : Next
   ProcedureReturn 1
 EndProcedure
+
+CompilerIf #PMD_NATIVE_BYTES=8
+; Explicit writable recurrent storage, with a 16-byte-aligned base.
+; Caller owns the entire capacity outside
+; the working arena, with no live aliases when a last-use operation consumes it.
+; Writes are in-place and are not rolled back after cancellation or an error.
+Procedure.i DBindMutableState(Id.i,Kind.i,Rank.i,DimsAddress.i,Address.i,Available.i)
+ If DRejectProgressReentry() : ProcedureReturn 0 : EndIf
+ If DHeap=0 Or Address<=0 Or (Address & 15)<>0 Or Available<0 Or Available>DLimit Or Address>#PMD_INTEGER_MAX-Available
+  ProcedureReturn DFail("Mutable state needs an aligned caller-owned capacity.")
+ EndIf
+ If Address<DHeap
+  If Available>DHeap-Address : ProcedureReturn DFail("Mutable state overlaps the working arena.") : EndIf
+ Else
+  If Address-DHeap<DHeapBytes : ProcedureReturn DFail("Mutable state overlaps the working arena.") : EndIf
+ EndIf
+ If DBindBorrowed(Id,Kind,Rank,DimsAddress,Address,Available)=0 : ProcedureReturn 0 : EndIf
+ DMutable(Id)=1 : DMutableCapacity(Id)=Available
+ ProcedureReturn 1
+EndProcedure
+CompilerEndIf
 
 Procedure.i DAllocCore(Id.i,Kind.i,Rank.i,DimsAddress.i,clear.i)
   Protected i.i=0
@@ -1850,19 +1878,31 @@ Procedure DShapeOf(Y.i,A.i)
   Next
 EndProcedure
 
-; Consume only a graph-proven last-use owned input. Borrowed or same-ID
-; inputs retain the copy path. The schedule releases the old input metadata.
+; Consume a graph-proven last-use allocation or explicit writable state.
+; Ordinary borrowed and same-ID inputs retain the copy path.
+; The schedule releases the old input metadata.
 Procedure.i DConsumeShape(Y.i,A.i,Rank.i,DimsAddress.i)
  Protected Dim dims.i(8)
- Protected i.i,count.i=1,extent.i,size.i,offset.i,span.i
+ Protected i.i,count.i=1,extent.i,size.i,offset.i,span.i,state.i=0
  If A<=0 Or A>#PMD_TENSOR_COUNT Or Y<=0 Or Y>#PMD_TENSOR_COUNT Or Y=A : ProcedureReturn 0 : EndIf
- If Dt(A)\Owned<>1 : ProcedureReturn 0 : EndIf
+ CompilerIf #PMD_NATIVE_BYTES=8
+ If Dt(A)\Owned=0 And DMutable(A)=1 : state=1 : EndIf
+ CompilerEndIf
+ If Dt(A)\Owned<>1 And state=0 : ProcedureReturn 0 : EndIf
  If DError Or DCancel Or DRejectProgressReentry() : ProcedureReturn 0 : EndIf
  If Rank<0 Or Rank>8 Or (Rank>0 And DimsAddress=0) : ProcedureReturn DFail("Consumed view rank or dimensions are invalid.") : EndIf
+ If state=0
  offset=Dt(A)\Data-DHeap-16
  If offset<0 Or offset>=DHeapBytes Or (offset & 15)<>0 : ProcedureReturn DFail("Consumed input has no owned arena block.") : EndIf
  span=PeekL(DHeap+offset)
  If span<32 Or span>DHeapBytes-offset Or PeekL(DHeap+offset+4)<>1 Or Dt(A)\Bytes<0 Or Dt(A)\Bytes>span-16 : ProcedureReturn DFail("Consumed input storage is invalid.") : EndIf
+ Else
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If Dt(A)\Data<=0 Or (Dt(A)\Data & 15)<>0 Or DMutableCapacity(A)<Dt(A)\Bytes Or DMutableCapacity(A)>DLimit
+   ProcedureReturn DFail("Consumed mutable state capacity is invalid.")
+  EndIf
+  CompilerEndIf
+ EndIf
  size=DSize(Dt(A)\Kind) : If size=0 : ProcedureReturn DFail("Consumed view type is invalid.") : EndIf
  For i=0 To Rank-1
   CompilerIf #PMD_NATIVE_BYTES=8
@@ -1878,8 +1918,12 @@ Procedure.i DConsumeShape(Y.i,A.i,Rank.i,DimsAddress.i)
  DRelease(Y)
  If DError Or DCancel : ProcedureReturn 0 : EndIf
  Dt(Y)\Data=Dt(A)\Data : Dt(Y)\Kind=Dt(A)\Kind : Dt(Y)\Rank=Rank
- Dt(Y)\Count=count : Dt(Y)\Bytes=Dt(A)\Bytes : Dt(Y)\Owned=1 : Dt(Y)\Scales=0
+ Dt(Y)\Count=count : Dt(Y)\Bytes=Dt(A)\Bytes : Dt(Y)\Owned=Dt(A)\Owned : Dt(Y)\Scales=0
  For i=0 To Rank-1 : DDims(Y*8+i)=dims(i) : Next
+ CompilerIf #PMD_NATIVE_BYTES=8
+ DMutable(Y)=DMutable(A) : DMutableCapacity(Y)=DMutableCapacity(A)
+ DMutable(A)=0 : DMutableCapacity(A)=0
+ CompilerEndIf
  Dt(A)\Owned=0
  ProcedureReturn 1
 EndProcedure

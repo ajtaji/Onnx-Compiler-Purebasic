@@ -763,6 +763,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   If ir\DecodedWeightBytes>1024*1024*1024 : PmoDynamicError="Decoded resident weights exceed the working-memory limit. Reduced storage is not reduced execution RAM." : Goto Failed : EndIf
   If PmdPortable
     metadataBytes=(id+1)*15*PmoTargets(targetIndex)\NativeIntegerBytes+4096
+    If PmoTargets(targetIndex)\NativeIntegerBytes=8 : metadataBytes=(id+2)*17*8+4096 : EndIf
     workingLimit=1024*1024*1024
     If PmoTargets(targetIndex)\RamBytes
       workingLimit=(PmoTargets(targetIndex)\RamBytes-PmoTargets(targetIndex)\RamReserveBytes-metadataBytes) & -16

@@ -1,0 +1,98 @@
+; Gemm reuse of the exact matrix kernel versus the old scalar Gemm.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure.i BindGuard(mode.i)
+ Protected Dim dims.i(8)
+ Protected rc.i,i.i
+ dims(0)=4
+ DError=0 : DCancel=0
+ If DBindMutableState(1,1,1,@dims(0),$EC000000,64)=0 : ProcedureReturn 10 : EndIf
+ Select mode
+ Case 0 : rc=DBindMutableState(0,1,1,@dims(0),$EC000000,64)
+ Case 1 : rc=DBindMutableState(1,1,9,@dims(0),$EC000000,64)
+ Case 2 : rc=DBindMutableState(1,1,1,0,$EC000000,64)
+ Case 3 : rc=DBindMutableState(1,1,1,@dims(0),$EC000000,15)
+ Case 4 : rc=DBindMutableState(1,1,1,@dims(0),$EC000000,-1)
+ Case 5 : rc=DBindMutableState(1,1,1,@dims(0),$EC000000,DLimit+1)
+ Case 6 : rc=DBindMutableState(1,1,1,@dims(0),0,64)
+ Case 7 : rc=DBindMutableState(1,1,1,@dims(0),DHeap-8,64)
+ Case 8 : rc=DBindMutableState(1,1,1,@dims(0),DHeap+64,64)
+ Case 9 : rc=DBindMutableState(1,1,1,@dims(0),$7FFFFFFFFFFFFFF8,64)
+ Case 10 : DCancel=1 : rc=DBindMutableState(1,1,1,@dims(0),$EC000000,64)
+ Case 11 : DProgressActive=1 : rc=DBindMutableState(1,1,1,@dims(0),$EC000000,64) : DProgressActive=0
+ Case 12 : PmIdleActive=1 : rc=DBindMutableState(1,1,1,@dims(0),$EC000000,64) : PmIdleActive=0
+ Case 13 : rc=DBindMutableState(1,1,-1,@dims(0),$EC000000,64)
+ Case 14 : rc=DBindMutableState(1,4,1,@dims(0),$EC000000,64)
+ Case 15 : dims(0)=DLimit+1 : rc=DBindMutableState(1,1,1,@dims(0),$EC000000,64)
+ Case 16 : DError=123 : rc=DBindMutableState(1,1,1,@dims(0),$EC000000,64)
+ Case 17 : rc=DBindMutableState(1,1,1,@dims(0),$EC000004,64)
+ Case 18 : rc=DBindMutableState(1,1,1,@dims(0),$EC000001,64)
+ EndSelect
+ If rc Or DError=0 Or Dt(1)\Data<>$EC000000 Or Dt(1)\Owned Or Dt(1)\Count<>4 Or Dt(1)\Bytes<>16 Or Dt(1)\Kind<>1 Or DMutable(1)<>1 Or DMutableCapacity(1)<>64 Or DDims(8)<>4 : ProcedureReturn 11 : EndIf
+ DError=0 : DCancel=0 : DRelease(1)
+ If DMutable(1) Or DMutableCapacity(1) Or DLive Or DHeapUsed : ProcedureReturn 12 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Lifecycle(empty.i)
+ Protected Dim dims.i(8)
+ Protected rc.i
+ dims(0)=4 : If empty : dims(0)=0 : EndIf
+ If DBindMutableState(1,1,1,@dims(0),$EC000000,dims(0)*4)=0 : ProcedureReturn 20 : EndIf
+ If DConsumeShape(4,1,1,@dims(0))=0 : ProcedureReturn 21 : EndIf
+ If Dt(4)\Data<>$EC000000 Or Dt(4)\Owned Or DMutable(4)<>1 Or DMutable(1) Or DMutableCapacity(4)<>dims(0)*4 : ProcedureReturn 22 : EndIf
+ DRelease(1)
+ If DBindBorrowed(4,1,1,@dims(0),$EC000000,dims(0)*4)=0 : ProcedureReturn 23 : EndIf
+ If DMutable(4) Or DMutableCapacity(4) Or DConsumeShape(5,4,1,@dims(0)) Or DError : ProcedureReturn 24 : EndIf
+ DRelease(4) : DRelease(5)
+ If DLive Or DHeapUsed : ProcedureReturn 25 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure.i Main(services.i)
+ Protected cases.i,rc.i,i.i,*pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PmTensorInt64Ok=1
+ If DHeapBind($EA000000,$1000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ For i=0 To 18
+  rc=BindGuard(i) : cases+1
+  If rc : Break : EndIf
+ Next
+ If rc=0
+  For i=0 To 1
+   rc=Lifecycle(i) : cases+1
+   If rc : Break : EndIf
+  Next
+ EndIf
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,DLive)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

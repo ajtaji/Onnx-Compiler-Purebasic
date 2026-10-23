@@ -19,6 +19,9 @@ for variant,target,expected in [('last','pi4',1),('later','pi4',0),('output','pi
  match=re.search(r'Source:\s*(.+)',q.stdout);path=Path(match[1].strip()) if match else out.with_suffix(suffix)
  if not path.is_file():
   paths=re.findall(r'([A-Z]:[^\r\n]+\.(?:pb|pi4|unoq|pico))',q.stdout);assert paths,q.stdout;path=Path(paths[0].strip())
- text=path.read_text();assert '#PMD_TENSOR_COUNT' in text,(variant,target,'Fixture did not select runtime-dimension emitter');got=len(re.findall(r'^\s*DViewAxesConsume\(',text,re.M));assert got==expected,(variant,target,got,expected)
+ text=path.read_text();assert '#PMD_TENSOR_COUNT' in text,(variant,target,'Fixture did not select runtime-dimension emitter')
+ if target in ['pi4','unoq']:
+  tensors=int(re.search(r'#PMD_TENSOR_COUNT\s*=\s*(\d+)',text)[1]);reserve=int(re.search(r'#PMD_METADATA_RESERVE\s*=\s*(\d+)',text)[1]);assert reserve==(tensors+2)*17*8+4096
+ got=len(re.findall(r'^\s*DViewAxesConsume\(',text,re.M));assert got==expected,(variant,target,got,expected)
  rows.append(dict(variant=variant,target=target,expected=expected,actual=got,source=str(path)))
 print(json.dumps(rows,indent=2));(p/'results.json').write_text(json.dumps(rows,indent=2))
