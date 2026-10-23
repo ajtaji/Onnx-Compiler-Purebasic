@@ -1148,3 +1148,36 @@ subsecond streaming starts remain unproved; no new map/Bluetooth demo is used.
 A four-step INT8 reduction unroll passes 1586 exact old-kernel comparisons
 but yields 2.456/3.388 seconds, with no complete-reply gain; it is excluded.
 PDF refresh remains pending the missing required artifact-operation marker.
+
+
+@SECTION Checked output destinations and state-boundary proof
+
+The optional caller output hint passes 168 physical capacity, overlap,
+zero-fill, type/shape, full guard and allocation-lifecycle cases. Another
+15 cases reject invalid addresses, alignment, arena overlap, capacity,
+overflow, tensor ids, prior errors, cancellation and invalid allocation
+shapes/types without changing the caller's buffer. The latter payload
+returned zero but its cleanup reply was lost. A bounded read-only recovery
+confirmed that exact returned run, all 15 results, zero live/heap bytes,
+healthy cores and deadman off, then restored Vulkan without rerunning it.
+
+An application binds the eight graph-output Concat destinations selected
+from the ONNX producer inventory. Full native replies improve about 2.6..2.8
+percent. A comparison first exposed a harness boundary mismatch: the old
+harness exited before the last state commit, whereas direct output storage
+already held those eight final results. Both versions were then compared
+after committing every final state, without emitting extra audio. The old
+version takes 2.330/3.220 seconds; the destination-hint version 2.265/3.131
+for identical 2.48/3.28 seconds of speech. Every waveform byte and the entire
+29,387,456-byte state digest match at that common commit boundary. First PCM
+appears at 98/113 ms. Sustained ratios 0.913/0.955 still provide limited map
+margin, so this is not a simultaneous-map or subsecond audible-onset claim.
+
+Normal CLI/UI rebuild and self-test pass. All nine normally emitted runtimes
+and the full mixed weight file match canonical sources, and the complete
+normal output-hint application image equals the physical candidate. This
+shared API can serve other stateful graphs; it is not a voice default or
+recorded phrase cache. A full buffer digest includes inactive capacity, so
+future independent numerical comparisons must also initialize that capacity
+consistently; a matching request boundary alone does not reset unused bytes.
+The guide PDF remains pending the unavailable required artifact marker.

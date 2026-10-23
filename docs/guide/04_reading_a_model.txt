@@ -763,3 +763,22 @@ exact multiply/add tiles and ascending input reduction order. Each worker
 owns a 6400-byte scratch region containing packed weights and a small output
 tile, with no large local array. Other shapes retain the ordinary native
 operator. The legacy internal Six helper names cover both geometries.
+
+
+@SECTION Optional caller-owned output storage on portable native64
+
+After resetting a request and before execution, an application may call
+DBindOutputStorage(PmModelOutput(index),address,capacity). The writable buffer
+belongs to the caller, is aligned to sixteen bytes and lies outside the
+working arena. It uses the same bounded-address validation as mutable state.
+No new tensor metadata or precision policy is introduced.
+
+This is a destination hint, not a promise of a particular returned pointer.
+Ordinary allocating producers use it only when the shape fits its capacity
+and no other live tensor's logical span overlaps the destination. Otherwise
+they allocate normally. View and consuming producers may ignore the hint.
+Always obtain the actual tensor through PmModelOutput; copy it to application
+storage only if needed. Release/reset clears the hint. Direct writes are not
+rolled back after a later error or cancellation, as with mutable input state.
+Unbound applications retain their existing behavior. The current public
+entry point is available in the generated portable native64 runtime.
