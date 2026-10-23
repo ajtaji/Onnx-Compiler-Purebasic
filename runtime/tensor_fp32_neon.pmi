@@ -5942,6 +5942,142 @@ Procedure.i PmTensorStftFp32Neon(*g.PmTensorStftArgs)
 EndProcedure
 CompilerEndIf
 
+ ; Exact signed INT64 comparisons. Strides are zero (scalar) or one.
+; Destination is disjoint from both input spans; no floating conversion.
+Procedure PmTensorCompareI64Neon(a.i,b.i,dst.i,count.i,astep.i,bstep.i,op.i)
+ ASM
+ cmp x3, #2
+ b.lt pmoI64MaskTail
+pmoI64MaskLoop:
+ cbz x4, pmoI64MaskAScalar
+ ldr q0, [x0]
+ b pmoI64MaskB
+pmoI64MaskAScalar:
+ ld1r {v0.2d}, [x0]
+pmoI64MaskB:
+ cbz x5, pmoI64MaskBScalar
+ ldr q1, [x1]
+ b pmoI64MaskOp
+pmoI64MaskBScalar:
+ ld1r {v1.2d}, [x1]
+pmoI64MaskOp:
+ cmp x6, #5
+ b.eq pmoI64MaskEq
+ cmp x6, #6
+ b.eq pmoI64MaskGt
+ cmp x6, #7
+ b.eq pmoI64MaskLt
+ cmp x6, #8
+ b.eq pmoI64MaskGe
+ cmeq v0.2d, v0.2d, #0
+ cmeq v1.2d, v1.2d, #0
+ orr v2.16b, v0.16b, v1.16b
+ mvn v2.16b, v2.16b
+ b pmoI64MaskStore
+pmoI64MaskEq:
+ cmeq v2.2d, v0.2d, v1.2d
+ b pmoI64MaskStore
+pmoI64MaskGt:
+ cmgt v2.2d, v0.2d, v1.2d
+ b pmoI64MaskStore
+pmoI64MaskLt:
+ cmgt v2.2d, v1.2d, v0.2d
+ b pmoI64MaskStore
+pmoI64MaskGe:
+ cmge v2.2d, v0.2d, v1.2d
+pmoI64MaskStore:
+ ushr v2.2d, v2.2d, #63
+ umov x7, v2.d[0]
+ umov x8, v2.d[1]
+ orr w7, w7, w8, lsl #8
+ strh w7, [x2]
+ add x2, x2, #2
+ add x0, x0, x4, lsl #4
+ add x1, x1, x5, lsl #4
+ sub x3, x3, #2
+ cmp x3, #2
+ b.ge pmoI64MaskLoop
+pmoI64MaskTail:
+ cbz x3, pmoI64MaskDone
+ ldr x7, [x0]
+ ldr x8, [x1]
+ cmp x6, #9
+ b.eq pmoI64MaskAndTail
+ cmp x7, x8
+ cset w9, eq
+ cset w10, gt
+ cset w11, lt
+ cset w12, ge
+ cmp x6, #6
+ csel w9, w10, w9, eq
+ cmp x6, #7
+ csel w9, w11, w9, eq
+ cmp x6, #8
+ csel w9, w12, w9, eq
+ b pmoI64MaskTailStore
+pmoI64MaskAndTail:
+ cmp x7, #0
+ cset w9, ne
+ cmp x8, #0
+ cset w10, ne
+ and w9, w9, w10
+pmoI64MaskTailStore:
+ strb w9, [x2]
+pmoI64MaskDone:
+ EndASM
+EndProcedure
+
+; BOOL storage accepts every nonzero byte as true and writes canonical 0/1.
+; Strides are zero or one; destination is disjoint from both input spans.
+Procedure PmTensorAndBoolNeon(a.i,b.i,dst.i,count.i,astep.i,bstep.i)
+ ASM
+ cmp x3, #16
+ b.lt pmoBoolMaskTail
+pmoBoolMaskLoop:
+ cbz x4, pmoBoolMaskAScalar
+ ldr q0, [x0]
+ b pmoBoolMaskB
+pmoBoolMaskAScalar:
+ ld1r {v0.16b}, [x0]
+pmoBoolMaskB:
+ cbz x5, pmoBoolMaskBScalar
+ ldr q1, [x1]
+ b pmoBoolMaskOp
+pmoBoolMaskBScalar:
+ ld1r {v1.16b}, [x1]
+pmoBoolMaskOp:
+ cmeq v0.16b, v0.16b, #0
+ cmeq v1.16b, v1.16b, #0
+ orr v2.16b, v0.16b, v1.16b
+ mvn v2.16b, v2.16b
+ ushr v2.16b, v2.16b, #7
+ str q2, [x2]
+ add x2, x2, #16
+ add x0, x0, x4, lsl #4
+ add x1, x1, x5, lsl #4
+ sub x3, x3, #16
+ cmp x3, #16
+ b.ge pmoBoolMaskLoop
+pmoBoolMaskTail:
+ cbz x3, pmoBoolMaskDone
+pmoBoolMaskTailLoop:
+ ldrb w7, [x0]
+ ldrb w8, [x1]
+ cmp w7, #0
+ cset w7, ne
+ cmp w8, #0
+ cset w8, ne
+ and w7, w7, w8
+ strb w7, [x2]
+ add x2, x2, #1
+ add x0, x0, x4
+ add x1, x1, x5
+ subs x3, x3, #1
+ b.ne pmoBoolMaskTailLoop
+pmoBoolMaskDone:
+ EndASM
+EndProcedure
+
 ; Ordered FLOAT comparisons with a contiguous BOOL result and scalar broadcasts.
 Procedure PmTensorCompareFp32Neon(*a.i,*b.i,*dst.i,count.i,aStride.i,bStride.i,op.i)
   ASM

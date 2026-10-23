@@ -1291,6 +1291,7 @@ Procedure PmBroadcastRows(Y.i,A.i,B.i,Op.i,width.i,astep.i,bstep.i)
   PmBroadcastRowsRange(Y,A,B,Op,width,astep,bstep,0,rows)
 EndProcedure
 
+Declare.i DSpansOverlap(a.i,an.i,b.i,bn.i)
 Procedure DBinary(Y.i,A.i,B.i,Op.i)
   Protected i.i=0
   Protected ai.i=0
@@ -1306,6 +1307,7 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
   Protected row.i=0
   Protected astep.i=0
   Protected bstep.i=0
+  Protected maskfast.i=0,chunk.i,left.i,offset.i
   Protected fastrow.i=0
   Protected amap.i=0
   Protected bmap.i=0
@@ -1336,9 +1338,18 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
       width=Dt(Y)\Count : astep=Bool(Dt(A)\Count<>1) : bstep=Bool(Dt(B)\Count<>1)
     EndIf
     If width=0 : ProcedureReturn : EndIf
+    maskfast=Bool(Op>=5 And DSpansOverlap(Dt(Y)\Data,Dt(Y)\Bytes,Dt(A)\Data,Dt(A)\Bytes)=0 And DSpansOverlap(Dt(Y)\Data,Dt(Y)\Bytes,Dt(B)\Data,Dt(B)\Bytes)=0)
     For row=0 To Dt(Y)\Count/width-1
       ai=Dt(A)\Data+DBroadcastIndex(row*width,Y,A)*8
       bi=Dt(B)\Data+DBroadcastIndex(row*width,Y,B)*8
+      If maskfast
+        offset=0
+        While offset<width
+          chunk=width-offset : If chunk>256 : chunk=256 : EndIf
+          PmTensorCompareI64Neon(ai+offset*astep*8,bi+offset*bstep*8,Dt(Y)\Data+row*width+offset,chunk,astep,bstep,Op)
+          offset+chunk : PmKernelIdle()
+        Wend
+      Else
       For i=row*width To (row+1)*width-1
         ia=PeekI(ai) : ib=PeekI(bi)
         If Op<=3
@@ -1359,6 +1370,7 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
         ai=ai+astep*8 : bi=bi+bstep*8
         If (i & 255)=255 : PmKernelIdle() : EndIf
       Next
+      EndIf
       PmKernelIdle()
     Next
     ProcedureReturn
@@ -1426,6 +1438,29 @@ Procedure DBinary(Y.i,A.i,B.i,Op.i)
       bi=DBroadcastIndex(row*width,Y,B)
       PmTensorCompareFp32Neon(Dt(A)\Data+ai*4,Dt(B)\Data+bi*4,Dt(Y)\Data+row*width,width,astep,bstep,Op)
       PmKernelIdle()
+    Next
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+  CompilerIf #PMD_NATIVE_BYTES=8
+  If Op=9 And Dt(A)\Kind=9 And Dt(B)\Kind=9 And DSpansOverlap(Dt(Y)\Data,Dt(Y)\Bytes,Dt(A)\Data,Dt(A)\Bytes)=0 And DSpansOverlap(Dt(Y)\Data,Dt(Y)\Bytes,Dt(B)\Data,Dt(B)\Bytes)=0
+    width=1 : If Dt(Y)\Rank : width=DDims(Y*8+Dt(Y)\Rank-1) : EndIf
+    If width=0 : ProcedureReturn : EndIf
+    astep=0 : bstep=0
+    If Dt(A)\Rank : astep=Bool(DDims(A*8+Dt(A)\Rank-1)<>1) : EndIf
+    If Dt(B)\Rank : bstep=Bool(DDims(B*8+Dt(B)\Rank-1)<>1) : EndIf
+    If (Dt(A)\Count=1 Or Dt(A)\Count=Dt(Y)\Count) And (Dt(B)\Count=1 Or Dt(B)\Count=Dt(Y)\Count)
+      width=Dt(Y)\Count : astep=Bool(Dt(A)\Count<>1) : bstep=Bool(Dt(B)\Count<>1)
+    EndIf
+    If width=0 : ProcedureReturn : EndIf
+    For row=0 To Dt(Y)\Count/width-1
+      ai=Dt(A)\Data+DBroadcastIndex(row*width,Y,A) : bi=Dt(B)\Data+DBroadcastIndex(row*width,Y,B)
+      offset=0
+      While offset<width
+        chunk=width-offset : If chunk>256 : chunk=256 : EndIf
+        PmTensorAndBoolNeon(ai+offset*astep,bi+offset*bstep,Dt(Y)\Data+row*width+offset,chunk,astep,bstep)
+        offset+chunk : PmKernelIdle()
+      Wend
     Next
     ProcedureReturn
   EndIf
