@@ -794,3 +794,28 @@ and weight scaling as the earlier sixteen-column kernel plus epilogue.
 Sixteen-column and scalar tails remain unchanged. Packed weights, wide INT8,
 multiple rows and small matrices keep their earlier paths. No extra resident
 weight cache, new precision policy or approximation is required.
+
+
+@SECTION Last-use mutable concat prefixes and separate recurrent parts
+
+On portable native64 targets the emitter can select DConcatConsume when its
+first input reaches its last use. Persistent tensors, graph outputs and later
+uses are excluded. Runtime shape/type/axis checks remain in place. A caller-
+owned mutable prefix can be reused only when its capacity fits the result,
+the product before the concat axis is one, and no other input overlaps the
+written tail. Existing prefix bytes are retained, appended inputs are copied,
+and the first descriptor's permission transfers to the result. Owned arena
+inputs, immutable buffers, insufficient capacity and other geometries retain
+the ordinary copy path. No new metadata or precision policy is introduced.
+
+Some recurrent exports stack key and value into one input and output even
+though their calculations are independent. The checked developer helper
+tests/split_recurrent_kv.py accepts explicit --pair INPUT OUTPUT arguments.
+It requires scalar axis-zero Gather readers and a final axis-zero stack of
+single-use Unsqueeze parts, then emits separate key/value interface tensors.
+Initializers and arithmetic nodes remain unchanged. Unsupported readers,
+existing output aliases and name collisions are refused. Applications must
+adopt the reported interface and provide separate capacities; this is not an
+automatic change to an application's existing bindings. Compile the resulting
+ONNX normally. Its PMW graph fingerprint changes even if all numerical weight
+payload bytes are identical, so preserve the original and use its new PMW.

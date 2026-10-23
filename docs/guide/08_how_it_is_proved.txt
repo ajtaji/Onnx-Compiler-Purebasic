@@ -1210,3 +1210,38 @@ proved. These runs remain silent. Normal compiler applications/self-test,
 nine emitted runtimes/full mixed weights and complete normal image equality
 to the physical candidate all pass. The same matrix rule helps eligible
 graphs beyond speech. PDF refresh remains pending the required marker helper.
+
+
+@SECTION Separate-cache and mutable-prefix proof
+
+Last-use concat append passes 656 physical old-versus-new value, lifecycle,
+capacity, overlap, error/cancel and complete guard comparisons across six data
+kinds. Ten additional cases cover duplicate prefixes, three inputs, negative
+axes and axis zero. Eleven compiler fixtures verify last use, retained and
+persistent values, first versus second input, and native64 target guards.
+
+The checked separate-cache export reproduces the experimentally verified graph
+byte for byte. Its numeric fixture and nine unsupported-layout refusals pass.
+For Pocket 18M, eight stacked Flow cache pairs become separate tensors: 80
+inputs/outputs become 88, removing only 40 routing nodes. Every original full
+output/state reconstructed over 64 host reference steps remains byte-exact,
+without changing tolerances, voice, weights or arithmetic. The resulting PMW
+differs only in its 32-byte graph fingerprint; original assets are preserved.
+
+On the physical Pi, the separate-copy application produces the exact original
+full waveforms in 2.142/2.959 seconds. All 86 named logical recurrent ranges,
+18,825,416 bytes, match the retained original-interface reference in shapes,
+types, sizes and full hashes. With mutable concat append this falls another
+7..8 percent to 1.985/2.736 seconds for 2.48/3.28 seconds of audio, ratios
+0.800/0.834. Its complete new-layout state buffer and 8448-byte shape/range
+records equal the accepted copy application, establishing the same 86-state
+identity without redundant range reads. Arena peak is about 14.2 MB versus
+18.8..19.1 MB with stacked state. First generated PCM is 94/107 ms.
+
+Normal CLI/UI and self-test pass; all nine emitted runtimes and the entire new
+PMW match canonical sources. The normal full image is byte-identical to the
+physically tested application. These are silent fresh-text tests, not recorded
+phrases. Broader eight-direction timing, safe audible startup and actual map/
+Bluetooth concurrency are separate checks; two replies alone do not prove
+them. Strict native-versus-upstream precision acceptance remains separate.
+The source guide is current; PDF refresh remains pending its required marker.
