@@ -1032,3 +1032,51 @@ normal full image is byte-identical to the physically tested candidate. No map
 demo, default voice change, firmware update or relaxed numerical tolerance is
 used to claim these results. Strict native/upstream precision acceptance remains
 a separate open check.
+
+
+@SECTION Block transposes and resumed GELU vector groups
+
+The mixed-precision two-direction Bluetooth replay completes again with zero
+underruns, transport faults or disconnect timeout. The listener now confirms
+the background static seems gone. This accepts that specific listening
+comparison; no default voice or simultaneous-map behavior is selected.
+
+A shared native64 Transpose path recognizes a rotation of consecutive axis
+groups with an unchanged contiguous trailing block. It copies whole strided
+rows, avoiding per-row coordinate division, with primary service retained.
+Overlapping spans and other permutations retain the earlier paths. An
+independent physical Pi gate passes 1,080 comparisons with the previous
+Transpose across six data kinds, rank-three/four/five layouts, a rank-six
+fixture, unaligned spans, empty dimensions, malformed permutations, prior-error
+guards, complete output bytes, source canaries and live allocation accounting.
+Complete mixed replies fall from 3.570/4.938 to 3.537/4.892 seconds, about
+0.9 percent less compute, with unchanged full waveforms.
+
+GELU's SIMD adapter now resumes after an out-of-range four-element group.
+The existing scalar implementation handles that group, then later eligible
+groups can use the existing exact vector kernel. The previous adapter made
+the entire remaining chunk scalar after its first rejected group. Partial
+overlap retains that previous behavior; separate buffers and exact in-place
+output use the new path. Arithmetic, coefficients, cutoff and scalar fallback
+are unchanged. Another 1,008 physical old-chunk comparisons cover boundary
+lengths, alignment, periodic outliers, signed zero/subnormals, NaNs, infinities,
+in-place and both partial-overlap directions, status and complete buffers.
+
+Complete replies now take 3.402/4.713 seconds for 2.48/3.28 seconds of audio,
+another 3.7..3.8 percent less compute after the transpose change. Combined
+savings in this batch are 4.4..4.7 percent versus the checked-INT64 baseline.
+Every native waveform byte, frame count, EOS and arena peak remains unchanged.
+Both normal compiler applications rebuild and their self-test passes. All
+nine normally emitted runtimes and complete mixed weights match canonical
+sources; the complete normal image equals the physically tested image.
+
+Three other exact experiments are excluded for insufficient whole-workload
+benefit: an immutable INT8 layout cache uses another 14.6 MB for under 0.4
+percent saving; paired narrow INT8 products pass 1,586 raw cases but slightly
+slow complete replies; hoisted GELU constants pass 420 exact cases but save
+under 0.2 percent. Passing numerical checks is not sufficient to retain them.
+The retained paths select by operation/layout, so other eligible graphs use
+them too. These new throughput tests are silent; no later Bluetooth or map
+result is implied. Ratios 1.372/1.437 remain slower than real time, and first
+PCM 0.118/0.134 seconds is not a sustained subsecond-playback or map-headroom
+pass. Strict native/upstream numerical acceptance remains separate and open.
