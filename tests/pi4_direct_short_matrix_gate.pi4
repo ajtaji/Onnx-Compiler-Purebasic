@@ -1,0 +1,287 @@
+; Exact direct short-matrix column ranges versus the independent old raw SIMD.
+; 2048 serial, four-core, dispatcher and one-core fallback cases.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure RefRawFour16(*t.PmTensorMatMul2ExactArgs)
+  ASM
+    ldr  x1, [x0, #0]                ; A row 0 cursor
+    ldr  x2, [x0, #8]                ; B cursor
+    ldr  x4, [x0, #24]               ; k
+    ldr  x5, [x0, #32]               ; bytes between A rows
+    ldr  x6, [x0, #40]               ; bytes between B rows
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    movi v20.4s, #0
+    movi v21.4s, #0
+    movi v22.4s, #0
+    movi v23.4s, #0
+    movi v24.4s, #0
+    movi v25.4s, #0
+    movi v26.4s, #0
+    movi v27.4s, #0
+    movi v28.4s, #0
+    movi v29.4s, #0
+    movi v30.4s, #0
+    movi v31.4s, #0
+    add  x9, x1, x5                  ; A row 1
+    add  x10, x9, x5                 ; A row 2
+    add  x11, x10, x5                ; A row 3
+    ; An empty reduction leaves every output at +0.0, which is what the
+    ; reference stores, and must not enter a bottom-tested loop.
+    cmp  x4, #1
+    b.lt refpmoMatMulExactFourStore
+refpmoMatMulExactFourLoop:
+refpmoMatMulExactFourSource:
+    ld1  {v0.4s-v3.4s}, [x2]
+    ld1r {v4.4s}, [x1], #4
+    fmul v5.4s, v4.4s, v0.4s
+refpmoMatMulExactFourAdd0:
+    fadd v16.4s, v16.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v17.4s, v17.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v18.4s, v18.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v19.4s, v19.4s, v5.4s
+    ld1r {v4.4s}, [x9], #4
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v20.4s, v20.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v21.4s, v21.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v22.4s, v22.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v23.4s, v23.4s, v5.4s
+    ld1r {v4.4s}, [x10], #4
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v24.4s, v24.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v25.4s, v25.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v26.4s, v26.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v27.4s, v27.4s, v5.4s
+    ld1r {v4.4s}, [x11], #4
+    fmul v5.4s, v4.4s, v0.4s
+    fadd v28.4s, v28.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v29.4s, v29.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v30.4s, v30.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v31.4s, v31.4s, v5.4s
+    add  x2, x2, x6
+    subs x4, x4, #1
+    b.ne refpmoMatMulExactFourLoop
+refpmoMatMulExactFourStore:
+    ldr  x3, [x0, #16]
+    ldr  x7, [x0, #48]
+refpmoMatMulExactFourStore0:
+    st1  {v16.4s-v19.4s}, [x3]
+    add  x3, x3, x7
+    st1  {v20.4s-v23.4s}, [x3]
+    add  x3, x3, x7
+    st1  {v24.4s-v27.4s}, [x3]
+    add  x3, x3, x7
+    st1  {v28.4s-v31.4s}, [x3]
+  EndASM
+EndProcedure
+Procedure RefRawOne16(*t.PmTensorMatMul2ExactArgs)
+  ASM
+    ldr  x1, [x0, #0]
+    ldr  x2, [x0, #8]
+    ldr  x4, [x0, #24]
+    ldr  x6, [x0, #40]
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    cmp  x4, #1
+    b.lt refpmoMatMulExactRowStore
+refpmoMatMulExactRowLoop:
+refpmoMatMulExactRowSource:
+    ld1  {v0.4s-v3.4s}, [x2]
+    ld1r {v4.4s}, [x1], #4
+    fmul v5.4s, v4.4s, v0.4s
+refpmoMatMulExactRowAdd0:
+    fadd v16.4s, v16.4s, v5.4s
+    fmul v5.4s, v4.4s, v1.4s
+    fadd v17.4s, v17.4s, v5.4s
+    fmul v5.4s, v4.4s, v2.4s
+    fadd v18.4s, v18.4s, v5.4s
+    fmul v5.4s, v4.4s, v3.4s
+    fadd v19.4s, v19.4s, v5.4s
+    add  x2, x2, x6
+    subs x4, x4, #1
+    b.ne refpmoMatMulExactRowLoop
+refpmoMatMulExactRowStore:
+    ldr  x3, [x0, #16]
+refpmoMatMulExactRowStore0:
+    st1  {v16.4s-v19.4s}, [x3]
+  EndASM
+EndProcedure
+Procedure RefRawMatrix(*a.i, *b.i, *dst.i, m.i, k.i, n.i)
+  Protected row.i
+  Protected col.i
+  Protected lane.i
+  Protected rowBlock.i
+  Protected colBlock.i
+  Protected t.PmTensorMatMul2ExactArgs
+  If *a=0 Or *b=0 Or *dst=0 Or m<1 Or n<1
+    ProcedureReturn
+  EndIf
+  ; The two block widths are named rather than written into the tests, so a
+  ; control build can narrow either one and prove the remaining bodies still
+  ; produce the reference's bits on their own.  Both tests are outside the
+  ; reduction, once per block, not once per inner index.
+  rowBlock=4
+  colBlock=16
+  t\Count=k
+  t\ARowBytes=k*4
+  t\BRowBytes=n*4
+  t\DstRowBytes=n*4
+  row=0
+  While row<m
+    If rowBlock>=4 And m-row>=4
+      col=0
+      While colBlock>=16 And n-col>=16
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        RefRawFour16(@t)
+        col+16
+      Wend
+      While colBlock>=4 And n-col>=4
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactFourByFour(@t)
+        col=col+4
+      Wend
+      While col<n
+        lane=0
+        While lane<4
+          t\A=*a+(row+lane)*k*4 : t\B=*b+col*4 : t\Dst=*dst+((row+lane)*n+col)*4
+          PmTensorMatMul2ExactOneByOne(@t)
+          lane+1
+        Wend
+        col+1
+      Wend
+      row+4
+    Else
+      col=0
+      While colBlock>=16 And n-col>=16
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        RefRawOne16(@t)
+        col+16
+      Wend
+      While colBlock>=4 And n-col>=4
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactOneByFour(@t)
+        col=col+4
+      Wend
+      While col<n
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactOneByOne(@t)
+        col+1
+      Wend
+      row+1
+    EndIf
+  Wend
+EndProcedure
+
+Procedure.i RawMatrix(m.i,k.i,n.i,pattern.i,mode.i)
+ Protected a.i=$EC000010,b.i=$EC200010,ref.i=$ED000010,dst.i=$ED100010,pack.i=$EE000000
+ Protected i.i,seed.i=$12345678,bits.i,x.f,count.i=m*k+k*n
+ PokeI(ref-8,$1122334455667788) : PokeI(ref+m*n*4,$1122334455667788)
+ PokeI(dst-8,$1122334455667788) : PokeI(dst+m*n*4,$1122334455667788)
+ For i=0 To count-1
+  seed=(seed*1664525+1013904223) & $FFFFFFFF
+  x=(seed & $FFFF)/16384.0 : x=x-2.0 : bits=PeekL(@x)
+  If pattern
+   Select i % 16
+    Case 0 : bits=0
+    Case 1 : bits=$80000000
+    Case 2 : bits=1
+    Case 3 : bits=$007FFFFF
+    Case 4 : bits=$7F7FFFFF
+    Case 5 : bits=$7F800000
+    Case 6 : bits=$FF800000
+    Case 7 : bits=$7FC12345
+    Case 8 : bits=$7FA12345
+    Case 9 : bits=$FFC54321
+   EndSelect
+  EndIf
+  If i<m*k : PokeL(a+i*4,bits) : Else : PokeL(b+(i-m*k)*4,bits) : EndIf
+ Next
+ RefRawMatrix(a,b,ref,m,k,n)
+ Select mode
+  Case 0 : PmTensorMatMul2DirectColumnsNeon(a,b,dst,m,k,n,0,n)
+  Case 1 : PmTensorMatMul2ColumnsParallelNeon(a,b,dst,m,k,n,0,4)
+  Case 2 : PmFastGemm(a,b,dst,m,k,n)
+  Case 3 : PmTensorMatMul2ColumnsParallelNeon(a,b,dst,m,k,n,0,1)
+ EndSelect
+ For i=0 To m*n*4-1
+  If PeekA(ref+i)<>PeekA(dst+i) : ProcedureReturn 1000+i : EndIf
+ Next
+ If PeekI(ref-8)<>$1122334455667788 Or PeekI(ref+m*n*4)<>$1122334455667788 : ProcedureReturn -1 : EndIf
+ If PeekI(dst-8)<>$1122334455667788 Or PeekI(dst+m*n*4)<>$1122334455667788 : ProcedureReturn -2 : EndIf
+ ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main(services.i)
+ Protected mi.i,ki.i,ni.i,pattern.i,mode.i,rc.i,cases.i,*pet
+ Protected Dim ms.i(8)
+ Protected Dim ks.i(4)
+ Protected Dim ns.i(8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PokeI($E1C01FF0,PmParallelCores())
+ If DHeapBind($EA000000,$1000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ ms(0)=1 : ms(1)=2 : ms(2)=3 : ms(3)=4 : ms(4)=5 : ms(5)=7 : ms(6)=8 : ms(7)=33
+ ks(0)=0 : ks(1)=1 : ks(2)=19 : ks(3)=512
+ ns(0)=0 : ns(1)=1 : ns(2)=15 : ns(3)=16 : ns(4)=17 : ns(5)=65 : ns(6)=257 : ns(7)=1536
+ For mi=0 To 7
+ For ki=0 To 3
+ For ni=0 To 7
+ For pattern=0 To 1
+ For mode=0 To 3
+  rc=RawMatrix(ms(mi),ks(ki),ns(ni),pattern,mode) : cases+1
+  If *pet : pet() : EndIf
+  If rc : PokeI($E1C01FD0,cases) : MmuDisableCachedFlushed() : ProcedureReturn rc : EndIf
+ Next
+ Next
+ Next
+ Next
+ Next
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,DLive)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

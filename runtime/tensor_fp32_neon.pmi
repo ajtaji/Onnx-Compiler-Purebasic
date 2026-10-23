@@ -5462,12 +5462,87 @@ Procedure PmTensorMatMul2ParallelNeon(*a.i,*b.i,*dst.i,m.i,k.i,n.i,*pack.i,parts
 EndProcedure
 
 
+; Disjoint output-column ranges retain original B/output row strides.
+Procedure PmTensorMatMul2DirectColumnsNeon(*a.i,*b.i,*dst.i,m.i,k.i,n.i,first.i,last.i)
+  Protected row.i
+  Protected col.i
+  Protected lane.i
+  Protected rowBlock.i
+  Protected colBlock.i
+  Protected t.PmTensorMatMul2ExactArgs
+  If *a=0 Or *b=0 Or *dst=0 Or m<1 Or n<1
+    ProcedureReturn
+  EndIf
+  ; The two block widths are named rather than written into the tests, so a
+  ; control build can narrow either one and prove the remaining bodies still
+  ; produce the reference's bits on their own.  Both tests are outside the
+  ; reduction, once per block, not once per inner index.
+  rowBlock=4
+  colBlock=16
+  t\Count=k
+  t\ARowBytes=k*4
+  t\BRowBytes=n*4
+  t\DstRowBytes=n*4
+  row=0
+  While row<m
+    If rowBlock>=4 And m-row>=4
+      col=first
+      While colBlock>=16 And last-col>=16
+        PmKernelIdle()
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactFourBySixteen(@t)
+        col+16
+      Wend
+      While colBlock>=4 And last-col>=4
+        PmKernelIdle()
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactFourByFour(@t)
+        col=col+4
+      Wend
+      While col<last
+        lane=0
+        While lane<4
+          t\A=*a+(row+lane)*k*4 : t\B=*b+col*4 : t\Dst=*dst+((row+lane)*n+col)*4
+          PmTensorMatMul2ExactOneByOne(@t)
+          lane+1
+        Wend
+        col+1
+      Wend
+      row+4
+    Else
+      col=first
+      While colBlock>=16 And last-col>=16
+        PmKernelIdle()
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactOneBySixteen(@t)
+        col+16
+      Wend
+      While colBlock>=4 And last-col>=4
+        PmKernelIdle()
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactOneByFour(@t)
+        col=col+4
+      Wend
+      While col<last
+        PmKernelIdle()
+        t\A=*a+row*k*4 : t\B=*b+col*4 : t\Dst=*dst+(row*n+col)*4
+        PmTensorMatMul2ExactOneByOne(@t)
+        col+1
+      Wend
+      row+1
+    EndIf
+  Wend
+EndProcedure
 ; Short matrices can have fewer than eight four-row tiles while still
 ; carrying substantial work across columns. Each worker owns whole aligned
 ; output panels, the original row strides, and a private packed B panel.
 Global Dim PmMatMulColumnParts.i[36]
 Procedure.i PmMatMulColumnWorker(*p.i)
+  If PeekI(*p+48)=0
+    PmTensorMatMul2DirectColumnsNeon(PeekI(*p),PeekI(*p+8),PeekI(*p+16),PeekI(*p+24),PeekI(*p+32),PeekI(*p+40),PeekI(*p+56),PeekI(*p+64))
+  Else
   PmTensorMatMul2ExactPackedColumnsNeon(PeekI(*p),PeekI(*p+8),PeekI(*p+16),PeekI(*p+24),PeekI(*p+32),PeekI(*p+40),PeekI(*p+48),PeekI(*p+56),PeekI(*p+64))
+  EndIf
   ProcedureReturn 0
 EndProcedure
 Procedure PmTensorMatMul2ColumnsParallelNeon(*a.i,*b.i,*dst.i,m.i,k.i,n.i,*pack.i,parts.i)
@@ -5478,12 +5553,12 @@ Procedure PmTensorMatMul2ColumnsParallelNeon(*a.i,*b.i,*dst.i,m.i,k.i,n.i,*pack.
       at=i*9
       PmMatMulColumnParts[at]=*a : PmMatMulColumnParts[at+1]=*b : PmMatMulColumnParts[at+2]=*dst
       PmMatMulColumnParts[at+3]=m : PmMatMulColumnParts[at+4]=k : PmMatMulColumnParts[at+5]=n
-      PmMatMulColumnParts[at+6]=*pack+i*k*64 : PmMatMulColumnParts[at+7]=first : PmMatMulColumnParts[at+8]=last
+      PmMatMulColumnParts[at+6]=0 : If *pack : PmMatMulColumnParts[at+6]=*pack+i*k*64 : EndIf : PmMatMulColumnParts[at+7]=first : PmMatMulColumnParts[at+8]=last
       first=last
     Next
     If pmSvcParRun(@PmMatMulColumnWorker,@PmMatMulColumnParts[0],72,parts)=#PMP_SVC_OK : ProcedureReturn : EndIf
   EndIf
-  PmTensorMatMul2ExactPackedNeon(*a,*b,*dst,m,k,n,*pack)
+  If *pack : PmTensorMatMul2ExactPackedNeon(*a,*b,*dst,m,k,n,*pack) : Else : PmTensorMatMul2DirectColumnsNeon(*a,*b,*dst,m,k,n,0,n) : EndIf
 EndProcedure
 
 ; ======================================================================
