@@ -122,7 +122,36 @@ Procedure.i PmoQuantWideNode(ModelSha.s, *Node.PmoOnnxNode)
   ProcedureReturn #False
 EndProcedure
 
-Procedure.i PmoQuantizeDynamicWeights(*Ir.PmoIrModel)
+; Preserve selected weight-operator families at FP32, for measured quality
+; comparisons. The ordinary INT8 default and all graph tensor types are unchanged.
+Procedure.s PmoQuantNormalizeFp32Ops(Operations.s)
+  NewMap Selected.i()
+  Protected i.i,item.s,result.s,order.s="Conv,Gemm,LSTM,MatMul"
+  PmoQuantError=""
+  If Trim(Operations)="" : ProcedureReturn "" : EndIf
+  For i=1 To CountString(Operations,",")+1
+    item=LCase(Trim(StringField(Operations,i,",")))
+    Select item
+      Case "conv" : Selected("Conv")=1
+      Case "gemm" : Selected("Gemm")=1
+      Case "lstm" : Selected("LSTM")=1
+      Case "matmul" : Selected("MatMul")=1
+      Default
+        PmoQuantFail("--int8-fp32-ops accepts Conv,Gemm,LSTM,MatMul separated by commas; invalid entry: "+item)
+        ProcedureReturn ""
+    EndSelect
+  Next
+  For i=1 To 4
+    item=StringField(order,i,",")
+    If FindMapElement(Selected(),item)
+      If result<>"" : result+"," : EndIf
+      result+item
+    EndIf
+  Next
+  ProcedureReturn result
+EndProcedure
+
+Procedure.i PmoQuantizeDynamicWeights(*Ir.PmoIrModel,KeepFp32Ops.s="")
   NewMap WideUses.i()
   NewMap Uses.i()
   NewMap EligibleUses.i()
@@ -131,7 +160,7 @@ Procedure.i PmoQuantizeDynamicWeights(*Ir.PmoIrModel)
   NewMap ScaleModes.i()
   NewMap ScaleStrides.q()
   NewList Candidates.s()
-  Protected Position.i
+  Protected Position.i,PreservedUses.i
   Protected Name.s
   Protected ScaleName.s
   Protected Index.q
@@ -154,7 +183,8 @@ Procedure.i PmoQuantizeDynamicWeights(*Ir.PmoIrModel)
   Protected Residual.f
   Protected Fine.f
   Protected Wide.i
-  PmoQuantError = ""
+  KeepFp32Ops=PmoQuantNormalizeFp32Ops(KeepFp32Ops)
+  If PmoQuantError<>"" : ProcedureReturn #False : EndIf
   If *Ir = 0 : ProcedureReturn PmoQuantFail("internal INT8 IR is null") : EndIf
   If *Ir\Source And *Ir\Source\FileData And *Ir\Source\FileBytes > 0
     UseSHA2Fingerprint()
@@ -172,7 +202,10 @@ Procedure.i PmoQuantizeDynamicWeights(*Ir.PmoIrModel)
         Uses(Name) + 1
         If FindMapElement(*Ir\ValueByName(), Name)
           *Value = *Ir\ValueByName()
-          If PmoQuantWeightPosition(*Ir\Nodes()\Node\Operation, Position, *Value)
+          If *Value\IsConstant And *Value\ElementType=1 And *Value\Elements>0 And PmoQuantWeightPosition(*Ir\Nodes()\Node\Operation,Position,*Value)
+            If FindString(","+KeepFp32Ops+",",","+*Ir\Nodes()\Node\Operation+",") : PreservedUses+1 : EndIf
+          EndIf
+          If PmoQuantWeightPosition(*Ir\Nodes()\Node\Operation, Position, *Value) And FindString(","+KeepFp32Ops+",",","+*Ir\Nodes()\Node\Operation+",")=0
             Mode\i = 0 : Channels\i = 0 : Stride\q = 0
             If PmoQuantChannelLayout(*Ir\Nodes()\Node, *Value, @Mode, @Channels, @Stride) = 0
               ProcedureReturn PmoQuantFail("cannot derive per-output-channel INT8 layout for " + Name)
@@ -283,7 +316,7 @@ Procedure.i PmoQuantizeDynamicWeights(*Ir.PmoIrModel)
     *Ir\Constants()\Data = *ScaleData : *Ir\Constants()\OwnsData = #True
     *Ir\ConstantByName(ScaleName) = @*Ir\Constants()
   Next
-  If ListSize(*Ir\QuantWeights()) = 0
+  If ListSize(*Ir\QuantWeights()) = 0 And PreservedUses=0
     ProcedureReturn PmoQuantFail("INT8 selected, but this graph has no exclusively used MatMul, Gemm, Conv, or LSTM constant weights")
   EndIf
   ProcedureReturn #True
@@ -334,6 +367,8 @@ Procedure.i PmoQuantPlanScratch(*Ir.PmoIrModel, TileBytes.q)
   Protected *Recurrent.PmoIrValue
   Protected *Output.PmoIrValue
   If *Ir = 0 : ProcedureReturn PmoQuantFail("internal INT8 scratch IR is null") : EndIf
+  ; An explicit preservation policy can leave an entirely FP32 graph.
+  If ListSize(*Ir\QuantWeights())=0 : ProcedureReturn #True : EndIf
   ForEach *Ir\QuantWeights()
     If *Ir\QuantWeights()\Wide
       ProcedureReturn PmoQuantFail("the fixed-shape path has no wide INT8 kernels; a model with a precision plan is compiled on the runtime-dimension path")

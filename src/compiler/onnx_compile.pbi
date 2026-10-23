@@ -803,7 +803,7 @@ Procedure PmoCompileManifestTensorList(File.i, Key.s, *Ir.PmoIrModel, List Names
 EndProcedure
 
 Procedure.i PmoCompileManifest(Path.s, *Ir.PmoIrModel, *Profile.PmoTargetProfile,
-                               Precision.s, Source.s, Weights.s)
+                               Precision.s, Source.s, Weights.s, Fp32Ops.s="")
   Protected Scheme.s="FP32 arithmetic and tensors"
   Protected Temp.s = Path + ".tmp"
   Protected File.i
@@ -873,6 +873,7 @@ Procedure.i PmoCompileManifest(Path.s, *Ir.PmoIrModel, *Profile.PmoTargetProfile
   If Precision="int8" : Scheme="per-output-channel symmetric signed INT8 weights, dynamic per-row signed INT8 activations, INT32 accumulation, FP32 operator seams" : EndIf
   If *Ir\ReducedWeightCount : Scheme=UCase(Precision)+" weight storage; decode once into resident FP32 memory; FP32 arithmetic and activations" : EndIf
   WriteStringN(File, "    " + PmoCompileJson("scheme") + ": " + PmoCompileJson(Scheme) + ",", #PB_UTF8)
+  WriteStringN(File, "    " + PmoCompileJson("fp32_weight_operators") + ": " + PmoCompileJson(Fp32Ops) + ",", #PB_UTF8)
   WriteStringN(File, "    " + PmoCompileJson("weight_count") + ": " + Str(ListSize(*Ir\QuantWeights())) + ",", #PB_UTF8)
   WriteStringN(File, "    " + PmoCompileJson("fp32_weight_bytes") + ": " + Str(OriginalBytes) + ",", #PB_UTF8)
   WriteStringN(File, "    " + PmoCompileJson("int8_weight_bytes") + ": " + Str(QuantizedBytes) + ",", #PB_UTF8)
@@ -918,7 +919,7 @@ Procedure.i PmoCompileCommand(ModelPath.s)
   Protected Ir.PmoIrModel
   Protected OutputPrefix.s
   Protected TargetId.s
-  Protected Precision.s = "fp32"
+  Protected Precision.s = "fp32",Fp32Ops.s
   Protected RuntimePath.s
   Protected OptionName.s
   Protected Index.i = 2
@@ -951,6 +952,8 @@ Procedure.i PmoCompileCommand(ModelPath.s)
       Index + 1 : TargetId = ProgramParameter(Index)
     ElseIf OptionName = "--precision" And Index + 1 < CountProgramParameters()
       Index + 1 : Precision = LCase(ProgramParameter(Index))
+    ElseIf OptionName = "--int8-fp32-ops" And Index + 1 < CountProgramParameters()
+      Index + 1 : Fp32Ops = ProgramParameter(Index)
     ElseIf OptionName = "--ort-dll" And Index + 1 < CountProgramParameters()
       Index + 1 : RuntimePath = ProgramParameter(Index)
     ElseIf OptionName = "--trace-input" And Index + 1 < CountProgramParameters()
@@ -984,6 +987,9 @@ Procedure.i PmoCompileCommand(ModelPath.s)
   TargetIndex = PmoTargetIndex(TargetId)
   If TargetIndex < 0 : ProcedureReturn PmoCompileFail("unknown target " + TargetId) : EndIf
   If PmoStoragePrecision(Precision)=0 : ProcedureReturn PmoCompileFail("--precision must be fp32, int8, fp16, bf16, or int4") : EndIf
+  Fp32Ops=PmoQuantNormalizeFp32Ops(Fp32Ops)
+  If PmoQuantError<>"" : ProcedureReturn PmoCompileFail(PmoQuantError) : EndIf
+  If Fp32Ops<>"" And Precision<>"int8" : ProcedureReturn PmoCompileFail("--int8-fp32-ops requires --precision int8") : EndIf
   If SpeechUi And TargetId <> "windows"
     ProcedureReturn PmoCompileFail("The speech-window adapter requires Windows. Remove --speech-ui when generating a model library for another target.")
   EndIf
@@ -1050,7 +1056,7 @@ Procedure.i PmoCompileCommand(ModelPath.s)
   If RandomInputs : PmoRandomNodesToInputs(@Ir) : EndIf
   If PmoCompileValidate(@Ir) = 0 : Goto PmoCompileCommandFailed : EndIf
   If PmoCompileAddCheckpoints(@Ir, Checkpoints()) = 0 : Goto PmoCompileCommandFailed : EndIf
-  If Precision = "int8" And PmoQuantizeDynamicWeights(@Ir) = 0
+  If Precision = "int8" And PmoQuantizeDynamicWeights(@Ir,Fp32Ops) = 0
     PmoCompileFail(PmoQuantError) : Goto PmoCompileCommandFailed
   EndIf
   If PmoIrPlanArena(@Ir) = 0
@@ -1093,7 +1099,7 @@ Procedure.i PmoCompileCommand(ModelPath.s)
   If FileSize(Weights) >= 0 And DeleteFile(Weights) = 0 : PmoCompileFail("cannot replace packed weights") : Goto PmoCompileCommandFailed : EndIf
   If RenameFile(PendingWeights, Weights) = 0 : PmoCompileFail("cannot publish packed weights") : Goto PmoCompileCommandFailed : EndIf
   PendingWeights = ""
-  If PmoCompileManifest(Manifest, @Ir, @PmoTargets(TargetIndex), Precision, Source, Weights) = 0
+  If PmoCompileManifest(Manifest, @Ir, @PmoTargets(TargetIndex), Precision, Source, Weights, Fp32Ops) = 0
     Goto PmoCompileCommandFailed
   EndIf
   PrintN("PASS: generated ONNX source for " + TargetId + " (" + Precision + ")")

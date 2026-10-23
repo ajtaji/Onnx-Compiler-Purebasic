@@ -26,6 +26,7 @@ Enumeration PmoUiGadget
   #PMO_UI_LOG
   #PMO_UI_REUSABLE
   #PMO_UI_RANDOM_INPUTS
+  #PMO_UI_FP32_OPS
 EndEnumeration
 
 #PMO_UI_DONE = #PB_Event_FirstCustomValue + 171
@@ -142,6 +143,7 @@ Procedure PmoUiSetRunning(Running.i)
   DisableGadget(#PMO_UI_OUTPUT_BROWSE, Running)
   DisableGadget(#PMO_UI_TARGET, Running)
   DisableGadget(#PMO_UI_PRECISION, Running)
+  DisableGadget(#PMO_UI_FP32_OPS, Bool(Running Or LCase(GetGadgetText(#PMO_UI_PRECISION))<>"int8"))
   DisableGadget(#PMO_UI_ORT, Running)
   DisableGadget(#PMO_UI_ORT_BROWSE, Running)
   DisableGadget(#PMO_UI_SIMPLIFY, Running)
@@ -286,6 +288,7 @@ Procedure PmoUiStartCompile()
   Protected TargetIndex.i = GetGadgetState(#PMO_UI_TARGET)
   Protected Precision.s = LCase(GetGadgetText(#PMO_UI_PRECISION))
   Protected OrtPath.s = Trim(GetGadgetText(#PMO_UI_ORT))
+  Protected Fp32Ops.s
   If FileSize(Model) <= 0
     MessageRequester("PureMetal ONNX Compiler", "Choose an ONNX model first.", #PB_MessageRequester_Error)
     ProcedureReturn
@@ -344,6 +347,11 @@ Procedure PmoUiStartCompile()
   ; Applies to either form; the compiler refuses it for a model with no random node.
   If GetGadgetState(#PMO_UI_RANDOM_INPUTS) : Arguments + " --random-inputs" : EndIf
 
+  If Precision="int8"
+    Fp32Ops=Trim(GetGadgetText(#PMO_UI_FP32_OPS))
+    If Fp32Ops<>"" And PmoUiQuote(Fp32Ops)="" : MessageRequester("INT8 weight precision","The operator list cannot contain a quote character.",#PB_MessageRequester_Error) : ProcedureReturn : EndIf
+    If Fp32Ops<>"" : Arguments+" --int8-fp32-ops "+PmoUiQuote(Fp32Ops) : EndIf
+  EndIf
   PmoUiJob\Arguments = Arguments
   PmoUiJob\OutputPrefix = Output
   PmoUiJob\TargetIndex = TargetIndex
@@ -392,7 +400,7 @@ Procedure PmoRunUi()
                            #PB_Window_MinimizeGadget | #PB_Window_MaximizeGadget |
                            #PB_Window_ScreenCentered)
   If PmoUiWindow = 0 : ProcedureReturn : EndIf
-  WindowBounds(PmoUiWindow, 820, 720, #PB_Ignore, #PB_Ignore)
+  WindowBounds(PmoUiWindow, 1040, 720, #PB_Ignore, #PB_Ignore)
 
   TextGadget(#PB_Any, 24, 20, 120, 24, "ONNX model")
   StringGadget(#PMO_UI_MODEL, 24, 44, 850, 28, "")
@@ -417,7 +425,10 @@ Procedure PmoRunUi()
   CheckBoxGadget(#PMO_UI_SIMPLIFY, 636, 171, 118, 26, "Simplify")
   CheckBoxGadget(#PMO_UI_RANDOM_INPUTS, 636, 204, 380, 24, "Random nodes as model inputs (comparison)")
   GadgetToolTip(#PMO_UI_RANDOM_INPUTS, "Compile every RandomNormal, RandomNormalLike, RandomUniform, RandomUniformLike, Bernoulli and Multinomial node as an extra model input that the caller fills, so a run can be compared sample for sample with a reference's noise. This changes the model's inputs; leave it off for deployment.")
-  TextGadget(#PB_Any, 770, 174, 242, 24, "Resident model (always)")
+  TextGadget(#PB_Any, 770, 144, 242, 24, "FP32 weight operators (INT8)")
+  StringGadget(#PMO_UI_FP32_OPS,770,168,242,28,"")
+  GadgetToolTip(#PMO_UI_FP32_OPS,"Optional comma-separated operator families whose weights stay FP32: Conv,Gemm,LSTM,MatMul. Shared weights also stay FP32 if a listed operator uses them. Leave blank for ordinary INT8 lowering.")
+  DisableGadget(#PMO_UI_FP32_OPS,#True)
 
   TextGadget(#PB_Any, 24, 208, 280, 24, "ONNX Runtime library (fixed-extent tracing only)")
   StringGadget(#PMO_UI_ORT, 24, 232, 850, 28, "")
@@ -463,6 +474,8 @@ Procedure PmoRunUi()
       Case #PB_Event_Gadget
         Gadget = EventGadget()
         Select Gadget
+          Case #PMO_UI_PRECISION
+            DisableGadget(#PMO_UI_FP32_OPS,Bool(LCase(GetGadgetText(#PMO_UI_PRECISION))<>"int8"))
           Case #PMO_UI_MODEL_BROWSE
             Path = OpenFileRequester("Choose an ONNX model", GetGadgetText(#PMO_UI_MODEL),
                                      "ONNX models (*.onnx)|*.onnx|All files (*.*)|*.*", 0)

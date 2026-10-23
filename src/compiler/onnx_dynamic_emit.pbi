@@ -613,7 +613,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   NewMap ids.i() : NewMap known.i() : NewMap persistent.i() : NewMap last.i()
   NewList calls.s() : NewList isstatic.i()
   NewList shapes.s()
-  Protected precision.s="fp32",kokoroText.i
+  Protected precision.s="fp32",kokoroText.i,Fp32Ops.s
   Protected target.s="windows",targetIndex.i,workingLimit.q=1024*1024*1024,metadataBytes.q,crc.i,pending.s,sourcePath.s
   PmdPortable=0
   PmdRandomInputs=0
@@ -634,6 +634,9 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
         index+1
         precision=LCase(ProgramParameter(index))
         If PmoStoragePrecision(precision)=0 : PmoDynamicError="Choose FP32, INT8, FP16, BF16, or INT4 precision." : ProcedureReturn 0 : EndIf
+      Case "--int8-fp32-ops"
+        index+1 : Fp32Ops=PmoQuantNormalizeFp32Ops(ProgramParameter(index))
+        If PmoQuantError<>"" : PmoDynamicError=PmoQuantError : ProcedureReturn 0 : EndIf
       Case "--shape"
         index+1 : AddElement(shapes()) : shapes()=ProgramParameter(index)
       Case "--trace-input", "--ort-dll"
@@ -748,7 +751,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   Next
   If PmcFinish(@model,@ir,ids(),known(),persistent(),last(),calls(),@id,n)=0 : PmoDynamicError=PmcError : Goto Failed : EndIf
   If precision="int8"
-    If PmoQuantizeDynamicWeights(@ir)=0 : PmoDynamicError=PmoQuantError : Goto Failed : EndIf
+    If PmoQuantizeDynamicWeights(@ir,Fp32Ops)=0 : PmoDynamicError=PmoQuantError : Goto Failed : EndIf
     ForEach ir\QuantWeights()
       id+1 : ids(ir\QuantWeights()\ScaleName)=id : known(Str(id))=1 : persistent(Str(id))=1
     Next
@@ -1098,6 +1101,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
   SetJSONString(AddJSONMember(object,"backend"),"reusable-runtime-dimensions")
   SetJSONString(AddJSONMember(object,"target"),target)
   SetJSONString(AddJSONMember(object,"precision"),precision)
+  SetJSONString(AddJSONMember(object,"fp32_weight_operators"),Fp32Ops)
   SetJSONInteger(AddJSONMember(object,"quantized_weight_count"),ListSize(ir\QuantWeights()))
   If precision="int8"
     SetJSONString(AddJSONMember(object,"computation"),"FP32 tensors; selected INT8 linear weights use dynamic per-row INT8 activations and INT32 accumulation; wide weights (a precision plan) add a residual INT8 plane and 16-bit activations")
