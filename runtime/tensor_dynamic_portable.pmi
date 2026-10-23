@@ -2164,6 +2164,43 @@ Procedure DTranspose(Y.i,A.i,Perm.i)
   If DAllocOverwrite(Y,Dt(A)\Kind,rank,@dims(0))=0
     ProcedureReturn
   EndIf
+  ; Swap consecutive axis groups while keeping a contiguous trailing block.
+  ; Attention layouts such as B,T,H,D -> B,H,T,D need no per-row divisions.
+  CompilerIf #PMD_NATIVE_BYTES=8
+  tail=rank-1 : contiguous=1
+  While tail>=0
+    If axes(tail)<>tail : Break : EndIf
+    contiguous*dims(tail) : tail-1
+  Wend
+  prefix=0
+  While prefix<=tail
+    If axes(prefix)<>prefix : Break : EndIf
+    prefix+1
+  Wend
+  If prefix<tail And tail<rank-1 And contiguous>0
+    pivot=axes(prefix) : simple=Bool(pivot>prefix And pivot<=tail)
+    For j=prefix To tail
+      expected=pivot+j-prefix
+      If expected>tail : expected=prefix+expected-tail-1 : EndIf
+      If axes(j)<>expected : simple=0 : EndIf
+    Next
+    If simple And DSpansOverlap(Dt(A)\Data,Dt(A)\Bytes,Dt(Y)\Data,Dt(Y)\Bytes)=0
+      height=DProduct(A,prefix,pivot-1) : width=DProduct(A,pivot,tail)
+      If height>0 And width>0
+        rows=Dt(A)\Count/(height*width*contiguous)
+        For batch=0 To rows-1
+          sp=Dt(A)\Data+batch*height*width*contiguous*size
+          dp=Dt(Y)\Data+batch*height*width*contiguous*size
+          For col=0 To width-1
+            DCopyRowsServiced(sp+col*contiguous*size,dp+col*height*contiguous*size,contiguous*size,width*contiguous*size,contiguous*size,height)
+          Next
+        Next
+      EndIf
+      ProcedureReturn
+    EndIf
+  EndIf
+  simple=1 : contiguous=1
+  CompilerEndIf
   If rank>=2 And size=4
     ; A rotation of two consecutive axis groups is a matrix transpose.
     ; This also covers NCHW->NHWC after collapsing the spatial dimensions.

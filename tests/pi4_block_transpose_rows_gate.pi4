@@ -1,0 +1,240 @@
+; Block transpose compares independent old output across 1080 physical cases.
+; Scratch: CC000000..CDFFFFFF arena, CE000100 source.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldTranspose(Y.i,A.i,Perm.i)
+  Protected Dim dims.i(8)
+  Protected Dim axes.i(8)
+  Protected Dim strides.i(8)
+  Protected Dim seen.i(8)
+  Protected contiguous.i=1
+  Protected tail.i
+  Protected batch.i
+  Protected height.i
+  Protected width.i
+  Protected rows.i
+  Protected col.i
+  Protected row.i
+  Protected sp.i
+  Protected dp.i
+  Protected simple.i=1
+  Protected prefix.i, pivot.i, expected.i
+  Protected i.i=0
+  Protected j.i=0
+  Protected n.i=0
+  Protected coord.i=0
+  Protected src.i=0
+  Protected size.i=DSize(Dt(A)\Kind)
+  Protected rank.i=Dt(A)\Rank
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  DZero(@axes(0),8*#PMD_NATIVE_BYTES)
+  DZero(@strides(0),8*#PMD_NATIVE_BYTES)
+  DZero(@seen(0),8*#PMD_NATIVE_BYTES)
+  For i=0 To rank-1
+    If PeekA(Perm)=0
+      axes(i)=rank-i-1
+    Else
+      axes(i)=DListValue(Perm,i+1)
+    EndIf
+    If axes(i)<0 Or axes(i)>=rank
+      DFail("Invalid transpose permutation.")
+      ProcedureReturn
+    EndIf
+    If seen(axes(i))
+      DFail("Transpose permutation has a duplicate axis.")
+      ProcedureReturn
+    EndIf
+    seen(axes(i))=1
+    dims(i)=DDims((A)*8+(axes(i)))
+    strides(i)=DProduct(A,axes(i)+1,rank-1)
+  Next
+  If DAllocOverwrite(Y,Dt(A)\Kind,rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  If rank>=2 And size=4
+    ; A rotation of two consecutive axis groups is a matrix transpose.
+    ; This also covers NCHW->NHWC after collapsing the spatial dimensions.
+    prefix=0
+    While prefix<rank
+      If axes(prefix)<>prefix : Break : EndIf
+      prefix+1
+    Wend
+    pivot=prefix
+    If prefix<rank : pivot=axes(prefix) : EndIf
+    If pivot<=prefix : simple=0 : EndIf
+    For j=prefix To rank-1
+      expected=pivot+j-prefix
+      If expected>=rank : expected=prefix+expected-rank : EndIf
+      If axes(j)<>expected : simple=0 : EndIf
+    Next
+    If simple
+      height=DProduct(A,prefix,pivot-1) : width=DProduct(A,pivot,rank-1)
+      If height>0 And width>0
+        rows=Dt(A)\Count/(height*width)
+        For batch=0 To rows-1
+          CompilerIf #PMD_NATIVE_BYTES=8
+          PmTransposeMatrixWords(Dt(A)\Data+batch*height*width*4,Dt(Y)\Data+batch*height*width*4,height,width)
+          CompilerElse
+          For col=0 To width-1
+            sp=Dt(A)\Data+(batch*height*width+col)*4
+            dp=Dt(Y)\Data+(batch*height*width+col*height)*4
+            For row=0 To height-1
+              PokeL(dp,PeekL(sp))
+              sp+width*4 : dp+4
+            Next
+          Next
+          CompilerEndIf
+        Next
+      EndIf
+      ProcedureReturn
+    EndIf
+  EndIf
+  ; Unchanged trailing axes form one contiguous run. Copy that run once;
+  ; only the permuted prefix needs coordinate division.
+  tail=rank-1
+  While tail>=0
+    If axes(tail)<>tail : Break : EndIf
+    contiguous=contiguous*dims(tail)
+    tail-1
+  Wend
+  If contiguous>1
+    For i=0 To Dt(Y)\Count-1 Step contiguous
+      n=i/contiguous : src=0
+      For j=tail To 0 Step -1
+        coord=n%dims(j) : n/dims(j)
+        src+coord*strides(j)
+      Next
+      DCopyServiced(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,contiguous*size)
+    Next
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(Y)\Count-1
+    n=i
+    src=0
+    For j=rank-1 To 0 Step -1
+      coord=n % dims(j)
+      n/dims(j)
+      src+coord*strides(j)
+    Next
+    DCopyServiced(Dt(A)\Data+src*size,Dt(Y)\Data+i*size,size)
+  Next
+EndProcedure
+
+Global TransposeIdle.i,TransposeFault.i
+Procedure TransposeService()
+ If PmKernelCore() : TransposeFault+1 : Else : TransposeIdle+1 : EndIf
+EndProcedure
+Procedure.i OneCase(kind.i,shape.i,perm.i,off.i,guard.i)
+ Protected Dim dims.i(8)
+ Protected rank.i=DListValue(shape,1),i.i,count.i=1,bytes.i,refused.i,rc.i
+ DError=0 : DCancel=0
+ For i=0 To rank-1 : dims(i)=DListValue(shape,i+2) : count*dims(i) : DDims(8+i)=dims(i) : Next
+ bytes=count*DSize(kind)
+ Dt(1)\Data=$CE000100+off : Dt(1)\Kind=kind : Dt(1)\Rank=rank : Dt(1)\Count=count : Dt(1)\Bytes=bytes : Dt(1)\Owned=0
+ For i=-8 To bytes+7 : PokeA(Dt(1)\Data+i,(i*73+31) & 255) : Next
+ If guard : DFail("Prior transpose error.") : EndIf
+ OldTranspose(2,1,perm) : refused=Bool(DError<>0)
+ DError=0 : If guard : DFail("Prior transpose error.") : EndIf
+ DTranspose(3,1,perm)
+ If Bool(DError<>0)<>refused : rc=20 : EndIf
+ If Dt(2)\Rank<>Dt(3)\Rank Or Dt(2)\Kind<>Dt(3)\Kind Or Dt(2)\Count<>Dt(3)\Count Or Dt(2)\Bytes<>Dt(3)\Bytes : rc=21 : EndIf
+ For i=0 To Dt(2)\Rank-1 : If DDims(16+i)<>DDims(24+i) : rc=22 : EndIf : Next
+ For i=0 To Dt(2)\Bytes-1 : If PeekA(Dt(2)\Data+i)<>PeekA(Dt(3)\Data+i) : rc=23 : Break : EndIf : Next
+ For i=-8 To bytes+7 : If (PeekA(Dt(1)\Data+i) & 255)<>((i*73+31) & 255) : rc=24 : Break : EndIf : Next
+ DError=0 : DCancel=0
+ For i=1 To 3 : DRelease(i) : Next
+ If DLive Or DHeapUsed : rc=25 : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i Main(services.i)
+ Protected rc.i,cases.i,kind.i,off.i,guard.i,*pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6)
+ DZero($E1C00000,8192) : PmTensorInt64Ok=1
+ If DHeapBind($CC000000,$2000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ PmSetIdleCallback(@TransposeService)
+ For kind=1 To 9
+ If kind=1 Or kind=2 Or kind=3 Or kind=6 Or kind=7 Or kind=9
+ For off=0 To 1
+ For guard=0 To 1
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","0,1,2,3",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","0,1,3,2",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","0,2,1,3",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","0,2,3,1",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","0,3,1,2",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","0,3,2,1",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","1,0,2,3",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","1,0,3,2",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","1,2,0,3",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","1,2,3,0",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","1,3,0,2",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","1,3,2,0",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","2,0,1,3",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","2,0,3,1",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","2,1,0,3",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","2,1,3,0",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","2,3,0,1",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","2,3,1,0",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","3,0,1,2",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","3,0,2,1",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","3,1,0,2",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","3,1,2,0",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","3,2,0,1",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,2,5,3","3,2,1,0",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"3,2,3,4","0,1,2",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"3,2,3,4","0,2,1",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"3,2,3,4","1,0,2",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"3,2,3,4","1,2,0",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"3,2,3,4","2,0,1",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"3,2,3,4","2,1,0",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"5,2,3,4,5,3","0,2,1,3,4",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"5,2,3,4,5,3","0,3,4,1,2",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"5,2,3,4,5,3","2,3,0,1,4",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"5,2,3,4,5,3","0,1,2,3,4",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"5,2,3,4,5,3","4,3,2,1,0",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,2,257,8,16","0,2,1,3",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,1,33,4,64","0,2,1,3",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,3,0,4,7","0,2,1,3",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,1,1,7,3","0,2,1,3",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,2,259,3,1","0,2,1,3",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"5,2,3,5,1,17","0,2,1,3,4",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"6,2,3,5,7,1,3","0,2,1,3,4,5",off,guard) : cases+1 : If *pet : pet() : EndIf : EndIf
+ If rc=0 : rc=OneCase(kind,"4,2,3,5,7","0,0,2,3",off,guard) : cases+1 : EndIf
+ If rc=0 : rc=OneCase(kind,"4,2,3,5,7","0,1,2,8",off,guard) : cases+1 : EndIf
+ If rc=0 : rc=OneCase(kind,"4,2,3,5,7","0,-1,2,3",off,guard) : cases+1 : EndIf
+Next : Next : EndIf : Next
+ PmSetIdleCallback(0)
+ If TransposeFault Or TransposeIdle=0 : rc=30 : EndIf
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,TransposeFault) : PokeI($E1C01FE0,TransposeIdle)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
