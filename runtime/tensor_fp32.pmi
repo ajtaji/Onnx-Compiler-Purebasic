@@ -5749,6 +5749,152 @@ pmoI8SingleFlush:
   st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5]
  EndASM
 EndProcedure
+Structure PmI8SingleWideArgs
+ B.i
+ BStride.i
+ Activation.i
+ Count.i
+ RowScale.i
+ WeightScales.i
+ Dst.i
+ ActivationStep.i
+EndStructure
+; Sixty-four adjacent columns reuse each loaded cache line and activation.
+; Integer reduction, conversion, row scaling, +0 and weight scaling retain
+; exactly the old sixteen-column kernel plus epilogue order per output.
+Procedure PmI8SingleWide64A64(*a.PmI8SingleWideArgs)
+ ASM
+  ldr x1, [x0]
+  ldr x2, [x0, #8]
+  ldr x10, [x0, #16]
+  ldr x3, [x0, #24]
+  ldr x6, [x0, #32]
+  ldr x11, [x0, #40]
+  ldr x5, [x0, #48]
+  ldr x14, [x0, #56]
+  movi v16.4s, #0
+  movi v17.4s, #0
+  movi v18.4s, #0
+  movi v19.4s, #0
+  movi v20.4s, #0
+  movi v21.4s, #0
+  movi v22.4s, #0
+  movi v23.4s, #0
+  movi v24.4s, #0
+  movi v25.4s, #0
+  movi v26.4s, #0
+  movi v27.4s, #0
+  movi v28.4s, #0
+  movi v29.4s, #0
+  movi v30.4s, #0
+  movi v31.4s, #0
+  cbz x3, pmoI8WideFlush
+pmoI8WideLoop:
+  ld1 {v0.16b-v3.16b}, [x1], x2
+  ld1r {v4.16b}, [x10], x14
+  smull v6.8h, v0.8b, v4.8b
+  smull2 v7.8h, v0.16b, v4.16b
+  saddw v16.4s, v16.4s, v6.4h
+  saddw2 v17.4s, v17.4s, v6.8h
+  saddw v18.4s, v18.4s, v7.4h
+  saddw2 v19.4s, v19.4s, v7.8h
+  smull v6.8h, v1.8b, v4.8b
+  smull2 v7.8h, v1.16b, v4.16b
+  saddw v20.4s, v20.4s, v6.4h
+  saddw2 v21.4s, v21.4s, v6.8h
+  saddw v22.4s, v22.4s, v7.4h
+  saddw2 v23.4s, v23.4s, v7.8h
+  smull v6.8h, v2.8b, v4.8b
+  smull2 v7.8h, v2.16b, v4.16b
+  saddw v24.4s, v24.4s, v6.4h
+  saddw2 v25.4s, v25.4s, v6.8h
+  saddw v26.4s, v26.4s, v7.4h
+  saddw2 v27.4s, v27.4s, v7.8h
+  smull v6.8h, v3.8b, v4.8b
+  smull2 v7.8h, v3.16b, v4.16b
+  saddw v28.4s, v28.4s, v6.4h
+  saddw2 v29.4s, v29.4s, v6.8h
+  saddw v30.4s, v30.4s, v7.4h
+  saddw2 v31.4s, v31.4s, v7.8h
+  subs x3, x3, #1
+  b.ne pmoI8WideLoop
+pmoI8WideFlush:
+  ld1r {v4.4s}, [x6]
+  movi v5.4s, #0
+  scvtf v16.4s, v16.4s
+  fmul v16.4s, v16.4s, v4.4s
+  fadd v16.4s, v5.4s, v16.4s
+  scvtf v17.4s, v17.4s
+  fmul v17.4s, v17.4s, v4.4s
+  fadd v17.4s, v5.4s, v17.4s
+  scvtf v18.4s, v18.4s
+  fmul v18.4s, v18.4s, v4.4s
+  fadd v18.4s, v5.4s, v18.4s
+  scvtf v19.4s, v19.4s
+  fmul v19.4s, v19.4s, v4.4s
+  fadd v19.4s, v5.4s, v19.4s
+  scvtf v20.4s, v20.4s
+  fmul v20.4s, v20.4s, v4.4s
+  fadd v20.4s, v5.4s, v20.4s
+  scvtf v21.4s, v21.4s
+  fmul v21.4s, v21.4s, v4.4s
+  fadd v21.4s, v5.4s, v21.4s
+  scvtf v22.4s, v22.4s
+  fmul v22.4s, v22.4s, v4.4s
+  fadd v22.4s, v5.4s, v22.4s
+  scvtf v23.4s, v23.4s
+  fmul v23.4s, v23.4s, v4.4s
+  fadd v23.4s, v5.4s, v23.4s
+  scvtf v24.4s, v24.4s
+  fmul v24.4s, v24.4s, v4.4s
+  fadd v24.4s, v5.4s, v24.4s
+  scvtf v25.4s, v25.4s
+  fmul v25.4s, v25.4s, v4.4s
+  fadd v25.4s, v5.4s, v25.4s
+  scvtf v26.4s, v26.4s
+  fmul v26.4s, v26.4s, v4.4s
+  fadd v26.4s, v5.4s, v26.4s
+  scvtf v27.4s, v27.4s
+  fmul v27.4s, v27.4s, v4.4s
+  fadd v27.4s, v5.4s, v27.4s
+  scvtf v28.4s, v28.4s
+  fmul v28.4s, v28.4s, v4.4s
+  fadd v28.4s, v5.4s, v28.4s
+  scvtf v29.4s, v29.4s
+  fmul v29.4s, v29.4s, v4.4s
+  fadd v29.4s, v5.4s, v29.4s
+  scvtf v30.4s, v30.4s
+  fmul v30.4s, v30.4s, v4.4s
+  fadd v30.4s, v5.4s, v30.4s
+  scvtf v31.4s, v31.4s
+  fmul v31.4s, v31.4s, v4.4s
+  fadd v31.4s, v5.4s, v31.4s
+  ld1 {v0.4s-v3.4s}, [x11], #64
+  fmul v16.4s, v16.4s, v0.4s
+  fmul v17.4s, v17.4s, v1.4s
+  fmul v18.4s, v18.4s, v2.4s
+  fmul v19.4s, v19.4s, v3.4s
+  st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5], #64
+  ld1 {v0.4s-v3.4s}, [x11], #64
+  fmul v20.4s, v20.4s, v0.4s
+  fmul v21.4s, v21.4s, v1.4s
+  fmul v22.4s, v22.4s, v2.4s
+  fmul v23.4s, v23.4s, v3.4s
+  st1 {v20.4s, v21.4s, v22.4s, v23.4s}, [x5], #64
+  ld1 {v0.4s-v3.4s}, [x11], #64
+  fmul v24.4s, v24.4s, v0.4s
+  fmul v25.4s, v25.4s, v1.4s
+  fmul v26.4s, v26.4s, v2.4s
+  fmul v27.4s, v27.4s, v3.4s
+  st1 {v24.4s, v25.4s, v26.4s, v27.4s}, [x5], #64
+  ld1 {v0.4s-v3.4s}, [x11], #64
+  fmul v28.4s, v28.4s, v0.4s
+  fmul v29.4s, v29.4s, v1.4s
+  fmul v30.4s, v30.4s, v2.4s
+  fmul v31.4s, v31.4s, v3.4s
+  st1 {v28.4s, v29.4s, v30.4s, v31.4s}, [x5], #64
+ EndASM
+EndProcedure
 Procedure PmI8ColumnOneNeon(b.i,n.i,c0.i,k.i,tile.i)
  Protected ta.PmI8TileArgs
  ta\L=b+c0 : ta\LStep=n : ta\P0=PeekI(tile+784) : ta\PStep=1
@@ -6263,6 +6409,23 @@ Procedure.i PmI8MatMulNeonColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,la
   Protected c0.i
   n16 = last & -16
   If n16 = 0 : ProcedureReturn 0 : EndIf
+  If *g\M=1 And *g\Wide=0 And packed=0 And n16-first>=64
+    Protected wideArgs.PmI8SingleWideArgs
+    wideArgs\BStride=*g\N : wideArgs\Activation=q : wideArgs\Count=*g\K : wideArgs\RowScale=s : wideArgs\ActivationStep=1
+    rows=PmI8RowBlock(q,s,1,*g\K,1,0,tile)
+    c0=first
+    While c0+64<=n16
+      wideArgs\B=*g\B+c0 : wideArgs\WeightScales=*g\Scales+c0*4 : wideArgs\Dst=*g\Dst+c0*4
+      PmI8SingleWide64A64(@wideArgs) : c0+64 : PmKernelIdle()
+    Wend
+    While c0<n16
+      PmI8ColumnOneNeon(*g\B,*g\N,c0,*g\K,tile)
+      ea\F1=tile : ea\F2=0 : ea\WS=*g\Scales+c0*4 : ea\Bias=0
+      ea\Dst=*g\Dst+c0*4 : ea\DStride=*g\N*4 : ea\Rows=1 : ea\LaneScale=1
+      PmI8EpiNeon(@ea) : c0+16
+    Wend
+    ProcedureReturn n16
+  EndIf
   If packed<>0 And *g\M>=8
     c0=first
     While c0<n16

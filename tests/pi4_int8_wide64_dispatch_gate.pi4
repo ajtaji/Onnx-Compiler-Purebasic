@@ -1,0 +1,184 @@
+; Exact narrow INT8 sixty-four-column kernel/dispatch proof; CC/CD scratch only.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldSingleRowTile(*a.PmI8TileArgs)
+ ASM
+  ldr x1, [x0, #0]
+  ldr x2, [x0, #8]
+  ldr x10, [x0, #16]
+  ldr x14, [x0, #48]
+  ldr x3, [x0, #56]
+  movi v16.4s, #0
+  movi v17.4s, #0
+  movi v18.4s, #0
+  movi v19.4s, #0
+  cbz x3, oldI8SingleFlush
+oldI8SingleLoop:
+  ld1 {v0.16b}, [x1], x2
+  ld1r {v4.16b}, [x10], x14
+  smull v6.8h, v0.8b, v4.8b
+  smull2 v7.8h, v0.16b, v4.16b
+  saddw v16.4s, v16.4s, v6.4h
+  saddw2 v17.4s, v17.4s, v6.8h
+  saddw v18.4s, v18.4s, v7.4h
+  saddw2 v19.4s, v19.4s, v7.8h
+  subs x3, x3, #1
+  b.ne oldI8SingleLoop
+oldI8SingleFlush:
+  scvtf v16.4s, v16.4s
+  scvtf v17.4s, v17.4s
+  scvtf v18.4s, v18.4s
+  scvtf v19.4s, v19.4s
+  ldr x5, [x0, #64]
+  ldr x6, [x0, #72]
+  ld1r {v4.4s}, [x6]
+  fmul v16.4s, v16.4s, v4.4s
+  fmul v17.4s, v17.4s, v4.4s
+  fmul v18.4s, v18.4s, v4.4s
+  fmul v19.4s, v19.4s, v4.4s
+  movi v0.4s, #0
+  fadd v16.4s, v0.4s, v16.4s
+  fadd v17.4s, v0.4s, v17.4s
+  fadd v18.4s, v0.4s, v18.4s
+  fadd v19.4s, v0.4s, v19.4s
+  st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5]
+ EndASM
+EndProcedure
+
+
+Procedure.i OldMatMulColumns(*g.PmI8MatMulArgs, q.i, s.i, tile.i,first.i,last.i)
+  Protected packed.i=PmI8PackFind(*g\B,*g\K,*g\N,*g\Wide)
+  Protected mask.i
+  If *g\Wide=0 : mask=PmMatrixFourCacheFind(*g\B,*g\K,*g\N) : EndIf
+  Protected ea.PmI8EpiArgs
+  Protected n16.i
+  Protected r0.i
+  Protected rows.i
+  Protected c0.i
+  n16 = last & -16
+  If n16 = 0 : ProcedureReturn 0 : EndIf
+  If packed<>0 And *g\M>=8
+    c0=first
+    While c0<n16
+      r0=0
+      While r0<*g\M
+        rows=PmI8RowBlock(q,s,*g\M,*g\K,1+ *g\Wide,r0,tile)
+        If rows=1 And *g\Wide=0
+          PmI8ColumnOneNeon(packed+c0* *g\K,16,0,*g\K,tile)
+        ElseIf mask<>0
+          PmMatrixFourColumn(packed+c0* *g\K,*g\K,tile,mask+(c0/16)*(*g\K/4))
+        Else
+          PmI8ColumnTileNeon(packed+c0* *g\K,(*g\N & -16)* *g\K,16,0,*g\K,*g\Wide,tile)
+        EndIf
+        ea\F1=tile : ea\F2=0 : If *g\Wide<>0 : ea\F2=tile+256 : EndIf
+        ea\WS=*g\Scales+c0*4 : ea\Bias=0
+        ea\Dst=*g\Dst+(r0* *g\N+c0)*4 : ea\DStride=*g\N*4
+        ea\Rows=rows : ea\LaneScale=1
+        PmI8EpiNeon(@ea)
+        r0=r0+4
+      Wend
+      c0=c0+16
+    Wend
+    ProcedureReturn n16
+  EndIf
+  r0 = 0
+  While r0 < *g\M
+    rows = PmI8RowBlock(q, s, *g\M, *g\K, 1 + *g\Wide, r0, tile)
+    c0 = first
+    While c0 < n16
+      If packed<>0
+        If rows=1 And *g\Wide=0
+          PmI8ColumnOneNeon(packed+c0* *g\K,16,0,*g\K,tile)
+        ElseIf mask<>0
+          PmMatrixFourColumn(packed+c0* *g\K,*g\K,tile,mask+(c0/16)*(*g\K/4))
+        Else
+          PmI8ColumnTileNeon(packed+c0* *g\K, (*g\N & -16)* *g\K, 16, 0, *g\K, *g\Wide, tile)
+        EndIf
+      Else
+        If rows=1 And *g\Wide=0
+          PmI8ColumnOneNeon(*g\B,*g\N,c0,*g\K,tile)
+        Else
+          PmI8ColumnTileNeon(*g\B, *g\Elements, *g\N, c0, *g\K, *g\Wide, tile)
+        EndIf
+      EndIf
+      ea\F1 = tile : ea\F2 = 0 : If *g\Wide <> 0 : ea\F2 = tile + 256 : EndIf
+      ea\WS = *g\Scales + c0 * 4 : ea\Bias = 0
+      ea\Dst = *g\Dst + (r0 * *g\N + c0) * 4 : ea\DStride = *g\N * 4
+      ea\Rows = rows : ea\LaneScale = 1
+      PmI8EpiNeon(@ea)
+      c0 = c0 + 16
+    Wend
+    r0 = r0 + 4
+  Wend
+  ProcedureReturn n16
+EndProcedure
+Procedure.i DispatchCase(m.i,k.i,n.i,first.i,last.i,wide.i)
+ Protected g.PmI8MatMulArgs
+ Protected b.i=$CC000100,q.i=$CD000100,ref.i=$CD100100,dst.i=$CD110100,tile.i=$CD200100,s.i=$CD210100,ws.i=$CD220100
+ Protected i.i,nbytes.i=m*n*4,oldStop.i,newStop.i,rc.i,es.i=1+wide
+ For i=0 To 2*k*n-1 : PokeA(b+i,(i*37) & 255) : Next
+ For i=0 To m*k*es-1 : PokeA(q+i,((i*13) % 255)-127) : Next
+ For i=0 To m-1 : PmTensorPut(s,i,(i+1)/64.0) : Next
+ For i=0 To n-1 : PmTensorPut(ws,i,(i % 5-2)/64.0) : Next
+ For i=-16 To nbytes+15 : PokeA(ref+i,$5A) : PokeA(dst+i,$5A) : Next
+ g\B=b : g\M=m : g\K=k : g\N=n : g\Wide=wide : g\Elements=k*n : g\Scales=ws
+ g\Dst=ref : oldStop=OldMatMulColumns(@g,q,s,tile,first,last)
+ g\Dst=dst : newStop=PmI8MatMulNeonColumns(@g,q,s,tile,first,last)
+ If oldStop<>newStop : rc=20 : EndIf
+ For i=-16 To nbytes+15 : If PeekA(ref+i)<>PeekA(dst+i) : rc=21 : PokeI($E1C01F80,i) : Break : EndIf : Next
+ If rc : PokeI($E1C01F88,m) : PokeI($E1C01F90,k) : PokeI($E1C01F98,n) : PokeI($E1C01FA0,first) : PokeI($E1C01FA8,last) : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i Main(services.i)
+ Protected Dim widths.i(9)
+ Protected m.i,ki.i,k.i,ni.i,wide.i,rc.i,cases.i,*pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ widths(0)=63 : widths(1)=64 : widths(2)=65 : widths(3)=79 : widths(4)=80 : widths(5)=96 : widths(6)=112 : widths(7)=128 : widths(8)=1536
+ For m=1 To 2
+ For ki=0 To 2
+  k=ki*3 : If ki=2 : k=64 : EndIf
+ For ni=0 To 8
+ For wide=0 To 1
+  rc=DispatchCase(m,k,widths(ni),0,widths(ni),wide) : cases+1
+  If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next
+ If rc=0 : rc=DispatchCase(1,64,128,16,96,0) : cases+1 : EndIf
+ If rc=0 : rc=DispatchCase(1,3,128,16,48,0) : cases+1 : EndIf
+ PokeI($E1C01FD0,cases)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

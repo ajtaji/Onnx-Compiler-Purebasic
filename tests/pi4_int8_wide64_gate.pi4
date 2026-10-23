@@ -1,0 +1,141 @@
+; Exact narrow INT8 sixty-four-column kernel/dispatch proof; CC/CD scratch only.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldSingleRowTile(*a.PmI8TileArgs)
+ ASM
+  ldr x1, [x0, #0]
+  ldr x2, [x0, #8]
+  ldr x10, [x0, #16]
+  ldr x14, [x0, #48]
+  ldr x3, [x0, #56]
+  movi v16.4s, #0
+  movi v17.4s, #0
+  movi v18.4s, #0
+  movi v19.4s, #0
+  cbz x3, oldI8SingleFlush
+oldI8SingleLoop:
+  ld1 {v0.16b}, [x1], x2
+  ld1r {v4.16b}, [x10], x14
+  smull v6.8h, v0.8b, v4.8b
+  smull2 v7.8h, v0.16b, v4.16b
+  saddw v16.4s, v16.4s, v6.4h
+  saddw2 v17.4s, v17.4s, v6.8h
+  saddw v18.4s, v18.4s, v7.4h
+  saddw2 v19.4s, v19.4s, v7.8h
+  subs x3, x3, #1
+  b.ne oldI8SingleLoop
+oldI8SingleFlush:
+  scvtf v16.4s, v16.4s
+  scvtf v17.4s, v17.4s
+  scvtf v18.4s, v18.4s
+  scvtf v19.4s, v19.4s
+  ldr x5, [x0, #64]
+  ldr x6, [x0, #72]
+  ld1r {v4.4s}, [x6]
+  fmul v16.4s, v16.4s, v4.4s
+  fmul v17.4s, v17.4s, v4.4s
+  fmul v18.4s, v18.4s, v4.4s
+  fmul v19.4s, v19.4s, v4.4s
+  movi v0.4s, #0
+  fadd v16.4s, v0.4s, v16.4s
+  fadd v17.4s, v0.4s, v17.4s
+  fadd v18.4s, v0.4s, v18.4s
+  fadd v19.4s, v0.4s, v19.4s
+  st1 {v16.4s, v17.4s, v18.4s, v19.4s}, [x5]
+ EndASM
+EndProcedure
+
+
+Procedure.i WideCase(k.i,stride.i,off.i,pattern.i,scale.i)
+ Protected ta.PmI8TileArgs,ea.PmI8EpiArgs,wide.PmI8SingleWideArgs
+ Protected b.i=$CC000100+off,q.i=$CD000100+off,ref.i=$CD100100,dst.i=$CD101100,tile.i=$CD200100,s.i=$CD210100,ws.i=$CD220100
+ Protected i.i,j.i,v.i,rc.i,c.i,seed.i=$12345678
+ For i=0 To k-1
+  seed=(seed*1664525+1013904223) & $FFFFFFFF : v=((seed >> 16) & 255)-127 : If v=128 : v=127 : EndIf
+  If pattern=1 : v=127 : EndIf
+  If pattern=2 : v=-127 : EndIf
+  If pattern=3 : v=0 : If i & 1 : v=-127 : EndIf : EndIf
+  PokeA(q+i,v)
+  For j=0 To 63
+   seed=(seed*1664525+1013904223) & $FFFFFFFF : v=(seed >> 16) & 255
+   If pattern=1 : v=128 : EndIf
+   If pattern=2 : v=127 : EndIf
+   If pattern=3 : v=128 : If i & 1 : v=127 : EndIf : EndIf
+   PokeA(b+i*stride+j,v)
+  Next
+ Next
+ For i=-16 To 271 : PokeA(ref+i,$5A) : PokeA(dst+i,$5A) : Next
+ Select scale
+ Case 0 : PokeL(s,$3F800000)
+ Case 1 : PokeL(s,$80000000)
+ Case 2 : PokeL(s,$3B800000)
+ EndSelect
+ For i=0 To 63 : PmTensorPut(ws,i,(i % 5-2)/64.0) : Next
+ For c=0 To 3
+  ta\L=b+c*16 : ta\LStep=stride : ta\P0=q : ta\PStep=1 : ta\Count=k : ta\F=tile : ta\S=s
+  OldSingleRowTile(@ta)
+  ea\F1=tile : ea\F2=0 : ea\WS=ws+c*64 : ea\Bias=0
+  ea\Dst=ref+c*64 : ea\DStride=256 : ea\Rows=1 : ea\LaneScale=1
+  PmI8EpiNeon(@ea)
+ Next
+ wide\B=b : wide\BStride=stride : wide\Activation=q : wide\Count=k
+ wide\RowScale=s : wide\WeightScales=ws : wide\Dst=dst : wide\ActivationStep=1
+ PmI8SingleWide64A64(@wide)
+ For i=-16 To 271 : If PeekA(ref+i)<>PeekA(dst+i) : rc=20 : PokeI($E1C01F80,i) : Break : EndIf : Next
+ ProcedureReturn rc
+EndProcedure
+Procedure.i Main(services.i)
+ Protected Dim ks.i(7)
+ Protected ni.i,stride.i,off.i,pat.i,scale.i,rc.i,cases.i,*pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ ks(0)=0 : ks(1)=1 : ks(2)=3 : ks(3)=16 : ks(4)=511 : ks(5)=512 : ks(6)=4097
+ For ni=0 To 6
+ For stride=64 To 1536 Step 1472
+ For off=0 To 1
+ For pat=0 To 3
+ For scale=0 To 2
+  rc=WideCase(ks(ni),stride,off,pat,scale) : cases+1
+  If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next
+ If rc=0 : rc=WideCase(133144,64,0,1,0) : cases+1 : EndIf
+ If *pet : pet() : EndIf
+ If rc=0 : rc=WideCase(133144,64,1,2,0) : cases+1 : EndIf
+ PokeI($E1C01FD0,cases)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure
