@@ -1245,3 +1245,22 @@ phrases. Broader eight-direction timing, safe audible startup and actual map/
 Bluetooth concurrency are separate checks; two replies alone do not prove
 them. Strict native-versus-upstream precision acceptance remains separate.
 The source guide is current; PDF refresh remains pending its required marker.
+
+
+@SECTION Eight-direction sustained and Bluetooth follow-up
+
+The full eight fresh-text directions now retain complete native waveform/EOS
+identity, and all 86 logical recurrent ranges (18,235,592 bytes) retain exact
+shapes, kinds, sizes and complete hashes. Silent generation ratios span
+0.787..0.848, first PCM 88..107ms and arena peak about14.2MB. Each new phrase
+is prepared from text on the Pi with a warm binding, without phrase audio.
+
+The speech-only Bluetooth test keeps the binding/link warm and uses 320ms
+of PCM prefill. All eight complete waveforms/state still match; there are
+zero underruns, receive errors, late events, core faults or disconnect timeout.
+Sender-scheduled first non-silent positions are 336..360ms, not microphone
+measurements. Bluetooth raises generation ratios to 0.909..0.981, so this
+does not yet establish sustained map concurrency. Transport overhead is the
+next measured target. Original mixed weights and assets remain preserved;
+separate-interface weights/state have been saved and reloaded with full SHA
+verification under distinct experimental USB names. No voice default changes.
