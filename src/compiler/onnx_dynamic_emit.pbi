@@ -509,16 +509,21 @@ Procedure PmdBorrowOutputGathers(List Calls.s(),List ScheduleStatic.i(),Map Last
 EndProcedure
 
 Procedure PmdConsumeDeadInputs(List Calls.s(),List ScheduleStatic.i(),Map Last.i(),Map Persistent.i())
-  Protected i.i,call.s,op.s,open.i,a.i,y.i,key.s
+  Protected i.i,call.s,op.s,open.i,a.i,y.i,key.s,quote.i
   ForEach Calls()
     i=ListIndex(Calls())
     SelectElement(ScheduleStatic(),i) : If ScheduleStatic()<>0 : Continue : EndIf
     call=Trim(Calls()) : open=FindString(call,"(")
     If open<1 : Continue : EndIf
     op=Left(call,open-1)
-    If op<>"DReshape" And op<>"DViewAxes" And op<>"DScatter" And op<>"DGather" And op<>"DExpand" : Continue : EndIf
+    If op<>"DReshape" And op<>"DViewAxes" And op<>"DScatter" And op<>"DGather" And op<>"DExpand" And op<>"DConcat" : Continue : EndIf
     y=Val(StringField(Mid(call,open+1),1,","))
-    a=Val(StringField(Mid(call,open+1),2,",")) : key=Str(a)
+    a=Val(StringField(Mid(call,open+1),2,","))
+    If op="DConcat"
+      quote=FindString(call,Chr(34),open+1) : a=0
+      If quote>0 : a=Val(Mid(call,quote+1)) : EndIf
+    EndIf
+    key=Str(a)
     If a<=0 Or y<=0 Or y=a Or Persistent(key) : Continue : EndIf
     If FindMapElement(Last(),key)=0 : Continue : EndIf
     If Last()<>i : Continue : EndIf

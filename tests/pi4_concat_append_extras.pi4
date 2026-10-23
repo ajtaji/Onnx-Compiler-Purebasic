@@ -1,0 +1,376 @@
+; Exact last-use explicit-mutable concat append; CC arena, CE buffers.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+Procedure OldConcat(Y.i,Inputs.i,Axis.i)
+  Protected Dim dims.i(8)
+  Protected count.i=DListCount(Inputs)
+  Protected a.i=DListValue(Inputs,1)
+  Protected i.i=0
+  Protected j.i=0
+  Protected outer.i=0
+  Protected inner.i=0
+  Protected offset.i=0
+  Protected span.i=0
+  Protected src.i,dst.i,bytes.i,step.i
+  Protected size.i=DSize(Dt(a)\Kind)
+  DZero(@dims(0),8*#PMD_NATIVE_BYTES)
+  If Axis<0
+    Axis+Dt(a)\Rank
+  EndIf
+  If Axis<0 Or Axis>=Dt(a)\Rank
+    DFail("Invalid Concat axis.")
+    ProcedureReturn
+  EndIf
+  For i=0 To Dt(a)\Rank-1
+    dims(i)=DDims((a)*8+(i))
+  Next
+  dims(Axis)=0
+  For i=1 To count
+    a=DListValue(Inputs,i)
+    If Dt(a)\Rank<>Dt(DListValue(Inputs,1))\Rank Or DSize(Dt(a)\Kind)<>size
+      DFail("Concat rank/type mismatch.")
+      ProcedureReturn
+    EndIf
+    For j=0 To Dt(a)\Rank-1
+      If j<>Axis And DDims((a)*8+(j))<>dims(j)
+        DFail("Concat non-axis extent mismatch.")
+        ProcedureReturn
+      EndIf
+    Next
+    dims(Axis)=dims(Axis)+DDims((a)*8+(Axis))
+  Next
+  If DAllocOverwrite(Y,Dt(a)\Kind,Dt(a)\Rank,@dims(0))=0
+    ProcedureReturn
+  EndIf
+  outer=DProduct(Y,0,Axis-1)
+  inner=DProduct(Y,Axis+1,Dt(Y)\Rank-1)
+  ; Each input contributes disjoint output spans. Hoist its list parsing
+  ; and row geometry, then write every byte without an initial zero fill.
+  step=dims(Axis)*inner*size
+  offset=0
+  For i=1 To count
+    a=DListValue(Inputs,i)
+    span=DDims(a*8+Axis)*inner
+    bytes=span*size
+    src=Dt(a)\Data
+    dst=Dt(Y)\Data+offset*size
+    If bytes
+      DCopyRowsServiced(src,dst,bytes,bytes,step,outer)
+    EndIf
+    offset+span
+  Next
+EndProcedure
+Procedure.i ConcatCase(kind.i,prefix.i,tail.i,outer.i,mode.i,small.i,alias.i,bad.i)
+ Protected Dim ad.i(3),Dim bd.i(3)
+ Protected a.i=$CE000100,b.i=$CE010100,snapshot.i=$CE020100,size.i=DSize(kind),oldBytes.i=outer*prefix*2*size,totalBytes.i=outer*(prefix+tail)*2*size
+ Protected cap.i=1024,i.i,rc.i,refused.i,expected.i,axis.i=1,direct.i
+ ad(0)=outer : ad(1)=prefix : ad(2)=2 : bd(0)=outer : bd(1)=tail : bd(2)=2
+ If small : cap=oldBytes : EndIf
+ For i=-16 To 1039 : PokeA(a+i,(i*37) & 255) : Next
+ If alias=1 : b=a+oldBytes : EndIf
+ If alias=2 : b=a : EndIf
+ For i=0 To outer*tail*2*size-1 : PokeA(b+i,(i*13+19) & 255) : Next
+ DCopy(a-16,snapshot-16,1056)
+ If DAllocOverwrite(1,kind,3,@ad(0))=0 : ProcedureReturn 10 : EndIf
+ DCopy(a,Dt(1)\Data,oldBytes)
+ If DBindBorrowed(2,kind,3,@bd(0),b,outer*tail*2*size)=0 : ProcedureReturn 11 : EndIf
+ If mode=0
+  If DBindBorrowed(3,kind,3,@ad(0),a,1024)=0 : ProcedureReturn 12 : EndIf
+ ElseIf mode=1
+  If DBindMutableState(3,kind,3,@ad(0),a,cap)=0 : ProcedureReturn 13 : EndIf
+ Else
+  If DAllocOverwrite(3,kind,3,@ad(0))=0 : ProcedureReturn 14 : EndIf
+  DCopy(a,Dt(3)\Data,oldBytes)
+ EndIf
+ If bad=1 : axis=-9 : EndIf
+ If bad=2 : DFail("Prior concat error.") : EndIf
+ If bad=3 : DCancel=1 : EndIf
+ OldConcat(4,"1,2",axis) : refused=Bool(DError<>0)
+ DError=0 : If bad=2 : DFail("Prior concat error.") : EndIf
+ DConcatConsume(5,"3,2",axis)
+ If Bool(DError<>0)<>refused : rc=20 : EndIf
+ If refused=0
+  If Dt(4)\Kind<>Dt(5)\Kind Or Dt(4)\Rank<>Dt(5)\Rank Or Dt(4)\Count<>Dt(5)\Count Or Dt(4)\Bytes<>Dt(5)\Bytes : rc=21 : EndIf
+  For i=0 To 2 : If DDims(4*8+i)<>DDims(5*8+i) : rc=22 : EndIf : Next
+  For i=0 To totalBytes-1 : If PeekA(Dt(4)\Data+i)<>PeekA(Dt(5)\Data+i) : rc=23 : Break : EndIf : Next
+  direct=Bool(Dt(5)\Data=a)
+  expected=Bool(mode=1 And outer=1 And totalBytes<=cap And cap>=size)
+  If alias=1 And tail>0 : expected=0 : EndIf
+  If alias=2 And tail>prefix : expected=0 : EndIf
+  If direct<>expected : rc=24 : EndIf
+  If direct
+   If Dt(3)\Data Or DMutable(3) Or Dt(5)\Owned Or DMutable(5)=0 : rc=25 : EndIf
+  EndIf
+ EndIf
+ For i=-16 To 1039
+  If direct=0 Or i<oldBytes Or i>=totalBytes
+   If PeekA(a+i)<>PeekA(snapshot+i) : rc=26 : Break : EndIf
+  EndIf
+ Next
+ DError=0 : DCancel=0
+ For i=1 To 5 : DRelease(i) : Next
+ If DLive Or DHeapUsed : rc=27 : EndIf
+ If rc : PokeI($E1C01F80,kind) : PokeI($E1C01F88,prefix) : PokeI($E1C01F90,tail) : PokeI($E1C01F98,outer) : PokeI($E1C01FA0,mode) : PokeI($E1C01FA8,small) : PokeI($E1C01FB0,alias) : PokeI($E1C01FB8,bad) : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i ConcatDuplicate(kind.i,prefix.i,tail.i,outer.i,mode.i,small.i,alias.i,bad.i)
+ Protected Dim ad.i(3),Dim bd.i(3)
+ Protected a.i=$CE000100,b.i=$CE010100,snapshot.i=$CE020100,size.i=DSize(kind),oldBytes.i=outer*prefix*2*size,totalBytes.i=outer*(prefix+tail)*2*size
+ Protected cap.i=1024,i.i,rc.i,refused.i,expected.i,axis.i=1,direct.i
+ ad(0)=outer : ad(1)=prefix : ad(2)=2 : bd(0)=outer : bd(1)=tail : bd(2)=2
+ If small : cap=oldBytes : EndIf
+ For i=-16 To 1039 : PokeA(a+i,(i*37) & 255) : Next
+ If alias=1 : b=a+oldBytes : EndIf
+ If alias=2 : b=a : EndIf
+ For i=0 To outer*tail*2*size-1 : PokeA(b+i,(i*13+19) & 255) : Next
+ DCopy(a-16,snapshot-16,1056)
+ If DAllocOverwrite(1,kind,3,@ad(0))=0 : ProcedureReturn 10 : EndIf
+ DCopy(a,Dt(1)\Data,oldBytes)
+ If DBindBorrowed(2,kind,3,@bd(0),b,outer*tail*2*size)=0 : ProcedureReturn 11 : EndIf
+ If mode=0
+  If DBindBorrowed(3,kind,3,@ad(0),a,1024)=0 : ProcedureReturn 12 : EndIf
+ ElseIf mode=1
+  If DBindMutableState(3,kind,3,@ad(0),a,cap)=0 : ProcedureReturn 13 : EndIf
+ Else
+  If DAllocOverwrite(3,kind,3,@ad(0))=0 : ProcedureReturn 14 : EndIf
+  DCopy(a,Dt(3)\Data,oldBytes)
+ EndIf
+ If bad=1 : axis=-9 : EndIf
+ If bad=2 : DFail("Prior concat error.") : EndIf
+ If bad=3 : DCancel=1 : EndIf
+ OldConcat(4,"1,1",axis) : refused=Bool(DError<>0)
+ DError=0 : If bad=2 : DFail("Prior concat error.") : EndIf
+ DConcatConsume(5,"3,3",axis)
+ If Bool(DError<>0)<>refused : rc=20 : EndIf
+ If refused=0
+  If Dt(4)\Kind<>Dt(5)\Kind Or Dt(4)\Rank<>Dt(5)\Rank Or Dt(4)\Count<>Dt(5)\Count Or Dt(4)\Bytes<>Dt(5)\Bytes : rc=21 : EndIf
+  For i=0 To 2 : If DDims(4*8+i)<>DDims(5*8+i) : rc=22 : EndIf : Next
+  For i=0 To totalBytes-1 : If PeekA(Dt(4)\Data+i)<>PeekA(Dt(5)\Data+i) : rc=23 : Break : EndIf : Next
+  direct=Bool(Dt(5)\Data=a)
+  expected=Bool(mode=1 And outer=1 And totalBytes<=cap And cap>=size)
+  If alias=1 And tail>0 : expected=0 : EndIf
+  If alias=2 And tail>prefix : expected=0 : EndIf
+  If direct<>expected : rc=24 : EndIf
+  If direct
+   If Dt(3)\Data Or DMutable(3) Or Dt(5)\Owned Or DMutable(5)=0 : rc=25 : EndIf
+  EndIf
+ EndIf
+ For i=-16 To 1039
+  If direct=0 Or i<oldBytes Or i>=totalBytes
+   If PeekA(a+i)<>PeekA(snapshot+i) : rc=26 : Break : EndIf
+  EndIf
+ Next
+ DError=0 : DCancel=0
+ For i=1 To 5 : DRelease(i) : Next
+ If DLive Or DHeapUsed : rc=27 : EndIf
+ If rc : PokeI($E1C01F80,kind) : PokeI($E1C01F88,prefix) : PokeI($E1C01F90,tail) : PokeI($E1C01F98,outer) : PokeI($E1C01FA0,mode) : PokeI($E1C01FA8,small) : PokeI($E1C01FB0,alias) : PokeI($E1C01FB8,bad) : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i ConcatThree(kind.i,prefix.i,tail.i,outer.i,mode.i,small.i,alias.i,bad.i)
+ Protected Dim ad.i(3),Dim bd.i(3)
+ Protected a.i=$CE000100,b.i=$CE010100,snapshot.i=$CE020100,size.i=DSize(kind),oldBytes.i=outer*prefix*2*size,totalBytes.i=outer*(prefix+tail*2)*2*size
+ Protected cap.i=1024,i.i,rc.i,refused.i,expected.i,axis.i=1,direct.i
+ ad(0)=outer : ad(1)=prefix : ad(2)=2 : bd(0)=outer : bd(1)=tail : bd(2)=2
+ If small : cap=oldBytes : EndIf
+ For i=-16 To 1039 : PokeA(a+i,(i*37) & 255) : Next
+ If alias=1 : b=a+oldBytes : EndIf
+ If alias=2 : b=a : EndIf
+ For i=0 To outer*tail*2*size-1 : PokeA(b+i,(i*13+19) & 255) : Next
+ DCopy(a-16,snapshot-16,1056)
+ If DAllocOverwrite(1,kind,3,@ad(0))=0 : ProcedureReturn 10 : EndIf
+ DCopy(a,Dt(1)\Data,oldBytes)
+ If DBindBorrowed(2,kind,3,@bd(0),b,outer*tail*2*size)=0 : ProcedureReturn 11 : EndIf
+ If mode=0
+  If DBindBorrowed(3,kind,3,@ad(0),a,1024)=0 : ProcedureReturn 12 : EndIf
+ ElseIf mode=1
+  If DBindMutableState(3,kind,3,@ad(0),a,cap)=0 : ProcedureReturn 13 : EndIf
+ Else
+  If DAllocOverwrite(3,kind,3,@ad(0))=0 : ProcedureReturn 14 : EndIf
+  DCopy(a,Dt(3)\Data,oldBytes)
+ EndIf
+ If bad=1 : axis=-9 : EndIf
+ If bad=2 : DFail("Prior concat error.") : EndIf
+ If bad=3 : DCancel=1 : EndIf
+ OldConcat(4,"1,2,2",axis) : refused=Bool(DError<>0)
+ DError=0 : If bad=2 : DFail("Prior concat error.") : EndIf
+ DConcatConsume(5,"3,2,2",axis)
+ If Bool(DError<>0)<>refused : rc=20 : EndIf
+ If refused=0
+  If Dt(4)\Kind<>Dt(5)\Kind Or Dt(4)\Rank<>Dt(5)\Rank Or Dt(4)\Count<>Dt(5)\Count Or Dt(4)\Bytes<>Dt(5)\Bytes : rc=21 : EndIf
+  For i=0 To 2 : If DDims(4*8+i)<>DDims(5*8+i) : rc=22 : EndIf : Next
+  For i=0 To totalBytes-1 : If PeekA(Dt(4)\Data+i)<>PeekA(Dt(5)\Data+i) : rc=23 : Break : EndIf : Next
+  direct=Bool(Dt(5)\Data=a)
+  expected=Bool(mode=1 And outer=1 And totalBytes<=cap And cap>=size)
+  If alias=1 And tail>0 : expected=0 : EndIf
+  If alias=2 And tail>prefix : expected=0 : EndIf
+  If direct<>expected : rc=24 : EndIf
+  If direct
+   If Dt(3)\Data Or DMutable(3) Or Dt(5)\Owned Or DMutable(5)=0 : rc=25 : EndIf
+  EndIf
+ EndIf
+ For i=-16 To 1039
+  If direct=0 Or i<oldBytes Or i>=totalBytes
+   If PeekA(a+i)<>PeekA(snapshot+i) : rc=26 : Break : EndIf
+  EndIf
+ Next
+ DError=0 : DCancel=0
+ For i=1 To 5 : DRelease(i) : Next
+ If DLive Or DHeapUsed : rc=27 : EndIf
+ If rc : PokeI($E1C01F80,kind) : PokeI($E1C01F88,prefix) : PokeI($E1C01F90,tail) : PokeI($E1C01F98,outer) : PokeI($E1C01FA0,mode) : PokeI($E1C01FA8,small) : PokeI($E1C01FB0,alias) : PokeI($E1C01FB8,bad) : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i ConcatNegative(kind.i,prefix.i,tail.i,outer.i,mode.i,small.i,alias.i,bad.i)
+ Protected Dim ad.i(3),Dim bd.i(3)
+ Protected a.i=$CE000100,b.i=$CE010100,snapshot.i=$CE020100,size.i=DSize(kind),oldBytes.i=outer*prefix*2*size,totalBytes.i=outer*(prefix+tail)*2*size
+ Protected cap.i=1024,i.i,rc.i,refused.i,expected.i,axis.i=-2,direct.i
+ ad(0)=outer : ad(1)=prefix : ad(2)=2 : bd(0)=outer : bd(1)=tail : bd(2)=2
+ If small : cap=oldBytes : EndIf
+ For i=-16 To 1039 : PokeA(a+i,(i*37) & 255) : Next
+ If alias=1 : b=a+oldBytes : EndIf
+ If alias=2 : b=a : EndIf
+ For i=0 To outer*tail*2*size-1 : PokeA(b+i,(i*13+19) & 255) : Next
+ DCopy(a-16,snapshot-16,1056)
+ If DAllocOverwrite(1,kind,3,@ad(0))=0 : ProcedureReturn 10 : EndIf
+ DCopy(a,Dt(1)\Data,oldBytes)
+ If DBindBorrowed(2,kind,3,@bd(0),b,outer*tail*2*size)=0 : ProcedureReturn 11 : EndIf
+ If mode=0
+  If DBindBorrowed(3,kind,3,@ad(0),a,1024)=0 : ProcedureReturn 12 : EndIf
+ ElseIf mode=1
+  If DBindMutableState(3,kind,3,@ad(0),a,cap)=0 : ProcedureReturn 13 : EndIf
+ Else
+  If DAllocOverwrite(3,kind,3,@ad(0))=0 : ProcedureReturn 14 : EndIf
+  DCopy(a,Dt(3)\Data,oldBytes)
+ EndIf
+ If bad=1 : axis=-9 : EndIf
+ If bad=2 : DFail("Prior concat error.") : EndIf
+ If bad=3 : DCancel=1 : EndIf
+ OldConcat(4,"1,2",axis) : refused=Bool(DError<>0)
+ DError=0 : If bad=2 : DFail("Prior concat error.") : EndIf
+ DConcatConsume(5,"3,2",axis)
+ If Bool(DError<>0)<>refused : rc=20 : EndIf
+ If refused=0
+  If Dt(4)\Kind<>Dt(5)\Kind Or Dt(4)\Rank<>Dt(5)\Rank Or Dt(4)\Count<>Dt(5)\Count Or Dt(4)\Bytes<>Dt(5)\Bytes : rc=21 : EndIf
+  For i=0 To 2 : If DDims(4*8+i)<>DDims(5*8+i) : rc=22 : EndIf : Next
+  For i=0 To totalBytes-1 : If PeekA(Dt(4)\Data+i)<>PeekA(Dt(5)\Data+i) : rc=23 : Break : EndIf : Next
+  direct=Bool(Dt(5)\Data=a)
+  expected=Bool(mode=1 And outer=1 And totalBytes<=cap And cap>=size)
+  If alias=1 And tail>0 : expected=0 : EndIf
+  If alias=2 And tail>prefix : expected=0 : EndIf
+  If direct<>expected : rc=24 : EndIf
+  If direct
+   If Dt(3)\Data Or DMutable(3) Or Dt(5)\Owned Or DMutable(5)=0 : rc=25 : EndIf
+  EndIf
+ EndIf
+ For i=-16 To 1039
+  If direct=0 Or i<oldBytes Or i>=totalBytes
+   If PeekA(a+i)<>PeekA(snapshot+i) : rc=26 : Break : EndIf
+  EndIf
+ Next
+ DError=0 : DCancel=0
+ For i=1 To 5 : DRelease(i) : Next
+ If DLive Or DHeapUsed : rc=27 : EndIf
+ If rc : PokeI($E1C01F80,kind) : PokeI($E1C01F88,prefix) : PokeI($E1C01F90,tail) : PokeI($E1C01F98,outer) : PokeI($E1C01FA0,mode) : PokeI($E1C01FA8,small) : PokeI($E1C01FB0,alias) : PokeI($E1C01FB8,bad) : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i ConcatAxisZero(kind.i,prefix.i,tail.i,outer.i,mode.i,small.i,alias.i,bad.i)
+ Protected Dim ad.i(3),Dim bd.i(3)
+ Protected a.i=$CE000100,b.i=$CE010100,snapshot.i=$CE020100,size.i=DSize(kind),oldBytes.i=outer*prefix*2*size,totalBytes.i=outer*(prefix+tail)*2*size
+ Protected cap.i=1024,i.i,rc.i,refused.i,expected.i,axis.i=0,direct.i
+ ad(0)=prefix : ad(1)=outer : ad(2)=2 : bd(0)=tail : bd(1)=outer : bd(2)=2
+ If small : cap=oldBytes : EndIf
+ For i=-16 To 1039 : PokeA(a+i,(i*37) & 255) : Next
+ If alias=1 : b=a+oldBytes : EndIf
+ If alias=2 : b=a : EndIf
+ For i=0 To outer*tail*2*size-1 : PokeA(b+i,(i*13+19) & 255) : Next
+ DCopy(a-16,snapshot-16,1056)
+ If DAllocOverwrite(1,kind,3,@ad(0))=0 : ProcedureReturn 10 : EndIf
+ DCopy(a,Dt(1)\Data,oldBytes)
+ If DBindBorrowed(2,kind,3,@bd(0),b,outer*tail*2*size)=0 : ProcedureReturn 11 : EndIf
+ If mode=0
+  If DBindBorrowed(3,kind,3,@ad(0),a,1024)=0 : ProcedureReturn 12 : EndIf
+ ElseIf mode=1
+  If DBindMutableState(3,kind,3,@ad(0),a,cap)=0 : ProcedureReturn 13 : EndIf
+ Else
+  If DAllocOverwrite(3,kind,3,@ad(0))=0 : ProcedureReturn 14 : EndIf
+  DCopy(a,Dt(3)\Data,oldBytes)
+ EndIf
+ If bad=1 : axis=-9 : EndIf
+ If bad=2 : DFail("Prior concat error.") : EndIf
+ If bad=3 : DCancel=1 : EndIf
+ OldConcat(4,"1,2",axis) : refused=Bool(DError<>0)
+ DError=0 : If bad=2 : DFail("Prior concat error.") : EndIf
+ DConcatConsume(5,"3,2",axis)
+ If Bool(DError<>0)<>refused : rc=20 : EndIf
+ If refused=0
+  If Dt(4)\Kind<>Dt(5)\Kind Or Dt(4)\Rank<>Dt(5)\Rank Or Dt(4)\Count<>Dt(5)\Count Or Dt(4)\Bytes<>Dt(5)\Bytes : rc=21 : EndIf
+  For i=0 To 2 : If DDims(4*8+i)<>DDims(5*8+i) : rc=22 : EndIf : Next
+  For i=0 To totalBytes-1 : If PeekA(Dt(4)\Data+i)<>PeekA(Dt(5)\Data+i) : rc=23 : Break : EndIf : Next
+  direct=Bool(Dt(5)\Data=a)
+  expected=Bool(mode=1 And outer=1 And totalBytes<=cap And cap>=size)
+  If alias=1 And tail>0 : expected=0 : EndIf
+  If alias=2 And tail>prefix : expected=0 : EndIf
+  If direct<>expected : rc=24 : EndIf
+  If direct
+   If Dt(3)\Data Or DMutable(3) Or Dt(5)\Owned Or DMutable(5)=0 : rc=25 : EndIf
+  EndIf
+ EndIf
+ For i=-16 To 1039
+  If direct=0 Or i<oldBytes Or i>=totalBytes
+   If PeekA(a+i)<>PeekA(snapshot+i) : rc=26 : Break : EndIf
+  EndIf
+ Next
+ DError=0 : DCancel=0
+ For i=1 To 5 : DRelease(i) : Next
+ If DLive Or DHeapUsed : rc=27 : EndIf
+ If rc : PokeI($E1C01F80,kind) : PokeI($E1C01F88,prefix) : PokeI($E1C01F90,tail) : PokeI($E1C01F98,outer) : PokeI($E1C01FA0,mode) : PokeI($E1C01FA8,small) : PokeI($E1C01FB0,alias) : PokeI($E1C01FB8,bad) : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i Main(services.i)
+ Protected rc.i,cases.i,*pet,kind.i
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ If DHeapBind($CC000000,$2000000)=0 : MmuDisableCachedFlushed() : ProcedureReturn 3 : EndIf
+ rc=ConcatDuplicate(1,2,2,1,1,0,0,0) : cases+1
+ If rc=0 : rc=ConcatDuplicate(7,1,1,1,1,0,0,0) : cases+1 : EndIf
+ If rc=0 : rc=ConcatDuplicate(9,1,1,1,1,0,0,0) : cases+1 : EndIf
+ If rc=0 : rc=ConcatThree(1,2,1,1,1,0,0,0) : cases+1 : EndIf
+ If rc=0 : rc=ConcatThree(7,2,1,1,1,0,0,0) : cases+1 : EndIf
+ If rc=0 : rc=ConcatThree(9,2,1,1,1,0,0,0) : cases+1 : EndIf
+ If rc=0 : rc=ConcatNegative(1,2,1,1,1,0,0,0) : cases+1 : EndIf
+ If rc=0 : rc=ConcatNegative(1,2,1,1,2,0,0,0) : cases+1 : EndIf
+ If rc=0 : rc=ConcatAxisZero(1,2,1,1,1,0,0,0) : cases+1 : EndIf
+ If rc=0 : rc=ConcatAxisZero(7,2,1,1,1,0,0,0) : cases+1 : EndIf
+ If *pet : pet() : EndIf
+ PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,DLive) : PokeI($E1C01FE0,DHeapUsed)
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

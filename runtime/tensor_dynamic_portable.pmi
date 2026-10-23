@@ -2493,7 +2493,7 @@ Procedure DGatherConsume(Y.i,A.i,Indices.i,Axis.i)
  DGather(Y,A,Indices,Axis)
 EndProcedure
 
-Procedure DConcat(Y.i,Inputs.i,Axis.i)
+Procedure DConcatCore(Y.i,Inputs.i,Axis.i,Consume.i)
   Protected Dim dims.i(8)
   Protected count.i=DListCount(Inputs)
   Protected a.i=DListValue(Inputs,1)
@@ -2531,6 +2531,38 @@ Procedure DConcat(Y.i,Inputs.i,Axis.i)
     Next
     dims(Axis)=dims(Axis)+DDims((a)*8+(Axis))
   Next
+  CompilerIf #PMD_NATIVE_BYTES=8
+  Protected firstSource.i=DListValue(Inputs,1),append.i=0,totalBytes.i=size,cap.i,oldBytes.i,address.i,sourceId.i,sourceBytes.i,sourceAddress.i,tailBytes.i
+  If Consume And firstSource<>Y And DMutable(firstSource) And Dt(firstSource)\Owned=0 And DProduct(firstSource,0,Axis-1)=1
+    append=1 : cap=DMutableCapacity(firstSource) : oldBytes=Dt(firstSource)\Bytes : address=Dt(firstSource)\Data
+    For j=0 To Dt(a)\Rank-1
+      If dims(j)<0 Or dims(j)>DLimit : append=0 : Break : EndIf
+      If dims(j)>0 And totalBytes>cap/dims(j) : append=0 : Break : EndIf
+      totalBytes=totalBytes*dims(j)
+    Next
+    If totalBytes<oldBytes : append=0 : EndIf
+    tailBytes=totalBytes-oldBytes
+    If append
+      For i=2 To count
+        sourceId=DListValue(Inputs,i) : sourceBytes=Dt(sourceId)\Bytes : sourceAddress=Dt(sourceId)\Data
+        If sourceId=Y : append=0 : Break : EndIf
+        If sourceBytes>0 And tailBytes>0
+          If (sourceAddress>=address+oldBytes And sourceAddress-address-oldBytes<tailBytes) Or (sourceAddress<address+oldBytes And address+oldBytes-sourceAddress<sourceBytes) : append=0 : Break : EndIf
+        EndIf
+      Next
+    EndIf
+    If append
+      If DBindBorrowed(Y,Dt(a)\Kind,Dt(a)\Rank,@dims(0),address,cap)=0 : ProcedureReturn : EndIf
+      DMutable(Y)=1 : DMutableCapacity(Y)=cap : offset=oldBytes
+      For i=2 To count
+        sourceId=DListValue(Inputs,i) : sourceBytes=Dt(sourceId)\Bytes
+        DCopyServiced(Dt(sourceId)\Data,address+offset,sourceBytes) : offset+sourceBytes
+      Next
+      DRelease(firstSource)
+      ProcedureReturn
+    EndIf
+  EndIf
+  CompilerEndIf
   If DAllocOverwrite(Y,Dt(a)\Kind,Dt(a)\Rank,@dims(0))=0
     ProcedureReturn
   EndIf
@@ -2552,6 +2584,13 @@ Procedure DConcat(Y.i,Inputs.i,Axis.i)
     offset+span
   Next
 EndProcedure
+Procedure DConcat(Y.i,Inputs.i,Axis.i)
+ DConcatCore(Y,Inputs,Axis,0)
+EndProcedure
+Procedure DConcatConsume(Y.i,Inputs.i,Axis.i)
+ DConcatCore(Y,Inputs,Axis,1)
+EndProcedure
+
 
 Procedure DSlice(Y.i,A.i,Starts.i,Ends.i,Axes.i,Steps.i)
   Protected Dim dims.i(8)
