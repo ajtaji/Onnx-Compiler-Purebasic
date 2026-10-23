@@ -2217,30 +2217,70 @@ pmoConvSixEightChannel:
   ldp q8, q9, [sp], #128
  EndASM
 EndProcedure
+; Embed two five-tap phases into the existing exact six-lane tiles.
+; Dummy lanes never reach caller output; real lanes keep their reduction order.
+Procedure PmConvTransposeFivePackA64(src.i,dst.i,channels.i,stride.i)
+ ASM
+pmoConvFivePackLoop:
+  ldr q0, [x0]
+  ldr s1, [x0, #16]
+  ldr q2, [x0, #20]
+  ldr s3, [x0, #36]
+  str q0, [x1]
+  str s1, [x1, #16]
+  str wzr, [x1, #20]
+  str q2, [x1, #24]
+  str s3, [x1, #40]
+  str wzr, [x1, #44]
+  add x1, x1, #48
+  add x0, x0, x3
+  subs x2, x2, #1
+  b.ne pmoConvFivePackLoop
+ EndASM
+EndProcedure
+Procedure PmConvTransposeFiveCopyA64(src.i,dst.i,rows.i)
+ ASM
+pmoConvFiveCopyLoop:
+  ldr q0, [x0]
+  ldr w3, [x0, #16]
+  str q0, [x1]
+  str w3, [x1, #16]
+  add x0, x0, #24
+  add x1, x1, #20
+  subs x2, x2, #1
+  b.ne pmoConvFiveCopyLoop
+ EndASM
+EndProcedure
 Procedure.i PmConvTransposeSixRange(*g.PmTensorConvTranspose1DArgs,ocFirst.i,ocLast.i,packed.i)
   Protected bn.i,oc.i,ic.i,group.i,ocg.i,ipg.i,opg.i,n.i,nFirst.i,nLast.i,take.i
-  Protected ox.i,phase.i,ix.i,src.i,weight.i,dst.i,endFirst.i,startLast.i,bias.i,weightStep.i
+  Protected ox.i,phase.i,ix.i,src.i,weight.i,dst.i,endFirst.i,startLast.i,bias.i,weightStep.i,phaseStride.i,weightBytes.i,realDst.i
   Protected Dim p.i[10]
   If *g=0 : ProcedureReturn 0 : EndIf
-  If *g\Stride<>6 Or *g\Kernel<>12 Or *g\Dilation<>1 Or *g\Groups<=0 Or *g\InWidth<=0 Or *g\OutWidth<=0 Or *g\Batches<=0 : ProcedureReturn 0 : EndIf
+  If (*g\Stride<>5 And *g\Stride<>6) Or *g\Kernel<>2* *g\Stride Or *g\Dilation<>1 Or *g\Groups<=0 Or *g\InWidth<=0 Or *g\OutWidth<=0 Or *g\Batches<=0 : ProcedureReturn 0 : EndIf
   ipg=*g\InChannels/ *g\Groups : opg=*g\OutChannels/ *g\Groups
   If ipg<=0 Or opg<=0 Or ipg* *g\Groups<>*g\InChannels Or opg* *g\Groups<>*g\OutChannels : ProcedureReturn 0 : EndIf
   If *g\PadLeft<0 : ProcedureReturn 0 : EndIf
-  nFirst=(*g\PadLeft+5)/6 : If nFirst<1 : nFirst=1 : EndIf
-  nLast=(*g\OutWidth+*g\PadLeft)/6
+  If *g\Stride=5 And (packed=0 Or ipg<32 Or ipg>128) : ProcedureReturn 0 : EndIf
+  phaseStride=*g\Stride : weightBytes=*g\Kernel*4
+  nFirst=(*g\PadLeft+phaseStride-1)/phaseStride : If nFirst<1 : nFirst=1 : EndIf
+  nLast=(*g\OutWidth+*g\PadLeft)/phaseStride
   If nLast>*g\InWidth : nLast=*g\InWidth : EndIf
   If nLast<nFirst : nLast=nFirst : EndIf
-  endFirst=nFirst*6-*g\PadLeft : If endFirst>*g\OutWidth : endFirst=*g\OutWidth : EndIf
-  startLast=nLast*6-*g\PadLeft : If startLast<endFirst : startLast=endFirst : EndIf
+  endFirst=nFirst*phaseStride-*g\PadLeft : If endFirst>*g\OutWidth : endFirst=*g\OutWidth : EndIf
+  startLast=nLast*phaseStride-*g\PadLeft : If startLast<endFirst : startLast=endFirst : EndIf
   For bn=0 To *g\Batches-1
     For oc=ocFirst To ocLast-1
       PmKernelIdle()
       group=oc/opg : ocg=oc-group*opg
       src=*g\Src+(bn* *g\InChannels+group*ipg)* *g\InWidth*4
-      weight=*g\Weight+((group*ipg)*opg+ocg)*48
-      weightStep=opg*48
+      weight=*g\Weight+((group*ipg)*opg+ocg)*weightBytes
+      weightStep=opg*weightBytes
       If packed<>0 And ipg>=32 And ipg<=128 And *g\InWidth>=16
-        PmConvTransposeSixPackA64(weight,packed,ipg,weightStep)
+        If phaseStride=5
+          PmConvTransposeFivePackA64(weight,packed,ipg,weightStep)
+        Else
+          PmConvTransposeSixPackA64(weight,packed,ipg,weightStep)
+        EndIf
         weight=packed : weightStep=48
       EndIf
       dst=*g\Dst+(bn* *g\OutChannels+oc)* *g\OutWidth*4
@@ -2248,16 +2288,18 @@ Procedure.i PmConvTransposeSixRange(*g.PmTensorConvTranspose1DArgs,ocFirst.i,ocL
       n=nFirst
       While n<nLast
         take=nLast-n : If take>=8 : take=8 : ElseIf take>4 : take=4 : EndIf
-        p[0]=src+(n-1)*4 : p[1]=weight : p[2]=dst+(n*6-*g\PadLeft)*4
+        p[0]=src+(n-1)*4 : p[1]=weight : p[2]=dst+(n*phaseStride-*g\PadLeft)*4
+        realDst=p[2] : If phaseStride=5 : p[2]=packed+6144 : EndIf
         p[3]=ipg : p[4]=*g\InWidth*4 : p[5]=weightStep : p[6]=take : p[8]=bias
         If take=8 : PmConvSixEightA64(@p[0]) : Else : PmConvTransposeSixTileA64(@p[0]) : EndIf
+        If phaseStride=5 : PmConvTransposeFiveCopyA64(packed+6144,realDst,take) : EndIf
         n+take
       Wend
       ox=0
       While ox<*g\OutWidth
         If ox=endFirst : ox=startLast : EndIf
         If ox>=*g\OutWidth : Break : EndIf
-        ix=(ox+*g\PadLeft)/6 : phase=(ox+*g\PadLeft) % 6
+        ix=(ox+*g\PadLeft)/phaseStride : phase=(ox+*g\PadLeft) % phaseStride
         p[0]=src : p[1]=weight : p[2]=dst+ox*4 : p[3]=ipg
         p[4]=*g\InWidth*4 : p[5]=weightStep : p[6]=ix : p[7]=phase : p[8]=bias : p[9]=*g\InWidth
         PmConvTransposeSixEdgeA64(@p[0])
@@ -2269,12 +2311,14 @@ Procedure.i PmConvTransposeSixRange(*g.PmTensorConvTranspose1DArgs,ocFirst.i,ocL
 EndProcedure
 
 
-; The worker stacks are small. Each worker receives a separate6144-byte
-; packing region owned by the calling operator, never a local packed array.
+; The worker stacks are small. Each worker receives a separate6400-byte
+; region: up to6144 bytes of packed weights and192 bytes for discarding
+; stride-five padding lanes, with64 bytes spare. Legacy Six helper names
+; now cover both kernel=2*stride cases (stride five or six).
 Procedure.i PmConvTransposeSixEligible(*g.PmTensorConvTranspose1DArgs)
   Protected ipg.i,opg.i
   If *g=0 : ProcedureReturn 0 : EndIf
-  If *g\Stride<>6 Or *g\Kernel<>12 Or *g\Dilation<>1 Or *g\Groups<=0 Or *g\Batches<=0 Or *g\InWidth<16 Or *g\OutWidth<32 Or *g\PadLeft<0 Or *g\PadLeft>12 : ProcedureReturn 0 : EndIf
+  If (*g\Stride<>5 And *g\Stride<>6) Or *g\Kernel<>2* *g\Stride Or *g\Dilation<>1 Or *g\Groups<=0 Or *g\Batches<=0 Or *g\InWidth<16 Or *g\OutWidth<32 Or *g\PadLeft<0 Or *g\PadLeft>12 : ProcedureReturn 0 : EndIf
   ipg=*g\InChannels/ *g\Groups : opg=*g\OutChannels/ *g\Groups
   If ipg<32 Or ipg>128 Or opg<1 Or ipg* *g\Groups<>*g\InChannels Or opg* *g\Groups<>*g\OutChannels : ProcedureReturn 0 : EndIf
   ProcedureReturn 1
@@ -2290,12 +2334,12 @@ Procedure.i PmConvTransposeSixParallel(*g.PmTensorConvTranspose1DArgs,scratch.i,
   If *g\OutChannels>=4 And *g\OutChannels* *g\OutWidth>=16384
     parts=PmParallelCores() : If parts>4 : parts=4 : EndIf
   EndIf
-  If bytes<parts*6144 : ProcedureReturn 0 : EndIf
+  If bytes<parts*6400 : ProcedureReturn 0 : EndIf
   If parts>1
     For i=0 To parts-1
       last=*g\OutChannels*(i+1)/parts
       PmConvSixParts[i*4]=*g : PmConvSixParts[i*4+1]=first : PmConvSixParts[i*4+2]=last
-      PmConvSixParts[i*4+3]=scratch+i*6144 : first=last
+      PmConvSixParts[i*4+3]=scratch+i*6400 : first=last
     Next
     ; A failed dispatch must not be hidden by a successful primary rerun.
     If pmSvcParRun(@PmConvSixWorker,@PmConvSixParts[0],32,parts)<>#PMP_SVC_OK : ProcedureReturn -1 : EndIf

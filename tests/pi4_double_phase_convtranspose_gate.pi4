@@ -1,0 +1,111 @@
+; 87 complete old-native comparisons for stride5/6, including marked four-core execution.
+; CE input/output/pack scratch, CE800000 markers; no audio.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+EnableFloatingPoint
+#PMD_TENSOR_COUNT = 64
+#PMD_NODE_COUNT = 64
+#PMD_NATIVE_BYTES=8
+#PMO_INT8_BACKEND=1
+#PMO_INT64_SPLIT=0
+#PMD_WORKING_MEMORY_LIMIT=1073741824
+#PMD_METADATA_RESERVE=16384
+#PMO_WEIGHT_FILE_BYTES=0
+#PMO_USE_BATCHNORM=1
+ #PMO_USE_STFT=1
+ #PMO_USE_RESIZE=1
+ #PMO_USE_CONVTRANSPOSE=1
+ #PMO_USE_CONV=1
+ #PMO_USE_LSTM=1
+ #PMO_USE_INT8=1
+ #PMO_USE_EXPLOG=1
+ #PMO_USE_TRIG=1
+ #PMO_USE_ATAN=1
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "../runtime/tensor_fp32.pmi"
+XIncludeFile "../runtime/tensor_fp32_neon.pmi"
+XIncludeFile "../runtime/tensor_trig_a64.pmi"
+XIncludeFile "../runtime/tensor_dynamic_portable.pmi"
+XIncludeFile "../runtime/tensor_norm_small.pmi"
+XIncludeFile "../runtime/tensor_dynamic_norm_small_portable.pmi"
+#PMO_OPS_INT32=0
+XIncludeFile "../runtime/tensor_ops.pmi"
+XIncludeFile "../runtime/tensor_dynamic_ops_portable.pmi"
+
+
+Global PhaseCallbacks.i,PhaseFault.i
+Procedure PhaseIdle()
+ If PmKernelCore() : PhaseFault+1 : EndIf
+ PhaseCallbacks+1
+EndProcedure
+Procedure.i MarkedPhaseWorker(p.i)
+ PokeI($CE800000+PmKernelCore()*8,1)
+ ProcedureReturn PmConvSixWorker(p)
+EndProcedure
+Procedure.i PhaseCase(stride.i,ipg.i,opg.i,width.i,pad.i,groups.i,batches.i,pattern.i,marked.i)
+ Protected g.PmTensorConvTranspose1DArgs
+ Protected i.i,rc.i,n.i,src.i=$CE000100,weight.i=$CE100100,bias.i=$CE200100,ref.i=$CE300100,dst.i=$CE400100,scratch.i=$CE500100
+ g\Src=src : g\Weight=weight : g\Bias=bias : g\Dst=ref
+ g\Batches=batches : g\InChannels=ipg*groups : g\OutChannels=opg*groups : g\InWidth=width : g\Kernel=stride*2
+ g\Groups=groups : g\Stride=stride : g\Dilation=1 : g\PadLeft=pad : g\OutWidth=width*stride+stride-pad
+ For i=0 To batches*g\InChannels*width-1 : PmTensorPut(src,i,((i*19) % 43-21)/32.0) : Next
+ For i=0 To g\InChannels*opg*g\Kernel-1 : PmTensorPut(weight,i,((i*13) % 29-14)/64.0) : Next
+ For i=0 To g\OutChannels-1 : PmTensorPut(bias,i,(i % 7-3)/32.0) : Next
+ If pattern=1 : g\Bias=0 : EndIf
+ If pattern=2
+  PokeL(src,$80000000) : PokeL(weight,$7FC12345) : PokeL(src+width*4,$7F800000)
+ EndIf
+ n=batches*g\OutChannels*g\OutWidth*4
+ For i=-16 To n+15 : PokeA(ref+i,$5A) : PokeA(dst+i,$5A) : Next
+ For i=-16 To 25615 : PokeA(scratch+i,$5A) : Next
+ For i=0 To 13 : PokeI($E1C01000+i*8,PeekI(@g+i*8)) : Next
+ PokeI($E1C01080,PmConvTransposeSixEligible(@g))
+ PmTensorConvTranspose1DFp32Neon(@g)
+ g\Dst=dst
+ If PmConvTransposeSixParallel(@g,scratch,25600)<>1 : ProcedureReturn 20 : EndIf
+ If marked
+  DZero($CE800000,32)
+  If PmParallelCores()<>4 : rc=31 : EndIf
+  If pmSvcParRun(@MarkedPhaseWorker,@PmConvSixParts[0],32,4)<>#PMP_SVC_OK : rc=32 : EndIf
+  For i=0 To 3 : If PeekI($CE800000+i*8)<>1 : rc=33 : EndIf : Next
+ EndIf
+ For i=-16 To n+15
+  If PeekA(ref+i)<>PeekA(dst+i) : PokeI($E1C01F80,i) : rc=21 : Break : EndIf
+ Next
+ For i=-16 To -1 : If PeekA(scratch+i)<>$5A : rc=22 : EndIf : Next
+ For i=25600 To 25615 : If PeekA(scratch+i)<>$5A : rc=23 : EndIf : Next
+ If rc : PokeI($E1C01F88,stride) : PokeI($E1C01F90,pad) : PokeI($E1C01F98,width) : EndIf
+ ProcedureReturn rc
+EndProcedure
+Procedure.i Main(services.i)
+ Protected stride.i,ipg.i,opg.i,width.i,pad.i,gp.i,pattern.i,rc.i,cases.i,*pet
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ If MmuBuildTables($00800000) : ProcedureReturn 12 : EndIf
+ MmuEnableCached() : PmSetAnvilServices(services) : *pet=pmAnvilSlot(6) : DZero($E1C00000,8192)
+ PmSetIdleCallback(@PhaseIdle)
+ For stride=5 To 6
+ For ipg=32 To 128 Step 96
+ For opg=1 To 4 Step 3
+ For width=16 To 17
+ For pad=0 To 12 Step 3
+  rc=PhaseCase(stride,ipg,opg,width,pad,1,1,0,0) : cases+1
+  If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next
+ If rc=0
+ For stride=5 To 6
+ For pattern=0 To 2
+  rc=PhaseCase(stride,32,4,19,5,2,2,pattern,0) : cases+1
+  If *pet : pet() : EndIf
+  If rc : Break : EndIf
+ Next : If rc : Break : EndIf
+ Next
+ EndIf
+ If rc=0 : rc=PhaseCase(5,32,64,63,0,1,1,0,1) : cases+1 : EndIf
+ PmSetIdleCallback(0) : PokeI($E1C01FD0,cases) : PokeI($E1C01FD8,PhaseFault) : PokeI($E1C01FE0,PhaseCallbacks)
+ If PhaseFault : rc=34 : EndIf
+ MmuDisableCachedFlushed() : ProcedureReturn rc
+EndProcedure

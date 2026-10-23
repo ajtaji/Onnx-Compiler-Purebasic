@@ -1084,7 +1084,7 @@ Procedure.i PmFastConv(*g.PmTensorConv1DArgs,Available.i)
 EndProcedure
 Procedure.i PmFastConvTranspose(*g.PmTensorConvTranspose1DArgs,Available.i)
   CompilerIf #PMD_NATIVE_BYTES=8
-  Protected scratch.i,bytes.i=24576,status.i
+  Protected scratch.i,bytes.i=25600,status.i
   If PmConvTransposeSixEligible(*g) And Available>=bytes
     scratch=DAcquireOverwrite(bytes)
     If scratch=0 : ProcedureReturn 0 : EndIf
