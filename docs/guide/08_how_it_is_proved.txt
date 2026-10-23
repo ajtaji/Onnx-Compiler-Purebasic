@@ -1181,3 +1181,32 @@ recorded phrase cache. A full buffer digest includes inactive capacity, so
 future independent numerical comparisons must also initialize that capacity
 consistently; a matching request boundary alone does not reset unused bytes.
 The guide PDF remains pending the unavailable required artifact marker.
+
+
+@SECTION Cache-line INT8 projection proof, 23 October 2026
+
+The sixty-four-column kernel passes 338 physical complete old-kernel-plus-
+epilogue comparisons, including K zero through 4097 and the large reduction
+boundary 133144, aligned/unaligned data, strides 64/1536, signed extremes,
+negative zero/scales and full output guards. Another 110 old-dispatch cases
+cover narrow/wide weights, one/two rows, widths near 64, sixteen-column tails,
+nonzero partition starts and ordinary fallbacks. Earlier runner text said674
+raw cases; the actual verified result is338 and is the count reported here.
+
+Without output hints, complete replies take 2.246/3.114 seconds versus the
+prior 2.329/3.216. With checked output storage and a common final commit,
+deterministically initialized caller capacity gives 2.189/3.031 seconds for
+2.48/3.28 seconds of audio. Against the same initialized output-storage
+baseline 2.268/3.137, this is another 3.4 percent less generation time.
+Complete waveforms and the entire 29,387,456-byte state digest remain exact.
+The harness initializes inactive capacity once before request timing; those
+bytes are not logical recurrent state but must be controlled for whole-buffer
+comparison. Every logical state can also be compared by named range rather
+than hashing padding left by a previous experiment.
+
+Current sustained ratios are 0.883/0.924, with first PCM at 98/113 ms.
+Simultaneous map smoothness and safe subsecond audible starts are still not
+proved. These runs remain silent. Normal compiler applications/self-test,
+nine emitted runtimes/full mixed weights and complete normal image equality
+to the physical candidate all pass. The same matrix rule helps eligible
+graphs beyond speech. PDF refresh remains pending the required marker helper.

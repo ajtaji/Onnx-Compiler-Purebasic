@@ -782,3 +782,15 @@ storage only if needed. Release/reset clears the hint. Direct writes are not
 rolled back after a later error or cancellation, as with mutable input state.
 Unbound applications retain their existing behavior. The current public
 entry point is available in the generated portable native64 runtime.
+
+
+@SECTION Exact sixty-four-column narrow INT8 projections
+
+The native INT8 single-row MatMul path processes sixty-four adjacent output
+columns together when weights are unpacked and enough columns remain. It
+reuses each loaded cache line and quantized activation. Each output retains
+the same INT32 reduction, conversion to FLOAT, row scaling, addition of zero
+and weight scaling as the earlier sixteen-column kernel plus epilogue.
+Sixteen-column and scalar tails remain unchanged. Packed weights, wide INT8,
+multiple rows and small matrices keep their earlier paths. No extra resident
+weight cache, new precision policy or approximation is required.
