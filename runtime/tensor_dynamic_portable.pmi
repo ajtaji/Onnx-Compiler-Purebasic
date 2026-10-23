@@ -2389,6 +2389,39 @@ EndProcedure
 
 ; Explicit last-use selection from caller-owned writable recurrent storage.
 ; Immutable or arena-owned sources retain ordinary Gather's copied result.
+; Read-only selection. The caller must retain A's backing through every use
+; of Y. Generated code selects this only for already-pinned source tensors.
+Procedure DGatherView(Y.i,A.i,Indices.i,Axis.i)
+ CompilerIf #PMD_NATIVE_BYTES=8
+ Protected Dim dims.i(8)
+ Protected i.i,p.i,rank.i,idx.i,extent.i,inner.i,size.i,bytes.i,offset.i
+ If Y<>A And Y<>Indices And A>0 And A<=#PMD_TENSOR_COUNT And Y>0 And Y<=#PMD_TENSOR_COUNT And Indices>0 And Indices<=#PMD_TENSOR_COUNT
+ If Dt(A)\Rank>0 And (Axis=0 Or Axis=-Dt(A)\Rank) And Dt(Indices)\Count=1
+  If DError Or DCancel : DFail("Request cancelled or an earlier operation failed.") : ProcedureReturn : EndIf
+  If DRejectProgressReentry() : ProcedureReturn : EndIf
+  rank=Dt(A)\Rank+Dt(Indices)\Rank-1
+  If rank>8 : DFail("Invalid Gather rank or axis.") : ProcedureReturn : EndIf
+  idx=DInt(Indices,0) : If DError : ProcedureReturn : EndIf
+  extent=DDims(A*8) : If idx<0 : idx+extent : EndIf
+  If idx<0 Or idx>=extent : DFail("Gather index is out of bounds.") : ProcedureReturn : EndIf
+  inner=DProduct(A,1,Dt(A)\Rank-1) : size=DSize(Dt(A)\Kind)
+  If inner<0 Or size=0 Or inner>DLimit/size : DFail("Borrowed Gather storage is invalid.") : ProcedureReturn : EndIf
+  bytes=inner*size
+  If bytes>Dt(A)\Bytes : DFail("Borrowed Gather span is invalid.") : ProcedureReturn : EndIf
+  If bytes>0
+   If idx>(Dt(A)\Bytes-bytes)/bytes : DFail("Borrowed Gather span is invalid.") : ProcedureReturn : EndIf
+  EndIf
+  offset=idx*bytes
+  For i=0 To Dt(Indices)\Rank-1 : dims(p)=DDims(Indices*8+i) : p+1 : Next
+  For i=1 To Dt(A)\Rank-1 : dims(p)=DDims(A*8+i) : p+1 : Next
+  DBindBorrowed(Y,Dt(A)\Kind,rank,@dims(0),Dt(A)\Data+offset,bytes)
+  ProcedureReturn
+ EndIf
+ EndIf
+ CompilerEndIf
+ DGather(Y,A,Indices,Axis)
+EndProcedure
+
 Procedure DGatherConsume(Y.i,A.i,Indices.i,Axis.i)
  CompilerIf #PMD_NATIVE_BYTES=8
  Protected Dim dims.i(8)

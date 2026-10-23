@@ -490,6 +490,24 @@ XIncludeFile "onnx_control_emit.pbi"
 ; Reuse an owned last-use input for a shape view or ScatterND source.
 ; Constants, graph outputs and later uses stay on the ordinary copy path.
 ; Borrowed inputs are checked by the runtime and retain their copy path.
+; Graph outputs retain their backing through request completion. A read-only
+; Gather slice may share that already-pinned backing without extending a life.
+Procedure PmdBorrowOutputGathers(List Calls.s(),List ScheduleStatic.i(),Map Last.i())
+  Protected i.i,n.i=ListSize(Calls()),call.s,open.i,a.i,y.i,key.s
+  ForEach Calls()
+    i=ListIndex(Calls())
+    SelectElement(ScheduleStatic(),i) : If ScheduleStatic()<>0 : Continue : EndIf
+    call=Trim(Calls()) : open=FindString(call,"(")
+    If open<1 Or Left(call,open-1)<>"DGather" : Continue : EndIf
+    y=Val(StringField(Mid(call,open+1),1,","))
+    a=Val(StringField(Mid(call,open+1),2,",")) : key=Str(a)
+    If a<=0 Or y<=0 Or y=a : Continue : EndIf
+    If FindMapElement(Last(),key)=0 : Continue : EndIf
+    If Last()<n : Continue : EndIf
+    Calls()="DGatherView"+Mid(call,open)
+  Next
+EndProcedure
+
 Procedure PmdConsumeDeadInputs(List Calls.s(),List ScheduleStatic.i(),Map Last.i(),Map Persistent.i())
   Protected i.i,call.s,op.s,open.i,a.i,y.i,key.s
   ForEach Calls()
@@ -760,6 +778,7 @@ Procedure.i PmoDynamicCommand(ModelPath.s)
     PmdCombineMultiplyAdd(calls(),isstatic(),last(),persistent())
     PmdCombineConvAdd(calls(),isstatic(),last(),persistent())
     PmdCombineTrigSquare(calls(),isstatic(),last(),persistent())
+    PmdBorrowOutputGathers(calls(),isstatic(),last())
     PmdConsumeDeadInputs(calls(),isstatic(),last(),persistent())
   EndIf
   If PmoStorageReduce(@ir,precision)=0 : PmoDynamicError=PmoQuantError : Goto Failed : EndIf
